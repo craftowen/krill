@@ -61,6 +61,7 @@ use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
 
+pub use crate::terminal::path_link::sanitize_http_url;
 pub use group_dialog::BotGroupMembersDialog;
 pub use group_panel::{GroupChatScope, GroupItemsFilter};
 pub use home::HomeFilter;
@@ -118,6 +119,7 @@ pub struct OpenBotHome {
     pub bot_id: BotId,
     pub kickoff: Option<String>,
     pub host: HostId,
+    pub warning: Option<String>,
 }
 
 /// Notify the host `Shell` when bots or their attention counts (`needs_you` + pending access) change.
@@ -207,7 +209,7 @@ pub struct View {
     detail_task: Option<Task<()>>,
     open_chat_task: Option<Task<()>>,
     tidy_task: Option<Task<()>>,
-    look_task: Option<Task<()>>,
+    look_tasks: std::collections::HashMap<BotId, Task<()>>,
     import_task: Option<Task<()>>,
     import_create_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
@@ -358,7 +360,7 @@ impl View {
             detail_task: None,
             open_chat_task: None,
             tidy_task: None,
-            look_task: None,
+            look_tasks: std::collections::HashMap::new(),
             import_task: None,
             import_create_task: None,
             mutation_task: None,
@@ -414,6 +416,21 @@ impl View {
     }
 
     #[must_use]
+    pub fn selected_bot_id(&self) -> Option<&BotId> {
+        self.selected_bot_id.as_ref()
+    }
+
+    /// Returns `true` when switching the panel view to `bot_id` is currently blocked by unsaved
+    /// Soul/Memory edits (either awaiting confirmation or explicitly declined by the user).
+    #[must_use]
+    pub fn is_panel_switch_blocked(&self, bot_id: &BotId, cx: &gpui::App) -> bool {
+        self.selected_bot_id.as_ref() != Some(bot_id)
+            && self.soul_memory.has_unsaved_edits(cx)
+            && (self.pending_switch_bot.as_ref() == Some(bot_id)
+                || self.panel_switch_dismissed_for.as_ref() == Some(bot_id))
+    }
+
+    #[must_use]
     pub fn session_meta_for(&self, bot_id: &BotId) -> Option<BotSessionMeta> {
         self.bots
             .iter()
@@ -447,16 +464,27 @@ impl View {
             self.detail_task = None;
             self.open_chat_task = None;
             self.tidy_task = None;
-            self.look_task = None;
+            self.look_tasks.clear();
+            self.soul_memory.look_around_running.clear();
+            self.import_task = None;
+            self.import_state.scanning = false;
+            self.import_create_task = None;
             self.mutation_task = None;
+            self.export_task = None;
             self.settings_save_task = None;
             self.patch_task = None;
+            self.settings.patch_queue.clear();
+            self.settings.extras_task = None;
+            self.settings.models_task = None;
+            self.settings.models_loading_for = None;
+            self.settings.agent_models = None;
             self.sessions_task = None;
             self.item_task = None;
             self.mark_items_seen_task = None;
             self.memory_task = None;
             self.topic_read_task = None;
             self.connector_task = None;
+            self.oauth_file_task = None;
             self.tools_task = None;
             self.tools_status_task = None;
             self.tools_cancel_oauth_task = None;
@@ -465,14 +493,18 @@ impl View {
             self.busy = false;
             self.chats.opening = false;
             self.chats.loading = false;
-            self.items.busy = false;
+            self.items.cancel_tasks_on_switch();
+            self.items.clear_all_seen();
             self.items.items_cache.clear();
             self.soul_memory.busy = false;
             self.soul_memory.tidy_running = false;
-            self.soul_memory.look_around_running = false;
+            self.settings.saving = false;
+            self.connectors.busy = false;
+            self.tools.busy = false;
             self.rpc = daemon_bot_rpc_for_host(&self.host, target);
             self.unsupported = None;
             self.selected_bot_id = None;
+            self.pending_switch_bot = None;
             self.bots.clear();
             self.bots_loaded_at_ms = None;
             self.bot_sessions.clear();
@@ -493,6 +525,8 @@ impl View {
             self.connectors.adding = None;
             self.connectors.add_rail = 0;
             clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
+            self.clear_connector_inputs_on_bot_switch(cx);
+            self.clear_tool_inputs_on_bot_switch(cx);
             self.soul_memory.set_loaded(String::new(), String::new());
             self.soul_memory.suggestions.clear();
             self.soul_memory.selected_topic = None;
@@ -500,7 +534,7 @@ impl View {
             self.settings.extras.clear();
             self.settings.reset_pages();
             self.group_panel.all_items.clear();
-            self.group_panel.closed_loaded_key = None;
+            self.invalidate_group_panel_items();
             self.reload(cx);
         } else {
             cx.notify();
@@ -541,6 +575,7 @@ impl View {
         self.armed_delete_bot = None;
         self.soul_memory.armed_forget = None;
         self.pending_switch_bot = None;
+        self.panel_switch_dismissed_for = None;
         self.oauth_poll_task = None;
         self.import_dialog.picture.cancel_running_generation();
         cx.notify();
@@ -553,11 +588,11 @@ impl View {
         self.panel_switch_dismissed_for = None;
         self.memory_task = None;
         self.tidy_task = None;
-        self.look_task = None;
+        self.look_tasks.clear();
         self.topic_read_task = None;
         self.soul_memory.busy = false;
         self.soul_memory.tidy_running = false;
-        self.soul_memory.look_around_running = false;
+        self.soul_memory.look_around_running.clear();
         self.error = None;
         self.notice = None;
         if !self.bots.is_empty() {
@@ -631,6 +666,7 @@ impl View {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load_gen = self.load_gen.wrapping_add(1);
         let generation = self.load_gen;
+        let req_host = self.host.clone();
         let rpc = self.rpc.clone();
         let target = (!self.rpc_is_mock)
             .then(|| {
@@ -731,7 +767,7 @@ impl View {
                 .await;
 
             this.update(cx, |this, cx| {
-                if this.load_gen != generation {
+                if this.load_gen != generation || this.host != req_host {
                     return;
                 }
                 this.loading = false;
@@ -785,6 +821,7 @@ impl View {
     pub fn select_bot(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
         if self.selected_bot_id.as_ref() != Some(&bot_id) && self.soul_memory.has_unsaved_edits(cx)
         {
+            self.panel_switch_dismissed_for = None;
             self.pending_switch_bot = Some(bot_id);
             cx.notify();
             return;
@@ -799,16 +836,37 @@ impl View {
         self.soul_memory.selected_topic = None;
         self.pending_switch_bot = None;
         self.panel_switch_dismissed_for = None;
-        self.memory_task = None;
-        self.tidy_task = None;
-        self.look_task = None;
-        self.topic_read_task = None;
-        self.soul_memory.busy = false;
-        self.soul_memory.tidy_running = false;
-        self.soul_memory.look_around_running = false;
         self.error = None;
         self.notice = None;
         if self.selected_bot_id.as_ref() != Some(&bot_id) {
+            if let Some(prev_id) = self.selected_bot_id.clone() {
+                self.items.clear_seen_for(&prev_id);
+            }
+            self.items.clear_seen_for(&bot_id);
+            // Cancel in-flight per-bot tasks so late responses from the previous bot cannot
+            // overwrite the newly selected bot's state (UB-20, UB-29).
+            self.memory_task = None;
+            self.tidy_task = None;
+            self.topic_read_task = None;
+            self.settings_save_task = None;
+            // Keep `self.patch_task` alive across bot switches so rapid queued patches in
+            // `settings.patch_queue` still finish persisting (`start_patch_update` and
+            // `start_remove_members` gate UI sync by `same_bot` and `req_host`).
+            self.item_task = None;
+            self.open_chat_task = None;
+            self.sessions_task = None;
+            self.mark_items_seen_task = None;
+            self.connector_task = None;
+            self.tools_task = None;
+            self.avatar_task = None;
+            self.chats.loading = false;
+            self.chats.opening = false;
+            self.soul_memory.busy = false;
+            self.soul_memory.tidy_running = false;
+            self.settings.saving = false;
+            self.connectors.busy = false;
+            self.tools.busy = false;
+            self.items.cancel_tasks_on_switch();
             // Home's items, open item, filter, folds, dialogs and look error belong to the last bot.
             self.items.clear_items();
             self.items.open_uid = None;
@@ -827,6 +885,9 @@ impl View {
             self.connectors.adding = None;
             self.connectors.add_rail = 0;
             clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
+            // Clear unsaved secret/credential inputs across bot switches (UB-47).
+            self.clear_connector_inputs_on_bot_switch(cx);
+            self.clear_tool_inputs_on_bot_switch(cx);
         }
         self.selected_bot_id = Some(bot_id.clone());
         self.screen = Screen::Detail;
@@ -874,11 +935,11 @@ impl View {
         self.panel_switch_dismissed_for = None;
         self.memory_task = None;
         self.tidy_task = None;
-        self.look_task = None;
+        self.look_tasks.clear();
         self.topic_read_task = None;
         self.soul_memory.busy = false;
         self.soul_memory.tidy_running = false;
-        self.soul_memory.look_around_running = false;
+        self.soul_memory.look_around_running.clear();
         self.error = None;
         self.notice = None;
         self.screen = Screen::Import;
@@ -892,6 +953,7 @@ impl View {
         }
         self.detail_gen = self.detail_gen.wrapping_add(1);
         let generation = self.detail_gen;
+        let req_host = self.host.clone();
         let rpc = self.rpc.clone();
         let target = (!self.rpc_is_mock)
             .then(|| {
@@ -1094,14 +1156,23 @@ impl View {
                 .await;
 
             this.update(cx, |this, cx| {
-                if this.detail_gen != generation || this.selected_bot_id.as_ref() != Some(&bot_id) {
+                if this.detail_gen != generation
+                    || this.host != req_host
+                    || this.selected_bot_id.as_ref() != Some(&bot_id)
+                {
                     return;
                 }
                 let mut errors = Vec::new();
-                match loaded.items_res {
-                    Ok(items) => this.items.set_items_for_bot(&bot_id, items),
-                    Err(e) => errors.push(e),
-                }
+                let items_ok = match loaded.items_res {
+                    Ok(items) => {
+                        this.items.set_items_for_bot(&bot_id, items);
+                        true
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        false
+                    }
+                };
                 let soul_opt = match loaded.soul_res {
                     Ok(val) => val,
                     Err(e) => {
@@ -1182,7 +1253,9 @@ impl View {
                 } else if !errors.is_empty() {
                     this.error = Some(this.load_error(&errors));
                 }
-                this.sync_open_items_for_bot(&bot_id);
+                if items_ok {
+                    this.sync_open_items_for_bot(&bot_id);
+                }
                 this.emit_badge(cx);
                 cx.notify();
             })
@@ -1244,6 +1317,8 @@ impl View {
             .and_then(|b| b.workspace.clone())
             .filter(|s| !s.trim().is_empty());
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_bot = bot_id.clone();
         let host_name = self.refusal_host_name();
         let origin_host_gen = self.host_gen;
         self.chats.opening = true;
@@ -1266,39 +1341,48 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
                 this.chats.opening = false;
+                let still_selected = this.selected_bot_id.as_ref() == Some(&req_bot);
                 match res {
                     Ok(BotRpcResponse::SessionStarted {
                         bot_id,
                         session_id,
                         pid,
                     }) => {
-                        this.bot_sessions.push(BotSessionSummary {
-                            session_id,
-                            bot_id: bot_id.clone(),
-                            link_id: None,
-                            pid,
-                            live: true,
-                            working: false,
-                            label: this
-                                .session_meta_for(&bot_id)
-                                .map(|m| m.bot_name)
-                                .unwrap_or_default(),
-                            created_at_ms: now_unix_ms(),
-                        });
+                        if !this.bot_sessions.iter().any(|s| s.session_id == session_id) {
+                            this.bot_sessions.push(BotSessionSummary {
+                                session_id,
+                                bot_id: bot_id.clone(),
+                                link_id: None,
+                                pid,
+                                live: true,
+                                working: false,
+                                label: this
+                                    .session_meta_for(&bot_id)
+                                    .map(|m| m.bot_name)
+                                    .unwrap_or_default(),
+                                created_at_ms: now_unix_ms(),
+                            });
+                        }
                         this.emit_sessions_changed(cx);
-                        cx.emit(OpenSession { bot_id, session_id });
+                        if still_selected {
+                            cx.emit(OpenSession { bot_id, session_id });
+                        }
                     }
                     Ok(other) => {
-                        this.error = Some(SharedString::from(format!(
-                            "unexpected StartBotSession response: {other:?}"
-                        )));
+                        if still_selected {
+                            this.error = Some(SharedString::from(format!(
+                                "unexpected StartBotSession response: {other:?}"
+                            )));
+                        }
                     }
                     Err(err) => {
-                        this.error = Some(SharedString::from(err));
+                        if still_selected {
+                            this.error = Some(SharedString::from(err));
+                        }
                     }
                 }
                 cx.notify();
@@ -1313,6 +1397,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let origin_host_gen = self.host_gen;
         self.chats.loading = true;
         self.sessions_task = Some(cx.spawn(async move |this, cx| {
@@ -1323,23 +1408,29 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
                 this.chats.loading = false;
+                let still_selected = this.selected_bot_id.as_ref() == Some(&bot_id);
                 match res {
                     Ok(BotRpcResponse::BotSessions(list)) => {
                         this.bot_sessions = list;
                         this.emit_sessions_changed(cx);
                     }
                     Ok(other) => {
-                        this.error = Some(SharedString::from(format!(
-                            "unexpected ListBotSessions response: {other:?}"
-                        )));
+                        if still_selected {
+                            this.error = Some(SharedString::from(format!(
+                                "unexpected ListBotSessions response: {other:?}"
+                            )));
+                        }
                     }
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                    Err(err) => {
+                        if still_selected {
+                            this.error = Some(SharedString::from(err));
+                        }
+                    }
                 }
-                let _ = &bot_id;
                 cx.notify();
             })
             .ok();
@@ -1423,6 +1514,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let host_name = self.refusal_host_name();
         let origin_host_gen = self.host_gen;
         self.chats.loading = true;
@@ -1444,34 +1536,38 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
                 this.chats.loading = false;
+                let still_selected = this.selected_bot_id.as_ref() == Some(&bot_id);
                 match res {
                     Ok((reply, sessions)) => {
                         if let Some(list) = sessions {
                             this.bot_sessions = list;
                             this.emit_sessions_changed(cx);
                         }
-                        if focus_on_start
-                            && let BotRpcResponse::SessionStarted {
-                                bot_id: bid,
-                                session_id,
-                                ..
-                            } = reply
-                        {
-                            cx.emit(OpenSession {
-                                bot_id: bid,
-                                session_id,
-                            });
-                        } else {
-                            let _ = &bot_id;
-                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        if still_selected {
+                            if focus_on_start
+                                && let BotRpcResponse::SessionStarted {
+                                    bot_id: bid,
+                                    session_id,
+                                    ..
+                                } = reply
+                            {
+                                cx.emit(OpenSession {
+                                    bot_id: bid,
+                                    session_id,
+                                });
+                            } else {
+                                this.notice = Some(SharedString::from(text::SAVED.get()));
+                            }
                         }
                     }
                     Err(err) => {
-                        this.error = Some(SharedString::from(err));
+                        if still_selected {
+                            this.error = Some(SharedString::from(err));
+                        }
                     }
                 }
                 cx.notify();
@@ -1486,6 +1582,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let origin_host_gen = self.host_gen;
         self.busy = true;
         self.error = None;
@@ -1519,7 +1616,7 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
                 this.busy = false;
@@ -1560,6 +1657,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let origin_host_gen = self.host_gen;
         self.busy = true;
         self.error = None;
@@ -1579,7 +1677,7 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
                 this.busy = false;
@@ -1675,7 +1773,10 @@ impl View {
             cx.notify();
             return;
         }
-        if self.pending_switch_bot.take().is_some() {
+        if let Some(declined) = self.pending_switch_bot.take() {
+            if self.mode == Mode::Panel {
+                self.panel_switch_dismissed_for = Some(declined);
+            }
             cx.notify();
             return;
         }
@@ -2761,28 +2862,39 @@ impl Render for View {
         }
         if self.screen == Screen::Import {
             let dialog = self.render_import_dialog(p, window, cx);
-            return ui::modal_focus_scope(
-                div()
-                    .id("bots-page")
-                    .debug_selector(|| "bots-page".into())
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "escape"
-                            && !event.keystroke.modifiers.modified()
-                            && !this.input_is_composing(window, cx)
-                        {
-                            this.handle_escape(cx);
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .w_full()
-                    .bg(p.background)
-                    .font_family(ui::FONT_UI)
-                    .text_size(ui::TEXT_MD)
-                    .text_color(p.foreground)
-                    .child(dialog),
-                &self.focus,
-            )
-            .into_any_element();
+            return div()
+                .w_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "tab"
+                        && !ev.keystroke.modifiers.modified()
+                        && this.try_accept_import_name_suggestion(window, cx)
+                    {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
+                }))
+                .child(ui::modal_focus_scope(
+                    div()
+                        .id("bots-page")
+                        .debug_selector(|| "bots-page".into())
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape"
+                                && !event.keystroke.modifiers.modified()
+                                && !this.input_is_composing(window, cx)
+                            {
+                                this.handle_escape(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .w_full()
+                        .bg(p.background)
+                        .font_family(ui::FONT_UI)
+                        .text_size(ui::TEXT_MD)
+                        .text_color(p.foreground)
+                        .child(dialog),
+                    &self.focus,
+                ))
+                .into_any_element();
         }
         let pending_switch_banner = self.render_pending_switch(p, cx);
 

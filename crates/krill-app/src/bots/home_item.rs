@@ -202,10 +202,12 @@ impl View {
                 if self.items.reply_hidden.get(&uid) == Some(&ask.id) {
                     self.submit_item_comment_with_attachments(uid, &body, input, has_files, cx);
                 } else {
+                    let decision_id = (!ask.decisions.is_empty()).then(|| format!("{}:0", ask.id));
                     self.answer_item_decision_with_cleanup(
                         uid,
                         Some(body),
                         None,
+                        decision_id,
                         input,
                         has_files,
                         None,
@@ -874,6 +876,7 @@ impl View {
                                                         Some(body_retry.clone()),
                                                         option_index,
                                                         None,
+                                                        None,
                                                         false,
                                                         ask_step_key.clone(),
                                                         cx,
@@ -1508,11 +1511,12 @@ impl View {
                 .line_height(px(18.))
                 .cursor_pointer()
         };
+        let event_id = event.id;
         let mut replies = div().mt(px(10.)).flex().flex_wrap().gap_2();
         for (o, option) in decision.options.iter().enumerate() {
             let recommended = decision.recommended == Some(o);
             let uid = item.uid.clone();
-            let id: SharedString = format!("bot-item-reply-{}-{d}-{o}", event.id).into();
+            let id: SharedString = format!("bot-item-reply-{event_id}-{d}-{o}").into();
             replies = replies.child(
                 chip(id)
                     .when(recommended, |c| {
@@ -1539,10 +1543,11 @@ impl View {
                         .items_center()
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.answer_item_decision(
+                        this.answer_item_decision_for(
                             uid.clone(),
                             None,
                             u32::try_from(o).ok(),
+                            Some(format!("{event_id}:{d}")),
                             None,
                             cx,
                         );
@@ -1624,7 +1629,7 @@ impl View {
         }
         let mentions = super::home_item_parts::trailing_mention(&value)
             .map(str::to_owned)
-            .map(|q| self.mention_matches(bot, &q))
+            .map(|q| self.mention_matches(bot, &q, cx))
             .unwrap_or_default();
         let files = self
             .items

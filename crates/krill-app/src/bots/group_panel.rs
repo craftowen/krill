@@ -57,14 +57,14 @@ struct GroupCacheKey {
     group_id: String,
     items_rev: u64,
     items_len: usize,
-    bots_sig: Vec<(BotId, String)>,
+    bots_sig: Vec<(usize, BotId, String)>,
     member_ids: Vec<BotId>,
     all_members_paused: bool,
     thread_ids: Vec<String>,
     filter: GroupItemsFilter,
     folds: Vec<&'static str>,
     group_shown: Vec<(&'static str, usize)>,
-    needs_keys: Vec<(BotId, String)>,
+    needs_keys: Vec<(BotId, String, super::home_needs::NeedKind)>,
     live_working_sessions: Vec<krill_proto::SessionId>,
     minute_bucket: u64,
     language: crate::i18n::Language,
@@ -307,6 +307,19 @@ impl View {
         cx.notify();
     }
 
+    #[must_use]
+    pub fn group_panel_matches(
+        &self,
+        group_id: &str,
+        member_ids: &[BotId],
+        thread_ids: &[String],
+    ) -> bool {
+        self.group_panel.active
+            && self.group_panel.group_id == group_id
+            && self.group_panel.member_ids == member_ids
+            && self.group_panel.thread_ids == thread_ids
+    }
+
     pub fn show_group_in_panel(
         &mut self,
         group_id: &str,
@@ -336,7 +349,7 @@ impl View {
         self.sync_group_items_backing();
     }
 
-    pub(super) fn retry_group_panel_items(&mut self, cx: &mut Context<Self>) {
+    pub fn retry_group_panel_items(&mut self, cx: &mut Context<Self>) {
         if !self.group_panel.active {
             return;
         }
@@ -458,11 +471,12 @@ impl View {
                 group_needs.push((bot.id.clone(), need));
             }
         }
-        let bots_sig: Vec<(BotId, String)> = self
+        let bots_sig: Vec<(usize, BotId, String)> = self
             .bots
             .iter()
-            .filter(|b| self.group_panel.member_ids.contains(&b.id))
-            .map(|b| (b.id.clone(), b.name.clone()))
+            .enumerate()
+            .filter(|(_, b)| self.group_panel.member_ids.contains(&b.id))
+            .map(|(idx, b)| (idx, b.id.clone(), b.name.clone()))
             .collect();
         let live_working_sessions: Vec<krill_proto::SessionId> = self
             .bot_sessions
@@ -489,7 +503,7 @@ impl View {
                 .collect(),
             needs_keys: group_needs
                 .iter()
-                .map(|(bid, n)| (bid.clone(), n.key.clone()))
+                .map(|(bid, n)| (bid.clone(), n.key.clone(), n.kind))
                 .collect(),
             live_working_sessions,
             minute_bucket: now / 60_000,
@@ -551,8 +565,15 @@ impl View {
             .iter()
             .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
             .flat_map(|g| {
+                let shown = self
+                    .items
+                    .group_shown
+                    .get(g.id())
+                    .copied()
+                    .unwrap_or(GROUP_ROWS);
                 grouped_indices[*g as usize]
                     .iter()
+                    .take(shown)
                     .map(|&idx| self.items.items[idx].uid.clone())
             })
             .collect();
@@ -752,6 +773,8 @@ impl View {
                     .owner_index
                     .get(owner_bot_id)
                     .and_then(|&i| self.bots.get(i))
+                    .filter(|b| b.id == *owner_bot_id)
+                    .or_else(|| self.bots.iter().find(|b| b.id == *owner_bot_id))
                 else {
                     return div().into_any_element();
                 };
@@ -770,6 +793,8 @@ impl View {
                     .owner_index
                     .get(&item.owner_bot_id)
                     .and_then(|&i| self.bots.get(i))
+                    .filter(|b| b.id == item.owner_bot_id)
+                    .or_else(|| self.bots.iter().find(|b| b.id == item.owner_bot_id))
                 else {
                     return div().into_any_element();
                 };
@@ -1138,5 +1163,56 @@ mod tests {
             &["thr-9".to_owned()],
             &GroupChatScope::AllTheirWork,
         ));
+    }
+
+    #[gpui::test]
+    fn group_cache_invalidates_when_non_member_removal_shifts_bot_indices(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+        let now = now_unix_ms();
+        let a = BotId::new("non-member-a").unwrap();
+        let b = BotId::new("member-b").unwrap();
+        let c = BotId::new("member-c").unwrap();
+        let cfg_a = BotConfig::new(a, "Alpha", "agy", now).unwrap();
+        let cfg_b = BotConfig::new(b.clone(), "Bravo", "agy", now).unwrap();
+        let cfg_c = BotConfig::new(c.clone(), "Charlie", "agy", now).unwrap();
+
+        let mut item_b = sample_item("u-b", Some("grp-1"));
+        item_b.owner_bot_id = b.clone();
+        let mut item_c = sample_item("u-c", Some("grp-1"));
+        item_c.owner_bot_id = c.clone();
+        item_c.number = 2;
+
+        let rpc: super::super::BotRpcCall = Arc::new(|_| Ok(BotRpcResponse::Ok));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.update(|_, cx| {
+            view.update(cx, |v, _| {
+                v.bots = vec![cfg_a, cfg_b.clone(), cfg_c.clone()];
+                v.group_panel.group_id = "grp-1".to_owned();
+                v.group_panel.member_ids = vec![b.clone(), c.clone()];
+                v.items.items = vec![item_b, item_c];
+                v.items.items_rev = 1;
+                v.sync_group_list_cache(now);
+                assert_eq!(v.group_panel.list_cache.owner_index.get(&b), Some(&1));
+                assert_eq!(v.group_panel.list_cache.owner_index.get(&c), Some(&2));
+
+                // Delete non-member `a`, shifting indices of `b` (1->0) and `c` (2->1).
+                v.bots.remove(0);
+                let before_rebuilds = v.group_panel.list_cache.rebuild_count;
+                v.sync_group_list_cache(now);
+                assert_eq!(
+                    v.group_panel.list_cache.rebuild_count,
+                    before_rebuilds + 1,
+                    "bots_sig must include member indices so shifting self.bots invalidates owner_index"
+                );
+                assert_eq!(v.group_panel.list_cache.owner_index.get(&b), Some(&0));
+                assert_eq!(v.group_panel.list_cache.owner_index.get(&c), Some(&1));
+            });
+        });
     }
 }

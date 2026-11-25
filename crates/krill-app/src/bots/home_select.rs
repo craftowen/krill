@@ -307,8 +307,7 @@ impl View {
         any_snoozed: bool,
     ) -> gpui_component::menu::PopupMenu {
         let now = now_unix_ms();
-        let offset = super::home::local_offset_secs(now);
-        for (label, at) in super::home::snooze_presets(now, offset) {
+        for (label, at) in super::home::snooze_presets_local(now) {
             let (this, bot, uids) = (this.clone(), bot_id.clone(), uids.to_vec());
             menu = menu.item(
                 PopupMenuItem::new(format!(
@@ -325,10 +324,10 @@ impl View {
         menu = menu.separator().item(
             PopupMenuItem::new(hm::SNOOZE_PICK.get())
                 .icon(IconName::CalendarClock)
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     pick_this
                         .update(cx, |v, cx| {
-                            v.open_snooze_pick(pick_bot.clone(), pick_uids.clone(), cx);
+                            v.open_snooze_pick_in(pick_bot.clone(), pick_uids.clone(), window, cx);
                         })
                         .ok();
                 }),
@@ -367,6 +366,9 @@ impl View {
     }
 
     fn submit_wait(&mut self, cx: &mut Context<Self>) {
+        if self.items.busy {
+            return;
+        }
         let Some(ask) = self.items.cancel_ask.as_ref() else {
             return;
         };
@@ -502,8 +504,10 @@ impl View {
             .shadow_lg()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_action(
-                cx.listener(|this, _: &gpui_component::input::Enter, _, cx| {
-                    this.submit_wait(cx);
+                cx.listener(|this, action: &gpui_component::input::Enter, window, cx| {
+                    if !action.secondary && !action.shift && !this.input_is_composing(window, cx) {
+                        this.submit_wait(cx);
+                    }
                 }),
             )
             .child(
@@ -526,7 +530,7 @@ impl View {
                     .child(
                         ui::primary("bot-wait-confirm", hm::WAIT_ON_CONFIRM.get())
                             .small()
-                            .disabled(!ready)
+                            .disabled(!ready || self.items.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.submit_wait(cx))),
                     ),
             );
@@ -562,6 +566,7 @@ impl View {
 
     /// Stale's "Cancel all" confirmation under its header.
     pub(super) fn render_stale_confirm(
+        &self,
         bot_id: &BotId,
         stale: &[&BotItem],
         stale_days: u64,
@@ -616,8 +621,13 @@ impl View {
                     )
                     .child(
                         ui::primary("bot-home-stale-cancel-all", hm::CANCEL_ALL.get())
+                            .debug_selector(|| "bot-home-stale-cancel-all".into())
                             .xsmall()
+                            .disabled(self.items.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.items.busy {
+                                    return;
+                                }
                                 this.items.stale_confirm = None;
                                 this.cancel_items(bot.clone(), &uids, &confirm_reason, cx);
                             })),
@@ -643,5 +653,147 @@ mod tests {
         );
         select_rows(&mut sel, Some("d"), &order, "c", false, true);
         assert_eq!(sel.iter().map(String::as_str).collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[gpui::test]
+    fn submit_wait_keeps_modal_open_when_busy(cx: &mut gpui::TestAppContext) {
+        use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let bot_id = BotId::new("bot-busy").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Busy Bot", "agy", 1_700_000_000_000).unwrap();
+        let bot_rpc = bot.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = cx.new(|cx| {
+                    let mut st = InputState::new(window, cx);
+                    st.set_value("Waiting on deploy".to_owned(), window, cx);
+                    st
+                });
+                v.items.cancel_ask = Some(WaitAsk {
+                    bot_id: bot_id.clone(),
+                    uids: vec!["u1".to_owned()],
+                    titles: vec!["Task".to_owned()],
+                    initial_note: None,
+                    input: Some(input),
+                });
+                v.items.busy = true;
+                v.submit_wait(cx);
+                assert!(
+                    v.items.cancel_ask.is_some(),
+                    "cancel_ask must not be cleared while items.busy is true"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn wait_dialog_guards_ime_enter_modified_enter_and_ime_escape(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+        use std::sync::{Arc, Mutex};
+
+        let bot_id = BotId::new("bot-wait-ime").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Wait Bot", "agy", 1_700_000_000_000).unwrap();
+        let bot_rpc = bot.clone();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&updates);
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::UpdateItem(params) => {
+                seen.lock().unwrap().push(params.as_ref().clone());
+                Ok(BotRpcResponse::Ok)
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.ask_waiting(
+                    bot_id.clone(),
+                    vec![("u1".to_owned(), "Task".to_owned())],
+                    None,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = v
+                    .items
+                    .cancel_ask
+                    .as_ref()
+                    .and_then(|a| a.input.as_ref())
+                    .expect("wait dialog input mounted")
+                    .clone();
+                input.update(cx, |st, cx| {
+                    st.focus(window, cx);
+                    st.set_value("reason ".to_owned(), window, cx);
+                    st.replace_and_mark_text_in_range(None, "한", None, window, cx);
+                });
+                assert!(v.input_is_composing(window, cx));
+            });
+        });
+        vcx.run_until_parked();
+
+        // Enter during IME composition must not submit or close the dialog.
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        assert!(updates.lock().unwrap().is_empty());
+        view.read_with(vcx, |v, _| assert!(v.items.cancel_ask.is_some()));
+
+        // Escape during IME composition must only unmark preedit, keeping the dialog open.
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| assert!(v.items.cancel_ask.is_some()));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(
+                    !v.input_is_composing(window, cx),
+                    "Escape during IME composition must unmark preedit"
+                );
+            });
+        });
+
+        // Modified Enter chords must not submit the dialog.
+        for key in ["shift-enter", "secondary-shift-enter", "secondary-enter"] {
+            vcx.simulate_keystrokes(key);
+            vcx.run_until_parked();
+            assert!(
+                updates.lock().unwrap().is_empty(),
+                "{key} must not submit Waiting note dialog"
+            );
+            view.read_with(vcx, |v, _| assert!(v.items.cancel_ask.is_some()));
+        }
+
+        // Plain Enter after composition ends submits the waiting note and closes the dialog.
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| assert!(v.items.cancel_ask.is_none()));
+        let recorded = updates.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].status, Some(BotItemStatus::Planned));
+        assert_eq!(recorded[0].close_note.as_deref(), Some("waiting:reason 한"));
     }
 }

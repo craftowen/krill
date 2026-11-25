@@ -141,6 +141,8 @@ pub(super) struct ItemsState {
     pub(super) group_shown: BTreeMap<&'static str, usize>,
     /// Home: the row under the pointer, which shows its actions.
     pub(super) hover_uid: Option<String>,
+    /// Home: open row/automation dropdown menu key so hover-out keeps the popover mounted & visible.
+    pub(super) open_menu_key: Option<String>,
     /// Home: the open item's description is unclamped.
     pub(super) desc_open: bool,
     /// Home: comment event IDs the reader explicitly expanded past the 8-line clamp.
@@ -161,6 +163,8 @@ pub(super) struct ItemsState {
     pub(super) look_error: Option<String>,
     /// Home: each bot's suggestions seen mark as its Home opened, so new rows keep their dot.
     pub(super) up_next_seen_at_open: BTreeMap<BotId, u64>,
+    /// Home: latest `MarkUpNextSeen` watermark already sent per `(host, bot)` to avoid render-loop RPC storms.
+    pub(super) up_next_seen_sent: BTreeMap<(crate::hosts::HostId, BotId), u64>,
     /// Home: the Snooze until dialog, while open.
     pub(super) snooze_pick: Option<super::home_snooze::SnoozePick>,
     /// Home: rows checked for a batch action (Orca's selection pill).
@@ -177,14 +181,22 @@ pub(super) struct ItemsState {
     pub(super) seen_at_open: BTreeMap<BotId, u64>,
     /// Home: reads the automations' runs again each minute, so "next" moves on (Orca `useBotNow`).
     pub(super) upcoming_poll: Option<gpui::Task<()>>,
+    /// Home: in-flight automation toggle / schedule-now RPC task.
+    pub(super) home_rpc_task: Option<gpui::Task<()>>,
+    /// Monotonic generation bumped on host/bot switch to discard stale item/home RPC completions.
+    pub(super) rpc_gen: u64,
     /// Home: PR chips' state by URL.
     pub(super) pr_reads: BTreeMap<String, super::home_item_parts::PrRead>,
     /// Home: "changed {field}" rows opened (`event:field`).
     pub(super) open_changes: std::collections::BTreeSet<String>,
     /// Home: an open ask of several questions, per (item, event).
     pub(super) ask_steps: BTreeMap<(String, u64), super::home_item_parts::AskSteps>,
-    /// Home: the bot folder's files, for @ mentions (read once per bot).
-    pub(super) mention_files: BTreeMap<BotId, Vec<String>>,
+    /// Home: the bot folder's files, for @ mentions, keyed by `(host, bot, root)`.
+    pub(super) mention_files: BTreeMap<(crate::hosts::HostId, BotId, PathBuf), Vec<String>>,
+    /// Home: currently scanning `(host, bot, root)` for @ mentions.
+    pub(super) mention_scanning: Option<(crate::hosts::HostId, BotId, PathBuf)>,
+    /// Home: background task scanning files for @ mentions.
+    pub(super) mention_scan_task: Option<gpui::Task<()>>,
     /// Home: items whose Activity shows its earlier events too.
     pub(super) events_all: std::collections::BTreeSet<String>,
     /// Home: files attached to a comment not sent yet, per item.
@@ -236,6 +248,53 @@ impl ItemsState {
         self.items.insert(0, item);
         self.items_cache.insert(bot_id, self.items.clone());
         self.bump_items_rev();
+    }
+
+    /// Clears cached Home/Up-Next seen watermarks for `bot_id` so returning to Home refreshes dots.
+    pub(super) fn clear_seen_for(&mut self, bot_id: &BotId) {
+        self.seen_at_open.remove(bot_id);
+        self.up_next_seen_at_open.remove(bot_id);
+        self.home_list.seen_checked = None;
+    }
+
+    /// Clears all cached Home/Up-Next seen watermarks (e.g. on host switch).
+    pub(super) fn clear_all_seen(&mut self) {
+        self.seen_at_open.clear();
+        self.up_next_seen_at_open.clear();
+        self.home_list.seen_checked = None;
+    }
+
+    /// Cancels in-flight Home/Items background tasks and resets switch-sensitive state.
+    pub(super) fn cancel_tasks_on_switch(&mut self) {
+        self.upcoming_poll = None;
+        self.home_rpc_task = None;
+        self.mention_scan_task = None;
+        self.mention_scanning = None;
+        self.open_menu_key = None;
+        self.rpc_gen = self.rpc_gen.wrapping_add(1);
+        self.busy = false;
+        self.up_next_seen_sent.clear();
+    }
+
+    /// Returns whether any text `InputState` owned by Items/Home currently holds keyboard focus.
+    pub(super) fn any_input_focused(&self, window: &Window, app: &App) -> bool {
+        use gpui::Focusable as _;
+        let focused = |opt: Option<&Entity<InputState>>| {
+            opt.is_some_and(|i| i.read(app).focus_handle(app).is_focused(window))
+        };
+        focused(self.new_title_input.as_ref())
+            || focused(self.new_desc_input.as_ref())
+            || focused(self.edit_title_input.as_ref())
+            || focused(self.edit_desc_input.as_ref())
+            || focused(self.edit_done_input.as_ref())
+            || focused(self.cancel_ask.as_ref().and_then(|a| a.input.as_ref()))
+            || self
+                .comment_inputs
+                .values()
+                .chain(self.link_inputs.values())
+                .chain(self.decision_inputs.values())
+                .chain(self.close_note_inputs.values())
+                .any(|i| i.read(app).focus_handle(app).is_focused(window))
     }
 
     pub(super) fn items_input_composing(&self, window: &mut Window, app: &mut App) -> bool {
@@ -340,11 +399,7 @@ enum LinkAction {
 fn link_chip_parts(link: &BotItemLink) -> (&'static str, &str, LinkAction) {
     match link {
         BotItemLink::Pr(v) => {
-            let act = if v.starts_with("https://") || v.starts_with("http://") {
-                LinkAction::OpenUrl(v.clone())
-            } else {
-                LinkAction::None
-            };
+            let act = super::sanitize_http_url(v).map_or(LinkAction::None, LinkAction::OpenUrl);
             (text::LINK_PR.get(), v.as_str(), act)
         }
         BotItemLink::Dispatch(v) => {
@@ -354,11 +409,7 @@ fn link_chip_parts(link: &BotItemLink) -> (&'static str, &str, LinkAction) {
             (text::LINK_DISPATCH.get(), v.as_str(), act)
         }
         BotItemLink::Url(v) => {
-            let act = if v.starts_with("https://") || v.starts_with("http://") {
-                LinkAction::OpenUrl(v.clone())
-            } else {
-                LinkAction::None
-            };
+            let act = super::sanitize_http_url(v).map_or(LinkAction::None, LinkAction::OpenUrl);
             (text::LINK_URL.get(), v.as_str(), act)
         }
         BotItemLink::File(v) => {
@@ -396,8 +447,13 @@ impl View {
                 &title_inp,
                 window,
                 |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
+                    if matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(inp, window, cx)
                         && let Some(bid) = this.selected_bot_id.clone()
                     {
                         let title = inp.read(cx).value().to_string();
@@ -421,8 +477,13 @@ impl View {
                 &desc_inp,
                 window,
                 |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
+                    if matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(inp, window, cx)
                         && let Some(bid) = this.selected_bot_id.clone()
                     {
                         let title = this
@@ -460,9 +521,10 @@ impl View {
                 window,
                 move |this, inp, ev: &InputEvent, window, cx| match ev {
                     InputEvent::Change => cx.notify(),
-                    InputEvent::PressEnter { .. }
-                        if !crate::jump::entity_input_is_composing(inp, window, cx) =>
-                    {
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    } if !crate::jump::entity_input_is_composing(inp, window, cx) => {
                         let body = inp.read(cx).value().to_string();
                         this.send_item_comment(
                             uid_owned.clone(),
@@ -491,8 +553,13 @@ impl View {
                 &input,
                 window,
                 move |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
+                    if matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(inp, window, cx)
                     {
                         let target = inp.read(cx).value().to_string();
                         this.submit_item_link(
@@ -511,43 +578,65 @@ impl View {
                 .push(sub);
             self.items.link_inputs.insert(uid.to_owned(), input);
         }
-        if !self.items.decision_inputs.contains_key(uid) {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(text::DECISION_ANSWER_PLACEHOLDER.get())
-            });
-            let uid_owned = uid.to_owned();
-            let input_clone = input.clone();
-            let sub = cx.subscribe_in(
-                &input,
-                window,
-                move |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
-                    {
-                        let ans = inp.read(cx).value().to_string();
-                        this.answer_item_decision(
-                            uid_owned.clone(),
-                            Some(ans),
-                            None,
-                            Some(input_clone.clone()),
-                            cx,
-                        );
-                    }
-                },
-            );
-            self.items
-                .per_item_subs
-                .entry(uid.to_owned())
-                .or_default()
-                .push(sub);
-            self.items.decision_inputs.insert(uid.to_owned(), input);
-        }
         if !self.items.close_note_inputs.contains_key(uid) {
             let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::ITEM_CLOSE_NOTE_PLACEHOLDER.get())
             });
             self.items.close_note_inputs.insert(uid.to_owned(), input);
         }
+    }
+
+    fn ensure_decision_input(
+        &mut self,
+        uid: &str,
+        decision_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<InputState>> {
+        if !cx.has_global::<gpui_component::Theme>() {
+            return None;
+        }
+        let key = format!("{uid}:{decision_id}");
+        if let Some(existing) = self.items.decision_inputs.get(&key) {
+            return Some(existing.clone());
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text::DECISION_ANSWER_PLACEHOLDER.get())
+        });
+        let uid_owned = uid.to_owned();
+        let dec_id_owned = decision_id.to_owned();
+        let input_clone = input.clone();
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, inp, ev: &InputEvent, window, cx| {
+                if matches!(
+                    ev,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    }
+                ) && !crate::jump::entity_input_is_composing(inp, window, cx)
+                {
+                    let ans = inp.read(cx).value().to_string();
+                    this.answer_item_decision_for(
+                        uid_owned.clone(),
+                        Some(ans),
+                        None,
+                        Some(dec_id_owned.clone()),
+                        Some(input_clone.clone()),
+                        cx,
+                    );
+                }
+            },
+        );
+        self.items
+            .per_item_subs
+            .entry(key.clone())
+            .or_default()
+            .push(sub);
+        self.items.decision_inputs.insert(key, input.clone());
+        Some(input)
     }
 
     pub fn create_bot_item(
@@ -569,6 +658,8 @@ impl View {
         }
         // Keep inputs intact until RPC succeeds so network/daemon errors do not erase drafts.
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -596,14 +687,17 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 match res {
                     Ok(item) => {
-                        this.items.push_front_item(item);
+                        let owner_id = item.owner_bot_id.clone();
+                        this.upsert_item(item, &owner_id);
                         let handle = this.window_handle;
                         clear_input_on_window(&mut this.items.new_title_input, handle, cx);
                         clear_input_on_window(&mut this.items.new_desc_input, handle, cx);
-                        this.sync_open_items_for_bot(&bot_id);
                         this.emit_badge(cx);
                     }
                     Err(err) => {
@@ -745,6 +839,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -756,6 +852,9 @@ impl View {
                 )
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
@@ -816,6 +915,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         let uid_for_clear = item_uid.clone();
         let body_for_retry = trimmed.clone();
         self.items.busy = true;
@@ -836,6 +937,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
@@ -912,6 +1016,8 @@ impl View {
             LinkKindChoice::File => BotItemLink::File(trimmed),
         };
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -929,6 +1035,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
@@ -967,6 +1076,28 @@ impl View {
             item_uid,
             answer_text,
             option_index,
+            None,
+            clear_input,
+            false,
+            None,
+            cx,
+        );
+    }
+
+    pub(super) fn answer_item_decision_for(
+        &mut self,
+        item_uid: String,
+        answer_text: Option<String>,
+        option_index: Option<u32>,
+        decision_id: Option<String>,
+        clear_input: Option<Entity<InputState>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_item_decision_with_cleanup(
+            item_uid,
+            answer_text,
+            option_index,
+            decision_id,
             clear_input,
             false,
             None,
@@ -983,6 +1114,7 @@ impl View {
         item_uid: String,
         answer_text: Option<String>,
         option_index: Option<u32>,
+        decision_id: Option<String>,
         clear_input: Option<Entity<InputState>>,
         clear_attachments: bool,
         clear_ask_step: Option<(String, u64)>,
@@ -999,6 +1131,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         let selected_bot_id = self.selected_bot_id.clone();
         let uid_for_clear = item_uid.clone();
         let text_for_recover = cleaned_text.clone();
@@ -1016,13 +1150,16 @@ impl View {
                             item_id: item_uid,
                             answer_text: cleaned_text,
                             option_index,
-                            decision_id: None,
+                            decision_id,
                             request_id: None,
                         },
                     )
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
@@ -1051,7 +1188,9 @@ impl View {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
                         }
-                        if let Some(bot_id) = selected_bot_id {
+                        if let Some(bot_id) = selected_bot_id
+                            && this.selected_bot_id.as_ref() == Some(&bot_id)
+                        {
                             this.load_selected_bot_detail(bot_id, cx);
                         }
                     }
@@ -1102,6 +1241,8 @@ impl View {
 
     pub fn mark_bot_items_opened(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         self.error = None;
         self.notice = None;
         self.mark_items_seen_task = Some(cx.spawn(async move |this, cx| {
@@ -1118,6 +1259,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 match res {
                     Ok(()) => this.notice = Some(SharedString::from(text::SAVED.get())),
                     Err(err) => this.error = Some(SharedString::from(err)),
@@ -1189,15 +1333,30 @@ impl View {
         } else if self.group_panel.active && self.group_panel.member_ids.contains(&owner_id) {
             self.group_panel.all_items.insert(0, updated.clone());
         }
-        if self.selected_bot_id.as_ref() == Some(&owner_id) {
+        let visible_in_current_list = if self.group_panel.active {
+            self.group_panel.member_ids.contains(&owner_id)
+        } else {
+            self.selected_bot_id
+                .as_ref()
+                .is_none_or(|selected| selected == &owner_id)
+        };
+        if visible_in_current_list {
             if let Some(slot) = self.items.items.iter_mut().find(|i| i.uid == updated.uid) {
-                *slot = updated;
+                *slot = updated.clone();
             } else {
-                self.items.items.insert(0, updated);
+                self.items.items.insert(0, updated.clone());
             }
-            self.items
-                .items_cache
-                .insert(owner_id.clone(), self.items.items.clone());
+            if !self.group_panel.active {
+                self.items
+                    .items_cache
+                    .insert(owner_id.clone(), self.items.items.clone());
+            } else if let Some(cached) = self.items.items_cache.get_mut(&owner_id) {
+                if let Some(slot) = cached.iter_mut().find(|i| i.uid == updated.uid) {
+                    *slot = updated;
+                } else {
+                    cached.insert(0, updated);
+                }
+            }
             self.items.bump_items_rev();
             self.sync_open_items_for_bot(&owner_id);
         } else {
@@ -1235,7 +1394,14 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_items_inputs(&bot.id, window, cx);
-        let item_uids: Vec<String> = self.items.items.iter().map(|i| i.uid.clone()).collect();
+        let item_uids: Vec<String> = self
+            .items
+            .items
+            .iter()
+            .filter(|i| i.owner_bot_id == bot.id)
+            .map(|i| i.uid.clone())
+            .collect();
+        let has_bot_items = !item_uids.is_empty();
         for uid in item_uids {
             self.ensure_per_item_inputs(&uid, window, cx);
         }
@@ -1258,7 +1424,7 @@ impl View {
                 .items
                 .items
                 .iter()
-                .filter(|item| filter.matches(item.status))
+                .filter(|item| item.owner_bot_id == bot.id && filter.matches(item.status))
                 .count();
             let fid = filter.id();
             pill_row = pill_row.child(
@@ -1272,17 +1438,15 @@ impl View {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_item_filter(filter, cx))),
             );
         }
-        filters = filters
-            .child(pill_row)
-            .when(!self.items.items.is_empty(), |d| {
-                d.child(
-                    ui::ghost("bots-items-mark-opened", text::ITEM_MARK_READ_BTN.get())
-                        .disabled(self.items.busy)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mark_bot_items_opened(bot_id_mark_read.clone(), cx);
-                        })),
-                )
-            });
+        filters = filters.child(pill_row).when(has_bot_items, |d| {
+            d.child(
+                ui::ghost("bots-items-mark-opened", text::ITEM_MARK_READ_BTN.get())
+                    .disabled(self.items.busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mark_bot_items_opened(bot_id_mark_read.clone(), cx);
+                    })),
+            )
+        });
 
         let composer = ui::card(p)
             .flex()
@@ -1337,7 +1501,7 @@ impl View {
             .items
             .items
             .iter()
-            .filter(|item| self.items.filter.matches(item.status))
+            .filter(|item| item.owner_bot_id == bot.id && self.items.filter.matches(item.status))
             .cloned()
             .collect();
 
@@ -1394,20 +1558,19 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (tone, status_label) = status_badge_spec(item.status);
-        let is_snoozed = item.snoozed_until_ms.is_some();
+        let now = now_unix_ms();
+        let is_snoozed = super::home::is_snoozed(item, now);
         let uid = item.uid.clone();
         let expanded = self.items.expanded_item_uid.as_deref() == Some(uid.as_str());
         let is_editing = self.items.editing_item_uid.as_deref() == Some(uid.as_str());
         let card_id = format!("bots-item-card-{uid}");
         let card_sel = card_id.clone();
 
-        let latest_decisions: Vec<BotItemDecision> = item
-            .events
-            .iter()
-            .rev()
-            .find(|ev| !ev.decisions.is_empty())
-            .map(|ev| ev.decisions.clone())
-            .unwrap_or_default();
+        let active_ask: Option<(u64, Vec<BotItemDecision>, Vec<Option<String>>)> =
+            super::home_item::waiting_question(item).map(|ev| {
+                let answered = super::home_item_parts::answered_lines(item, ev);
+                (ev.id, ev.decisions.clone(), answered)
+            });
 
         let bot_done = bot.id.clone();
         let bot_working = bot.id.clone();
@@ -1761,13 +1924,47 @@ impl View {
             );
         }
 
-        // Interactive decision prompt cards when NeedsYou decisions are present.
-        if item.status == BotItemStatus::NeedsYou && !latest_decisions.is_empty() {
+        // Interactive decision prompt cards when an active (non-stale) waiting ask has open decisions.
+        if let Some((event_id, latest_decisions, answered)) = active_ask {
             for (didx, decision) in latest_decisions.into_iter().enumerate() {
+                let decision_id = format!("{event_id}:{didx}");
+                let card_key = format!("bots-item-decision-card-{uid}-{event_id}-{didx}");
+                if let Some(answer_text) = answered.get(didx).and_then(Option::as_deref) {
+                    let ans_sel = format!("bots-item-decision-answered-{uid}-{didx}");
+                    card = card.child(
+                        div()
+                            .id(SharedString::from(card_key))
+                            .debug_selector(move || ans_sel.clone())
+                            .w_full()
+                            .p_2p5()
+                            .rounded(ui::RADIUS_SM)
+                            .bg(p.muted.opacity(0.45))
+                            .border_1()
+                            .border_color(p.border)
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_XS)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.muted_foreground)
+                                    .child(decision.question),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(p.success)
+                                    .child(format!("✓ {answer_text}")),
+                            ),
+                    );
+                    continue;
+                }
                 let mut opts_row = div().flex().flex_wrap().items_center().gap_1p5();
                 for (oidx, opt) in decision.options.into_iter().enumerate() {
                     let is_rec = decision.recommended == Some(oidx);
                     let uid_ans = uid.clone();
+                    let dec_id_opt = decision_id.clone();
                     let label = if is_rec {
                         format!("{opt} ({})", text::DECISION_RECOMMENDED.get())
                     } else {
@@ -1784,20 +1981,23 @@ impl View {
                         btn.debug_selector(move || btn_sel.clone())
                             .disabled(self.items.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.answer_item_decision(
+                                this.answer_item_decision_for(
                                     uid_ans.clone(),
                                     None,
                                     u32::try_from(oidx).ok(),
+                                    Some(dec_id_opt.clone()),
                                     None,
                                     cx,
                                 );
                             })),
                     );
                 }
-                let dec_inp = self.items.decision_inputs.get(&uid).cloned();
+                let dec_inp = self.ensure_decision_input(&uid, &decision_id, window, cx);
                 let uid_custom = uid.clone();
+                let dec_id_custom = decision_id.clone();
                 card = card.child(
                     div()
+                        .id(SharedString::from(card_key))
                         .w_full()
                         .p_2p5()
                         .rounded(ui::RADIUS_SM)
@@ -1817,6 +2017,8 @@ impl View {
                         .child(opts_row)
                         .when_some(dec_inp, |d, inp| {
                             let inp_read = inp.clone();
+                            let submit_id = format!("bots-item-decision-submit-{uid}-{didx}");
+                            let submit_sel = submit_id.clone();
                             d.child(
                                 div()
                                     .flex()
@@ -1825,19 +2027,19 @@ impl View {
                                     .child(div().flex_1().min_w_0().child(Input::new(&inp).small()))
                                     .child(
                                         ui::secondary(
-                                            SharedString::from(format!(
-                                                "bots-item-decision-submit-{uid}-{didx}"
-                                            )),
+                                            SharedString::from(submit_id),
                                             text::DECISION_SUBMIT_BTN.get(),
                                         )
+                                        .debug_selector(move || submit_sel.clone())
                                         .disabled(self.items.busy)
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 let val = inp_read.read(cx).value().to_string();
-                                                this.answer_item_decision(
+                                                this.answer_item_decision_for(
                                                     uid_custom.clone(),
                                                     Some(val),
                                                     None,
+                                                    Some(dec_id_custom.clone()),
                                                     Some(inp_read.clone()),
                                                     cx,
                                                 );
@@ -1866,10 +2068,14 @@ impl View {
                 let link_id = format!("bots-item-link-{uid}-{lidx}");
                 match action {
                     LinkAction::OpenUrl(url) => {
-                        row = row.child(
-                            ui::ghost(SharedString::from(link_id), text_label)
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
-                        );
+                        row =
+                            row.child(ui::ghost(SharedString::from(link_id), text_label).on_click(
+                                move |_, _, cx| {
+                                    if let Some(clean) = super::sanitize_http_url(&url) {
+                                        cx.open_url(&clean);
+                                    }
+                                },
+                            ));
                     }
                     LinkAction::DispatchSession(session_id) => {
                         let uid_disp = uid.clone();
@@ -2127,5 +2333,337 @@ mod swarm_regression_tests {
         );
         assert!(state.restore_cached(&bot_id));
         assert!(state.items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{Modifiers, px};
+    use krill_proto::bots::{
+        BotConfig, BotId, BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind,
+        BotItemStatus, BotRpcRequest, BotRpcResponse,
+    };
+
+    use super::*;
+
+    fn sample_item(
+        bot_id: &BotId,
+        uid: &str,
+        number: u64,
+        status: BotItemStatus,
+        now: u64,
+    ) -> BotItem {
+        BotItem {
+            uid: uid.to_owned(),
+            number,
+            owner_bot_id: bot_id.clone(),
+            title: format!("Task #{number}"),
+            description: None,
+            done_means: None,
+            status,
+            close_note: None,
+            links: vec![],
+            events: vec![],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: now,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn items_state_clear_seen_and_cancel_tasks_on_switch() {
+        let b1 = BotId::new("b-one").unwrap();
+        let b2 = BotId::new("b-two").unwrap();
+        let mut st = ItemsState::default();
+        st.seen_at_open.insert(b1.clone(), 10);
+        st.seen_at_open.insert(b2.clone(), 20);
+        st.up_next_seen_at_open.insert(b1.clone(), 100);
+        st.up_next_seen_at_open.insert(b2.clone(), 200);
+        st.home_list.seen_checked = Some((b1.clone(), 1, 10));
+
+        st.clear_seen_for(&b1);
+        assert!(!st.seen_at_open.contains_key(&b1));
+        assert!(st.seen_at_open.contains_key(&b2));
+        assert!(!st.up_next_seen_at_open.contains_key(&b1));
+        assert!(st.up_next_seen_at_open.contains_key(&b2));
+        assert!(st.home_list.seen_checked.is_none());
+
+        st.home_list.seen_checked = Some((b2.clone(), 2, 20));
+        st.clear_all_seen();
+        assert!(st.seen_at_open.is_empty());
+        assert!(st.up_next_seen_at_open.is_empty());
+        assert!(st.home_list.seen_checked.is_none());
+
+        st.busy = true;
+        st.up_next_seen_sent
+            .insert((crate::hosts::HostId::Local, b1.clone()), 500);
+        st.open_menu_key = Some("row-more:u1".to_owned());
+        let gen_before = st.rpc_gen;
+        st.cancel_tasks_on_switch();
+        assert!(!st.busy);
+        assert!(st.up_next_seen_sent.is_empty());
+        assert!(st.open_menu_key.is_none());
+        assert_ne!(st.rpc_gen, gen_before);
+    }
+
+    #[gpui::test]
+    fn modal_multi_question_cards_use_distinct_decision_ids_and_inputs_and_respect_snooze_expiry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        type CapturedAnswer = (Option<String>, Option<u32>, Option<String>);
+        let now = now_unix_ms();
+        let b1 = BotId::new("modal-b1").unwrap();
+        let b2 = BotId::new("modal-b2").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "agy", now).unwrap();
+
+        let mut multi = sample_item(&b1, "u-multi", 1, BotItemStatus::NeedsYou, now);
+        // Expired snooze in the past: must NOT be treated as snoozed (UB-34).
+        multi.snoozed_until_ms = Some(now.saturating_sub(60_000));
+        multi.events.push(BotItemEvent {
+            id: 42,
+            item_uid: "u-multi".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Bot {
+                bot_id: b1.clone(),
+                session_id: None,
+            },
+            text: "Two questions".to_owned(),
+            decisions: vec![
+                BotItemDecision {
+                    question: "First?".to_owned(),
+                    options: vec!["A1".to_owned(), "A2".to_owned()],
+                    recommended: Some(0),
+                    multi: false,
+                },
+                BotItemDecision {
+                    question: "Second?".to_owned(),
+                    options: vec!["B1".to_owned(), "B2".to_owned()],
+                    recommended: None,
+                    multi: false,
+                },
+            ],
+            created_at_ms: now,
+        });
+        // Foreign bot item: must NOT be shown in b1's modal Items tab (UB-28).
+        let foreign = sample_item(&b2, "u-foreign", 2, BotItemStatus::Planned, now);
+
+        let captured: Arc<Mutex<Vec<CapturedAnswer>>> = Arc::new(Mutex::new(Vec::new()));
+        let bots_rpc = vec![cfg1, cfg2];
+        let items_rpc = vec![multi.clone(), foreign];
+        let cap_rpc = captured.clone();
+        let multi_rpc = multi.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items_rpc.clone())),
+            BotRpcRequest::AnswerBotItem {
+                decision_id,
+                option_index,
+                answer_text,
+                ..
+            } => {
+                cap_rpc.lock().unwrap().push((
+                    decision_id.clone(),
+                    *option_index,
+                    answer_text.clone(),
+                ));
+                Ok(BotRpcResponse::Item(Box::new(multi_rpc.clone())))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        vcx.run_until_parked();
+
+        // UB-28: foreign bot's card must not render under b1.
+        assert!(vcx.debug_bounds("bots-item-card-u-multi").is_some());
+        assert!(vcx.debug_bounds("bots-item-card-u-foreign").is_none());
+
+        // UB-26: each question has its own distinct InputState entity.
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let i0 = v
+                .items
+                .decision_inputs
+                .get("u-multi:42:0")
+                .expect("decision 0 input");
+            let i1 = v
+                .items
+                .decision_inputs
+                .get("u-multi:42:1")
+                .expect("decision 1 input");
+            assert_ne!(i0.entity_id(), i1.entity_id());
+        });
+
+        // Clicking question #2's option #1 sends decision_id = Some("42:1") and option_index = Some(1).
+        let q2_opt1 = vcx
+            .debug_bounds("bots-item-decision-u-multi-1-1")
+            .expect("second question option 1");
+        vcx.simulate_click(q2_opt1.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![(Some("42:1".to_owned()), Some(1), None)]
+        );
+
+        // UB-34: expired snooze must show Snooze 1h (not Unsnooze) — verify via helper & upsert_item isolation (UB-29).
+        assert!(!super::super::home::is_snoozed(&multi, now));
+        vcx.update(|_, cx| {
+            view.update(cx, |v, _| {
+                v.all_open_items
+                    .push(sample_item(&b2, "b2-other", 9, BotItemStatus::Working, now));
+                let b2_upd = sample_item(&b2, "b2-new", 10, BotItemStatus::Planned, now);
+                v.upsert_item(b2_upd, &b2);
+                assert!(
+                    !v.items.items.iter().any(|i| i.uid == "b2-new"),
+                    "upsert_item for non-selected bot must not inject into current bot's items"
+                );
+                assert!(
+                    v.all_open_items.iter().any(|i| i.uid == "b2-other"),
+                    "upsert_item for non-selected bot must not wipe its other open items"
+                );
+                assert!(v.all_open_items.iter().any(|i| i.uid == "b2-new"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn modal_items_tab_hides_stale_decisions_and_marks_partial_answers_settled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = now_unix_ms();
+        let b1 = BotId::new("modal-stale").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+
+        // Item 1: historical decision #10 followed by Done -> plain NeedsYou (no decisions).
+        let mut stale = sample_item(&b1, "u-stale", 1, BotItemStatus::NeedsYou, now);
+        stale.events = vec![
+            BotItemEvent {
+                id: 10,
+                item_uid: "u-stale".to_owned(),
+                kind: BotItemEventKind::Commented,
+                actor: BotItemActor::Bot {
+                    bot_id: b1.clone(),
+                    session_id: None,
+                },
+                text: "Old ask".to_owned(),
+                decisions: vec![BotItemDecision {
+                    question: "Old question?".to_owned(),
+                    options: vec!["OldA".to_owned()],
+                    recommended: None,
+                    multi: false,
+                }],
+                created_at_ms: now - 30_000,
+            },
+            BotItemEvent {
+                id: 11,
+                item_uid: "u-stale".to_owned(),
+                kind: BotItemEventKind::Status,
+                actor: BotItemActor::Bot {
+                    bot_id: b1.clone(),
+                    session_id: None,
+                },
+                text: "needs_you -> done".to_owned(),
+                decisions: vec![],
+                created_at_ms: now - 20_000,
+            },
+            BotItemEvent {
+                id: 12,
+                item_uid: "u-stale".to_owned(),
+                kind: BotItemEventKind::Status,
+                actor: BotItemActor::Bot {
+                    bot_id: b1.clone(),
+                    session_id: None,
+                },
+                text: "done -> needs_you".to_owned(),
+                decisions: vec![],
+                created_at_ms: now - 10_000,
+            },
+        ];
+
+        // Item 2: active multi-decision ask where Q1 is already answered and Q2 is still open.
+        let mut partial = sample_item(&b1, "u-partial", 2, BotItemStatus::NeedsYou, now);
+        partial.events = vec![
+            BotItemEvent {
+                id: 20,
+                item_uid: "u-partial".to_owned(),
+                kind: BotItemEventKind::Commented,
+                actor: BotItemActor::Bot {
+                    bot_id: b1.clone(),
+                    session_id: None,
+                },
+                text: "Two questions".to_owned(),
+                decisions: vec![
+                    BotItemDecision {
+                        question: "**Env?**".to_owned(),
+                        options: vec!["Staging".to_owned(), "Prod".to_owned()],
+                        recommended: Some(0),
+                        multi: false,
+                    },
+                    BotItemDecision {
+                        question: "Notify?".to_owned(),
+                        options: vec!["Yes".to_owned(), "No".to_owned()],
+                        recommended: None,
+                        multi: false,
+                    },
+                ],
+                created_at_ms: now - 5_000,
+            },
+            BotItemEvent {
+                id: 21,
+                item_uid: "u-partial".to_owned(),
+                kind: BotItemEventKind::Commented,
+                actor: BotItemActor::Owner { device: None },
+                text: "**Env?** → Staging".to_owned(),
+                decisions: vec![],
+                created_at_ms: now - 2_000,
+            },
+        ];
+
+        let bots_rpc = vec![cfg1];
+        let items_rpc = vec![stale, partial];
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items_rpc.clone())),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (_view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.simulate_resize(gpui::size(px(1000.), px(900.)));
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("bots-item-decision-u-stale-0-0").is_none(),
+            "stale historical decision after Done must not render as active"
+        );
+        assert!(
+            vcx.debug_bounds("bots-item-decision-answered-u-partial-0")
+                .is_some(),
+            "already-answered decision slot must render as settled"
+        );
+        assert!(
+            vcx.debug_bounds("bots-item-decision-u-partial-0-0")
+                .is_none(),
+            "already-answered decision slot must not render active option buttons"
+        );
+        assert!(
+            vcx.debug_bounds("bots-item-decision-u-partial-1-0")
+                .is_some(),
+            "remaining unanswered decision slot must stay interactive"
+        );
     }
 }

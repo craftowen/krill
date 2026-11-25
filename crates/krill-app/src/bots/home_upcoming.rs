@@ -377,13 +377,16 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         let host_name = self.refusal_host_name();
         let Some(bot_id) = self.selected_bot_id.clone() else {
             return;
         };
+        let req_bot = bot_id.clone();
         self.error = None;
         self.notice = None;
-        self.patch_task = Some(cx.spawn(async move |this, cx| {
+        self.items.home_rpc_task = Some(cx.spawn(async move |this, cx| {
             let (res, up) = cx
                 .background_executor()
                 .spawn(async move {
@@ -396,22 +399,30 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&req_bot);
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
-                        this.settings.schedules.clone_from(&updated.schedules);
+                        if this.selected_bot_id.as_ref() == Some(&updated.id) {
+                            this.settings.schedules.clone_from(&updated.schedules);
+                        }
                         this.upsert_bot_config(*updated);
                         this.emit_badge(cx);
                     }
                     Ok(BotRpcResponse::Error(err)) | Err(err) => {
-                        this.error = Some(SharedString::from(err));
+                        if same_bot {
+                            this.error = Some(SharedString::from(err));
+                        }
                     }
                     Ok(_) => {
-                        if let Some(n) = notice {
+                        if same_bot && let Some(n) = notice {
                             this.notice = Some(SharedString::from(n));
                         }
                     }
                 }
-                if up.is_some() {
+                if same_bot && up.is_some() {
                     this.items.upcoming = up;
                 }
                 cx.notify();
@@ -441,25 +452,33 @@ impl View {
 
     /// Orca's Look now: looks around, then reads when it looked. A failure shows on its row.
     pub(super) fn look_now(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        if self.soul_memory.look_around_running {
+        if self.soul_memory.is_looking_around(&bot_id) {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_bot = bot_id.clone();
         let host_name = self.refusal_host_name();
-        self.soul_memory.look_around_running = true;
-        self.items.look_error = None;
-        self.look_task = Some(cx.spawn(async move |this, cx| {
+        self.soul_memory.look_around_running.insert(bot_id.clone());
+        if self.selected_bot_id.as_ref() == Some(&bot_id) {
+            self.items.look_error = None;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            let bot_id_bg = req_bot.clone();
             let (res, up) = cx
                 .background_executor()
                 .spawn(async move {
                     let res = call_checked_on(
                         &rpc,
                         &BotRpcRequest::RunLookAround {
-                            bot_id: bot_id.clone(),
+                            bot_id: bot_id_bg.clone(),
                         },
                         host_name.as_deref(),
                     );
-                    let up = match call_checked(&rpc, &BotRpcRequest::GetBotUpcoming { bot_id }) {
+                    let up = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetBotUpcoming { bot_id: bot_id_bg },
+                    ) {
                         Ok(BotRpcResponse::Upcoming(up)) => Some(up),
                         _ => None,
                     };
@@ -467,12 +486,25 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.soul_memory.look_around_running = false;
+                if this.host != req_host {
+                    return;
+                }
+                this.soul_memory.look_around_running.remove(&req_bot);
+                this.look_tasks.remove(&req_bot);
+                if this.selected_bot_id.as_ref() != Some(&req_bot) {
+                    cx.notify();
+                    return;
+                }
                 match res {
                     Ok(
                         BotRpcResponse::LookAroundResult { suggestions, .. }
                         | BotRpcResponse::Suggestions(suggestions),
-                    ) => this.soul_memory.suggestions = suggestions,
+                    ) => {
+                        this.soul_memory.suggestions = suggestions
+                            .into_iter()
+                            .filter(|s| s.bot_id == req_bot)
+                            .collect();
+                    }
                     Ok(BotRpcResponse::Error(err)) | Err(err) => this.items.look_error = Some(err),
                     Ok(other) => this.items.look_error = Some(format!("{other:?}")),
                 }
@@ -482,7 +514,8 @@ impl View {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.look_tasks.insert(bot_id, task);
         cx.notify();
     }
 
@@ -504,12 +537,12 @@ impl View {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(60))
                     .await;
-                let Ok(Some((rpc, bot_id))) = this.update(cx, |this, _| {
+                let Ok(Some((req_host, rpc, bot_id, req_gen))) = this.update(cx, |this, _| {
                     (this.detail_tab == DetailTab::Items)
                         .then(|| {
-                            this.selected_bot_id
-                                .clone()
-                                .map(|id| (this.rpc.clone(), id))
+                            this.selected_bot_id.clone().map(|id| {
+                                (this.host.clone(), this.rpc.clone(), id, this.items.rpc_gen)
+                            })
                         })
                         .flatten()
                 }) else {
@@ -518,6 +551,7 @@ impl View {
                     }
                     continue;
                 };
+                let req_bot = bot_id.clone();
                 let up = cx
                     .background_executor()
                     .spawn(async move {
@@ -529,6 +563,12 @@ impl View {
                     .await;
                 if this
                     .update(cx, |this, cx| {
+                        if this.host != req_host
+                            || this.items.rpc_gen != req_gen
+                            || this.selected_bot_id.as_ref() != Some(&req_bot)
+                        {
+                            return;
+                        }
                         if up.is_some() {
                             this.items.upcoming = up;
                         }
@@ -560,7 +600,7 @@ impl View {
         automation_rows_on(
             bot,
             self.items.upcoming.as_ref(),
-            self.soul_memory.look_around_running,
+            self.soul_memory.is_looking_around(&bot.id),
             self.items.look_error.as_deref(),
             host_name.as_deref(),
             now,
@@ -762,6 +802,11 @@ impl View {
         let hover_key = format!("auto:{}", row.key);
         let hovered = self.items.hover_uid.as_deref() == Some(hover_key.as_str());
         let busy = row.running && row.kind == AutoKind::Look;
+        let menu_key = format!("auto:{}:{}", bot.id.as_str(), row.key);
+        let menu_open = self.items.open_menu_key.as_deref() == Some(menu_key.as_str());
+        let keep_visible = hovered || busy || menu_open;
+        let row_group: SharedString =
+            format!("bot-home-auto-group-{}-{}", bot.id.as_str(), row.key).into();
         let sel = format!("bot-home-automation-{}", row.key.replace(':', "-"));
         let debug = sel.clone();
         let open_page = match row.kind {
@@ -774,9 +819,10 @@ impl View {
             Some(s) => format!("{}, {}", row.title, s.label()).into(),
             None => row.title.clone().into(),
         };
-        let mut el = div()
+        div()
             .id(SharedString::from(sel))
             .debug_selector(move || debug.clone())
+            .group(row_group.clone())
             .relative()
             .min_w_0()
             .flex()
@@ -786,13 +832,7 @@ impl View {
             .px_2()
             .py_1()
             .hover(|d| d.bg(p.sidebar_accent))
-            .on_hover(cx.listener(move |this, on: &bool, _, cx| {
-                let now_on = this.items.hover_uid.as_deref() == Some(hover_key.as_str());
-                if *on != now_on {
-                    this.items.hover_uid = on.then(|| hover_key.clone());
-                    cx.notify();
-                }
-            }))
+            .when(menu_open, |d| d.bg(p.sidebar_accent))
             .child(
                 div()
                     .h(px(20.))
@@ -826,16 +866,24 @@ impl View {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_row_action(&open_bot, RowAction::Settings(open_page), cx);
                     })),
-            );
-        if hovered || busy {
-            el = el.child(Self::render_automation_actions(bot, row, p, cx));
-        }
-        el
+            )
+            .child(Self::render_automation_actions(
+                bot,
+                row,
+                row_group,
+                keep_visible,
+                menu_key,
+                p,
+                cx,
+            ))
     }
 
     fn render_automation_actions(
         bot: &BotConfig,
         row: &AutoRow,
+        row_group: SharedString,
+        keep_visible: bool,
+        menu_key: String,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -918,6 +966,7 @@ impl View {
             };
         let button_bot = bot.clone();
         let menu_bot = bot.clone();
+        let open_this = this.clone();
         let key = row.key.replace(':', "-");
         div()
             .absolute()
@@ -931,6 +980,10 @@ impl View {
             .pr(px(6.))
             .rounded(ui::RADIUS_XS)
             .bg(p.sidebar_accent)
+            .when(!keep_visible, |d| {
+                d.invisible().group_hover(row_group, gpui::Styled::visible)
+            })
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 Button::new(SharedString::from(format!("bot-home-automation-btn-{key}")))
                     .debug_selector({
@@ -944,6 +997,7 @@ impl View {
                     .tooltip(button_label)
                     .accessibility_label(button_label)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
                         this.run_row_action(&button_bot, button_action.clone(), cx);
                     })),
             )
@@ -979,6 +1033,18 @@ impl View {
                         }
                     }
                     menu
+                })
+                .on_open_change(move |open, _, cx| {
+                    open_this
+                        .update(cx, |v, cx| {
+                            if *open {
+                                v.items.open_menu_key = Some(menu_key.clone());
+                            } else if v.items.open_menu_key.as_deref() == Some(menu_key.as_str()) {
+                                v.items.open_menu_key = None;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                 }),
             )
     }
@@ -999,26 +1065,29 @@ impl View {
             .filter(|s| s.bot_id == bot.id && !s.dismissed)
             .cloned()
             .collect();
-        let looking = self.soul_memory.look_around_running;
+        let looking = self.soul_memory.is_looking_around(&bot.id);
         if rows.is_empty() && !looking {
             return None;
         }
         let open = !self.items.folds.contains("suggestions");
         // What the owner had seen when this Home opened: newer rows keep their dot.
-        let host_seen = self
-            .items
-            .upcoming
-            .as_ref()
-            .map_or(0, |u| u.up_next_seen_ms);
-        let seen_at = *self
-            .items
-            .up_next_seen_at_open
-            .entry(bot.id.clone())
-            .or_insert(host_seen);
+        // Wait until `upcoming` loads so we never latch 0 or spam MarkUpNextSeen on every frame.
+        let seen_at =
+            if let Some(host_seen) = self.items.upcoming.as_ref().map(|u| u.up_next_seen_ms) {
+                let seen = *self
+                    .items
+                    .up_next_seen_at_open
+                    .entry(bot.id.clone())
+                    .or_insert(host_seen);
+                let latest_ms = rows.iter().map(|s| s.created_at_ms).max().unwrap_or(0);
+                if open && latest_ms > host_seen {
+                    self.mark_up_next_seen(bot.id.clone(), latest_ms, cx);
+                }
+                seen
+            } else {
+                u64::MAX
+            };
         let new_count = rows.iter().filter(|s| s.created_at_ms > seen_at).count();
-        if open && rows.iter().any(|s| s.created_at_ms > host_seen) {
-            self.mark_up_next_seen(bot.id.clone(), cx);
-        }
         let summary = (!open).then(|| {
             if new_count > 0 {
                 format!(
@@ -1086,7 +1155,7 @@ impl View {
                             .tooltip(look_tip)
                             .accessibility_label(look_label)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.soul_memory.look_around_running {
+                                if this.soul_memory.is_looking_around(&look_bot) {
                                     let next = !this.items.look_steps_open;
                                     this.items.look_steps_open = next;
                                     if next {
@@ -1230,6 +1299,7 @@ impl View {
                         .build(window, cx)
                     }
                 };
+            let open_url = link.as_deref().and_then(super::sanitize_http_url);
             let mut row = div()
                 .id(SharedString::from(sel))
                 .debug_selector(move || debug.clone())
@@ -1244,7 +1314,7 @@ impl View {
                 .rounded(ui::RADIUS_XS)
                 .px_2()
                 .py_1()
-                .when(link.is_some(), gpui::Styled::cursor_pointer)
+                .when(open_url.is_some(), gpui::Styled::cursor_pointer)
                 .hover(|d| d.bg(p.sidebar_accent))
                 .tooltip(card)
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -1255,7 +1325,7 @@ impl View {
                     }
                 }))
                 .on_click(move |_, _, cx| {
-                    if let Some(url) = link.as_deref().filter(|l| l.starts_with("http")) {
+                    if let Some(url) = open_url.as_deref() {
                         cx.open_url(url);
                     }
                 })
@@ -1296,6 +1366,8 @@ impl View {
                     )
                 });
             if hovered {
+                let start_sel = format!("bot-home-suggestion-start-{}", s.id);
+                let dismiss_sel = format!("bot-home-suggestion-dismiss-{}", s.id);
                 row = row.child(
                     div()
                         .absolute()
@@ -1309,21 +1381,26 @@ impl View {
                         .pr(px(6.))
                         .rounded(ui::RADIUS_XS)
                         .bg(p.sidebar_accent)
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
-                            ui::secondary("bot-home-suggestion-start", hm::START.get())
+                            ui::secondary(SharedString::from(start_sel.clone()), hm::START.get())
+                                .debug_selector(move || start_sel.clone())
                                 .xsmall()
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.start_suggestion(start_bot.clone(), start_id.clone(), cx);
                                 })),
                         )
                         .child(
-                            Button::new("bot-home-suggestion-dismiss")
+                            Button::new(SharedString::from(dismiss_sel.clone()))
+                                .debug_selector(move || dismiss_sel.clone())
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::new(IconName::X).size(px(14.)))
                                 .tooltip(hm::DISMISS.get())
                                 .accessibility_label(hm::DISMISS.get())
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.dismiss_suggestion(
                                         dismiss_bot.clone(),
                                         dismiss_id.clone(),
@@ -1340,11 +1417,23 @@ impl View {
 
     /// Marks the bot's suggestions seen (once per new batch), leaving this Home's dots as they
     /// opened.
-    fn mark_up_next_seen(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        let now = now_unix_ms();
-        if let Some(up) = self.items.upcoming.as_mut() {
-            up.up_next_seen_ms = now;
+    fn mark_up_next_seen(&mut self, bot_id: BotId, latest_ms: u64, cx: &mut Context<Self>) {
+        let Some(up) = self.items.upcoming.as_mut() else {
+            return;
+        };
+        let watermark = now_unix_ms().max(latest_ms);
+        let dedup_key = (self.host.clone(), bot_id.clone());
+        if self
+            .items
+            .up_next_seen_sent
+            .get(&dedup_key)
+            .is_some_and(|&sent| sent >= latest_ms)
+        {
+            up.up_next_seen_ms = up.up_next_seen_ms.max(watermark);
+            return;
         }
+        up.up_next_seen_ms = up.up_next_seen_ms.max(watermark);
+        self.items.up_next_seen_sent.insert(dedup_key, watermark);
         let rpc = self.rpc.clone();
         cx.background_executor()
             .spawn(async move {
@@ -1440,5 +1529,184 @@ mod tests {
         );
         let rows = automation_rows(&bot, None, false, None, now);
         assert_eq!(header_quiet_line(&rows, now).0, text::BP_IDLE.get());
+    }
+
+    #[gpui::test]
+    fn suggestions_wait_for_upcoming_and_deduplicate_mark_up_next_seen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use krill_proto::bots::BotSuggestion;
+        use std::sync::{Arc, Mutex};
+
+        let now = now_unix_ms();
+        let bot_id = BotId::new("sug-bot").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Scout", "agy", now).unwrap();
+        // Remote suggestion timestamp ahead of local wall clock (clock skew scenario).
+        let remote_suggestion = BotSuggestion {
+            id: "sug-1".to_owned(),
+            bot_id: bot_id.clone(),
+            title: "Check remote CI".to_owned(),
+            why: "Build failed".to_owned(),
+            ask: "Investigate CI".to_owned(),
+            link: None,
+            source: None,
+            dismissed: false,
+            created_at_ms: now + 600_000,
+        };
+        let upcoming_resp: Arc<Mutex<Option<BotUpcoming>>> = Arc::new(Mutex::new(None));
+        let mark_calls = Arc::new(Mutex::new(0usize));
+        let bot_rpc = bot.clone();
+        let sug_rpc = remote_suggestion.clone();
+        let up_rpc = upcoming_resp.clone();
+        let mark_rpc = mark_calls.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![])),
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => {
+                Ok(BotRpcResponse::Suggestions(vec![sug_rpc.clone()]))
+            }
+            BotRpcRequest::GetBotUpcoming { .. } => match up_rpc.lock().unwrap().clone() {
+                Some(up) => Ok(BotRpcResponse::Upcoming(up)),
+                None => Ok(BotRpcResponse::Ok),
+            },
+            BotRpcRequest::MarkUpNextSeen { .. } => {
+                *mark_rpc.lock().unwrap() += 1;
+                Ok(BotRpcResponse::Ok)
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(360.), px(700.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, DetailTab::Items, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // `upcoming` is still None: must NOT latch 0 or fire MarkUpNextSeen on render.
+        assert_eq!(*mark_calls.lock().unwrap(), 0);
+        vcx.update(|_, cx| {
+            assert!(
+                !view
+                    .read(cx)
+                    .items
+                    .up_next_seen_at_open
+                    .contains_key(&bot_id)
+            );
+        });
+
+        // Once `upcoming` loads, MarkUpNextSeen fires ONCE even though remote timestamp > local now.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.items.upcoming = Some(BotUpcoming {
+                    up_next_seen_ms: 1_000,
+                    ..Default::default()
+                });
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(*mark_calls.lock().unwrap(), 1);
+
+        // Trigger additional renders (and even a stale upcoming refresh): dedup prevents a storm.
+        for _ in 0..3 {
+            vcx.update(|_, cx| {
+                view.update(cx, |v, cx| {
+                    if let Some(up) = v.items.upcoming.as_mut() {
+                        up.up_next_seen_ms = 1_000;
+                    }
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+        }
+        assert_eq!(*mark_calls.lock().unwrap(), 1);
+    }
+
+    #[gpui::test]
+    fn look_now_scopes_state_per_bot_and_drops_stale_bot_results(cx: &mut gpui::TestAppContext) {
+        use krill_proto::bots::BotSuggestion;
+        use std::sync::Arc;
+
+        let now = now_unix_ms();
+        let b1 = BotId::new("look-a").unwrap();
+        let b2 = BotId::new("look-b").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "agy", now).unwrap();
+        let sug_a = BotSuggestion {
+            id: "sug-a".to_owned(),
+            bot_id: b1.clone(),
+            title: "Alpha suggestion".to_owned(),
+            why: "Reason".to_owned(),
+            ask: "Ask".to_owned(),
+            link: None,
+            source: None,
+            dismissed: false,
+            created_at_ms: now,
+        };
+        let bots_rpc = vec![cfg1, cfg2];
+        let sug_rpc = sug_a.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![])),
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => {
+                Ok(BotRpcResponse::Upcoming(BotUpcoming::default()))
+            }
+            BotRpcRequest::RunLookAround { bot_id } => Ok(BotRpcResponse::LookAroundResult {
+                bot_id: bot_id.clone(),
+                suggestions: vec![sug_rpc.clone()],
+            }),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+
+        // Select Beta, then run look_now for Alpha: Alpha's completion must NOT overwrite Beta's
+        // suggestions, and Alpha must be removed from look_around_running + look_tasks.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&b2, DetailTab::Items, cx);
+                v.look_now(b1.clone(), cx);
+                assert!(v.soul_memory.is_looking_around(&b1));
+                assert!(!v.soul_memory.is_looking_around(&b2));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(!v.soul_memory.is_looking_around(&b1));
+            assert!(!v.look_tasks.contains_key(&b1));
+            assert!(
+                v.soul_memory.suggestions.is_empty(),
+                "Alpha's look_now result must not populate Beta's suggestions"
+            );
+        });
     }
 }

@@ -1418,3 +1418,56 @@ fn flush_queued_prompt_preserves_failures_and_handles_bracketed_and_slash(cx: &m
         "queued TUI-opening slash command must switch pane to terminal"
     );
 }
+
+#[gpui::test]
+fn unbracketed_turn_watcher_stops_when_transport_becomes_stale(cx: &mut TestAppContext) {
+    let (view, cx, _, _) = fixture(
+        cx,
+        "chat-unbracketed-stale-transport",
+        &permission(),
+        "ready",
+    );
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.chat.prompt_confirmed = Some(false);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("hello unbracketed", window, cx);
+            });
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.chat.turn_tasks.is_empty());
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][0].status,
+            PendingStatus::Sending
+        );
+    });
+    // Keep a draft in the composer so failure keeps the pending card in ReviewRequired
+    // instead of restoring into an empty composer, then drop the pane's live transport.
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("next draft", window, cx);
+            });
+            shell.live.remove(&pane);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(40));
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell.chat.turn_tasks.is_empty(),
+            "stale transport must stop unbracketed turn watcher promptly"
+        );
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][0].status,
+            PendingStatus::ReviewRequired,
+            "stale transport must transition pending prompt to ReviewRequired"
+        );
+    });
+}

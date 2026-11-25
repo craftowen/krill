@@ -1035,8 +1035,8 @@ impl Shell {
                 cx.stop_propagation();
                 this.step_launcher_selection(id, 1, cx);
             }))
-            .capture_action(cx.listener(move |this, _: &Enter, window, cx| {
-                if this.launcher_input_is_composing(id, window, cx) {
+            .capture_action(cx.listener(move |this, action: &Enter, window, cx| {
+                if action.secondary || this.launcher_input_is_composing(id, window, cx) {
                     return;
                 }
                 cx.stop_propagation();

@@ -2238,3 +2238,604 @@ fn s2_07_08_11_15_bot_section_errors_delete_cleanup_offline_dialogs_and_up_next(
         "S2-09: completed sessions must be pruned from RoomState::member_items"
     );
 }
+
+#[gpui::test]
+fn offline_remote_host_returns_none_for_bot_rpc_and_blocks_group_approval(cx: &mut TestAppContext) {
+    use crate::shell::bot_group_chat::{GroupRoomKey, RoomState};
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::BotRpcResponse;
+
+    let (view, cx) = open(cx, state_path("bot-ub01-offline-remote"));
+    let local_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let local_calls_ref = Arc::clone(&local_calls);
+    let offline_remote = HostId::Remote("iroh:offline-box".into());
+    let key = GroupRoomKey {
+        host: offline_remote.clone(),
+        group_id: "grp-remote".into(),
+        thread_id: None,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(Arc::new(move |_| {
+                local_calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BotRpcResponse::Ok)
+            }));
+            assert!(s.bot_rpc_on(&HostId::Local).is_some());
+            assert!(
+                s.bot_rpc_on(&offline_remote).is_none(),
+                "offline remote host must not fall back to local bot_rpc_override"
+            );
+            assert!(matches!(
+                s.resolved_target_for_host(&offline_remote),
+                crate::shell::bot_section::ResolvedHostTarget::Offline
+            ));
+            s.bot_ui
+                .group_chat
+                .rooms
+                .insert(key.clone(), RoomState::default());
+            s.send_group_approval_input(key.clone(), SessionId(99), "y\r", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(local_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.bot_ui.group_chat.rooms[&key].action_error.is_some(),
+            "offline remote approval input must surface disconnect error instead of hitting local daemon"
+        );
+    });
+}
+
+#[gpui::test]
+fn close_panes_for_group_closes_background_split_without_touching_active_tab_or_other_host(
+    cx: &mut TestAppContext,
+) {
+    use crate::shell::bot_group_chat::{GroupRoomKey, RoomState};
+    use krill_app::hosts::HostId;
+    use krill_app::layout::{Axis, GroupPaneTarget};
+
+    let (view, cx) = open(cx, state_path("bot-ub02-close-panes-group"));
+    let remote = HostId::Remote("iroh:studio".into());
+    let (p_active, p_bg_regular, p_bg_group, p_remote_group) = view.update(cx, |s, cx| {
+        // Tab 0 (active): regular pane.
+        let p_active = s.layout.focused().unwrap();
+        s.layout.set_session(p_active, SessionId(1));
+
+        // Tab 1 (background): split with regular pane + local group "grp-x".
+        s.layout.new_tab();
+        let p_bg_regular = s.layout.focused().unwrap();
+        s.layout.set_session(p_bg_regular, SessionId(2));
+        s.layout.split(Axis::Horizontal);
+        let p_bg_group = s.layout.focused().unwrap();
+        s.layout.set_host(p_bg_group, HostId::Local);
+        s.layout.set_group_pane(
+            p_bg_group,
+            Some(GroupPaneTarget {
+                group_id: "grp-x".into(),
+                thread_id: None,
+            }),
+        );
+
+        // Tab 2 (background): remote group with the same id "grp-x".
+        s.layout.new_tab();
+        let p_remote_group = s.layout.focused().unwrap();
+        s.layout.set_host(p_remote_group, remote.clone());
+        s.layout.set_group_pane(
+            p_remote_group,
+            Some(GroupPaneTarget {
+                group_id: "grp-x".into(),
+                thread_id: None,
+            }),
+        );
+
+        // Return focus to Tab 0's regular pane before closing the local group.
+        s.layout.activate(0);
+        s.layout.focus(p_active);
+
+        s.bot_ui.group_chat.rooms.insert(
+            GroupRoomKey {
+                host: HostId::Local,
+                group_id: "grp-x".into(),
+                thread_id: None,
+            },
+            RoomState::default(),
+        );
+        s.bot_ui.group_chat.rooms.insert(
+            GroupRoomKey {
+                host: remote.clone(),
+                group_id: "grp-x".into(),
+                thread_id: None,
+            },
+            RoomState::default(),
+        );
+
+        s.close_panes_for_group(&HostId::Local, "grp-x", cx);
+        (p_active, p_bg_regular, p_bg_group, p_remote_group)
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.layout.pane_exists(p_active),
+            "active tab pane must stay open"
+        );
+        assert_eq!(s.layout.focused(), Some(p_active));
+        assert!(s.layout.pane_exists(p_bg_regular));
+        assert!(
+            !s.layout.pane_exists(p_bg_group),
+            "background split group pane on Local must be closed"
+        );
+        assert!(
+            s.layout.pane_exists(p_remote_group),
+            "same-id group pane on remote host must stay open"
+        );
+        assert!(
+            !s.bot_ui.group_chat.rooms.contains_key(&GroupRoomKey {
+                host: HostId::Local,
+                group_id: "grp-x".into(),
+                thread_id: None,
+            }),
+            "Local room state must be pruned"
+        );
+        assert!(
+            s.bot_ui.group_chat.rooms.contains_key(&GroupRoomKey {
+                host: remote,
+                group_id: "grp-x".into(),
+                thread_id: None,
+            }),
+            "Remote room state must remain"
+        );
+    });
+}
+
+#[gpui::test]
+fn group_room_uses_active_thread_prunes_member_items_and_discards_stale_polls(
+    cx: &mut TestAppContext,
+) {
+    use crate::shell::bot_group_chat::{GroupRoomKey, RoomState};
+    use krill_app::hosts::HostId;
+    use krill_proto::agent_history::{ChatItem, ChatItemKind};
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupRoomView, BotRpcRequest,
+        BotRpcResponse,
+    };
+
+    let (view, cx) = setup(cx, "bot-ub11-ub12-group-poll");
+    let seen_threads = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let seen_ref = Arc::clone(&seen_threads);
+    let key = GroupRoomKey {
+        host: HostId::Local,
+        group_id: "grp-sync".into(),
+        thread_id: None,
+    };
+    let room_view = BotGroupRoomView {
+        group: BotGroupChat {
+            id: "grp-sync".into(),
+            name: "Sync Crew".into(),
+            bot_ids: vec![BotId::new("krill").unwrap()],
+            description: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        active_thread_id: Some("thr-resolved".into()),
+        messages: vec![BotGroupMessage {
+            message_id: "m1".into(),
+            group_id: "grp-sync".into(),
+            thread_id: "thr-resolved".into(),
+            sender_id: "owner".into(),
+            sender_name: "You".into(),
+            body: "hi".into(),
+            mentions: Vec::new(),
+            created_at_ms: 10,
+            in_progress: false,
+        }],
+        has_earlier: true,
+        active_turns: Vec::new(),
+    };
+    let room_for_rpc = room_view.clone();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::ReadGroupRoom {
+            thread_id,
+            before_message_id,
+            ..
+        } => {
+            let tag = if before_message_id.is_some() {
+                "earlier"
+            } else {
+                "poll"
+            };
+            seen_ref
+                .lock()
+                .unwrap()
+                .push((tag.to_owned(), thread_id.clone()));
+            Ok(BotRpcResponse::GroupRoom(room_for_rpc.clone()))
+        }
+        BotRpcRequest::SendGroupMessageWithAudience { thread_id, .. } => {
+            seen_ref
+                .lock()
+                .unwrap()
+                .push(("send".to_owned(), thread_id.clone()));
+            Ok(BotRpcResponse::Ok)
+        }
+        BotRpcRequest::StopGroupMember { thread_id, .. } => {
+            seen_ref
+                .lock()
+                .unwrap()
+                .push(("stop".to_owned(), thread_id.clone()));
+            Ok(BotRpcResponse::Ok)
+        }
+        BotRpcRequest::SetGroupReplyAudience { group_id, audience } => {
+            Ok(BotRpcResponse::GroupReplyAudienceUpdated {
+                group_id: group_id.clone(),
+                audience: audience.clone(),
+            })
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            let mut state = RoomState {
+                room: Some(room_view),
+                draft: "follow up".into(),
+                ..Default::default()
+            };
+            // Seed a stale member_items entry for an exited/finished session (41 = Done in setup).
+            state.member_items.insert(
+                SessionId(41),
+                vec![ChatItem {
+                    kind: ChatItemKind::Question,
+                    text: "old prompt".into(),
+                    ..Default::default()
+                }],
+            );
+            s.bot_ui.group_chat.rooms.insert(key.clone(), state);
+
+            // Calling poll while loading sets repoll_needed rather than silently dropping.
+            s.bot_ui.group_chat.rooms.get_mut(&key).unwrap().loading = true;
+            s.poll_group_room(key.clone(), cx);
+            assert!(s.bot_ui.group_chat.rooms[&key].repoll_needed);
+            s.bot_ui.group_chat.rooms.get_mut(&key).unwrap().loading = false;
+
+            // Poll, load earlier, send, and stop all forward resolved `active_thread_id`.
+            s.poll_group_room(key.clone(), cx);
+            s.load_earlier_group_messages(key.clone(), cx);
+            s.send_group_composer_message(key.clone(), window, cx);
+            s.stop_group_turn(key.clone(), None, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let log = seen_threads.lock().unwrap().clone();
+    for tag in ["poll", "earlier", "send", "stop"] {
+        assert!(
+            log.iter()
+                .any(|(t, tid)| t == tag && tid.as_deref() == Some("thr-resolved")),
+            "expected {tag} to forward active_thread_id thr-resolved, got {log:?}"
+        );
+    }
+
+    // Finished turn's stale member_items must be pruned after poll applies snapshot.
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.bot_ui.group_chat.rooms[&key].member_items.is_empty(),
+            "stale member_items must be pruned when active_turns is empty"
+        );
+    });
+
+    // Optimistic reply_audience bumps poll_gen so an older in-flight poll cannot revert it.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.poll_group_room(key.clone(), cx);
+            s.set_group_reply_audience(key.clone(), BotGroupReplyAudience::All, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert_eq!(
+            s.bot_ui.group_chat.rooms[&key].reply_audience,
+            BotGroupReplyAudience::All
+        );
+    });
+}
+
+#[gpui::test]
+fn inline_bot_and_group_rename_stop_click_propagation_and_cancel_on_escape(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::{BotGroupChat, BotGroupReplyAudience, BotGroupSummary};
+
+    let (view, cx) = setup(cx, "bot-ub14-inline-rename");
+    let group_summary = BotGroupSummary {
+        group: BotGroupChat {
+            id: "grp-ren".into(),
+            name: "Ops".into(),
+            bot_ids: vec![BotId::new("krill").unwrap()],
+            description: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: None,
+        active_turns: Vec::new(),
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let bots = s.sidebar_bots.clone();
+            s.apply_sidebar_state(0, bots, vec![group_summary], cx);
+            let id = BotId::new("krill").unwrap();
+            s.start_bot_rename_on(&HostId::Local, &id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let tabs_before = view.read_with(cx, |s, _| s.layout.tabs().len());
+    // Clicking inside the bot rename input must not bubble to row on_click (open_bot_home).
+    click(cx, "bot-row-rename-krill");
+    view.read_with(cx, |s, _| {
+        assert!(s.bot_ui.renaming.is_some());
+        assert_eq!(s.layout.tabs().len(), tabs_before);
+    });
+    // Pressing Escape cancels bot rename.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| assert!(s.bot_ui.renaming.is_none()));
+
+    // Same for group inline rename.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.start_group_rename_on(&HostId::Local, "grp-ren", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "bot-group-row-rename-grp-ren");
+    view.read_with(cx, |s, _| {
+        assert!(s.bot_ui.renaming_group.is_some());
+        assert_eq!(s.layout.tabs().len(), tabs_before);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| assert!(s.bot_ui.renaming_group.is_none()));
+}
+
+#[gpui::test]
+fn inline_bot_and_group_rename_guard_ime_escape_and_modified_enter(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler as _;
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::{BotGroupChat, BotGroupReplyAudience, BotGroupSummary};
+
+    let (view, cx) = setup(cx, "bot-r3a02-r3a05-inline-rename");
+    let group_summary = BotGroupSummary {
+        group: BotGroupChat {
+            id: "grp-ime".into(),
+            name: "Ops".into(),
+            bot_ids: vec![BotId::new("krill").unwrap()],
+            description: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: None,
+        active_turns: Vec::new(),
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let bots = s.sidebar_bots.clone();
+            s.apply_sidebar_state(0, bots, vec![group_summary], cx);
+            let id = BotId::new("krill").unwrap();
+            s.start_bot_rename_on(&HostId::Local, &id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.bot_ui.renaming.as_ref().unwrap().2.clone();
+            input.update(cx, |st, cx| {
+                st.focus(window, cx);
+                st.set_value("Renamed".to_owned(), window, cx);
+                st.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    // First Escape cancels IME preedit only, keeping inline bot rename open.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.bot_ui.renaming.is_some(),
+            "Escape during IME composition must not cancel bot inline rename"
+        );
+    });
+
+    // Modified Enter (Cmd+Shift+Enter / Shift+Enter) must not commit bot rename.
+    for key in ["secondary-shift-enter", "shift-enter", "secondary-enter"] {
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        view.read_with(cx, |s, _| {
+            assert!(
+                s.bot_ui.renaming.is_some(),
+                "{key} must not commit bot inline rename"
+            );
+        });
+    }
+
+    // Second Escape (no IME composition) cancels bot rename.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| assert!(s.bot_ui.renaming.is_none()));
+
+    // Same for group inline rename.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.start_group_rename_on(&HostId::Local, "grp-ime", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.bot_ui.renaming_group.as_ref().unwrap().2.clone();
+            input.update(cx, |st, cx| {
+                st.focus(window, cx);
+                st.set_value("RenamedGrp".to_owned(), window, cx);
+                st.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.bot_ui.renaming_group.is_some(),
+            "Escape during IME composition must not cancel group inline rename"
+        );
+    });
+    for key in ["secondary-shift-enter", "shift-enter", "secondary-enter"] {
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        view.read_with(cx, |s, _| {
+            assert!(
+                s.bot_ui.renaming_group.is_some(),
+                "{key} must not commit group inline rename"
+            );
+        });
+    }
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| assert!(s.bot_ui.renaming_group.is_none()));
+}
+
+#[gpui::test]
+fn bot_attention_facts_and_lifecycle_panel_reset_dedup_and_group_rename_rollback(
+    cx: &mut TestAppContext,
+) {
+    use crate::shell::bot_panel::HomeChrome;
+    use krill_app::bots::DetailTab;
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::{
+        BotConfig, BotGroupChat, BotGroupReplyAudience, BotGroupSummary, BotRpcRequest,
+        BotRpcResponse,
+    };
+
+    let (view, cx) = setup(cx, "bot-ub13-ub16-ub43-ub44-ub45");
+    let group_summary = BotGroupSummary {
+        group: BotGroupChat {
+            id: "grp-rb".into(),
+            name: "Original Name".into(),
+            bot_ids: vec![BotId::new("krill").unwrap()],
+            description: String::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: None,
+        active_turns: Vec::new(),
+    };
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(|req| match req {
+        BotRpcRequest::StartBotSession { bot_id, .. } => Ok(BotRpcResponse::SessionStarted {
+            bot_id: bot_id.clone(),
+            session_id: SessionId(21), // Already in krill's sessions!
+            pid: 123,
+        }),
+        BotRpcRequest::UpdateGroup { .. } => Ok(BotRpcResponse::Error("rename refused".into())),
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            // UB-16: bot with attention > 0 and idle sessions must have needs_you == true.
+            let mut attn_bot = bot(
+                "attn",
+                "Attn Bot",
+                "Needs review",
+                vec![chat("attn", 41, "")],
+            );
+            attn_bot.attention = 2;
+            let facts = s.bot_facts(&attn_bot, None, cx);
+            assert!(facts.needs_you);
+
+            let bots = s.sidebar_bots.clone();
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_state(0, bots, vec![group_summary], cx);
+
+            // UB-43: SessionStarted with existing session_id must not duplicate row.sessions.
+            let krill_id = BotId::new("krill").unwrap();
+            s.start_bot_session_on(&HostId::Local, krill_id.clone(), None, cx);
+
+            // UB-44: rename_group_rpc_on rolls back optimistic name on Err.
+            s.rename_group_rpc_on(&HostId::Local, "grp-rb", "Optimistic Name", cx);
+            assert_eq!(s.sidebar_groups[0].group.name, "Optimistic Name");
+
+            // UB-13 & UB-45: delete_bot_keep_folder_on clears panel shown/settings/pending_draft/home_chrome.
+            let zed_id = BotId::new("zed").unwrap();
+            s.bot_ui.panel.shown = Some((HostId::Local, zed_id.clone(), DetailTab::SoulMemory));
+            s.bot_ui.panel.settings = Some(DetailTab::SoulMemory);
+            s.bot_ui.panel.pending_draft = Some((HostId::Local, zed_id.clone(), "draft".into()));
+            s.bot_ui.panel.home_chrome = HomeChrome {
+                bot_id: Some(zed_id.clone()),
+                quiet_line: Some(("Running".into(), None, true)),
+                ..Default::default()
+            };
+            s.bot_ui.panel.stale = false;
+            s.delete_bot_keep_folder_on(&HostId::Local, zed_id, cx);
+            assert!(s.bot_ui.panel.shown.is_none());
+            assert!(s.bot_ui.panel.settings.is_none());
+            assert!(s.bot_ui.panel.pending_draft.is_none());
+            assert!(s.bot_ui.panel.home_chrome.bot_id.is_none());
+            assert!(s.bot_ui.panel.stale);
+
+            // UB-13: same-host Created event clears panel shown/settings/pending_draft and marks stale.
+            s.bot_ui.panel.shown = Some((HostId::Local, krill_id.clone(), DetailTab::Items));
+            s.bot_ui.panel.settings = Some(DetailTab::Settings);
+            s.bot_ui.panel.pending_draft = Some((HostId::Local, krill_id, "old".into()));
+            s.bot_ui.panel.stale = false;
+            let created_cfg =
+                BotConfig::new(BotId::new("fresh").unwrap(), "Fresh", "claude", 1).unwrap();
+            s.on_new_bot_event(
+                &krill_app::bots::new_bot::Event::Created {
+                    bot: Box::new(created_cfg),
+                    warning: None,
+                    host: HostId::Local,
+                },
+                window,
+                cx,
+            );
+            assert!(s.bot_ui.panel.shown.is_none());
+            assert!(s.bot_ui.panel.settings.is_none());
+            assert!(s.bot_ui.panel.pending_draft.is_none());
+            assert!(s.bot_ui.panel.stale);
+        });
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, _| {
+        let krill_row = s
+            .sidebar_bots
+            .iter()
+            .find(|b| b.id.as_str() == "krill")
+            .unwrap();
+        assert_eq!(
+            krill_row
+                .sessions
+                .iter()
+                .filter(|x| x.session_id == SessionId(21))
+                .count(),
+            1,
+            "duplicate session_id must not be inserted into row.sessions"
+        );
+        assert_eq!(
+            s.sidebar_groups[0].group.name, "Original Name",
+            "failed group rename must roll back optimistic name"
+        );
+    });
+}

@@ -101,8 +101,71 @@ fn malformed_responses_fail_and_non_web_urls_cannot_be_opened() {
     assert!(serde_json::from_str::<Page>(r#"{"unexpected":[]}"#).is_err());
     let mut page = page("one", None);
     assert!(page.artifacts[0].openable());
-    page.artifacts[0].share_url = "file:///private/key".into();
-    assert!(!page.artifacts[0].openable());
+    for bad in [
+        "file:///private/key",
+        "https://share.krill.page/a/one\nnewline",
+        "https://share.krill.page/a/\u{202E}one",
+        "https://share.krill.page/a/one two",
+        "http://",
+        "https:///missing-host",
+    ] {
+        page.artifacts[0].share_url = bad.into();
+        assert!(
+            !page.artifacts[0].openable(),
+            "unsanitized share_url must not be openable: {bad:?}"
+        );
+        assert!(detail::fetch_remote_raw(bad).is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_remote_preview_truncates_large_streams_and_rejects_failures() {
+    let mut big = Command::new("/bin/sh");
+    big.args(["-c", "head -c 400000 /dev/zero | tr '\\0' 'A'"]);
+    let (text, truncated) =
+        detail::read_bounded_command_preview(&mut big, std::time::Duration::from_secs(5))
+            .expect("large 2xx stream should truncate cleanly");
+    assert!(truncated);
+    assert_eq!(text.len(), 256 * 1024);
+
+    let mut failed = Command::new("/bin/sh");
+    failed.args(["-c", "printf 'partial'; exit 22"]);
+    assert!(
+        detail::read_bounded_command_preview(&mut failed, std::time::Duration::from_secs(5))
+            .is_none(),
+        "non-zero exit under cap must fail"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_remote_preview_accepts_over_cap_on_sigpipe_exit_23_and_rejects_exact_cap_error() {
+    for _ in 0..10 {
+        let mut over_cap_err = Command::new("/bin/sh");
+        over_cap_err.args([
+            "-c",
+            "(head -c 262145 /dev/zero | tr '\\0' 'A') 2>/dev/null; exit 23",
+        ]);
+        let (text, truncated) = detail::read_bounded_command_preview(
+            &mut over_cap_err,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("over-cap stream exiting with SIGPIPE/exit 23 must still return preview");
+        assert!(truncated);
+        assert_eq!(text.len(), 256 * 1024);
+    }
+
+    let mut exact_cap_err = Command::new("/bin/sh");
+    exact_cap_err.args(["-c", "head -c 262144 /dev/zero | tr '\\0' 'A'; exit 23"]);
+    assert!(
+        detail::read_bounded_command_preview(
+            &mut exact_cap_err,
+            std::time::Duration::from_secs(5),
+        )
+        .is_none(),
+        "non-zero exit at or below cap must fail"
+    );
 }
 
 #[test]

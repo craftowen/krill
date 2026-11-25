@@ -88,12 +88,26 @@ fn month_day(c: &CivilTime, lang: Language) -> String {
 /// Orca's `formatWaitTime`: the time today, the weekday within six days, else the date.
 /// Orca's `formatBotItemSnoozeTime`: as `wait_time`, always with minutes ("Thu 9:00 AM").
 pub(super) fn snooze_time(at: u64, now: u64) -> String {
-    wait_time_in(at, now, local_offset_secs(now), language(), false)
+    wait_time_in(
+        at,
+        now,
+        local_offset_secs(at),
+        local_offset_secs(now),
+        language(),
+        false,
+    )
 }
 
-fn wait_time_in(at: u64, now: u64, offset: i64, lang: Language, short: bool) -> String {
-    let (day, c, weekday) = local(at, offset);
-    let (today, ..) = local(now, offset);
+fn wait_time_in(
+    at: u64,
+    now: u64,
+    at_offset: i64,
+    now_offset: i64,
+    lang: Language,
+    short: bool,
+) -> String {
+    let (day, c, weekday) = local(at, at_offset);
+    let (today, ..) = local(now, now_offset);
     let time = clock(&c, short, lang);
     if day == today {
         return time;
@@ -107,28 +121,28 @@ fn wait_time_in(at: u64, now: u64, offset: i64, lang: Language, short: bool) -> 
 }
 
 /// Today, yesterday or earlier, as Orca's `lookedDay` says.
-fn day_of(at: u64, now: u64, offset: i64) -> i64 {
-    local(now, offset).0 - local(at, offset).0
+fn day_of(at: u64, now: u64, at_offset: i64, now_offset: i64) -> i64 {
+    local(now, now_offset).0 - local(at, at_offset).0
 }
 
 /// Orca's `upcomingAt`: "Today at 4:00 PM", "Tomorrow at 9:00 AM", then the wait time.
 pub(super) fn upcoming_at(at: u64, now: u64) -> String {
-    let offset = local_offset_secs(now);
+    let (at_offset, now_offset) = (local_offset_secs(at), local_offset_secs(now));
     let lang = language();
-    let time = clock(&local(at, offset).1, false, lang);
-    match day_of(at, now, offset) {
+    let time = clock(&local(at, at_offset).1, false, lang);
+    match day_of(at, now, at_offset, now_offset) {
         0 => text::TODAY_AT.format(&[("time", &time)]),
         -1 => text::TOMORROW_AT.format(&[("time", &time)]),
-        _ => wait_time_in(at, now, offset, lang, true),
+        _ => wait_time_in(at, now, at_offset, now_offset, lang, true),
     }
 }
 
 /// Orca's `ranText`: "Ran 6:00 PM" today, "Ran yesterday", then "Ran Nov 11".
 pub(super) fn ran_text(at: u64, now: u64) -> String {
-    let offset = local_offset_secs(now);
+    let (at_offset, now_offset) = (local_offset_secs(at), local_offset_secs(now));
     let lang = language();
-    let c = local(at, offset).1;
-    match day_of(at, now, offset) {
+    let c = local(at, at_offset).1;
+    match day_of(at, now, at_offset, now_offset) {
         0 => text::RAN_AT.format(&[("time", &clock(&c, false, lang))]),
         1 => text::RAN_YESTERDAY.get().to_owned(),
         _ => text::RAN_AT.format(&[("time", &month_day(&c, lang))]),
@@ -137,10 +151,10 @@ pub(super) fn ran_text(at: u64, now: u64) -> String {
 
 /// Orca's `lookedText`: "Looked 4:12 PM", "Looked yesterday 4:12 PM", then "Looked Oct 29".
 pub(super) fn looked_text(at: u64, now: u64) -> String {
-    let offset = local_offset_secs(now);
+    let (at_offset, now_offset) = (local_offset_secs(at), local_offset_secs(now));
     let lang = language();
-    let c = local(at, offset).1;
-    match day_of(at, now, offset) {
+    let c = local(at, at_offset).1;
+    match day_of(at, now, at_offset, now_offset) {
         0 => text::LOOKED.format(&[("time", &clock(&c, false, lang))]),
         1 => text::LOOKED_YESTERDAY.format(&[("time", &clock(&c, false, lang))]),
         _ => text::LOOKED.format(&[("time", &month_day(&c, lang))]),
@@ -151,16 +165,28 @@ pub(super) fn looked_text(at: u64, now: u64) -> String {
 /// `"오전 12:07"` / `"12:07 AM"` today, `"어제 오후 9:52"` / `"Yesterday 9:52 PM"` yesterday,
 /// `"11월 20일 오후 9:52"` / `"Nov 20, 9:52 PM"` earlier.
 pub(super) fn activity_timestamp(at: u64, now: u64) -> String {
-    activity_timestamp_in(at, now, local_offset_secs(now), language())
+    activity_timestamp_with_offsets(
+        at,
+        now,
+        local_offset_secs(at),
+        local_offset_secs(now),
+        language(),
+    )
 }
 
-pub(super) fn activity_timestamp_in(at: u64, now: u64, offset: i64, lang: Language) -> String {
+fn activity_timestamp_with_offsets(
+    at: u64,
+    now: u64,
+    at_offset: i64,
+    now_offset: i64,
+    lang: Language,
+) -> String {
     if at == 0 {
         return String::new();
     }
-    let c = local(at, offset).1;
+    let c = local(at, at_offset).1;
     let time = clock(&c, false, lang);
-    match day_of(at, now, offset) {
+    match day_of(at, now, at_offset, now_offset) {
         0 => time,
         1 => text::YESTERDAY_AT.format_in(lang, &[("time", &time)]),
         _ => {
@@ -183,13 +209,13 @@ pub(super) fn quiet_line(
     let Some((name, at)) = next else {
         return (crate::i18n::catalog::bots::BP_IDLE.get().to_owned(), None);
     };
-    let offset = local_offset_secs(now);
+    let (at_offset, now_offset) = (local_offset_secs(at), local_offset_secs(now));
     let lang = language();
-    let time = clock(&local(at, offset).1, false, lang);
-    let when = match day_of(at, now, offset) {
+    let time = clock(&local(at, at_offset).1, false, lang);
+    let when = match day_of(at, now, at_offset, now_offset) {
         0 => time,
         -1 => text::TOMORROW_LOWER.format(&[("time", &time)]),
-        _ => wait_time_in(at, now, offset, lang, true),
+        _ => wait_time_in(at, now, at_offset, now_offset, lang, true),
     };
     (
         text::IDLE_NEXT.format(&[("when", &when), ("name", name)]),
@@ -225,25 +251,47 @@ mod tests {
     fn wait_time_says_the_time_then_the_weekday_then_the_date() {
         let en = Language::En;
         assert_eq!(
-            wait_time_in(MON_8PM, MON_8PM - 3_600_000, 0, en, true),
+            wait_time_in(MON_8PM, MON_8PM - 3_600_000, 0, 0, en, true),
             "8 PM"
         );
         assert_eq!(
-            wait_time_in(MON_8PM + 4 * DAY_MS + 1_800_000, MON_8PM, 0, en, true),
+            wait_time_in(MON_8PM + 4 * DAY_MS + 1_800_000, MON_8PM, 0, 0, en, true),
             "Fri 8:30 PM"
         );
         assert_eq!(
-            wait_time_in(MON_8PM + 10 * DAY_MS, MON_8PM, 0, en, true),
+            wait_time_in(MON_8PM + 10 * DAY_MS, MON_8PM, 0, 0, en, true),
             "Dec 3, 8 PM"
         );
         assert_eq!(
-            wait_time_in(MON_8PM + DAY_MS, MON_8PM, 0, Language::Ko, true),
+            wait_time_in(MON_8PM + DAY_MS, MON_8PM, 0, 0, Language::Ko, true),
             "화 오후 8시"
         );
         assert_eq!(
-            wait_time_in(MON_8PM + 10 * DAY_MS, MON_8PM, 0, Language::Ko, true),
+            wait_time_in(MON_8PM + 10 * DAY_MS, MON_8PM, 0, 0, Language::Ko, true),
             "12월 3일 오후 8시"
         );
+    }
+
+    #[test]
+    fn wait_time_and_day_of_apply_target_offset_across_dst() {
+        // Now: 2026-03-07 15:00 UTC = 10:00 EST (-5h).
+        // Target: 2026-03-08 13:00 UTC = 09:00 EDT (-4h, after spring-forward).
+        let now_winter = 1_772_895_600_000;
+        let target_summer = 1_772_974_800_000;
+        let est = -5 * 3_600;
+        let edt = -4 * 3_600;
+        // Using target's own EDT offset gives Sun 9:00 AM, not Sun 8:00 AM.
+        assert_eq!(
+            wait_time_in(target_summer, now_winter, edt, est, Language::En, false),
+            "Sun 9:00 AM"
+        );
+        assert_eq!(day_of(target_summer, now_winter, edt, est), -1);
+
+        // Midnight crossing under DST shift:
+        // Now: 2026-03-08 04:30 UTC = 2026-03-07 23:30 EST (-5h).
+        // Target: 2026-03-08 13:00 UTC = 2026-03-08 09:00 EDT (-4h).
+        let late_sat = 1_772_944_200_000;
+        assert_eq!(day_of(target_summer, late_sat, edt, est), -1);
     }
 
     #[test]

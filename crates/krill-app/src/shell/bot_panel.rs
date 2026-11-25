@@ -142,6 +142,7 @@ pub(super) struct BotPanel {
 
 #[derive(Default, PartialEq, Eq)]
 pub(super) struct HomeChrome {
+    pub bot_id: Option<BotId>,
     pub filter: Option<krill_app::bots::HomeFilter>,
     pub item_open: bool,
     pub quiet_line: Option<(String, Option<String>, bool)>,
@@ -319,6 +320,7 @@ impl Shell {
         cx.observe(&view, |this, view, cx| {
             let v = view.read(cx);
             let chrome = HomeChrome {
+                bot_id: v.selected_bot_id().cloned(),
                 filter: v.home_filter(),
                 item_open: v.home_item_open(),
                 quiet_line: v.home_quiet_line(),
@@ -335,6 +337,7 @@ impl Shell {
         self.bot_ui.panel.view = Some(view.clone());
         self.bot_ui.panel.shown = None;
         self.bot_ui.panel.stale = false;
+        self.bot_ui.panel.home_chrome = HomeChrome::default();
         Some(view)
     }
 
@@ -364,7 +367,7 @@ impl Shell {
     }
 
     /// Puts a pending draft in the bot's Home Chat composer once that chat is the focused pane.
-    fn apply_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((host, bot_id, _)) = &self.bot_ui.panel.pending_draft else {
             return;
         };
@@ -451,7 +454,9 @@ impl Shell {
                 );
             });
             let want = (host.clone(), bot.id.clone(), page);
-            if self.bot_ui.panel.shown.as_ref() != Some(&want) {
+            if self.bot_ui.panel.shown.as_ref() != Some(&want)
+                && !view.read(cx).is_panel_switch_blocked(&bot.id, cx)
+            {
                 // Orca `#47162`: show cached items immediately before the daemon refresh finishes.
                 if self.bot_ui.panel.shown.as_ref().map(|(h, id, _)| (h, id))
                     != Some((&host, &bot.id))
@@ -480,7 +485,9 @@ impl Shell {
                 .shown
                 .as_ref()
                 .is_some_and(|(h, id, _)| h == &host && id == &bot.id);
-            if !same_bot && view.update(cx, |v, cx| v.show_in_panel(&bot.id, DetailTab::Items, cx))
+            if !same_bot
+                && !view.read(cx).is_panel_switch_blocked(&bot.id, cx)
+                && view.update(cx, |v, cx| v.show_in_panel(&bot.id, DetailTab::Items, cx))
             {
                 self.bot_ui.panel.shown = Some((host, bot.id.clone(), DetailTab::Items));
             }
@@ -494,8 +501,19 @@ impl Shell {
             BotPanelTab::Chats => self.render_bot_chats(bot, width, p, cx).into_any_element(),
             BotPanelTab::Connectors => div().size_full().children(view).into_any_element(),
             BotPanelTab::Home => {
+                let display_bot: &SidebarBot = view
+                    .as_ref()
+                    .and_then(|v| v.read(cx).selected_bot_id().cloned())
+                    .filter(|shown_id| shown_id != &bot.id)
+                    .and_then(|shown_id| {
+                        self.sidebar_bots
+                            .iter()
+                            .find(|b| b.host == bot.host && b.id == shown_id)
+                    })
+                    .unwrap_or(bot);
                 if let Some(page) = self.bot_ui.panel.settings {
-                    Self::render_bot_settings_page(bot, page, view, p, cx).into_any_element()
+                    Self::render_bot_settings_page(display_bot, page, view, p, cx)
+                        .into_any_element()
                 } else {
                     // An open item takes Home's place, header and all (Orca's item pane).
                     // Once `view` has loaded the bot, `BotPanelHeader` renders inside Home's
@@ -504,14 +522,14 @@ impl Shell {
                     let item_open = view.as_ref().is_some_and(|v| v.read(cx).home_item_open());
                     let view_renders_header = view
                         .as_ref()
-                        .is_some_and(|v| v.read(cx).home_renders_header(&bot.id));
+                        .is_some_and(|v| v.read(cx).home_renders_header(&display_bot.id));
                     div()
                         .size_full()
                         .flex()
                         .flex_col()
                         .when(!item_open && !view_renders_header, |d| {
                             d.child(self.render_bot_panel_header(
-                                bot,
+                                display_bot,
                                 view.as_ref(),
                                 width <= NARROW_HEADER_WIDTH,
                                 p,
@@ -665,7 +683,19 @@ impl Shell {
         // Orca says what its automations do while nothing waits or runs ("Running …", "Idle ·
         // next 8:00 PM · Look around"); the bot's job is the sidebar's line only.
         let quiet = !bot.paused && bot.attention == 0 && bot.working() == 0;
-        let quiet_line = self.bot_ui.panel.home_chrome.quiet_line.clone();
+        let quiet_line = match view {
+            Some(v) => {
+                let v = v.read(cx);
+                if v.selected_bot_id() == Some(&bot.id) {
+                    v.home_quiet_line()
+                } else {
+                    None
+                }
+            }
+            None => (self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot.id))
+                .then(|| self.bot_ui.panel.home_chrome.quiet_line.clone())
+                .flatten(),
+        };
         let automation_running = quiet_line.as_ref().is_some_and(|q| q.2);
         let status = if quiet || activity.trim().is_empty() {
             match quiet_line {
@@ -1067,7 +1097,9 @@ impl Shell {
         let active = focused == Some((&bot.host, s.session_id));
         let session = s.session_id;
         let live = s.live;
-        let home = s.link_id.is_none();
+        let home = bot
+            .home_session()
+            .is_some_and(|h| h.session_id == s.session_id);
         let id = SharedString::from(format!("bot-panel-chat-{}", s.session_id.0));
         let group: SharedString = format!("bot-chat-{}", s.session_id.0).into();
         let open_host = bot.host.clone();

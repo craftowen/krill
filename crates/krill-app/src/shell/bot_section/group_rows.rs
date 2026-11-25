@@ -199,11 +199,32 @@ impl Shell {
 
         let unread = facts.status == RowStatus::Permission;
         let name: AnyElement = match renaming {
-            Some(input) => div()
-                .flex_1()
-                .min_w_0()
-                .child(Input::new(&input).xsmall().appearance(false))
-                .into_any_element(),
+            Some(input) => {
+                let esc_input = input.clone();
+                let rename_sel = format!("bot-group-row-rename-{gid}");
+                div()
+                    .id(SharedString::from(rename_sel.clone()))
+                    .debug_selector(move || rename_sel.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .capture_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                        if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                            let composing = esc_input.update(cx, |s, cx| {
+                                gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
+                            });
+                            if !composing {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.bot_ui.renaming_group = None;
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .child(Input::new(&input).xsmall().appearance(false))
+                    .into_any_element()
+            }
             None => div()
                 .flex_1()
                 .min_w_0()
@@ -290,6 +311,14 @@ impl Shell {
                     .hover(|d| d.bg(p.worktree_sidebar_accent))
             })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                if this
+                    .bot_ui
+                    .renaming_group
+                    .as_ref()
+                    .is_some_and(|(h, id, _, _)| *h == click_host && id == &gid_click)
+                {
+                    return;
+                }
                 if e.click_count() > 1 {
                     this.start_group_rename_on(&click_host, &gid_click, window, cx);
                 } else {
@@ -787,7 +816,10 @@ impl Shell {
             &input,
             window,
             move |this, input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => {
                     let composing = input.update(cx, |s, cx| {
                         gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
                     });
@@ -810,7 +842,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn rename_group_rpc_on(
+    pub(super) fn rename_group_rpc_on(
         &mut self,
         host: &HostId,
         group_id: &str,
@@ -828,13 +860,20 @@ impl Shell {
         let host_owned = host.clone();
         let gid = group_id.to_owned();
         let name = trimmed.to_owned();
-        if let Some(s) = self
+        let previous = self
             .sidebar_groups
             .iter_mut()
             .find(|s| s.host == host_owned && s.group.id == gid)
-        {
-            s.group.name.clone_from(&name);
+            .map(|s| {
+                let prev = s.group.name.clone();
+                s.group.name.clone_from(&name);
+                prev
+            });
+        if previous.as_deref() == Some(name.as_str()) {
+            cx.notify();
+            return;
         }
+        let optimistic = name.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let gid_bg = gid.clone();
@@ -870,8 +909,22 @@ impl Shell {
                         this.invalidate_group_room(&host_owned, &gid);
                         this.refresh_bots_for_host(&host_owned, true, cx);
                     }
-                    Ok(_) => {}
-                    Err(err) => this.notice = Some(err),
+                    Ok(_) => {
+                        this.refresh_bots_for_host(&host_owned, true, cx);
+                    }
+                    Err(err) => {
+                        if let Some(prev) = previous
+                            && let Some(s) = this
+                                .sidebar_groups
+                                .iter_mut()
+                                .find(|s| s.host == host_owned && s.group.id == gid)
+                            && s.group.name == optimistic
+                        {
+                            s.group.name = prev;
+                        }
+                        this.refresh_bots_for_host(&host_owned, true, cx);
+                        this.notice = Some(err);
+                    }
                 }
                 cx.notify();
             })

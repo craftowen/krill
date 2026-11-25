@@ -6354,8 +6354,15 @@ impl SettingsView {
             subs.push(cx.subscribe_in(
                 input,
                 window,
-                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
-                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                |this, input, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(
+                        event,
+                        gpui_component::input::InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                    {
                         this.submit_ssh_host_form(window, cx);
                     }
                 },
@@ -11564,8 +11571,15 @@ impl SettingsView {
             cx.subscribe_in(
                 input,
                 window,
-                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
-                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                |this, input, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(
+                        event,
+                        gpui_component::input::InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                    {
                         this.submit_quick_command(window, cx);
                     }
                 },

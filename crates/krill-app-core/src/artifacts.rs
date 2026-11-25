@@ -113,8 +113,13 @@ impl Item {
     }
 
     #[must_use]
+    pub fn sanitized_share_url(&self) -> Option<String> {
+        crate::terminal::path_link::sanitize_http_url(&self.share_url)
+    }
+
+    #[must_use]
     pub fn openable(&self) -> bool {
-        self.share_url.starts_with("https://") || self.share_url.starts_with("http://")
+        self.sanitized_share_url().is_some()
     }
 }
 
@@ -1234,7 +1239,11 @@ impl Render for View {
                                     .on_click(
                                         move |_, _, cx| {
                                             cx.stop_propagation();
-                                            cx.open_url(&open);
+                                            if let Some(clean) =
+                                                crate::terminal::path_link::sanitize_http_url(&open)
+                                            {
+                                                cx.open_url(&clean);
+                                            }
                                         },
                                     ),
                                 )

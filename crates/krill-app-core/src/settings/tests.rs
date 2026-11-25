@@ -12244,3 +12244,77 @@ fn chat_auto_continue_after_rate_limit_defaults_off_and_toml_roundtrips() {
         settings
     );
 }
+
+#[gpui::test]
+fn ssh_and_quick_command_forms_ignore_enter_during_ime_composition(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        crate::settings::init(cx);
+    });
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(gpui::size(px(1000.), px(720.)));
+    vcx.run_until_parked();
+
+    // SSH host form: PressEnter during IME composition must not submit.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.tab = AdminTab::Machines;
+            v.ensure_ssh_form(window, cx);
+            let form = v.ssh_form.as_ref().unwrap();
+            let label = form.label.clone();
+            let address = form.address.clone();
+            address.update(cx, |s, cx| s.set_value("dev@10.0.0.1", window, cx));
+            label.update(cx, |s, cx| {
+                s.focus(window, cx);
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    s, None, "한", None, window, cx,
+                );
+            });
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.ssh_form
+                .as_ref()
+                .unwrap()
+                .address
+                .read(cx)
+                .value()
+                .as_ref()
+                == "dev@10.0.0.1",
+            "SSH form must not submit and clear while IME is composing (R2A-16)"
+        );
+    });
+
+    // Quick command form: PressEnter during IME composition must not submit.
+    let before_qc = vcx.update(|_, cx| current(cx).quick_commands.len());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.tab = AdminTab::QuickCommands;
+            v.ensure_quick_form(window, cx);
+            let form = v.quick_form.as_ref().unwrap();
+            let name = form.name.clone();
+            let command = form.command.clone();
+            command.update(cx, |s, cx| s.set_value("git status", window, cx));
+            name.update(cx, |s, cx| {
+                s.focus(window, cx);
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    s, None, "상", None, window, cx,
+                );
+            });
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let after_qc = vcx.update(|_, cx| current(cx).quick_commands.len());
+    assert_eq!(
+        after_qc, before_qc,
+        "Quick command form must not submit while IME is composing (R2A-16)"
+    );
+}

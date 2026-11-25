@@ -5609,6 +5609,25 @@ fn tab_rename_inline_saves_clears_and_cancels(cx: &mut TestAppContext) {
         });
     });
     cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.tab_rename.is_none(),
+            "Escape inside tab-rename-input must cancel inline rename (R2A-12)"
+        );
+    });
+    assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
+    // Clicking away / blurring after Escape must not save the cancelled text.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            assert!(
+                s.focus.is_focused(window),
+                "Escape must return focus to Shell workspace"
+            );
+            s.focus.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
     cx.simulate_keystrokes("cmd-r");
     cx.run_until_parked();
@@ -14934,4 +14953,81 @@ fn draggable_scrollbar_drags_smoothly_and_hides_on_alt_screen_and_narrow_panes(
         cx.debug_bounds("scrollbar").is_none(),
         "narrow panes (< 5 cols) must hide scrollbar"
     );
+}
+
+#[gpui::test]
+fn round2_shell_bot_dialogs_and_group_composer_shortcuts(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("round2-shell-bot-checks"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    // R2A-13: opening NewBot after closing settings (which sets files.refocus = true) must
+    // block sync_files from stealing focus back to the workspace.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(Arc::new(|_| Ok(krill_proto::bots::BotRpcResponse::Ok)));
+            s.files.refocus = true;
+            s.request_new_bot(None, None, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let s = view.read(cx);
+        assert!(s.bot_ui.new_bot.is_some());
+        assert!(
+            s.has_workspace_focus_blocker(cx),
+            "NewBot dialog must be counted as a workspace focus blocker (R2A-13)"
+        );
+        assert!(
+            !s.focus.is_focused(window),
+            "sync_files must not steal focus back to Shell workspace while NewBot is open"
+        );
+    });
+    view.update(cx, |s, cx| {
+        s.bot_ui.new_bot = None;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // R2A-10: Shift+Enter in Bot Group Chat composer inserts a newline without sending.
+    let key = super::bot_group_chat::GroupRoomKey {
+        host: krill_app::hosts::HostId::Local,
+        group_id: "grp-alpha".to_owned(),
+        thread_id: Some("thr-2".to_owned()),
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.open_bot_group_on(
+                &krill_app::hosts::HostId::Local,
+                "grp-alpha",
+                Some("thr-2"),
+                Some(window),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let composer = s.ensure_group_composer(&key, window, cx);
+            composer.update(cx, |inp, cx| {
+                inp.set_value("hello".to_owned(), window, cx);
+                inp.focus(window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-enter");
+    cx.run_until_parked();
+    view.read_with(cx, |s, cx| {
+        let room = s.bot_ui.group_chat.rooms.get(&key).unwrap();
+        let val = room.composer.as_ref().unwrap().0.read(cx).value();
+        assert!(
+            val.contains('\n'),
+            "Shift+Enter in group composer must insert a newline, got {val:?}"
+        );
+        assert!(
+            !room.sending,
+            "Shift+Enter in group composer must not send the message (R2A-10)"
+        );
+    });
 }

@@ -749,7 +749,7 @@ impl NewBot {
     }
 
     fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.input_is_composing(window, cx) {
+        if window.default_prevented() || self.input_is_composing(window, cx) {
             return;
         }
         let keys = &e.keystroke;
@@ -1731,5 +1731,75 @@ mod tests {
             );
             assert_eq!(template_bot_slug(tpl, "커스텀 이름", &[]), None);
         }
+    }
+
+    #[gpui::test]
+    fn escape_during_ime_composition_does_not_close_new_bot_dialog(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        use std::sync::{Arc, Mutex};
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let rpc: super::super::rpc::BotRpcCall = Arc::new(|_| Ok(BotRpcResponse::Ok));
+        let closes = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&closes);
+        let (dialog, vcx) = cx.add_window_view(|window, cx| {
+            NewBot::new(
+                vec![HostChoice {
+                    id: HostId::Local,
+                    label: "My Mac".into(),
+                    rpc,
+                }],
+                Vec::new(),
+                None,
+                window,
+                cx,
+            )
+        });
+        vcx.update(|_, cx| {
+            cx.subscribe(&dialog, move |_, e: &Event, _| {
+                if matches!(e, Event::Close) {
+                    *seen.lock().unwrap() += 1;
+                }
+            })
+            .detach();
+        });
+        vcx.run_until_parked();
+
+        // Start IME composition in the Name input.
+        vcx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.name.update(cx, |st, cx| {
+                    st.focus(window, cx);
+                    st.replace_and_mark_text_in_range(None, "한", None, window, cx);
+                });
+                assert!(d.input_is_composing(window, cx));
+            });
+        });
+        vcx.run_until_parked();
+
+        // First Escape only cancels IME preedit and must NOT close the dialog.
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        assert_eq!(
+            *closes.lock().unwrap(),
+            0,
+            "Escape during IME composition must not emit Event::Close"
+        );
+        vcx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                assert!(
+                    !d.input_is_composing(window, cx),
+                    "Escape must unmark IME preedit"
+                );
+            });
+        });
+
+        // Second Escape (after composition ended) closes the dialog normally.
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        assert_eq!(*closes.lock().unwrap(), 1);
     }
 }

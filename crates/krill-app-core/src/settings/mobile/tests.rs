@@ -796,3 +796,53 @@ fn mobile_page_sidebar_toggle_fits_without_overlap_or_shift(cx: &mut gpui::TestA
         vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
     }
 }
+
+#[gpui::test]
+fn mobile_account_action_rejects_unsanitized_verification_url(cx: &mut gpui::TestAppContext) {
+    let call: Call = Arc::new(move |req| {
+        match req {
+        MobileRequest::Workflow(json) if json.contains("relay_auth_start") => {
+            Ok(MobileReply::Workflow(
+                serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "requires_sign_in": true,
+                        "signed_in": false,
+                        "pending": true,
+                        "verification_uri_complete": "https://relay.krill.sh/auth/device?code=1\r\nfoo"
+                    }
+                })
+                .to_string(),
+            ))
+        }
+        MobileRequest::Workflow(_) => Ok(MobileReply::Workflow(
+            serde_json::json!({"ok": true, "data": {"requires_sign_in": true, "signed_in": false}})
+                .to_string(),
+        )),
+        _ => Err("unused".into()),
+    }
+    });
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut view = SettingsView::new(cx);
+        view.visible = false;
+        view.mobile = Panel::new(call);
+        view
+    });
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile.account.connect_after_login = Some(ConnectMode::Tunnel);
+            v.mobile_account_action(false, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            !v.mobile.account.pending,
+            "invalid verification URL must not leave account login pending"
+        );
+        assert!(v.mobile.account.connect_after_login.is_none());
+        assert_eq!(v.mobile.error.as_deref(), Some(text::ACCOUNT_ERROR.get()));
+    });
+}

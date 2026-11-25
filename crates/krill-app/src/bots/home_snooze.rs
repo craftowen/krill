@@ -11,7 +11,7 @@ use krill_proto::bots::{
     BotId, BotItemStatus, BotRpcRequest, BotRpcResponse, FieldPatch, UpdateBotItemParams,
 };
 
-use super::home::{local_offset_secs, snooze_presets};
+use super::home::{local_offset_secs_at_epoch, local_wall_to_epoch_ms_with, snooze_presets_with};
 use super::home_time::{clock_minutes as clock, snooze_time};
 use super::rpc::call_checked;
 use super::{View, now_unix_ms};
@@ -65,54 +65,108 @@ pub(super) struct SnoozePick {
     pub month_first: i64,
 }
 
-/// `minutes` past local midnight of `day`, as an instant.
-fn at(day: i64, minutes: u32, offset: i64) -> u64 {
-    u64::try_from((day * DAY_SECS + i64::from(minutes) * 60 - offset) * 1000).unwrap_or(0)
+/// `minutes` past local midnight of `day`, using the local timezone offset at the target time.
+fn at_with(day: i64, minutes: u32, offset_secs_at: impl Fn(i64) -> i64) -> u64 {
+    local_wall_to_epoch_ms_with(day, i64::from(minutes), offset_secs_at)
 }
 
+fn at_local(day: i64, minutes: u32) -> u64 {
+    at_with(day, minutes, local_offset_secs_at_epoch)
+}
+
+fn today_with(now: u64, offset_secs_at: impl Fn(i64) -> i64) -> i64 {
+    let epoch = i64::try_from(now / 1000).unwrap_or(0);
+    (epoch + offset_secs_at(epoch)).div_euclid(DAY_SECS)
+}
+
+fn today_local(now: u64) -> i64 {
+    today_with(now, local_offset_secs_at_epoch)
+}
+
+#[cfg(test)]
 fn today(now: u64, offset: i64) -> i64 {
-    (i64::try_from(now / 1000).unwrap_or(0) + offset).div_euclid(DAY_SECS)
+    today_with(now, |_| offset)
 }
 
 /// Quarter hours on `day` still ahead of `now` and within the cap (Orca `botItemSnoozeSlots`).
-pub(super) fn slots(day: i64, now: u64, offset: i64) -> Vec<u32> {
+fn slots_with(day: i64, now: u64, offset_secs_at: impl Fn(i64) -> i64) -> Vec<u32> {
     (0..24 * 60)
         .step_by(SLOT_MINUTES as usize)
         .filter(|&m| {
-            let until = at(day, m, offset);
+            let until = at_with(day, m, &offset_secs_at);
             until > now && until <= now + MAX_MS
         })
         .collect()
 }
 
+fn slots_local(day: i64, now: u64) -> Vec<u32> {
+    slots_with(day, now, local_offset_secs_at_epoch)
+}
+
+#[cfg(test)]
+pub(super) fn slots(day: i64, now: u64, offset: i64) -> Vec<u32> {
+    slots_with(day, now, |_| offset)
+}
+
 /// `minutes` if still open on `day`, else the next open slot, else the day's last.
-pub(super) fn slot_on(day: i64, minutes: u32, now: u64, offset: i64) -> Option<u32> {
-    let open = slots(day, now, offset);
+fn slot_on_with(
+    day: i64,
+    minutes: u32,
+    now: u64,
+    offset_secs_at: impl Fn(i64) -> i64,
+) -> Option<u32> {
+    let open = slots_with(day, now, offset_secs_at);
     open.iter()
         .copied()
         .find(|&s| s >= minutes)
         .or_else(|| open.last().copied())
 }
 
+fn slot_on_local(day: i64, minutes: u32, now: u64) -> Option<u32> {
+    slot_on_with(day, minutes, now, local_offset_secs_at_epoch)
+}
+
+#[cfg(test)]
+pub(super) fn slot_on(day: i64, minutes: u32, now: u64, offset: i64) -> Option<u32> {
+    slot_on_with(day, minutes, now, |_| offset)
+}
+
 /// The first and last days with an open slot.
-pub(super) fn day_range(now: u64, offset: i64) -> (i64, i64) {
-    let mut first = today(now, offset);
-    if slots(first, now, offset).is_empty() {
+fn day_range_with(now: u64, offset_secs_at: impl Fn(i64) -> i64) -> (i64, i64) {
+    let mut first = today_with(now, &offset_secs_at);
+    if slots_with(first, now, &offset_secs_at).is_empty() {
         first += 1;
     }
-    (first, today(now + MAX_MS, offset))
+    (first, today_with(now + MAX_MS, &offset_secs_at))
+}
+
+fn day_range_local(now: u64) -> (i64, i64) {
+    day_range_with(now, local_offset_secs_at_epoch)
+}
+
+#[cfg(test)]
+pub(super) fn day_range(now: u64, offset: i64) -> (i64, i64) {
+    day_range_with(now, |_| offset)
 }
 
 /// The picker's presets: the menu's three, then 9 AM a week out (Orca
 /// `botItemSnoozePickerPresets`).
-pub(super) fn picker_presets(now: u64, offset: i64) -> Vec<(String, u64)> {
-    let week = at(today(now, offset) + 7, DEFAULT_MINUTES, offset);
-    let mut presets: Vec<_> = snooze_presets(now, offset)
+fn picker_presets_with(now: u64, offset_secs_at: impl Fn(i64) -> i64) -> Vec<(String, u64)> {
+    let week = at_with(
+        today_with(now, &offset_secs_at) + 7,
+        DEFAULT_MINUTES,
+        &offset_secs_at,
+    );
+    let mut presets: Vec<_> = snooze_presets_with(now, &offset_secs_at)
         .into_iter()
         .filter(|(_, at)| *at != week)
         .collect();
     presets.push((hm::SNOOZE_WEEK.get().to_owned(), week));
     presets
+}
+
+fn picker_presets_local(now: u64) -> Vec<(String, u64)> {
+    picker_presets_with(now, local_offset_secs_at_epoch)
 }
 
 fn civil(day: i64) -> (i32, u8, u8) {
@@ -133,6 +187,18 @@ fn prev_month(first: i64) -> i64 {
 }
 
 impl View {
+    /// Opens the Snooze until dialog for these items and focuses its modal scope when a window is provided.
+    pub(super) fn open_snooze_pick_in(
+        &mut self,
+        bot_id: BotId,
+        uids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus.focus(window, cx);
+        self.open_snooze_pick(bot_id, uids, cx);
+    }
+
     /// Opens the Snooze until dialog for these items.
     pub(super) fn open_snooze_pick(
         &mut self,
@@ -141,7 +207,7 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let now = now_unix_ms();
-        let day = today(now, local_offset_secs(now)) + 1;
+        let day = today_local(now) + 1;
         self.items.snooze_pick = Some(SnoozePick {
             bot_id,
             uids,
@@ -164,6 +230,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let req_gen = self.items.rpc_gen;
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -179,6 +247,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host || this.items.rpc_gen != req_gen {
+                    return;
+                }
                 this.items.busy = false;
                 for res in results {
                     match res {
@@ -252,7 +323,7 @@ impl View {
     ) -> Option<gpui::AnyElement> {
         let pick = self.items.snooze_pick.clone()?;
         let now = now_unix_ms();
-        let offset = local_offset_secs(now);
+        let busy = self.items.busy;
         let close = cx.listener(|this, _, _, cx| {
             this.items.snooze_pick = None;
             cx.notify();
@@ -276,10 +347,11 @@ impl View {
                     .on_click(close),
             );
         let body = if pick.picking {
-            Self::render_snooze_grid(&pick, now, offset, p, cx).into_any_element()
+            self.render_snooze_grid(&pick, now, p, cx)
+                .into_any_element()
         } else {
             let mut rows = div().flex().flex_col().gap_0p5().mx(px(-8.));
-            for (i, (label, until)) in picker_presets(now, offset).into_iter().enumerate() {
+            for (i, (label, until)) in picker_presets_local(now).into_iter().enumerate() {
                 let (bot_id, uids) = (pick.bot_id.clone(), pick.uids.clone());
                 rows = rows.child(
                     div()
@@ -294,9 +366,12 @@ impl View {
                         .gap_2()
                         .rounded(ui::RADIUS_SM)
                         .px_2()
-                        .cursor_pointer()
                         .text_size(ui::TEXT_SM)
-                        .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                        .when(busy, |d| d.opacity(0.5))
+                        .when(!busy, |d| {
+                            d.cursor_pointer()
+                                .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                        })
                         .child(div().flex_1().child(label))
                         .child(
                             div()
@@ -304,6 +379,9 @@ impl View {
                                 .child(snooze_time(until, now)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.items.busy {
+                                return;
+                            }
                             this.items.snooze_pick = None;
                             this.snooze_items(bot_id.clone(), &uids, Some(until), cx);
                         })),
@@ -394,20 +472,20 @@ impl View {
     }
 
     fn render_snooze_grid(
+        &self,
         pick: &SnoozePick,
         now: u64,
-        offset: i64,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let (first, last) = day_range(now, offset);
+        let (first, last) = day_range_local(now);
         let chosen = pick.day.clamp(first, last);
-        let slot = slot_on(chosen, pick.minutes, now, offset);
-        let until = slot.map(|s| at(chosen, s, offset));
+        let slot = slot_on_local(chosen, pick.minutes, now);
+        let until = slot.map(|s| at_local(chosen, s));
         let (year, month, _) = civil(pick.month_first);
         let month_name = FULL_MONTHS[usize::from(month.clamp(1, 12)) - 1].get();
         let caption = hm::MONTH_YEAR.format(&[("year", &year.to_string()), ("month", month_name)]);
-        let today = today(now, offset);
+        let today = today_local(now);
         let can_prev = pick.month_first > month_first(first);
         let can_next = next_month(pick.month_first) <= last;
         let nav = div()
@@ -522,7 +600,7 @@ impl View {
             grid = grid.child(week);
             start += 7;
         }
-        let slot_list = slots(chosen, now, offset);
+        let slot_list = slots_local(chosen, now);
         let this = cx.weak_entity();
         let time = div()
             .h(px(32.))
@@ -585,8 +663,11 @@ impl View {
                 ui::primary("bot-snooze-submit", text::HM_SNOOZE.get())
                     .debug_selector(|| "bot-snooze-submit".into())
                     .small()
-                    .disabled(until.is_none())
+                    .disabled(until.is_none() || self.items.busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.items.busy {
+                            return;
+                        }
                         if let Some(until) = until {
                             this.items.snooze_pick = None;
                             this.snooze_items(bot_id.clone(), &uids, Some(until), cx);
@@ -677,5 +758,180 @@ mod tests {
             CAL_DAYS.map(|d| d.in_language(Language::Ko)),
             ["일", "월", "화", "수", "목", "금", "토"]
         );
+    }
+
+    #[test]
+    fn dst_transition_presets_and_custom_slots_use_target_offset() {
+        use crate::local_time::{CivilTime, epoch_from_civil};
+
+        let utc_ms = |y, m, d, h, min| {
+            u64::try_from(
+                epoch_from_civil(CivilTime {
+                    year: y,
+                    month: m,
+                    day: d,
+                    hour: h,
+                    minute: min,
+                    second: 0,
+                })
+                .unwrap()
+                    * 1000,
+            )
+            .unwrap()
+        };
+
+        // Synthetic America/New_York spring-forward: 2026-03-08 07:00 UTC (-5h -> -4h).
+        let transition_secs = epoch_from_civil(CivilTime {
+            year: 2026,
+            month: 3,
+            day: 8,
+            hour: 7,
+            minute: 0,
+            second: 0,
+        })
+        .unwrap();
+        let ny_offset = |epoch_secs: i64| {
+            if epoch_secs < transition_secs {
+                -5 * 3_600
+            } else {
+                -4 * 3_600
+            }
+        };
+
+        // Sat 2026-03-07 10:00 EST (15:00 UTC).
+        let now = utc_ms(2026, 3, 7, 15, 0);
+        let presets = picker_presets_with(now, ny_offset);
+        // Tomorrow 9:00 AM EDT = 2026-03-08 13:00 UTC (NOT 14:00 UTC).
+        assert_eq!(presets[1].1, utc_ms(2026, 3, 8, 13, 0));
+        // Monday 9:00 AM EDT = 2026-03-09 13:00 UTC.
+        assert_eq!(presets[2].1, utc_ms(2026, 3, 9, 13, 0));
+        // Next week (Sat 2026-03-14) 9:00 AM EDT = 13:00 UTC.
+        assert_eq!(presets[3].1, utc_ms(2026, 3, 14, 13, 0));
+
+        // Custom date 116 days out (2026-07-01 09:00 EDT = 13:00 UTC).
+        let july_1_day = today_with(utc_ms(2026, 7, 1, 12, 0), ny_offset);
+        assert_eq!(
+            at_with(july_1_day, 9 * 60, ny_offset),
+            utc_ms(2026, 7, 1, 13, 0)
+        );
+    }
+
+    #[gpui::test]
+    fn snooze_submit_keeps_dialog_open_when_busy(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+        use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let bot_id = BotId::new("bot-snooze-busy").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Snooze Bot", "agy", 1_700_000_000_000).unwrap();
+        let bot_rpc = bot.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(400.), px(700.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_snooze_pick(bot_id.clone(), vec!["u1".to_owned()], cx);
+                v.items.busy = true;
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+
+        let preset = vcx
+            .debug_bounds("bot-snooze-preset-0")
+            .expect("snooze preset 0");
+        vcx.simulate_click(preset.center(), Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(
+                view.read(cx).items.snooze_pick.is_some(),
+                "preset click must not clear snooze_pick while items.busy is true"
+            );
+        });
+
+        // Switch to custom grid and verify submit stays disabled/preserves modal while busy.
+        let custom = vcx
+            .debug_bounds("bot-snooze-custom")
+            .expect("snooze custom");
+        vcx.simulate_click(custom.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let submit = vcx
+            .debug_bounds("bot-snooze-submit")
+            .expect("snooze submit");
+        vcx.simulate_click(submit.center(), Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(
+                view.read(cx).items.snooze_pick.is_some(),
+                "custom submit must not clear snooze_pick while items.busy is true"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn panel_overlay_dialogs_focus_on_open_so_escape_closes_them(cx: &mut gpui::TestAppContext) {
+        use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let bot_id = BotId::new("bot-overlay-focus").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Overlay Bot", "agy", 1_700_000_000_000).unwrap();
+        let bot_rpc = bot.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(420.), px(720.)));
+        vcx.run_until_parked();
+
+        // Snooze dialog focuses view.focus so Escape closes it even if focus started unfocused.
+        vcx.update(|window, cx| {
+            window.blur(cx);
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_snooze_pick_in(bot_id.clone(), vec!["u1".to_owned()], window, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(
+                view.read(cx).items.snooze_pick.is_none(),
+                "Escape must close snooze dialog opened via open_snooze_pick_in"
+            );
+        });
+
+        // Add connector dialog focuses add_search so Escape closes it.
+        vcx.update(|window, cx| {
+            window.blur(cx);
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Connectors, cx);
+                v.open_connector_add_dialog(window, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(
+                view.read(cx).connectors.adding.is_none(),
+                "Escape must close connector add dialog opened via open_connector_add_dialog"
+            );
+        });
     }
 }

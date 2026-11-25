@@ -102,16 +102,21 @@ pub(super) fn question_step_state(
     }
 }
 
-/// Orca's `botItemQuestionLine`: a question's first line with leading Markdown marks stripped.
-pub(super) fn question_line(q: &str) -> String {
-    let first = q
-        .lines()
+/// Raw first non-empty line of a question, trimmed (for back-compat with historical/CLI/Modal
+/// answer lines written before Markdown normalization).
+fn raw_question_line(q: &str) -> &str {
+    q.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let stripped = first
-        .trim_start_matches(['#', '>', '-', '*', '+'])
-        .trim_start();
+        .unwrap_or("")
+}
+
+/// Orca's `botItemQuestionLine`: a question's first line with leading Markdown marks stripped.
+pub(super) fn question_line(q: &str) -> String {
+    let first = raw_question_line(q);
+    let stripped = first.trim_start_matches(|c: char| {
+        matches!(c, '#' | '>' | '-' | '*' | '+') || c.is_whitespace()
+    });
     stripped
         .replace("**", "")
         .replace("__", "")
@@ -121,22 +126,55 @@ pub(super) fn question_line(q: &str) -> String {
 }
 
 /// Orca's `botItemNamedAnswers`: per question, what an owner's comment answered it with
-/// ("Question → answer" lines).
+/// ("Question → answer" lines). Matches both normalized (`question_line`) and raw-Markdown
+/// prefixes on read for backwards compatibility with historical/CLI/Modal answers.
 pub(super) fn named_answers(decisions: &[BotItemDecision], text: &str) -> Vec<Option<String>> {
-    let heads: Vec<String> = decisions
+    let heads: Vec<Vec<String>> = decisions
         .iter()
-        .map(|d| format!("{} →", question_line(&d.question)))
+        .map(|d| {
+            let norm = question_line(&d.question);
+            let raw = raw_question_line(&d.question);
+            let mut candidates = Vec::new();
+            if !norm.is_empty() {
+                candidates.push(format!("{norm} →"));
+            }
+            if !raw.is_empty() && raw != norm {
+                candidates.push(format!("{raw} →"));
+            }
+            candidates
+        })
         .collect();
     let mut answers = vec![None; decisions.len()];
     for line in text.lines().map(str::trim) {
-        let best = heads
+        let mut best_len = 0_usize;
+        let mut best_matches: Vec<(usize, usize)> = Vec::new();
+        for (idx, candidates) in heads.iter().enumerate() {
+            if let Some(matched_len) = candidates
+                .iter()
+                .filter(|h| line.starts_with(h.as_str()))
+                .map(String::len)
+                .max()
+            {
+                match matched_len.cmp(&best_len) {
+                    std::cmp::Ordering::Greater => {
+                        best_len = matched_len;
+                        best_matches.clear();
+                        best_matches.push((idx, matched_len));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        best_matches.push((idx, matched_len));
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+        let chosen = best_matches
             .iter()
-            .enumerate()
-            .filter(|(_, h)| line.starts_with(h.as_str()))
-            .max_by_key(|(_, h)| h.len())
-            .map(|(i, _)| i);
-        if let Some(i) = best {
-            let words = line.get(heads[i].len()..).unwrap_or_default().trim();
+            .copied()
+            .find(|&(idx, _)| answers[idx].is_none())
+            .or_else(|| best_matches.first().copied());
+        if let Some((i, prefix_len)) = chosen {
+            let words = line.get(prefix_len..).unwrap_or_default().trim();
             if !words.is_empty() && answers[i].is_none() {
                 answers[i] = Some(words.to_owned());
             }
@@ -222,8 +260,8 @@ pub(super) fn markdown(id: impl Into<SharedString>, src: &str) -> AnyElement {
         .scrollable(false)
         .selectable(true)
         .on_link_click(|url, _, _, cx| {
-            if url.starts_with("https://") || url.starts_with("http://") {
-                cx.open_url(url);
+            if let Some(clean) = super::sanitize_http_url(url) {
+                cx.open_url(&clean);
             }
         })
         .into_any_element()
@@ -276,12 +314,32 @@ impl View {
     /// The items in the list's order, as ↑ ↓ walk them (Orca `use-bot-item-walk`).
     pub(super) fn walk_order(&self) -> Vec<String> {
         let now = now_unix_ms();
+        if self.group_panel.active {
+            let filter = &self.group_panel.filter;
+            let members = &self.group_panel.member_ids;
+            let shown = self.items.items.iter().filter(|item| {
+                members.contains(&item.owner_bot_id)
+                    && (filter.bot_ids.is_empty() || filter.bot_ids.contains(&item.owner_bot_id))
+                    && super::group_panel::item_matches_group_scope(
+                        item,
+                        &self.group_panel.group_id,
+                        &self.group_panel.thread_ids,
+                        &filter.chat_scope,
+                    )
+                    && (!filter.needs_you_only
+                        || item.status == krill_proto::bots::BotItemStatus::NeedsYou)
+            });
+            return grouped(shown, |i| self.item_live(i), Some(5), now)
+                .iter()
+                .flat_map(|g| g.iter().map(|i| i.uid.clone()))
+                .collect();
+        }
         let filter_on = self.items.needs_you_only;
-        let shown = self
-            .items
-            .items
-            .iter()
-            .filter(|i| !filter_on || i.status == krill_proto::bots::BotItemStatus::NeedsYou);
+        let selected_bot = self.selected_bot_id.as_ref();
+        let shown = self.items.items.iter().filter(|i| {
+            selected_bot.is_none_or(|id| &i.owner_bot_id == id)
+                && (!filter_on || i.status == krill_proto::bots::BotItemStatus::NeedsYou)
+        });
         let stale_days = self.selected_bot_id.as_ref().map_or_else(
             || krill_proto::bots::BotItemsStale::default().days(),
             |id| self.settings_extras(id).items_stale.days(),
@@ -295,18 +353,16 @@ impl View {
     /// Opens the previous (`-1`) or next (`1`) item.
     pub(super) fn step_item(&mut self, direction: i32, cx: &mut Context<Self>) {
         let order = self.walk_order();
-        let Some(at) = self
+        let next = match self
             .items
             .open_uid
             .as_ref()
             .and_then(|uid| order.iter().position(|u| u == uid))
-        else {
-            return;
-        };
-        let next = if direction < 0 {
-            at.checked_sub(1)
-        } else {
-            Some(at + 1).filter(|&n| n < order.len())
+        {
+            Some(at) if direction < 0 => at.checked_sub(1),
+            Some(at) => Some(at + 1).filter(|&n| n < order.len()),
+            None if direction > 0 && !order.is_empty() => Some(0),
+            None => None,
         };
         if let Some(uid) = next.and_then(|n| order.get(n)).cloned() {
             self.open_home_item(uid, cx);
@@ -323,12 +379,18 @@ impl View {
     ) -> gpui::Stateful<gpui::Div> {
         let order = self.walk_order();
         let total = order.len();
-        let index = self
+        let pos = self
             .items
             .open_uid
             .as_ref()
-            .and_then(|uid| order.iter().position(|u| u == uid))
-            .map_or(0, |i| i + 1);
+            .and_then(|uid| order.iter().position(|u| u == uid));
+        let (display_index, prev_disabled, next_disabled) = match pos {
+            Some(i) => {
+                let one_based = i + 1;
+                (one_based.to_string(), one_based <= 1, one_based >= total)
+            }
+            None => ("—".to_owned(), true, total == 0),
+        };
         let arrow = |id: &'static str, icon: IconName, label: &'static str, keys: &'static str| {
             Button::new(id)
                 .debug_selector(move || id.into())
@@ -343,7 +405,7 @@ impl View {
             .debug_selector(|| "bot-item-stepper".into())
             .role(gpui::Role::Group)
             .aria_label(SharedString::from(hm::ITEM_NAV.format(&[
-                ("index", &index.to_string()),
+                ("index", &display_index),
                 ("total", &total.to_string()),
             ])))
             .when(show_counter, |d| d.flex_1().min_w_0())
@@ -365,7 +427,7 @@ impl View {
                                 .whitespace_nowrap()
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
-                                .child(format!("{index} / {total}")),
+                                .child(format!("{display_index} / {total}")),
                         ),
                 )
             })
@@ -376,7 +438,7 @@ impl View {
                     hm::PREV_ITEM.get(),
                     "⌥⌘↑",
                 )
-                .disabled(index <= 1)
+                .disabled(prev_disabled)
                 .on_click(cx.listener(|this, _, _, cx| this.step_item(-1, cx))),
             )
             .child(
@@ -386,13 +448,13 @@ impl View {
                     hm::NEXT_ITEM.get(),
                     "⌥⌘↓",
                 )
-                .disabled(index >= total)
+                .disabled(next_disabled)
                 .on_click(cx.listener(|this, _, _, cx| this.step_item(1, cx))),
             )
             .child(div().mx_1().h(px(16.)).w(px(1.)).flex_none().bg(p.border))
     }
 
-    /// Orca's item chords: Esc and ⌘[ (or ⌥←) go back, ⌥⌘↑ / ⌥⌘↓ step, even while typing.
+    /// Orca's item chords: Esc and ⌘[ (or ⌥← when not editing text) go back, ⌥⌘↑ / ⌥⌘↓ step.
     pub(super) fn item_key(
         &mut self,
         ev: &gpui::KeyDownEvent,
@@ -411,13 +473,16 @@ impl View {
                 cx.stop_propagation();
                 self.step_item(1, cx);
             }
-            "[" if m.platform && !m.alt && !m.shift => {
+            "[" if m.platform && !m.alt && !m.shift && !m.control => {
                 cx.stop_propagation();
                 self.close_home_item(cx);
             }
-            "left" if m.alt && !m.platform && !m.shift => {
-                cx.stop_propagation();
-                self.close_home_item(cx);
+            "left" if m.alt && !m.platform && !m.shift && !m.control => {
+                // Leave Option+Left alone while typing in a text input (macOS MoveToPreviousWord).
+                if !self.items.any_input_focused(window, cx) {
+                    cx.stop_propagation();
+                    self.close_home_item(cx);
+                }
             }
             "escape" if !m.modified() => {
                 // An empty comment box gives Esc back to the pane.
@@ -664,8 +729,8 @@ impl View {
                         )
                         .tooltip(move |w, cx| ui::tooltip_view("bot-item-pr", tip.clone(), w, cx))
                         .on_click(move |_, _, cx| {
-                            if open.starts_with("https://") || open.starts_with("http://") {
-                                cx.open_url(&open);
+                            if let Some(clean) = super::sanitize_http_url(&open) {
+                                cx.open_url(&clean);
                             }
                         })
                         .into_any_element()
@@ -685,8 +750,8 @@ impl View {
                         )
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .on_click(move |_, _, cx| {
-                            if open.starts_with("https://") || open.starts_with("http://") {
-                                cx.open_url(&open);
+                            if let Some(clean) = super::sanitize_http_url(&open) {
+                                cx.open_url(&clean);
                             }
                         })
                         .into_any_element()
@@ -749,6 +814,7 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         self.error = None;
         self.notice = None;
         cx.spawn(async move |this, cx| {
@@ -773,6 +839,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
                 match res {
                     Ok(Some(list)) => {
                         this.bot_sessions = list;
@@ -1260,6 +1329,7 @@ impl View {
             uid,
             Some(body),
             None,
+            None,
             clear_input,
             clear_attachments,
             Some(key.clone()),
@@ -1347,24 +1417,55 @@ impl View {
     }
 
     /// The bot folder's files matching an @ query (Orca's comment mentions), up to eight.
-    pub(super) fn mention_matches(&mut self, bot: &BotConfig, query: &str) -> Vec<String> {
+    /// Scans off the UI thread and caches per `(host, bot, root)` so switching workspace/host/bot
+    /// never blocks rendering or serves stale paths.
+    pub(super) fn mention_matches(
+        &mut self,
+        bot: &BotConfig,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
         let Some(root) = self.bot_home_folder(bot) else {
             return Vec::new();
         };
-        let files = self
-            .items
-            .mention_files
-            .entry(bot.id.clone())
-            .or_insert_with(|| list_files(&root, 400));
-        let q = query.to_lowercase();
-        files
-            .iter()
-            .filter(|f| q.is_empty() || f.to_lowercase().contains(&q))
-            .take(8)
-            .cloned()
-            .collect()
+        let key = (self.host.clone(), bot.id.clone(), root.clone());
+        if let Some(files) = self.items.mention_files.get(&key) {
+            let q = query.to_lowercase();
+            return files
+                .iter()
+                .filter(|f| q.is_empty() || f.to_lowercase().contains(&q))
+                .take(8)
+                .cloned()
+                .collect();
+        }
+        if self.items.mention_scanning.as_ref() != Some(&key) {
+            self.items.mention_scanning = Some(key.clone());
+            self.items.mention_scan_task = Some(cx.spawn(async move |this, cx| {
+                let scanned = cx
+                    .background_executor()
+                    .spawn(async move { list_files(&root, MAX_MENTION_FILES) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.items.mention_scanning.as_ref() == Some(&key) {
+                        this.items.mention_scanning = None;
+                    }
+                    if this.host == key.0 {
+                        this.items
+                            .mention_files
+                            .retain(|(h, b, _), _| !(h == &key.0 && b == &key.1));
+                        this.items.mention_files.insert(key, scanned);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+        Vec::new()
     }
 }
+
+const MAX_MENTION_FILES: usize = 400;
+const MAX_MENTION_DIRS: usize = 512;
 
 /// A dispatch reference recorded on a bot item's `Linked` event (`dispatch:<id>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1380,12 +1481,21 @@ fn repo_of(url: &str) -> Option<String> {
     Some(format!("{}/{}", parts.next()?, parts.next()?))
 }
 
-/// The files under `root` (relative, hidden ones skipped), breadth first, at most `cap`.
-/// ponytail: a bounded walk on open; watch the folder if bots keep thousands of files.
+/// The files under `root` (relative, hidden ones and symlinks skipped), breadth first, capped
+/// by both file count and visited directories so huge trees or symlink cycles never hang.
 fn list_files(root: &std::path::Path, cap: usize) -> Vec<String> {
+    list_files_bounded(root, cap, MAX_MENTION_DIRS)
+}
+
+fn list_files_bounded(root: &std::path::Path, max_files: usize, max_dirs: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut visited_dirs = 0usize;
     while let Some(dir) = queue.pop_front() {
+        if visited_dirs >= max_dirs {
+            break;
+        }
+        visited_dirs += 1;
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -1396,12 +1506,21 @@ fn list_files(root: &std::path::Path, cap: usize) -> Vec<String> {
             if name.starts_with('.') {
                 continue;
             }
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            // Never follow symlinked directories or files (avoids symlink loops and escapes).
+            if ft.is_symlink() {
+                continue;
+            }
             let path = e.path();
-            if path.is_dir() {
+            if ft.is_dir() {
                 queue.push_back(path);
-            } else if let Ok(rel) = path.strip_prefix(root) {
+            } else if ft.is_file()
+                && let Ok(rel) = path.strip_prefix(root)
+            {
                 out.push(rel.to_string_lossy().into_owned());
-                if out.len() >= cap {
+                if out.len() >= max_files {
                     return out;
                 }
             }
@@ -1486,6 +1605,46 @@ mod tests {
     fn question_line_strips_markdown_marks() {
         assert_eq!(question_line("## **Ship it?**\nDetails"), "Ship it?");
         assert_eq!(question_line("- Run `cargo test`?"), "Run cargo test?");
+    }
+
+    #[test]
+    fn named_answers_matches_both_normalized_and_raw_markdown_prefixes() {
+        let ds = vec![d("## **Target env?**\nExtra"), d("- Run `cargo test`?")];
+        // Normalized prefixes (Home / new daemon)
+        assert_eq!(
+            named_answers(&ds, "Target env? → Staging\nRun cargo test? → Yes"),
+            [Some("Staging".to_owned()), Some("Yes".to_owned())]
+        );
+        // Raw Markdown prefixes (historical / CLI / Modal)
+        assert_eq!(
+            named_answers(&ds, "## **Target env?** → Prod\n- Run `cargo test`? → Skip"),
+            [Some("Prod".to_owned()), Some("Skip".to_owned())]
+        );
+    }
+
+    #[test]
+    fn question_line_and_named_answers_strip_interleaved_markdown_prefixes() {
+        assert_eq!(question_line("> - Target env?"), "Target env?");
+        assert_eq!(question_line("> ## Target env?"), "Target env?");
+        assert_eq!(question_line("## *Target* env?"), "Target* env?");
+        assert_eq!(
+            question_line("  >  -  **Deploy** now?\nDetails"),
+            "Deploy now?"
+        );
+
+        let ds = vec![d("> - Target env?"), d("> ## Rollback plan?")];
+        assert_eq!(
+            answers_text(&ds, &[Some("Staging".to_owned()), None]),
+            "Target env? → Staging"
+        );
+        assert_eq!(
+            named_answers(&ds, "Target env? → Staging\nRollback plan? → Revert"),
+            [Some("Staging".to_owned()), Some("Revert".to_owned())]
+        );
+        assert_eq!(
+            named_answers(&ds, "> - Target env? → Prod\n> ## Rollback plan? → None"),
+            [Some("Prod".to_owned()), Some("None".to_owned())]
+        );
     }
 
     #[test]
@@ -2092,5 +2251,287 @@ mod tests {
         vcx.run_until_parked();
         assert!(vcx.debug_bounds("bot-webhooks-card").is_some());
         assert!(vcx.debug_bounds("bot-webhook-copy-0").is_some());
+    }
+
+    #[test]
+    fn list_files_skips_symlink_loops_and_enforces_dir_cap() {
+        let base = std::env::temp_dir().join(format!(
+            "krill-mention-symlink-test-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(base.join("readme.md"), "hi").unwrap();
+        std::fs::write(sub.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(base.join(".hidden"), "secret").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("..", sub.join("loop")).unwrap();
+            std::os::unix::fs::symlink(&base, base.join("self_loop")).unwrap();
+            std::os::unix::fs::symlink(base.join("readme.md"), base.join("link.md")).unwrap();
+        }
+
+        let files = list_files(&base, MAX_MENTION_FILES);
+        assert!(files.contains(&"readme.md".to_owned()), "{files:?}");
+        assert!(
+            files.contains(&format!("sub{}main.rs", std::path::MAIN_SEPARATOR)),
+            "{files:?}"
+        );
+        assert!(!files.iter().any(|f| f.contains("loop")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains("link.md")), "{files:?}");
+        assert!(!files.iter().any(|f| f.contains(".hidden")), "{files:?}");
+
+        // Verify directory visit cap terminates early on wide trees.
+        for i in 0..12 {
+            let d = base.join(format!("dir-{i:02}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f.txt"), "x").unwrap();
+        }
+        let capped = list_files_bounded(&base, 400, 3);
+        assert!(
+            capped.len() < 12,
+            "dir cap must stop walk early: {capped:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[gpui::test]
+    fn mention_matches_scans_in_background_and_invalidates_on_workspace_change(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let base = std::env::temp_dir().join(format!(
+            "krill-mention-ws-test-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let ws1 = base.join("ws1");
+        let ws2 = base.join("ws2");
+        std::fs::create_dir_all(&ws1).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+        std::fs::write(ws1.join("alpha.rs"), "").unwrap();
+        std::fs::write(ws2.join("beta.rs"), "").unwrap();
+
+        let bot_id = BotId::new("mention-bot").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Helper", "agy", 1_700_000_000_000).unwrap();
+        bot.workspace = Some(ws1.to_string_lossy().into_owned());
+        let bot_rpc = bot.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+
+        // First call schedules background scan and returns empty synchronously.
+        let initial = vcx.update(|_, cx| view.update(cx, |v, cx| v.mention_matches(&bot, "", cx)));
+        assert!(initial.is_empty());
+        vcx.run_until_parked();
+        let ws1_matches =
+            vcx.update(|_, cx| view.update(cx, |v, cx| v.mention_matches(&bot, "", cx)));
+        assert_eq!(ws1_matches, vec!["alpha.rs"]);
+
+        // Switching bot.workspace invalidates the cache key and scans ws2 instead of serving ws1.
+        bot.workspace = Some(ws2.to_string_lossy().into_owned());
+        let after_switch =
+            vcx.update(|_, cx| view.update(cx, |v, cx| v.mention_matches(&bot, "", cx)));
+        assert!(after_switch.is_empty());
+        vcx.run_until_parked();
+        let ws2_matches =
+            vcx.update(|_, cx| view.update(cx, |v, cx| v.mention_matches(&bot, "", cx)));
+        assert_eq!(ws2_matches, vec!["beta.rs"]);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[gpui::test]
+    fn alt_left_respects_input_focus_and_control_modifier(cx: &mut gpui::TestAppContext) {
+        use gpui::{KeyDownEvent, Keystroke, Modifiers};
+        use krill_proto::bots::{BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let now = now_unix_ms();
+        let bot_id = BotId::new("key-bot").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Key Bot", "agy", now).unwrap();
+        let item = BotItem {
+            uid: "k-1".to_owned(),
+            number: 1,
+            owner_bot_id: bot_id.clone(),
+            title: "Task".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::Planned,
+            close_note: None,
+            links: vec![],
+            events: vec![],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: now,
+            created_at_ms: now,
+            updated_at_ms: now,
+            closed_at_ms: None,
+        };
+        let bot_rpc = bot.clone();
+        let item_rpc = item.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![item_rpc.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(400.), px(700.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_home_item("k-1".to_owned(), cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Focus comment input: Option+Left must NOT close the item pane.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let inp = v.items.comment_inputs.get("k-1").unwrap().clone();
+                inp.update(cx, |s, cx| s.focus(window, cx));
+                let ev = KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: Modifiers::alt(),
+                        key: "left".to_owned(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                v.item_key(&ev, window, cx);
+                assert_eq!(v.items.open_uid.as_deref(), Some("k-1"));
+            });
+        });
+
+        // Unfocus input: Ctrl+Option+Left must NOT close; plain Option+Left closes.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                window.focus(&v.focus, cx);
+                let ctrl_alt_left = KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: Modifiers {
+                            control: true,
+                            alt: true,
+                            ..Modifiers::default()
+                        },
+                        key: "left".to_owned(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                v.item_key(&ctrl_alt_left, window, cx);
+                assert_eq!(v.items.open_uid.as_deref(), Some("k-1"));
+
+                let alt_left = KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: Modifiers::alt(),
+                        key: "left".to_owned(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                v.item_key(&alt_left, window, cx);
+                assert_eq!(v.items.open_uid, None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn stepper_handles_filtered_out_open_item_and_group_panel_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use krill_proto::bots::{BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse};
+        use std::sync::Arc;
+
+        let now = now_unix_ms();
+        let b1 = BotId::new("step-b1").unwrap();
+        let b2 = BotId::new("step-b2").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "agy", now).unwrap();
+        let mk = |bot: &BotId, uid: &str, n: u64, status: BotItemStatus, desc: &str| BotItem {
+            uid: uid.to_owned(),
+            number: n,
+            owner_bot_id: bot.clone(),
+            title: format!("Item {uid}"),
+            description: Some(desc.to_owned()),
+            done_means: None,
+            status,
+            close_note: None,
+            links: vec![],
+            events: vec![],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: now - n * 1_000,
+            created_at_ms: now - n * 1_000,
+            updated_at_ms: now - n * 1_000,
+            closed_at_ms: None,
+        };
+        let items = vec![
+            mk(&b1, "u-work", 1, BotItemStatus::Working, "grp-1"),
+            mk(&b1, "u-need-1", 2, BotItemStatus::NeedsYou, "grp-1"),
+            mk(&b2, "u-need-2", 3, BotItemStatus::NeedsYou, "grp-1"),
+        ];
+        let bots_rpc = vec![cfg1, cfg2];
+        let items_rpc = items.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items_rpc.clone())),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+
+        // Single-bot mode: open item is Working while `needs_you_only` filters it out ->
+        // step_item(1) advances into order[0] ("u-need-1") instead of no-oping.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&b1, super::super::DetailTab::Items, cx);
+                v.items.set_items(items.clone());
+                v.items.needs_you_only = true;
+                v.open_home_item("u-work".to_owned(), cx);
+                assert_eq!(v.walk_order(), vec!["u-need-1"]);
+                v.step_item(-1, cx);
+                assert_eq!(v.items.open_uid.as_deref(), Some("u-work"));
+                v.step_item(1, cx);
+                assert_eq!(v.items.open_uid.as_deref(), Some("u-need-1"));
+            });
+        });
+
+        // Group panel mode: walk_order respects group_panel.filter (bot_ids & needs_you_only).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_group_in_panel("grp-1", &[b1.clone(), b2.clone()], &[], cx);
+                v.items.set_items(items.clone());
+                v.toggle_group_filter_bot(b2.clone(), cx);
+                assert_eq!(v.walk_order(), vec!["u-need-2"]);
+            });
+        });
     }
 }

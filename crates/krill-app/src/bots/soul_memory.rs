@@ -3,6 +3,8 @@
 //! parsed memory facts (Edit/Forget), Memory History + Undo, Memory Topics (`memory/<topic>.md`),
 //! Memory Tidy-up config/undo, and Look Around settings + persisted suggestions.
 
+use std::collections::HashSet;
+
 use gpui::{App, Context, Entity, FontWeight, SharedString, Subscription, Window, div, prelude::*};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Disableable as _, Sizable as _};
@@ -35,11 +37,13 @@ pub(super) struct SoulMemoryState {
     pub(super) soul_loaded: String,
     pub(super) memory_loaded: String,
     pub(super) soul_input: Option<Entity<TextareaState>>,
+    pub(super) soul_input_sub: Option<Subscription>,
+    pub(super) saving_soul_content: Option<String>,
     pub(super) memory_input: Option<Entity<TextareaState>>,
     pub(super) sync_mask: u8,
     pub(super) deletion_violation: Option<MemoryDeletionViolation>,
     pub(super) armed_forget: Option<String>,
-    pub(super) editing_fact: Option<String>,
+    pub(super) editing_fact: Option<(usize, String)>,
     pub(super) fact_edit_input: Option<Entity<InputState>>,
     pub(super) fact_edit_sub: Option<Subscription>,
     pub(super) memory_history: Vec<BotMemoryHistoryEntry>,
@@ -52,7 +56,7 @@ pub(super) struct SoulMemoryState {
     pub(super) last_tidy_summary: Option<SharedString>,
     pub(super) tidy_status: Option<BotMemoryTidyStatus>,
     pub(super) tidy_config: BotMemoryTidyConfig,
-    pub(super) look_around_running: bool,
+    pub(super) look_around_running: HashSet<BotId>,
     pub(super) look_around_config: BotLookAroundConfig,
     pub(super) look_around_focus_input: Option<Entity<InputState>>,
     pub(super) suggestions: Vec<BotSuggestion>,
@@ -60,6 +64,10 @@ pub(super) struct SoulMemoryState {
 }
 
 impl SoulMemoryState {
+    pub(super) fn is_looking_around(&self, bot_id: &BotId) -> bool {
+        self.look_around_running.contains(bot_id)
+    }
+
     pub(super) fn request_sync(&mut self, flag: u8) {
         self.sync_mask |= flag;
     }
@@ -171,12 +179,30 @@ impl View {
         }
         if self.soul_memory.soul_input.is_none() {
             let initial = self.soul_memory.soul_loaded.clone();
-            self.soul_memory.soul_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .auto_grow(5, 14)
                     .placeholder(text::SOUL_PLACEHOLDER.get())
                     .default_value(initial)
-            }));
+            });
+            self.soul_memory.soul_input_sub = Some(cx.subscribe_in(
+                &input,
+                window,
+                |this, _, ev: &InputEvent, _, cx| match ev {
+                    InputEvent::Change => {
+                        cx.notify();
+                    }
+                    InputEvent::Blur
+                        if this.mode == super::Mode::Panel
+                            && this.detail_tab == super::DetailTab::Settings
+                            && this.settings.page == super::settings_root::SettingsPage::Soul =>
+                    {
+                        this.flush_unsaved_soul_edits(cx);
+                    }
+                    _ => {}
+                },
+            ));
+            self.soul_memory.soul_input = Some(input);
         }
         if self.soul_memory.memory_input.is_none() {
             let initial = self.soul_memory.memory_loaded.clone();
@@ -241,14 +267,24 @@ impl View {
     }
 
     pub fn save_soul(&mut self, bot_id: BotId, content: String, cx: &mut Context<Self>) {
+        let _ = self.try_save_soul(bot_id, content, cx);
+    }
+
+    pub(super) fn try_save_soul(
+        &mut self,
+        bot_id: BotId,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.soul_memory.busy {
-            return;
+            return false;
         }
         let rpc = self.rpc.clone();
         let origin_host_gen = self.host_gen;
         let origin_detail_gen = self.detail_gen;
         let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
+        self.soul_memory.saving_soul_content = Some(content.clone());
         self.error = None;
         self.notice = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -267,6 +303,7 @@ impl View {
                     return;
                 }
                 this.soul_memory.busy = false;
+                this.soul_memory.saving_soul_content = None;
                 match res {
                     Ok(_) => {
                         this.soul_memory.soul_loaded = saved_copy;
@@ -282,6 +319,20 @@ impl View {
             .ok();
         }));
         cx.notify();
+        true
+    }
+
+    pub(super) fn flush_unsaved_soul_edits(&mut self, cx: &mut Context<Self>) {
+        let Some(bot_id) = self.selected_bot_id.clone() else {
+            return;
+        };
+        let Some(input) = &self.soul_memory.soul_input else {
+            return;
+        };
+        let draft = input.read(cx).value().to_string();
+        if draft != self.soul_memory.soul_loaded {
+            let _ = self.try_save_soul(bot_id, draft, cx);
+        }
     }
 
     pub fn save_memory(&mut self, bot_id: BotId, content: String, cx: &mut Context<Self>) {
@@ -348,6 +399,9 @@ impl View {
                     )) => {
                         this.soul_memory.memory_loaded = next_content;
                         this.soul_memory.request_sync(SYNC_MEMORY);
+                        if !this.soul_memory.has_unsaved_edits(cx) {
+                            this.panel_switch_dismissed_for = None;
+                        }
                         if let Some(entries) = hist {
                             this.soul_memory.memory_history = entries;
                         }
@@ -364,6 +418,9 @@ impl View {
                     }
                     Ok((_, hist)) => {
                         this.soul_memory.memory_loaded = sent;
+                        if !this.soul_memory.has_unsaved_edits(cx) {
+                            this.panel_switch_dismissed_for = None;
+                        }
                         if let Some(entries) = hist {
                             this.soul_memory.memory_history = entries;
                         }
@@ -670,14 +727,21 @@ impl View {
                     let hist = match call_checked(
                         &rpc,
                         &BotRpcRequest::GetMemoryHistory {
-                            bot_id: bot_id_bg,
+                            bot_id: bot_id_bg.clone(),
                             limit: Some(25),
                         },
                     ) {
                         Ok(BotRpcResponse::MemoryHistory(entries)) => Some(entries),
                         _ => None,
                     };
-                    Ok::<_, String>((tidy, mem, status, hist))
+                    let topics = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListMemoryTopics { bot_id: bot_id_bg },
+                    ) {
+                        Ok(BotRpcResponse::MemoryTopics(list)) => Some(list),
+                        _ => None,
+                    };
+                    Ok::<_, String>((tidy, mem, status, hist, topics))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -696,6 +760,7 @@ impl View {
                         mem,
                         status,
                         hist,
+                        topics,
                     )) => {
                         if let Some(m) = mem {
                             this.soul_memory.memory_loaded = m;
@@ -707,12 +772,15 @@ impl View {
                         if let Some(entries) = hist {
                             this.soul_memory.memory_history = entries;
                         }
+                        if let Some(list) = topics {
+                            this.soul_memory.memory_topics = list;
+                        }
                         let msg = text::TIDY_RESULT
                             .format(&[("changes", &changes.to_string()), ("summary", &summary)]);
                         this.soul_memory.last_tidy_summary = Some(SharedString::from(msg.clone()));
                         this.notice = Some(SharedString::from(msg));
                     }
-                    Ok((_, mem, status, hist)) => {
+                    Ok((_, mem, status, hist, topics)) => {
                         if let Some(m) = mem {
                             this.soul_memory.memory_loaded = m;
                             this.soul_memory.request_sync(SYNC_MEMORY);
@@ -722,6 +790,9 @@ impl View {
                         }
                         if let Some(entries) = hist {
                             this.soul_memory.memory_history = entries;
+                        }
+                        if let Some(list) = topics {
+                            this.soul_memory.memory_topics = list;
                         }
                     }
                     Err(err) => {
@@ -786,14 +857,21 @@ impl View {
                     let hist = match call_checked(
                         &rpc,
                         &BotRpcRequest::GetMemoryHistory {
-                            bot_id: bot_id_bg,
+                            bot_id: bot_id_bg.clone(),
                             limit: Some(25),
                         },
                     ) {
                         Ok(BotRpcResponse::MemoryHistory(entries)) => Some(entries),
                         _ => None,
                     };
-                    Ok::<_, String>((mem, status, hist))
+                    let topics = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListMemoryTopics { bot_id: bot_id_bg },
+                    ) {
+                        Ok(BotRpcResponse::MemoryTopics(list)) => Some(list),
+                        _ => None,
+                    };
+                    Ok::<_, String>((mem, status, hist, topics))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -805,7 +883,7 @@ impl View {
                 }
                 this.soul_memory.tidy_running = false;
                 match res {
-                    Ok((mem, status, hist)) => {
+                    Ok((mem, status, hist, topics)) => {
                         if let Some(m) = mem {
                             this.soul_memory.memory_loaded = m;
                             this.soul_memory.request_sync(SYNC_MEMORY);
@@ -815,6 +893,9 @@ impl View {
                         }
                         if let Some(entries) = hist {
                             this.soul_memory.memory_history = entries;
+                        }
+                        if let Some(list) = topics {
+                            this.soul_memory.memory_topics = list;
                         }
                         this.notice = Some(SharedString::from(text::MEMORY_SAVED.get()));
                     }
@@ -1019,28 +1100,33 @@ impl View {
     }
 
     pub fn run_look_around(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        if self.soul_memory.look_around_running {
+        if self.soul_memory.is_looking_around(&bot_id) {
             return;
         }
         let rpc = self.rpc.clone();
         let origin_host_gen = self.host_gen;
-        let origin_detail_gen = self.detail_gen;
-        let expected_bot = bot_id.clone();
-        self.soul_memory.look_around_running = true;
+        let req_host = self.host.clone();
+        let bot_id_key = bot_id.clone();
+        self.soul_memory.look_around_running.insert(bot_id.clone());
         self.error = None;
-        self.look_task = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
+            let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
-                .spawn(async move { call_checked(&rpc, &BotRpcRequest::RunLookAround { bot_id }) })
+                .spawn(async move {
+                    call_checked(&rpc, &BotRpcRequest::RunLookAround { bot_id: bot_id_bg })
+                })
                 .await;
             this.update(cx, |this, cx| {
-                if this.host_gen != origin_host_gen
-                    || this.detail_gen != origin_detail_gen
-                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
-                {
+                if this.host_gen != origin_host_gen || this.host != req_host {
                     return;
                 }
-                this.soul_memory.look_around_running = false;
+                this.soul_memory.look_around_running.remove(&bot_id);
+                this.look_tasks.remove(&bot_id);
+                if this.selected_bot_id.as_ref() != Some(&bot_id) {
+                    cx.notify();
+                    return;
+                }
                 match res {
                     Ok(
                         BotRpcResponse::LookAroundResult { suggestions, .. }
@@ -1060,7 +1146,8 @@ impl View {
                 cx.notify();
             })
             .ok();
-        }));
+        });
+        self.look_tasks.insert(bot_id_key, task);
         cx.notify();
     }
 
@@ -1077,6 +1164,9 @@ impl View {
             input.read(cx).value().trim().clone_into(&mut cfg.focus);
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let req_host = self.host.clone();
+        let bot_id_check = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         let cfg_bg = cfg.clone();
@@ -1109,18 +1199,27 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.soul_memory.busy = false;
+                if this.host_gen != origin_host_gen || this.host != req_host {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id_check);
+                if same_bot {
+                    this.soul_memory.busy = false;
+                }
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
-                        this.soul_memory.look_around_config = updated.look_around.clone();
+                        if same_bot {
+                            this.soul_memory.look_around_config = updated.look_around.clone();
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
                         this.upsert_bot_config(*updated);
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
-                    Ok(_) => {
+                    Ok(_) if same_bot => {
                         this.soul_memory.look_around_config = cfg;
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                    Err(err) if same_bot => this.error = Some(SharedString::from(err)),
+                    Ok(_) | Err(_) => {}
                 }
                 cx.notify();
             })
@@ -1139,6 +1238,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let req_host = self.host.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -1157,6 +1258,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.host != req_host
+                    || this.selected_bot_id.as_ref() != Some(&bot_id)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok(BotRpcResponse::SessionStarted {
@@ -1199,6 +1306,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let req_host = self.host.clone();
+        let bot_id_check = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -1216,6 +1326,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.host != req_host
+                    || this.selected_bot_id.as_ref() != Some(&bot_id_check)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok(_) => {
@@ -1429,8 +1545,11 @@ impl View {
                 let fact_for_edit_start = fact.text.clone();
                 let fact_for_edit_save = fact.text.clone();
                 let armed = self.soul_memory.armed_forget.as_deref() == Some(fact_text.as_str());
-                let is_editing =
-                    self.soul_memory.editing_fact.as_deref() == Some(fact_text.as_str());
+                let is_editing = self
+                    .soul_memory
+                    .editing_fact
+                    .as_ref()
+                    .is_some_and(|(row_idx, orig)| *row_idx == idx && orig == &fact_text);
                 let bot_forget = bot.id.clone();
                 let bot_edit = bot.id.clone();
                 let btn_id = format!("bots-forget-fact-{idx}");
@@ -1492,9 +1611,15 @@ impl View {
                                         .disabled(self.soul_memory.busy)
                                         .on_click(cx.listener(
                                             move |this, _, window, cx| {
-                                                if this.soul_memory.editing_fact.as_deref()
-                                                    == Some(fact_for_edit_start.as_str())
-                                                {
+                                                let already_editing = this
+                                                    .soul_memory
+                                                    .editing_fact
+                                                    .as_ref()
+                                                    .is_some_and(|(row_idx, orig)| {
+                                                        *row_idx == idx
+                                                            && orig == &fact_for_edit_start
+                                                    });
+                                                if already_editing {
                                                     this.soul_memory.editing_fact = None;
                                                 } else {
                                                     let cur = fact_for_edit_start.clone();
@@ -1516,7 +1641,10 @@ impl View {
                                                                   cx| {
                                                                 if matches!(
                                                                     ev,
-                                                                    InputEvent::PressEnter { .. }
+                                                                    InputEvent::PressEnter {
+                                                                        secondary: false,
+                                                                        shift: false,
+                                                                    }
                                                                 ) && !crate::jump::entity_input_is_composing(
                                                                     ent, window, cx,
                                                                 ) && let Some(bid) = &bot_submit {
@@ -1536,7 +1664,7 @@ impl View {
                                                     );
                                                     this.soul_memory.fact_edit_input = Some(inp);
                                                     this.soul_memory.editing_fact =
-                                                        Some(fact_for_edit_start.clone());
+                                                        Some((idx, fact_for_edit_start.clone()));
                                                 }
                                                 cx.notify();
                                             },
@@ -1933,19 +2061,20 @@ impl View {
                                     .child(text::LOOK_AROUND_DESC.get()),
                             ),
                     )
-                    .child(
+                    .child({
+                        let look_running = self.soul_memory.is_looking_around(&bot.id);
                         ui::button_with_reserved_label(
                             "bots-run-look-around",
                             text::RUN_LOOK_AROUND_BTN.get(),
                             text::LOOK_AROUND_RUNNING.get(),
-                            self.soul_memory.look_around_running,
+                            look_running,
                         )
                         .debug_selector(|| "bots-run-look-around".into())
-                        .disabled(self.soul_memory.look_around_running)
+                        .disabled(look_running)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.run_look_around(look_bot_id.clone(), cx);
-                        })),
-                    ),
+                        }))
+                    }),
             )
             .child(
                 div()
@@ -2064,10 +2193,7 @@ impl View {
                 let sid_dismiss = s.id.clone();
                 let track_title = s.title.clone();
                 let track_desc = format!("{}\n{}", s.why, s.ask);
-                let link_url = s
-                    .link
-                    .clone()
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
+                let link_url = s.link.as_deref().and_then(super::sanitize_http_url);
                 look_card =
                     look_card.child(
                         div()
@@ -2108,7 +2234,13 @@ impl View {
                                                         )),
                                                         text::OPEN_URL_BTN.get(),
                                                     )
-                                                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                                                    .on_click(move |_, _, cx| {
+                                                        if let Some(clean) =
+                                                            super::sanitize_http_url(&url)
+                                                        {
+                                                            cx.open_url(&clean);
+                                                        }
+                                                    }),
                                                 )
                                             })
                                             .child(
@@ -2200,5 +2332,187 @@ impl View {
             .child(topics_card)
             .child(tidy_card)
             .child(look_card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::Modifiers;
+    use krill_proto::bots::{BotConfig, BotMemoryTopicInfo, BotRpcRequest, BotRpcResponse};
+
+    use super::*;
+    use crate::bots::{DetailTab, settings_root::SettingsPage};
+
+    fn make_bot(id: &str, name: &str) -> BotConfig {
+        BotConfig::new(BotId::new(id).unwrap(), name, "claude", 1_700_000_000_000).unwrap()
+    }
+
+    #[gpui::test]
+    fn soul_save_clears_declined_switch_and_guards_stale_bot_and_tidy_refreshes_topics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_a = make_bot("bot-a", "Alpha");
+        let bot_b = make_bot("bot-b", "Beta");
+        let id_a = bot_a.id.clone();
+        let id_b = bot_b.id.clone();
+        let saved_soul = Arc::new(Mutex::new(String::new()));
+        let topics = Arc::new(Mutex::new(Vec::<BotMemoryTopicInfo>::new()));
+        let saved_cap = saved_soul.clone();
+        let topics_cap = topics.clone();
+        let bots_list = vec![bot_a, bot_b];
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_list.clone())),
+            BotRpcRequest::GetSoul { .. } => Ok(BotRpcResponse::Text("Initial soul".to_owned())),
+            BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text("# Memory\n\n- Fact 1\n".to_owned()))
+            }
+            BotRpcRequest::SetSoul { content, .. } => {
+                saved_cap.lock().unwrap().clone_from(content);
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::RunMemoryTidy { bot_id } => {
+                topics_cap.lock().unwrap().push(BotMemoryTopicInfo {
+                    topic: "archive-2026-11".to_owned(),
+                    bytes: 42,
+                    updated_at_ms: 1_700_000_000_100,
+                });
+                Ok(BotRpcResponse::MemoryTidyResult {
+                    bot_id: bot_id.clone(),
+                    summary: "Archived 1".to_owned(),
+                    changes: 1,
+                })
+            }
+            BotRpcRequest::UndoMemoryTidy { .. } => {
+                topics_cap.lock().unwrap().clear();
+                Ok(BotRpcResponse::MemoryUpdated {
+                    content: "# Memory\n\n- Fact 1\n".to_owned(),
+                    restored_facts: Vec::new(),
+                    removed_count: 0,
+                })
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(
+                topics_cap.lock().unwrap().clone(),
+            )),
+            BotRpcRequest::RunLookAround { bot_id } => Ok(BotRpcResponse::LookAroundResult {
+                bot_id: bot_id.clone(),
+                suggestions: Vec::new(),
+            }),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(gpui::px(400.), gpui::px(900.)));
+        vcx.run_until_parked();
+
+        // Open Bot A Settings > Soul and simulate editing + leaving Soul page (UB-17).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&id_a, DetailTab::Settings, cx);
+                v.open_settings_page(SettingsPage::Soul, cx);
+                v.panel_switch_dismissed_for = Some(id_b.clone());
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.settings.soul_editing = Some(true);
+                let inp = v.soul_memory.soul_input.clone().unwrap();
+                inp.update(cx, |s, cx| s.set_value("Edited soul", window, cx));
+                v.close_settings_subpage(cx);
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(*saved_soul.lock().unwrap(), "Edited soul");
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.soul_memory.soul_loaded, "Edited soul");
+            assert!(
+                v.panel_switch_dismissed_for.is_none(),
+                "successful Soul save must clear panel_switch_dismissed_for"
+            );
+        });
+
+        // UB-20: Stale save_soul completion after switching selected_bot_id must not clobber Bot B.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.try_save_soul(id_a.clone(), "Stale A soul".to_owned(), cx));
+                v.selected_bot_id = Some(id_b.clone());
+                v.soul_memory.soul_loaded = "Bot B soul".to_owned();
+                v.soul_memory.busy = false;
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(view.read(cx).soul_memory.soul_loaded, "Bot B soul");
+        });
+
+        // UB-49: run_memory_tidy and undo_memory_tidy refresh memory_topics.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| v.run_memory_tidy(id_b.clone(), cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(view.read(cx).soul_memory.memory_topics.len(), 1);
+            assert_eq!(
+                view.read(cx).soul_memory.memory_topics[0].topic,
+                "archive-2026-11"
+            );
+        });
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| v.undo_memory_tidy(id_b.clone(), cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(view.read(cx).soul_memory.memory_topics.is_empty());
+        });
+
+        // UB-29: look_around_running is tracked per bot_id.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.run_look_around(id_a.clone(), cx);
+                assert!(v.soul_memory.is_looking_around(&id_a));
+                assert!(!v.soul_memory.is_looking_around(&id_b));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(!v.soul_memory.is_looking_around(&id_a));
+            assert!(v.look_tasks.is_empty());
+        });
+
+        // UB-17: Clicking Read while busy must NOT flip soul_editing to Some(false).
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.selected_bot_id = Some(id_a.clone());
+                v.open_settings_page(SettingsPage::Soul, cx);
+                v.settings.soul_editing = Some(true);
+                v.soul_memory.soul_loaded = "Saved".to_owned();
+                let inp = v.soul_memory.soul_input.clone().unwrap();
+                inp.update(cx, |s, cx| s.set_value("Unsaved while busy", window, cx));
+                v.soul_memory.busy = true;
+                v.soul_memory.saving_soul_content = None;
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let read_btn = vcx
+            .debug_bounds("bot-soul-read")
+            .expect("Read tab rendered");
+        vcx.simulate_click(read_btn.center(), Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).settings.soul_editing,
+                Some(true),
+                "clicking Read while busy must not flip soul_editing to false"
+            );
+        });
     }
 }

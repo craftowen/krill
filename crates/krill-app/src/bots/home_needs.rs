@@ -170,9 +170,10 @@ impl View {
             NeedKind::SignIn => (IconName::CircleAlert, p.destructive),
             NeedKind::Access => (IconName::UserPlus, p.agent_question),
         };
-        let hover_key = format!("need:{}", need.key);
+        let hover_key = format!("need:{}:{}", bot.id.as_str(), need.key);
         let hovered = self.items.hover_uid.as_deref() == Some(hover_key.as_str());
-        let sel = format!("bot-home-need-{}", need.key.replace(':', "-"));
+        let need_slug = format!("{}-{}", bot.id.as_str(), need.key.replace(':', "-"));
+        let sel = format!("bot-home-need-{need_slug}");
         let debug = sel.clone();
         let (title, detail) = (need.title.clone(), need.detail.clone());
         let card = move |window: &mut Window, cx: &mut gpui::App| {
@@ -261,6 +262,8 @@ impl View {
                     .child(need.title.clone()),
             );
         if hovered {
+            let action_id = format!("bot-home-need-action-{need_slug}");
+            let action_sel = action_id.clone();
             row = row.child(
                 div()
                     .absolute()
@@ -273,13 +276,137 @@ impl View {
                     .pr(px(4.))
                     .rounded(ui::RADIUS_XS)
                     .bg(p.sidebar_accent)
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        ui::ghost("bot-home-need-action", need.action.clone())
+                        ui::ghost(SharedString::from(action_id), need.action.clone())
+                            .debug_selector(move || action_sel.clone())
                             .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| go2(this, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                go2(this, cx);
+                            })),
                     ),
             );
         }
         row
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{Modifiers, px};
+    use krill_proto::bots::{
+        BotConfig, BotConnectorStatus, BotErrorCategory, BotId, BotRpcRequest, BotRpcResponse,
+        ConnectorHealthState, ExternalSource,
+    };
+
+    use super::*;
+
+    #[gpui::test]
+    fn need_row_action_button_stops_propagation_and_scopes_ids_by_bot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = super::super::now_unix_ms();
+        let b1 = BotId::new("bot-alpha").unwrap();
+        let b2 = BotId::new("bot-beta").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "agy", now).unwrap();
+        let statuses = vec![
+            BotConnectorStatus {
+                bot_id: b1.clone(),
+                source: ExternalSource::Slack,
+                enabled: true,
+                connected: false,
+                state: ConnectorHealthState::Error,
+                error_category: Some(BotErrorCategory::SignedOut),
+                last_error: Some("signed out".to_owned()),
+                last_sync_ms: None,
+                account_label: None,
+            },
+            BotConnectorStatus {
+                bot_id: b2.clone(),
+                source: ExternalSource::Slack,
+                enabled: true,
+                connected: false,
+                state: ConnectorHealthState::Error,
+                error_category: Some(BotErrorCategory::SignedOut),
+                last_error: Some("signed out".to_owned()),
+                last_sync_ms: None,
+                account_label: None,
+            },
+        ];
+        let bots_rpc = vec![cfg1, cfg2];
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![])),
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => {
+                Ok(BotRpcResponse::ConnectorStatuses(statuses.clone()))
+            }
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        let opens = Arc::new(Mutex::new(Vec::<BotId>::new()));
+        let opens_sub = opens.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &super::super::OpenBotConnectors, _| {
+                opens_sub.lock().unwrap().push(ev.0.clone());
+            })
+            .detach();
+        });
+        vcx.simulate_resize(gpui::size(px(360.), px(600.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_group_in_panel("grp-needs", &[b1.clone(), b2.clone()], &[], cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Both bots have Slack needs with distinct bot-prefixed selectors.
+        assert!(
+            vcx.debug_bounds("bot-home-need-bot-alpha-connector-slack")
+                .is_some()
+        );
+        assert!(
+            vcx.debug_bounds("bot-home-need-bot-beta-connector-slack")
+                .is_some()
+        );
+
+        // Hover only bot-alpha's need row; only bot-alpha's action button appears,
+        // and clicking it emits OpenBotConnectors exactly once (no double bubble).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.items.hover_uid = Some("need:bot-alpha:connector:slack".to_owned());
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let action_btn = vcx
+            .debug_bounds("bot-home-need-action-bot-alpha-connector-slack")
+            .expect("bot-alpha action button");
+        assert!(
+            vcx.debug_bounds("bot-home-need-action-bot-beta-connector-slack")
+                .is_none()
+        );
+        vcx.simulate_click(action_btn.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(*opens.lock().unwrap(), vec![b1]);
     }
 }

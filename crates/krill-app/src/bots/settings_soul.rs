@@ -215,13 +215,22 @@ impl View {
                         mode_tab("bot-soul-read", text::SV_SOUL_READ.get(), !editing).on_click(
                             cx.listener(move |this, _, _, cx| {
                                 // Leaving Edit saves, as Orca's editor does on Read and blur.
+                                let mut can_leave = true;
                                 if let Some(i) = &this.soul_memory.soul_input {
                                     let draft = i.read(cx).value().to_string();
                                     if draft != this.soul_memory.soul_loaded {
-                                        this.save_soul(save_bot.clone(), draft, cx);
+                                        let already_saving_same = this.soul_memory.busy
+                                            && this.soul_memory.saving_soul_content.as_deref()
+                                                == Some(draft.as_str());
+                                        if !already_saving_same {
+                                            can_leave =
+                                                this.try_save_soul(save_bot.clone(), draft, cx);
+                                        }
                                     }
                                 }
-                                this.settings.soul_editing = Some(false);
+                                if can_leave {
+                                    this.settings.soul_editing = Some(false);
+                                }
                                 cx.notify();
                             }),
                         ),
@@ -365,8 +374,13 @@ impl View {
         self.settings.memory_add_sub =
             Some(
                 cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(ent, window, cx)
+                    if matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(ent, window, cx)
                     {
                         let typed = ent.read(cx).value().trim().to_owned();
                         if this.remember_fact(&typed, cx) {
@@ -594,7 +608,11 @@ impl View {
             if i > 0 {
                 card = card.child(div().pl_3().child(div().h(px(1.)).bg(p.border)));
             }
-            let editing = self.soul_memory.editing_fact.as_deref() == Some(fact.text.as_str());
+            let editing = self
+                .soul_memory
+                .editing_fact
+                .as_ref()
+                .is_some_and(|(row_idx, orig)| *row_idx == i && orig == &fact.text);
             if editing && let Some(input) = &self.soul_memory.fact_edit_input {
                 let save_bot = bot.id.clone();
                 let old = fact.text.clone();
@@ -613,18 +631,29 @@ impl View {
                                 .justify_end()
                                 .gap_1()
                                 .child(
-                                    ui::ghost("bot-memory-edit-cancel", text::CANCEL.get())
-                                        .xsmall()
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                    ui::ghost(
+                                        SharedString::from(format!("bot-memory-edit-cancel-{i}")),
+                                        text::CANCEL.get(),
+                                    )
+                                    .debug_selector(move || format!("bot-memory-edit-cancel-{i}"))
+                                    .xsmall()
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
                                             this.soul_memory.editing_fact = None;
                                             cx.notify();
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .child(
-                                    ui::primary("bot-memory-edit-save", text::SV_SAVE.get())
-                                        .xsmall()
-                                        .disabled(self.soul_memory.busy)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    ui::primary(
+                                        SharedString::from(format!("bot-memory-edit-save-{i}")),
+                                        text::SV_SAVE.get(),
+                                    )
+                                    .debug_selector(move || format!("bot-memory-edit-save-{i}"))
+                                    .xsmall()
+                                    .disabled(self.soul_memory.busy)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             let val = read.read(cx).value().to_string();
                                             this.edit_memory_fact(
                                                 save_bot.clone(),
@@ -632,7 +661,8 @@ impl View {
                                                 &val,
                                                 cx,
                                             );
-                                        })),
+                                        },
+                                    )),
                                 ),
                         ),
                 );
@@ -662,7 +692,7 @@ impl View {
                     .hover(|d| d.bg(p.accent.opacity(0.5)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_fact_edit(&edit_text, window, cx);
+                        this.start_fact_edit(i, &edit_text, window, cx);
                     }))
                     .child(
                         div()
@@ -740,7 +770,13 @@ impl View {
             .child(Self::inset_frame(Some(title), Some(action), card, None, p))
     }
 
-    fn start_fact_edit(&mut self, fact: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_fact_edit(
+        &mut self,
+        row_idx: usize,
+        fact: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cur = fact.to_owned();
         let input = cx.new(|cx| {
             let mut s = InputState::new(window, cx);
@@ -752,8 +788,13 @@ impl View {
             &input,
             window,
             move |this, ent, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. })
-                    && !crate::jump::entity_input_is_composing(ent, window, cx)
+                if matches!(
+                    ev,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    }
+                ) && !crate::jump::entity_input_is_composing(ent, window, cx)
                     && let Some(bid) = this.selected_bot_id.clone()
                 {
                     let val = ent.read(cx).value().to_string();
@@ -763,7 +804,7 @@ impl View {
         ));
         input.update(cx, |s, cx| s.focus(window, cx));
         self.soul_memory.fact_edit_input = Some(input);
-        self.soul_memory.editing_fact = Some(fact.to_owned());
+        self.soul_memory.editing_fact = Some((row_idx, fact.to_owned()));
         cx.notify();
     }
 
@@ -1122,6 +1163,7 @@ impl View {
                             SharedString::from(format!("bots-sched-toggle-{idx}")),
                             format!("{} ({})", sched.name, text::ENABLE_LABEL.get()),
                             sched.enabled,
+                            saving,
                             move |on, _, cx| {
                                 let (b, s) = (bid_t.clone(), sid_t.clone());
                                 ent.update(cx, |this, cx| {
@@ -1210,5 +1252,84 @@ impl View {
                 None,
                 p,
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+
+    use super::*;
+    use crate::bots::{DetailTab, settings_root::SettingsPage};
+
+    #[gpui::test]
+    fn duplicate_fact_inline_edit_matches_only_clicked_row_with_indexed_buttons(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot = BotConfig::new(
+            BotId::new("bot-1").unwrap(),
+            "Memo",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let bot_id = bot.id.clone();
+        let bots = vec![bot];
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots.clone())),
+            BotRpcRequest::GetMemory { .. } => Ok(BotRpcResponse::Text(
+                "# Memory\n\n- 2026-11-20 Same fact\n- 2026-11-21 Same fact\n".to_owned(),
+            )),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(gpui::px(400.), gpui::px(900.)));
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, DetailTab::Settings, cx);
+                v.open_settings_page(SettingsPage::Memory, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.start_fact_edit(1, "Same fact", window, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.debug_bounds("bot-memory-edit-save-1").is_some(),
+            "clicked row index 1 must render indexed save button"
+        );
+        assert!(
+            vcx.debug_bounds("bot-memory-edit-cancel-1").is_some(),
+            "clicked row index 1 must render indexed cancel button"
+        );
+        assert!(
+            vcx.debug_bounds("bot-memory-edit-save-0").is_none(),
+            "duplicate text at index 0 must NOT enter edit mode"
+        );
+
+        // Modified Enter (Cmd+Shift+Enter / Shift+Enter) must not submit or close fact edit (R3A-05).
+        for key in ["secondary-shift-enter", "shift-enter", "secondary-enter"] {
+            vcx.simulate_keystrokes(key);
+            vcx.run_until_parked();
+            view.read_with(vcx, |v, _| {
+                assert!(
+                    v.soul_memory.editing_fact.is_some(),
+                    "{key} must not commit fact edit"
+                );
+            });
+        }
     }
 }

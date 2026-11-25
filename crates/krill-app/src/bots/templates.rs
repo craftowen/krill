@@ -381,7 +381,9 @@ impl Templates {
     }
 
     fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if crate::jump::entity_input_is_composing(&self.search, window, cx) {
+        if crate::jump::entity_input_is_composing(&self.search, window, cx)
+            || e.keystroke.modifiers.modified()
+        {
             return;
         }
         match e.keystroke.key.as_str() {
@@ -1194,5 +1196,52 @@ mod tests {
                 .iter()
                 .any(|t| t.id == "bug-investigation")
         );
+    }
+
+    #[gpui::test]
+    fn modified_navigation_and_escape_keys_are_ignored(cx: &mut gpui::TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(Templates::new);
+        let closed = Arc::new(Mutex::new(false));
+        let closed_cap = closed.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &Event, _| {
+                if matches!(ev, Event::Close) {
+                    *closed_cap.lock().unwrap() = true;
+                }
+            })
+            .detach();
+        });
+        vcx.run_until_parked();
+
+        let first = BUILTIN_BOT_TEMPLATES[0].id;
+        let second = BUILTIN_BOT_TEMPLATES[1].id;
+        vcx.update(|_, cx| assert_eq!(view.read(cx).selected, Some(first)));
+
+        // Modified down/up/escape must NOT intercept or close.
+        vcx.simulate_keystrokes("cmd-down");
+        vcx.simulate_keystrokes("shift-down");
+        vcx.simulate_keystrokes("cmd-escape");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert_eq!(view.read(cx).selected, Some(first)));
+        assert!(!*closed.lock().unwrap());
+
+        // Plain down/up step selection; plain escape closes when search is empty.
+        vcx.simulate_keystrokes("down");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert_eq!(view.read(cx).selected, Some(second)));
+
+        vcx.simulate_keystrokes("up");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert_eq!(view.read(cx).selected, Some(first)));
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        assert!(*closed.lock().unwrap());
     }
 }

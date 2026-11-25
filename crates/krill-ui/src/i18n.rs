@@ -1092,7 +1092,7 @@ catalog! {
         SCHEDULE_ADD_BTN => ("스케줄 추가", "Add Schedule"),
         SCHEDULE_EMPTY => ("등록된 스케줄이 없습니다.", "No schedules configured yet."),
         SETTINGS_SAVE_BTN => ("설정 저장", "Save Settings"),
-        SETTINGS_AVATAR_TOO_LARGE => ("PNG 파일은 4 MiB 이하만 업로드할 수 있습니다.", "PNG avatar must be 4 MiB or smaller."),
+        SETTINGS_AVATAR_TOO_LARGE => ("PNG 파일은 512 KiB 이하만 업로드할 수 있습니다.", "PNG avatar must be 512 KiB or smaller."),
         SETTINGS_AVATAR_INVALID_PNG => ("올바른 PNG 이미지 파일이 아닙니다.", "Selected file is not a valid PNG image."),
         ERR_EMPTY_SCHEDULE => ("스케줄 이름·크론·프롬프트를 모두 입력하세요.", "Enter schedule name, cron expression, and prompt."),
         GROUP_NAME_PLACEHOLDER => ("그룹 이름 (예: 릴리스 팀)", "Group name (e.g. Release Crew)"),

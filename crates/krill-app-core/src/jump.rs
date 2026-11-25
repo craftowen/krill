@@ -294,30 +294,52 @@ fn repo_badge_color(repo_name: &str) -> Hsla {
 }
 
 fn cwd_repo_and_worktree(cwd: &str) -> (String, String) {
-    let trimmed = cwd.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    let mut trimmed = cwd.trim();
+    while let Some(stripped) = trimmed.strip_suffix(['/', '\\']) {
+        // Preserve Windows drive roots like `C:\` and POSIX `/`.
+        let bytes = trimmed.as_bytes();
+        if trimmed.len() <= 1 || (trimmed.len() == 3 && bytes[1] == b':') {
+            break;
+        }
+        trimmed = stripped;
+    }
+    if trimmed.is_empty() || trimmed == "/" {
         return (String::new(), String::new());
     }
-    let path = Path::new(trimmed);
-    let leaf = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let parent = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
+    let bytes = trimmed.as_bytes();
+    if trimmed.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return (String::new(), String::new());
+    }
+    let segments: Vec<&str> = trimmed
+        .split(['/', '\\'])
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    let Some(&leaf) = segments.last() else {
+        return (String::new(), String::new());
+    };
+    let is_drive_prefix = |s: &str| {
+        let b = s.as_bytes();
+        b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    };
+    if is_drive_prefix(leaf) {
+        return (String::new(), String::new());
+    }
+    let parent = segments
+        .len()
+        .checked_sub(2)
+        .and_then(|idx| segments.get(idx).copied())
         .filter(|p| {
             !p.is_empty()
+                && !is_drive_prefix(p)
                 && !matches!(
-                    p.as_str(),
+                    *p,
                     "Users" | "home" | "tmp" | "var" | "private" | "Documents" | "wProject"
                 )
         });
     if let Some(repo) = parent {
-        (repo, leaf)
+        (repo.to_owned(), leaf.to_owned())
     } else {
-        (leaf, String::new())
+        (leaf.to_owned(), String::new())
     }
 }
 
@@ -682,24 +704,6 @@ impl Mode {
     }
 }
 
-fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/tmp")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/tmp{rest}");
-    }
-    if let Some(rest) = trimmed.strip_prefix("/private/var")
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return format!("/var{rest}");
-    }
-    trimmed.to_owned()
-}
-
 fn filter_vault(
     hits: &[VaultHit],
     query: &str,
@@ -743,14 +747,9 @@ fn filter_vault(
             if active_paths.is_empty() {
                 return true;
             }
-            let norm = normalize_path(&hit.cwd);
-            active_paths.iter().any(|p| {
-                let p_norm = normalize_path(p);
-                norm == p_norm
-                    || norm
-                        .strip_prefix(p_norm.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+            active_paths
+                .iter()
+                .any(|p| krill_proto::agent_history::path_inside_or_equal(&hit.cwd, p))
         })
         .filter(|(_, hit)| {
             if terms.is_empty() {

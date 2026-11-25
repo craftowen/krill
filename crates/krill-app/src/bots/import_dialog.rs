@@ -117,6 +117,18 @@ impl ImportDialog {
             || super::opt_input_composing(self.filter_input.as_ref(), window, app)
             || self.picture.input_is_composing(window, app)
     }
+
+    pub(super) fn add_export_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if path.is_dir() {
+                if self.folder.is_none() {
+                    self.folder = Some(path);
+                }
+            } else if self.folder.as_ref() != Some(&path) && !self.files.contains(&path) {
+                self.files.push(path);
+            }
+        }
+    }
 }
 
 fn pick_key(c: &ExternalBotCandidate) -> String {
@@ -488,6 +500,7 @@ impl View {
                     bot_id: existing.id,
                     kickoff: Some(draft),
                     host,
+                    warning: None,
                 });
                 cx.notify();
                 return;
@@ -616,36 +629,50 @@ impl View {
                             }
                         }
                     };
-                    if let Some(png_bytes) = upload_png
-                        && let Ok(BotRpcResponse::BotAvatar(_)) = call_checked(
+                    let mut avatar_warning: Option<String> = None;
+                    if let Some(png_bytes) = upload_png {
+                        match call_checked(
                             &rpc,
                             &BotRpcRequest::UploadBotAvatar {
                                 bot_id: bot.id.clone(),
                                 png_bytes,
                             },
-                        )
-                    {
-                        bot.avatar = Some(avatar::UPLOAD_AVATAR.to_owned());
+                        ) {
+                            Ok(BotRpcResponse::BotAvatar(_)) => {
+                                bot.avatar = Some(avatar::UPLOAD_AVATAR.to_owned());
+                            }
+                            Ok(other) => {
+                                avatar_warning =
+                                    Some(format!("unexpected UploadBotAvatar response: {other:?}"));
+                            }
+                            Err(err) => {
+                                avatar_warning = Some(err);
+                            }
+                        }
                     }
-                    Ok::<_, String>((bot, kickoff))
+                    Ok::<_, String>((bot, kickoff, avatar_warning))
                 })
                 .await;
 
             this.update(cx, |this, cx| {
                 this.import_dialog.creating = false;
                 match made {
-                    Ok((bot, kickoff)) => {
+                    Ok((bot, kickoff, warning)) => {
                         let id = bot.id.clone();
                         if host == this.host {
                             this.upsert_bot_config(bot);
                             this.emit_badge(cx);
                             this.selected_bot_id = Some(id.clone());
                         }
+                        if let Some(err) = &warning {
+                            this.error = Some(SharedString::from(err.clone()));
+                        }
                         this.screen = super::Screen::Detail;
                         cx.emit(OpenBotHome {
                             bot_id: id,
                             kickoff,
                             host,
+                            warning,
                         });
                     }
                     Err(err) => this.error = Some(SharedString::from(err)),
@@ -666,19 +693,40 @@ impl View {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = chosen.await {
                 this.update(cx, |this, cx| {
-                    for p in paths {
-                        if p.is_dir() && this.import_dialog.folder.is_none() {
-                            this.import_dialog.folder = Some(p);
-                        } else if !this.import_dialog.files.contains(&p) {
-                            this.import_dialog.files.push(p);
-                        }
-                    }
+                    this.import_dialog.add_export_paths(paths);
                     cx.notify();
                 })
                 .ok();
             }
         })
         .detach();
+    }
+
+    /// Accepts the suggested export-folder bot name when pressing unmodified Tab on the Import
+    /// screen (invoked from capture phase outside `modal_focus_scope`, R2A-18).
+    pub(super) fn try_accept_import_name_suggestion(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.import_dialog.input_is_composing(window, cx)
+            || self.import_dialog.typed.is_some()
+            || !self.import_exporting()
+        {
+            return false;
+        }
+        let Some(s) = self
+            .import_dialog
+            .folder
+            .clone()
+            .or_else(|| self.import_dialog.files.first().cloned())
+            .as_deref()
+            .and_then(name_from_export_folder)
+        else {
+            return false;
+        };
+        self.take_name_suggestion(s, window, cx);
+        true
     }
 
     /// Orca's `ImportBotDialog`.
@@ -1015,25 +1063,6 @@ impl View {
                         .picture
                         .paste_image(Self::import_picture_mut, cx)
                     {
-                        cx.stop_propagation();
-                    }
-                }),
-            )
-            .on_key_down(
-                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
-                    if ev.keystroke.key == "tab"
-                        && !ev.keystroke.modifiers.shift
-                        && this.import_dialog.typed.is_none()
-                        && this.import_exporting()
-                        && let Some(s) = this
-                            .import_dialog
-                            .folder
-                            .clone()
-                            .or_else(|| this.import_dialog.files.first().cloned())
-                            .as_deref()
-                            .and_then(name_from_export_folder)
-                    {
-                        this.take_name_suggestion(s, window, cx);
                         cx.stop_propagation();
                     }
                 }),
@@ -1454,13 +1483,8 @@ impl View {
         let mut drop_list = div()
             .id("bot-import-dropzone")
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                for p in paths.paths() {
-                    if p.is_dir() && this.import_dialog.folder.is_none() {
-                        this.import_dialog.folder = Some(p.clone());
-                    } else if !this.import_dialog.files.contains(p) {
-                        this.import_dialog.files.push(p.clone());
-                    }
-                }
+                this.import_dialog
+                    .add_export_paths(paths.paths().iter().cloned());
                 cx.notify();
             }))
             .flex()
@@ -1563,5 +1587,129 @@ mod tests {
         );
         let k = export_kickoff("Sage", std::path::Path::new("/d/sage-export"), &[], "hi");
         assert!(k.contains("/d/sage-export") && k.ends_with("hi"));
+    }
+
+    #[gpui::test]
+    fn export_paths_skip_duplicate_or_extra_directories(cx: &mut gpui::TestAppContext) {
+        let dir1 = std::env::temp_dir().join(format!("krill-import-dir1-{}", std::process::id()));
+        let dir2 = std::env::temp_dir().join(format!("krill-import-dir2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+        let file = dir1.join("notes.md");
+        std::fs::write(&file, b"hello").unwrap();
+
+        cx.update(|cx| {
+            let mut dialog = ImportDialog::new(cx);
+            dialog.add_export_paths([dir1.clone()]);
+            assert_eq!(dialog.folder.as_ref(), Some(&dir1));
+            assert!(dialog.files.is_empty());
+
+            // Dropping/picking the same folder again or another folder must NOT append into files.
+            dialog.add_export_paths([dir1.clone(), dir2.clone(), file.clone(), file.clone()]);
+            assert_eq!(dialog.folder.as_ref(), Some(&dir1));
+            assert_eq!(dialog.files, vec![file.clone()]);
+        });
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir(&dir1).ok();
+        std::fs::remove_dir(&dir2).ok();
+    }
+
+    #[gpui::test]
+    fn import_tab_accepts_suggested_name_and_surfaces_avatar_upload_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!(
+            "krill-import-tab-sage-export-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let export_dir = dir.join("sage-export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+
+        let created_bot = BotConfig::new(
+            BotId::new("sage").unwrap(),
+            "Sage",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let created_rpc = created_bot.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(Vec::new())),
+            BotRpcRequest::CreateBotV2(_) => Ok(BotRpcResponse::Bot(Box::new(created_rpc.clone()))),
+            BotRpcRequest::UploadBotAvatar { .. } => Err("avatar upload rejected".to_owned()),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let emitted: Arc<Mutex<Vec<OpenBotHome>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_sub = emitted.clone();
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let mut v = View::with_rpc(rpc, None, cx);
+            v.screen = super::super::Screen::Import;
+            v
+        });
+        vcx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &OpenBotHome, _| {
+                emitted_sub.lock().unwrap().push(ev.clone());
+            })
+            .detach();
+        });
+        vcx.simulate_resize(gpui::size(px(900.), px(780.)));
+        vcx.run_until_parked();
+
+        // Set export folder so the "Use Sage [Tab]" suggestion is active, then focus the scope
+        // and press Tab: capture_key_down outside modal_focus_scope must accept the suggestion (R2A-18).
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.import_dialog.view = ImportView::Export;
+                v.import_dialog.add_export_paths([export_dir.clone()]);
+                v.focus.focus(window, cx);
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("tab");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).import_name(),
+                "Sage",
+                "Tab on Import screen must accept the suggested export-folder name"
+            );
+        });
+
+        // Attach a custom PNG avatar and submit: UploadBotAvatar failure must surface (R2A-07).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+                let img = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png.clone()));
+                v.import_dialog.picture.custom = Some((png, img, None, "Your image".to_owned()));
+                v.import_dialog.picture.showing_custom = true;
+                v.create_imported_bot(cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(
+                v.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("avatar upload rejected")),
+                "UploadBotAvatar error must be surfaced on view.error, got {:?}",
+                v.error
+            );
+        });
+        let events = emitted.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].warning.as_deref(), Some("avatar upload rejected"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

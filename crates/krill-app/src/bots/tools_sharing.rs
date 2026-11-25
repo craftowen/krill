@@ -144,6 +144,48 @@ fn auth_kind_label(kind: BotMcpAuthKind) -> &'static str {
     }
 }
 
+/// Generates a unique custom MCP tool ID that never collides with existing tools on the bot
+/// or any curated [`BOT_MCP_APPS`] catalog entry.
+fn unique_custom_mcp_tool_id(name: &str, existing: &[BotMcpToolConfig]) -> String {
+    let base = bot_slug_from_name(name).as_str().to_owned();
+    let is_taken = |candidate: &str| {
+        BOT_MCP_APPS.iter().any(|app| app.id == candidate)
+            || existing.iter().any(|tool| tool.id == candidate)
+    };
+    if !is_taken(&base) {
+        return base;
+    }
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn read_bot_zip_bounded(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let max_u64 = u64::try_from(MAX_RPC_ZIP_BYTES).unwrap_or(u64::MAX);
+    let too_large =
+        || text::IMPORT_ZIP_TOO_LARGE.format(&[("max", &(MAX_RPC_ZIP_BYTES / 1024).to_string())]);
+    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if len > max_u64 {
+        return Err(too_large());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(max_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_RPC_ZIP_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 impl View {
     fn ensure_tools_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !cx.has_global::<gpui_component::Theme>() {
@@ -199,6 +241,30 @@ impl View {
             .app_secret_inputs
             .insert(app_id.to_owned(), input.clone());
         Some(input)
+    }
+
+    pub(super) fn clear_tool_inputs_on_bot_switch(&mut self, cx: &mut Context<Self>) {
+        let handle = self.window_handle;
+        for slot in [
+            &mut self.tools.custom_name,
+            &mut self.tools.custom_url,
+            &mut self.tools.custom_cmd,
+            &mut self.tools.custom_header,
+            &mut self.tools.custom_secret,
+        ] {
+            clear_input_on_window(slot, handle, cx);
+        }
+        let mut stale_keys = Vec::new();
+        for (key, input) in &self.tools.app_secret_inputs {
+            let mut slot = Some(input.clone());
+            clear_input_on_window(&mut slot, handle, cx);
+            if slot.is_none() {
+                stale_keys.push(key.clone());
+            }
+        }
+        for key in stale_keys {
+            self.tools.app_secret_inputs.remove(&key);
+        }
     }
 
     pub fn refresh_tool_relay_status(&mut self, cx: &mut Context<Self>) {
@@ -432,10 +498,10 @@ impl View {
                 this.tools.busy = false;
                 match res {
                     Ok(BotRpcResponse::McpOAuth(st)) => {
-                        if let Some(url) = &st.auth_url
-                            && (url.starts_with("https://") || url.starts_with("http://"))
+                        if let Some(clean) =
+                            st.auth_url.as_deref().and_then(super::sanitize_http_url)
                         {
-                            cx.open_url(url);
+                            cx.open_url(&clean);
                         }
                         let should_poll = !matches!(
                             st.status.as_str(),
@@ -725,11 +791,7 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    if bytes.len() > MAX_RPC_ZIP_BYTES {
-                        return Err(text::IMPORT_ZIP_TOO_LARGE
-                            .format(&[("max", &(MAX_RPC_ZIP_BYTES / 1024).to_string())]));
-                    }
+                    let bytes = read_bot_zip_bounded(&path)?;
                     call_checked(
                         &rpc,
                         &BotRpcRequest::ImportBotZipV2 {
@@ -769,6 +831,7 @@ impl View {
                                 bot_id: id,
                                 kickoff: None,
                                 host: this.host.clone(),
+                                warning: None,
                             });
                         } else {
                             this.selected_bot_id = Some(id.clone());
@@ -890,6 +953,7 @@ impl View {
                                         bot_id: id,
                                         kickoff: None,
                                         host: this.host.clone(),
+                                        warning: None,
                                     });
                                 } else {
                                     this.selected_bot_id = Some(id.clone());
@@ -1126,7 +1190,15 @@ impl View {
                                             SharedString::from(format!("bots-mcp-docs-{app_id}")),
                                             text::MCP_DOCS_BTN.get(),
                                         )
-                                        .on_click(move |_, _, cx| cx.open_url(docs_url)),
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                if let Some(clean) =
+                                                    super::sanitize_http_url(docs_url)
+                                                {
+                                                    cx.open_url(&clean);
+                                                }
+                                            },
+                                        ),
                                     )
                                     .child(
                                         ui::switch(
@@ -1593,12 +1665,18 @@ impl View {
                                         .map(|i| i.read(cx).value().trim().to_owned())
                                         .filter(|s| !s.is_empty());
 
-                                    let id = bot_slug_from_name(&name).as_str().to_owned();
+                                    let mut next = this
+                                        .bots
+                                        .iter()
+                                        .find(|b| b.id == bot_add_custom)
+                                        .map_or_else(
+                                            || tools_add_custom.clone(),
+                                            |b| b.mcp_tools.clone(),
+                                        );
+                                    let id = unique_custom_mcp_tool_id(&name, &next);
                                     let sref = secret
                                         .as_ref()
                                         .map(|_| mcp_secret_ref(bot_add_custom.as_str(), &id));
-                                    let mut next = tools_add_custom.clone();
-                                    next.retain(|t| t.id != id);
                                     next.push(BotMcpToolConfig {
                                         id,
                                         name,
@@ -1730,5 +1808,123 @@ impl View {
             custom: custom_card.into_any_element(),
             sharing: sharing_card.into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_tool(id: &str, name: &str) -> BotMcpToolConfig {
+        BotMcpToolConfig {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            endpoint_url: Some("https://example.test/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::None,
+            header_names: Vec::new(),
+            secret_ref: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn custom_mcp_tool_ids_avoid_cjk_and_curated_collisions() {
+        let mut existing = Vec::new();
+        let first_cjk = unique_custom_mcp_tool_id("사내 문서", &existing);
+        assert_eq!(first_cjk, "bot");
+        existing.push(dummy_tool(&first_cjk, "사내 문서"));
+
+        let second_cjk = unique_custom_mcp_tool_id("고객 위키", &existing);
+        assert_eq!(second_cjk, "bot-2");
+        existing.push(dummy_tool(&second_cjk, "고객 위키"));
+
+        let third_cjk = unique_custom_mcp_tool_id("배포 도구", &existing);
+        assert_eq!(third_cjk, "bot-3");
+
+        // Curated catalog IDs (e.g. "sentry", "notion") must never be overwritten even when not yet on the bot.
+        let sentry_custom = unique_custom_mcp_tool_id("Sentry", &existing);
+        assert_eq!(sentry_custom, "sentry-2");
+        assert!(BOT_MCP_APPS.iter().all(|app| app.id != sentry_custom));
+
+        existing.push(dummy_tool("sentry-2", "Sentry"));
+        assert_eq!(unique_custom_mcp_tool_id("Sentry", &existing), "sentry-3");
+    }
+
+    #[test]
+    fn read_bot_zip_bounded_rejects_oversized_file_before_full_read() {
+        let base = std::env::temp_dir().join(format!("krill-zip-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ok_path = base.join("small.zip");
+        std::fs::write(&ok_path, b"PK\x03\x04").unwrap();
+        assert_eq!(read_bot_zip_bounded(&ok_path).unwrap(), b"PK\x03\x04");
+
+        let big_path = base.join("huge.zip");
+        let file = std::fs::File::create(&big_path).unwrap();
+        file.set_len(u64::try_from(MAX_RPC_ZIP_BYTES).unwrap() + 1)
+            .unwrap();
+        drop(file);
+        assert!(
+            read_bot_zip_bounded(&big_path).is_err(),
+            "oversized zip must fail via metadata length check"
+        );
+
+        std::fs::remove_file(&ok_path).ok();
+        std::fs::remove_file(&big_path).ok();
+        std::fs::remove_dir(&base).ok();
+    }
+
+    #[gpui::test]
+    fn clear_tool_inputs_on_bot_switch_clears_all_secrets_and_custom_fields(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let rpc: super::super::BotRpcCall = Arc::new(|_| Ok(BotRpcResponse::Ok));
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.ensure_tools_inputs(window, cx);
+                let app_inp = v.ensure_mcp_secret_input("datadog", window, cx).unwrap();
+                app_inp.update(cx, |s, cx| s.set_value("dd-secret", window, cx));
+                for slot in [
+                    &v.tools.custom_name,
+                    &v.tools.custom_url,
+                    &v.tools.custom_cmd,
+                    &v.tools.custom_header,
+                    &v.tools.custom_secret,
+                ] {
+                    slot.as_ref()
+                        .unwrap()
+                        .update(cx, |s, cx| s.set_value("filled", window, cx));
+                }
+            });
+        });
+
+        cx.update(|cx| {
+            view.update(cx, View::clear_tool_inputs_on_bot_switch);
+            let v = view.read(cx);
+            assert!(
+                v.tools
+                    .app_secret_inputs
+                    .get("datadog")
+                    .is_none_or(|i| i.read(cx).value().is_empty())
+            );
+            for slot in [
+                &v.tools.custom_name,
+                &v.tools.custom_url,
+                &v.tools.custom_cmd,
+                &v.tools.custom_header,
+                &v.tools.custom_secret,
+            ] {
+                assert!(slot.as_ref().is_none_or(|i| i.read(cx).value().is_empty()));
+            }
+        });
     }
 }

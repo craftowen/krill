@@ -63,6 +63,7 @@ pub(super) struct SettingsState {
     pub(super) models_task: Option<gpui::Task<()>>,
     pub(super) look_focus_input: Option<Entity<InputState>>,
     pub(super) look_focus_sub: Option<gpui::Subscription>,
+    pub(super) look_focus_synced: Option<String>,
     /// Soul's Read or Edit; `None` reads a soul with words and edits an empty one.
     pub(super) soul_editing: Option<bool>,
     pub(super) memory_add_input: Option<Entity<InputState>>,
@@ -80,6 +81,8 @@ pub(super) struct SettingsState {
     pub(super) inline_name_editing: bool,
     pub(super) inline_name_input: Option<Entity<InputState>>,
     pub(super) inline_name_sub: Option<gpui::Subscription>,
+    /// Serialized queue of settings patches / member removals so rapid clicks never drop updates.
+    pub(super) patch_queue: std::collections::VecDeque<super::settings_root::PendingPatch>,
 }
 
 impl SettingsState {
@@ -90,6 +93,7 @@ impl SettingsState {
         self.tidy_review = false;
         self.look_focus_input = None;
         self.look_focus_sub = None;
+        self.look_focus_synced = None;
         self.soul_editing = None;
         self.history_open = None;
         self.topic_open = None;
@@ -238,7 +242,7 @@ impl View {
         }
     }
 
-    fn pick_settings_workspace(window: &mut Window, cx: &mut Context<Self>) {
+    fn pick_settings_workspace(&self, window: &mut Window, cx: &mut Context<Self>) {
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -246,6 +250,8 @@ impl View {
             prompt: Some(text::FIELD_WORKSPACE.get().into()),
         });
         let win_handle = window.window_handle();
+        let req_host = self.host.clone();
+        let req_bot = self.selected_bot_id.clone();
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = chosen.await
                 && let Some(path) = paths.into_iter().next()
@@ -254,6 +260,9 @@ impl View {
                 win_handle
                     .update(cx, |_, window, cx| {
                         this.update(cx, |this, cx| {
+                            if this.host != req_host || this.selected_bot_id != req_bot {
+                                return;
+                            }
                             if let Some(input) = &this.settings.workspace_input {
                                 input.update(cx, |s, cx| s.set_value(path_str, window, cx));
                             }
@@ -280,6 +289,7 @@ impl View {
             prompt: Some(text::SETTINGS_AVATAR_LABEL.get().into()),
         });
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         self.error = None;
         self.notice = None;
         self.avatar_task = Some(cx.spawn(async move |this, cx| {
@@ -324,6 +334,10 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id);
                 match outcome {
                     Ok((updated, image)) => {
                         this.settings.avatar_cache.insert(updated.id.clone(), image);
@@ -333,11 +347,14 @@ impl View {
                             this.bots.iter().map(|b| &b.id).collect();
                         this.settings.avatar_cache.retain(|id, _| live.contains(id));
                         this.emit_badge(cx);
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
+                        if same_bot {
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
                     }
-                    Err(err) => {
+                    Err(err) if same_bot => {
                         this.error = Some(SharedString::from(err));
                     }
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -351,6 +368,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         self.settings.saving = true;
         self.error = None;
         self.notice = None;
@@ -384,19 +402,28 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.settings.saving = false;
+                if this.host != req_host {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id);
+                if same_bot {
+                    this.settings.saving = false;
+                }
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
                         this.settings.avatar_cache.remove(&bot_id);
                         this.upsert_bot_config(*updated);
                         this.emit_badge(cx);
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
+                        if same_bot {
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
                     }
                     Ok(_) => {
                         this.settings.avatar_cache.remove(&bot_id);
                         this.emit_badge(cx);
                     }
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                    Err(err) if same_bot => this.error = Some(SharedString::from(err)),
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -494,6 +521,8 @@ impl View {
         };
 
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let bot_id_check = params.bot_id.clone();
         let prev_agent = self
             .bots
             .iter()
@@ -522,38 +551,51 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.settings.saving = false;
+                if this.host != req_host {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id_check);
+                if same_bot {
+                    this.settings.saving = false;
+                }
                 match res {
                     Ok((Some(updated), extras_err)) => {
                         let provider_changed = prev_agent.as_deref().is_some_and(|prev| {
                             prev != krill_proto::agent::canonical_id(&updated.agent_id)
                         });
-                        this.settings.sync_from_bot(&updated);
+                        if same_bot {
+                            this.settings.sync_from_bot(&updated);
+                        }
                         if provider_changed {
-                            this.settings.agent_models = None;
-                            this.settings.models_loading_for = None;
-                            this.settings.models_task = None;
+                            if same_bot {
+                                this.settings.agent_models = None;
+                                this.settings.models_loading_for = None;
+                                this.settings.models_task = None;
+                            }
                             this.bot_sessions.retain(|s| s.bot_id != updated.id);
                         }
                         this.upsert_bot_config(updated);
                         this.emit_badge(cx);
                         this.emit_sessions_changed(cx);
+                        if same_bot {
+                            if let Some(err) = extras_err {
+                                this.error = Some(SharedString::from(err));
+                            } else {
+                                this.notice = Some(SharedString::from(text::SAVED.get()));
+                            }
+                        }
+                    }
+                    Ok((None, extras_err)) if same_bot => {
                         if let Some(err) = extras_err {
                             this.error = Some(SharedString::from(err));
                         } else {
                             this.notice = Some(SharedString::from(text::SAVED.get()));
                         }
                     }
-                    Ok((None, extras_err)) => {
-                        if let Some(err) = extras_err {
-                            this.error = Some(SharedString::from(err));
-                        } else {
-                            this.notice = Some(SharedString::from(text::SAVED.get()));
-                        }
-                    }
-                    Err(err) => {
+                    Err(err) if same_bot => {
                         this.error = Some(SharedString::from(err));
                     }
+                    Ok((None, _)) | Err(_) => {}
                 }
                 cx.notify();
             })
@@ -651,6 +693,8 @@ impl View {
             mcp_tools: None,
         };
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let bot_id_check = params.bot_id.clone();
         self.settings.saving = true;
         self.error = None;
         self.notice = None;
@@ -662,30 +706,50 @@ impl View {
                 )
                 .await;
             this.update(cx, |this, cx| {
-                this.settings.saving = false;
+                if this.host != req_host {
+                    return;
+                }
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id_check);
+                if same_bot {
+                    this.settings.saving = false;
+                }
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
-                        this.settings.schedules.clone_from(&updated.schedules);
-                        this.upsert_bot_config(*updated);
-                        if clear_inputs {
-                            let handle = this.window_handle;
-                            clear_input_on_window(&mut this.settings.sched_name_input, handle, cx);
-                            clear_input_on_window(&mut this.settings.sched_cron_input, handle, cx);
-                            clear_input_on_window(
-                                &mut this.settings.sched_prompt_input,
-                                handle,
-                                cx,
-                            );
+                        if same_bot {
+                            this.settings.schedules.clone_from(&updated.schedules);
+                            if clear_inputs {
+                                let handle = this.window_handle;
+                                clear_input_on_window(
+                                    &mut this.settings.sched_name_input,
+                                    handle,
+                                    cx,
+                                );
+                                clear_input_on_window(
+                                    &mut this.settings.sched_cron_input,
+                                    handle,
+                                    cx,
+                                );
+                                clear_input_on_window(
+                                    &mut this.settings.sched_prompt_input,
+                                    handle,
+                                    cx,
+                                );
+                            }
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
                         }
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
+                        this.upsert_bot_config(*updated);
                     }
                     Ok(other) => {
-                        this.error = Some(SharedString::from(format!(
-                            "unexpected UpdateBot response: {other:?}"
-                        )));
+                        if same_bot {
+                            this.error = Some(SharedString::from(format!(
+                                "unexpected UpdateBot response: {other:?}"
+                            )));
+                        }
                     }
                     Err(err) => {
-                        this.error = Some(SharedString::from(err));
+                        if same_bot {
+                            this.error = Some(SharedString::from(err));
+                        }
                     }
                 }
                 cx.notify();
@@ -1032,8 +1096,8 @@ impl View {
                                             text::CHOOSE_FOLDER.get(),
                                         )
                                         .on_click(
-                                            cx.listener(|_, _, window, cx| {
-                                                Self::pick_settings_workspace(window, cx);
+                                            cx.listener(|this, _, window, cx| {
+                                                this.pick_settings_workspace(window, cx);
                                             }),
                                         ),
                                     ),
@@ -1312,5 +1376,127 @@ impl View {
             .child(identity_card)
             .child(runtime_card)
             .child(schedules_card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[gpui::test]
+    fn stale_save_and_schedule_completions_do_not_clobber_switched_bot_or_host(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_a_id = BotId::new("bot-a").unwrap();
+        let bot_b_id = BotId::new("bot-b").unwrap();
+        let bot_a = BotConfig::new(bot_a_id.clone(), "Alpha", "claude", 1_700_000_000_000).unwrap();
+        let bot_b = BotConfig::new(bot_b_id.clone(), "Beta", "claude", 1_700_000_000_001).unwrap();
+        let bots_state = Arc::new(Mutex::new(vec![bot_a, bot_b.clone()]));
+        let bs = bots_state.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bs.lock().unwrap().clone())),
+            BotRpcRequest::UpdateBot(params) => {
+                let mut list = bs.lock().unwrap();
+                let target = list.iter_mut().find(|b| b.id == params.bot_id).unwrap();
+                if let Some(name) = &params.name {
+                    target.name.clone_from(name);
+                }
+                if let Some(schedules) = &params.schedules {
+                    target.schedules.clone_from(schedules);
+                }
+                Ok(BotRpcResponse::Bot(Box::new(target.clone())))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.confirm_select_bot(bot_a_id.clone(), cx);
+                v.set_detail_tab(super::super::DetailTab::Settings, cx);
+                let bot = v.selected_bot().unwrap().clone();
+                v.ensure_settings_inputs(&bot, window, cx);
+                if let Some(input) = &v.settings.name_input {
+                    input.update(cx, |s, cx| {
+                        s.set_value("Alpha Renamed".to_owned(), window, cx);
+                    });
+                }
+                v.save_bot_settings(bot_a_id.clone(), cx);
+                // Simulate switching selection to Bot B before Bot A's save task completes.
+                v.selected_bot_id = Some(bot_b_id.clone());
+                v.settings.sync_from_bot(&bot_b);
+                v.settings.saving = false;
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let alpha = v.bots.iter().find(|b| b.id == bot_a_id).unwrap();
+            assert_eq!(alpha.name, "Alpha Renamed");
+            assert_eq!(v.settings.synced_bot_id.as_ref(), Some(&bot_b_id));
+            assert!(
+                v.notice.is_none(),
+                "stale Bot A save must not flash Saved notice on Bot B"
+            );
+        });
+
+        // Stale schedule save for Bot A must not overwrite Bot B's settings.schedules.
+        let sched = BotScheduleConfig {
+            id: "sched-1".to_owned(),
+            name: "Daily".to_owned(),
+            cron: "0 9 * * *".to_owned(),
+            prompt: "check".to_owned(),
+            enabled: true,
+            timezone: None,
+        };
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.selected_bot_id = Some(bot_a_id.clone());
+                v.persist_schedules(bot_a_id.clone(), vec![sched], false, cx);
+                v.selected_bot_id = Some(bot_b_id.clone());
+                v.settings.sync_from_bot(&bot_b);
+                v.settings.saving = false;
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let alpha = v.bots.iter().find(|b| b.id == bot_a_id).unwrap();
+            assert_eq!(alpha.schedules.len(), 1);
+            assert!(
+                v.settings.schedules.is_empty(),
+                "Bot B schedules must stay untouched"
+            );
+            assert!(v.notice.is_none());
+        });
+
+        // Host switch ignores late completion entirely.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.selected_bot_id = Some(bot_a_id.clone());
+                v.persist_schedules(bot_a_id.clone(), Vec::new(), false, cx);
+                v.host = crate::hosts::HostId::Remote("iroh:other".into());
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let alpha = v.bots.iter().find(|b| b.id == bot_a_id).unwrap();
+            assert_eq!(
+                alpha.schedules.len(),
+                1,
+                "stale completion from previous host must not mutate current host bots"
+            );
+        });
     }
 }

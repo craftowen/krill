@@ -244,16 +244,19 @@ impl SessionChatLog {
         &mut self,
         notes: Vec<Arc<work_run::ItemNote>>,
         turns: Vec<work_run::TurnStamp>,
-    ) {
+    ) -> bool {
         if self.item_notes.0 != notes || self.item_notes.1 != turns {
             self.item_notes = (notes, turns);
             self.cached_feed = None;
             self.revision = self.revision.wrapping_add(1);
+            true
+        } else {
+            false
         }
     }
 
     /// Turns the bot chat turn fold on (`Some(live)`: whether the last turn still runs) or off.
-    pub(super) fn set_turn_fold(&mut self, live: Option<bool>) {
+    pub(super) fn set_turn_fold(&mut self, live: Option<bool>) -> bool {
         let next = live.map(|live| work_run::TurnFold {
             live,
             expanded: self
@@ -262,21 +265,27 @@ impl SessionChatLog {
                 .map(|f| f.expanded.clone())
                 .unwrap_or_default(),
         });
-        if self.turn_fold != next {
+        if self.turn_fold == next {
+            false
+        } else {
             self.turn_fold = next;
             self.cached_feed = None;
             self.revision = self.revision.wrapping_add(1);
+            true
         }
     }
 
     /// Opens or closes the work folded behind the turn the prompt at `user_abs_idx` started.
-    pub(super) fn toggle_turn(&mut self, user_abs_idx: usize) {
+    pub(super) fn toggle_turn(&mut self, user_abs_idx: usize) -> bool {
         if let Some(fold) = self.turn_fold.as_mut() {
             if !fold.expanded.remove(&user_abs_idx) {
                 fold.expanded.insert(user_abs_idx);
             }
             self.cached_feed = None;
             self.revision = self.revision.wrapping_add(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -809,13 +818,16 @@ fn chat_tail_request(session: SessionId, before: Option<u64>) -> String {
     .to_string()
 }
 
-/// `None` also covers an older daemon, which has no tail page and is read from the start instead.
-fn parse_chat_page(raw: &str) -> Option<ChatPage> {
-    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return None;
-    }
-    let data = root.get("data")?;
+fn chat_incremental_poll_request(session: SessionId, offset: u64) -> String {
+    serde_json::json!({
+        "action": "chat_poll",
+        "session": session.0,
+        "offset": offset,
+    })
+    .to_string()
+}
+
+fn parse_chat_snapshot_data(data: &serde_json::Value) -> Option<ChatPollSnapshot> {
     let mut snapshot: ChatPollSnapshot = serde_json::from_value(data.clone()).ok()?;
     if let Some(raw_items) = data.get("items").and_then(serde_json::Value::as_array) {
         for (item, raw_item) in snapshot.items.iter_mut().zip(raw_items.iter()) {
@@ -829,11 +841,44 @@ fn parse_chat_page(raw: &str) -> Option<ChatPage> {
             }
         }
     }
+    Some(snapshot)
+}
+
+/// Parses an incremental JSON `chat_poll` response (including per-item `at` timestamps).
+fn parse_chat_snapshot(raw: &str) -> Option<ChatPollSnapshot> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = root.get("data")?;
+    if data.get("next_offset").is_none() || data.get("items").is_none() {
+        return None;
+    }
+    parse_chat_snapshot_data(data)
+}
+
+/// `None` also covers an older daemon, which has no tail page and is read from the start instead.
+fn parse_chat_page(raw: &str) -> Option<ChatPage> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = root.get("data")?;
+    let snapshot = parse_chat_snapshot_data(data)?;
     Some(ChatPage {
         start: data.get("page_start")?.as_u64()?,
         has_earlier: data.get("has_earlier")?.as_bool()?,
         snapshot,
     })
+}
+
+fn rebase_tool_key(key: &str, delta: usize) -> String {
+    if let Some((prefix, idx_str)) = key.rsplit_once(':')
+        && let Ok(idx) = idx_str.parse::<usize>()
+    {
+        return format!("{prefix}:{}", idx.saturating_add(delta));
+    }
+    key.to_owned()
 }
 
 fn ratio_percent(used: u64, limit: u64) -> Option<u8> {
@@ -1554,8 +1599,26 @@ impl Shell {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(log) = self.chat.logs.get_mut(key) {
-            log.set_item_notes(notes, turns);
+        let notes_changed = self
+            .chat
+            .logs
+            .get_mut(key)
+            .is_some_and(|log| log.set_item_notes(notes, turns));
+        if notes_changed {
+            self.recompute_chat_find(key);
+        }
+    }
+
+    pub(super) fn set_cached_bot_paused(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        bot_id: &krill_proto::bots::BotId,
+        paused: bool,
+    ) {
+        for ((h, _), bot) in &mut self.chat.cached_bots {
+            if h == host && &bot.id == bot_id {
+                bot.paused = paused;
+            }
         }
     }
 
@@ -2725,15 +2788,15 @@ impl Shell {
         let generation = self.chat.next_poll_generation;
         self.chat.poll_generations.insert(key.clone(), generation);
         let offset = self.chat.logs.get(&key).map_or(0, |log| log.offset);
-        let seed = self
-            .chat
-            .logs
-            .get(&key)
-            .is_none_or(|log| !log.seeded)
-            .then(|| self.workflow_call_for_key(&key))
-            .flatten();
+        let seeded = self.chat.logs.get(&key).is_some_and(|log| log.seeded);
+        let workflow = self.workflow_call_for_key(&key);
         #[cfg(test)]
-        let seed = seed.filter(|_| self.chat.workflow_call.is_some());
+        let workflow = workflow.filter(|_| self.chat.workflow_call.is_some());
+        let (seed, incremental_workflow) = if seeded {
+            (None, workflow)
+        } else {
+            (workflow, None)
+        };
         let local = host.is_local();
         let settled = self
             .chat
@@ -2754,9 +2817,23 @@ impl Shell {
                     let page = seed.and_then(|workflow| {
                         parse_chat_page(&workflow(&chat_tail_request(session, None)).ok()?)
                     });
-                    let reply = page.is_none().then(|| {
-                        call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
-                    });
+                    let reply = if page.is_some() {
+                        None
+                    } else {
+                        let json_snap = incremental_workflow.and_then(|workflow| {
+                            parse_chat_snapshot(
+                                &workflow(&chat_incremental_poll_request(session, offset)).ok()?,
+                            )
+                        });
+                        if let Some(snap) = json_snap {
+                            Some(Ok(Reply::AgentHistory(Response::ChatPolled(snap))))
+                        } else {
+                            Some(call(&Request::AgentHistory(Action::ChatPoll {
+                                session,
+                                offset,
+                            })))
+                        }
+                    };
                     let meta = match (&page, &reply) {
                         (Some(page), _) => poll_composer_meta(&page.snapshot, local, None),
                         (None, Some(Ok(Reply::AgentHistory(Response::ChatPolled(snap))))) => {
@@ -2892,6 +2969,18 @@ impl Shell {
             log.observed_user_at_ms = std::mem::take(&mut log.observed_user_at_ms)
                 .into_iter()
                 .map(|(idx, ts)| (idx.saturating_add(delta), ts))
+                .collect();
+            log.answered = std::mem::take(&mut log.answered)
+                .into_iter()
+                .map(|k| rebase_tool_key(&k, delta))
+                .collect();
+            log.submissions = std::mem::take(&mut log.submissions)
+                .into_iter()
+                .map(|(k, v)| (rebase_tool_key(&k, delta), v))
+                .collect();
+            log.multi_selected = std::mem::take(&mut log.multi_selected)
+                .into_iter()
+                .map(|(k, v)| (rebase_tool_key(&k, delta), v))
                 .collect();
             if let Some(pending) = self.chat.pending_prompts.get_mut(&key) {
                 for entry in pending.iter_mut() {
@@ -5355,21 +5444,11 @@ impl Shell {
                     if this.chat_prompt_turn_started(&task_key, initial_status, cx) {
                         return Outcome::Confirmed;
                     }
-                    let same_epoch =
-                        this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
-                    if same_epoch
+                    let transport_current = this.chat_prompt_transport_current(&origin);
+                    if transport_current
                         && is_agy
-                        && let Some(qm) = this.live.get(&pane).and_then(|live| {
-                            #[cfg(test)]
-                            if this.chat.prompt_confirmed == Some(false) {
-                                return None;
-                            }
-                            krill_proto::screen::agy::queued_submission_confirmed(
-                                live.pane.screen(),
-                                &submitted_payload,
-                                baseline_queued,
-                            )
-                        })
+                        && let Some(qm) =
+                            this.chat_agy_queued_match(&origin, &submitted_payload, baseline_queued)
                     {
                         return Outcome::AgyQueued {
                             send_immediately_hint: qm.send_immediately_hint,
@@ -5378,7 +5457,7 @@ impl Shell {
                     if this.chat_prompt_view_detached(&origin, cx) {
                         return Outcome::Detached;
                     }
-                    if !same_epoch {
+                    if !transport_current {
                         return Outcome::Failed;
                     }
                     if step % 5 == 0 {
@@ -5401,7 +5480,10 @@ impl Shell {
                         send_immediately_hint,
                     } => {
                         this.update(cx, |this, cx| {
-                            if steer && send_immediately_hint && this.is_pane_chat_view(pane, cx) {
+                            if steer
+                                && send_immediately_hint
+                                && this.chat_prompt_current(&origin, cx)
+                            {
                                 let _ = this.send_chat_prompt_input(
                                     pane,
                                     session,
@@ -5918,16 +6000,29 @@ impl Shell {
             if placed.contains(path) {
                 continue;
             }
-            placed.insert(path.clone());
             let number = (ix + 1).to_string();
+            let token_id = format!("{IMAGE_TOKEN_PREFIX}{}", path.display());
             let token = gpui_component::input::InlineToken::new(
-                format!("{IMAGE_TOKEN_PREFIX}{}", path.display()),
+                token_id.clone(),
                 format!("[Image #{number}]"),
             )
             .with_label(ctext::IMAGE_NUMBER.format(&[("number", &number)]));
-            input.update(cx, |state, cx| {
-                state.replace_with_token(token, window, cx).ok();
+            let inserted = input.update(cx, |state, cx| {
+                let existing = state
+                    .tokens()
+                    .iter()
+                    .find(|span| span.token().id().as_ref() == token_id.as_str())
+                    .map(gpui_component::input::InlineTokenSpan::range);
+                match existing {
+                    Some(range) => state
+                        .replace_range_with_token(range, token, window, cx)
+                        .is_ok(),
+                    None => state.replace_with_token(token, window, cx).is_ok(),
+                }
             });
+            if inserted {
+                placed.insert(path.clone());
+            }
         }
         if placed.is_empty() {
             self.chat.image_tokens.remove(key);

@@ -4902,14 +4902,22 @@ impl Sidebar {
         let name = self.name(&path);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
         input.update(cx, |input, cx| input.focus(window, cx));
-        self.edit_subscription =
-            Some(
-                cx.subscribe_in(&input, window, |s, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        s.finish_rename(Some(window), cx);
+        self.edit_subscription = Some(cx.subscribe_in(
+            &input,
+            window,
+            |s, input, event: &InputEvent, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
                     }
-                }),
-            );
+                ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    s.finish_rename(Some(window), cx);
+                }
+            },
+        ));
         self.editing = Some((path, input));
         cx.notify();
     }

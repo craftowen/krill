@@ -1683,7 +1683,9 @@ impl Panel {
                     this.schedule_async_search(true, cx);
                 }
             }
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter {
+                secondary: false, ..
+            } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.query = val;
                 this.schedule_async_search(false, cx);
@@ -1725,7 +1727,9 @@ impl Panel {
                     this.schedule_async_search(true, cx);
                 }
             }
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter {
+                secondary: false, ..
+            } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.include_pattern = val;
                 this.schedule_async_search(false, cx);
@@ -1767,7 +1771,9 @@ impl Panel {
                     this.schedule_async_search(true, cx);
                 }
             }
-            InputEvent::PressEnter { .. } => {
+            InputEvent::PressEnter {
+                secondary: false, ..
+            } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.exclude_pattern = val;
                 this.schedule_async_search(false, cx);

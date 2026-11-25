@@ -344,7 +344,11 @@ impl Panel {
     }
 
     pub fn toggle_pr_draft(&mut self, cx: &mut Context<Self>) {
-        if self.checks.loading || self.checks.merging || self.remote_host() {
+        if self.checks.loading
+            || self.checks.merging
+            || self.checks.pending_merge.is_some()
+            || self.remote_host()
+        {
             return;
         }
         let Some(pr) = &self.checks.inspection else {
@@ -356,30 +360,49 @@ impl Panel {
             _ => return,
         };
         self.checks.loading = true;
+        self.checks.merging = true;
         self.checks.fix_status = None;
+        self.checks.action_error = None;
         let repo = self.repo.clone();
+        let bg_repo = repo.clone();
+        let generation = self.checks.generation;
         let branch_override = self.checks.branch_override.clone();
         let service = Arc::clone(&self.editing.pr_service);
-        self.checks.task = Some(cx.spawn(async move |this, cx| {
+        self.checks.merge_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let (branch, _) =
-                        resolve_branch_and_empty_state(&repo, branch_override.as_deref());
+                        resolve_branch_and_empty_state(&bg_repo, branch_override.as_deref());
                     let Some(branch) = branch else {
                         return Err(text::GH_FAILED.get());
                     };
-                    service.set_draft(&repo, &branch, to_draft)
+                    service.set_draft(&bg_repo, &branch, to_draft)
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // The retained mutation task owns the busy state even across hide or repo switch.
                 this.checks.loading = false;
-                match result {
-                    Ok(()) => {
-                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                this.checks.merging = false;
+                if this.repo != repo || this.checks.generation != generation {
+                    if this.visible && this.tab == PanelTab::Checks {
                         this.refresh_checks(cx);
                     }
-                    Err(_) => {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.checks.action_error = None;
+                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                        if this.visible && this.tab == PanelTab::Checks {
+                            this.refresh_checks(cx);
+                        } else {
+                            this.checks.inspection = None;
+                        }
+                    }
+                    Err(reason) => {
+                        this.checks.action_error = Some(reason.to_owned());
                         this.checks.fix_status = Some(text::ACTION_FAILED);
                     }
                 }
@@ -422,14 +445,8 @@ impl Panel {
         let Some(comment) = pr.review_comments.get(idx) else {
             return;
         };
-        let rel = comment.path.trim();
-        if rel.is_empty() {
+        let Some(path) = resolve_review_comment_path(&self.repo, &comment.path) else {
             return;
-        }
-        let path = if Path::new(rel).is_absolute() {
-            std::path::PathBuf::from(rel)
-        } else {
-            self.repo.join(rel)
         };
         let line = comment.display_line().unwrap_or(1).max(1);
         cx.emit(super::OpenFileAt {
@@ -1447,5 +1464,124 @@ impl Panel {
             .child(footer)
             .children(self.render_merge_confirmation(window, cx))
             .into_any_element()
+    }
+}
+
+fn resolve_review_comment_path(repo: &Path, raw: &str) -> Option<std::path::PathBuf> {
+    let rel = raw.trim();
+    if rel.is_empty()
+        || rel.contains('\0')
+        || rel.starts_with('/')
+        || rel.starts_with('\\')
+        || Path::new(rel).is_absolute()
+    {
+        return None;
+    }
+    // Reject Windows drive-prefixed paths (e.g. `C:\foo` or `C:foo`) even on Unix hosts.
+    if rel.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && rel.as_bytes().get(1) == Some(&b':')
+    {
+        return None;
+    }
+    let mut clean_rel = std::path::PathBuf::new();
+    for component in Path::new(rel).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                if part.to_str().is_some_and(|s| s.contains('\\')) {
+                    return None;
+                }
+                clean_rel.push(part);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if clean_rel.as_os_str().is_empty() {
+        return None;
+    }
+    let joined = repo.join(&clean_rel);
+    if let Ok(repo_canon) = krill_proto::os::canonicalize(repo) {
+        if joined.symlink_metadata().is_ok() {
+            let joined_canon = krill_proto::os::canonicalize(&joined).ok()?;
+            if !joined_canon.starts_with(&repo_canon) || joined_canon == repo_canon {
+                return None;
+            }
+        } else {
+            for ancestor in joined.ancestors().skip(1) {
+                if ancestor.symlink_metadata().is_ok() {
+                    let anc_canon = krill_proto::os::canonicalize(ancestor).ok()?;
+                    if !anc_canon.starts_with(&repo_canon) {
+                        return None;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Some(joined)
+}
+
+#[cfg(test)]
+mod checks_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_review_comment_path_rejects_traversal_absolute_and_escaping_symlinks() {
+        let base =
+            std::env::temp_dir().join(format!("krill-review-path-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+
+        assert_eq!(
+            resolve_review_comment_path(&repo, "src/main.rs"),
+            Some(repo.join("src/main.rs"))
+        );
+        assert_eq!(
+            resolve_review_comment_path(&repo, "./src/deleted.rs"),
+            Some(repo.join("src/deleted.rs"))
+        );
+        for blocked in [
+            "",
+            "   ",
+            ".",
+            "/etc/passwd",
+            "../../outside/secret.txt",
+            "src/../../outside/secret.txt",
+            "C:\\Windows\\win.ini",
+            "\\etc\\passwd",
+            "src\\..\\secret.txt",
+            "src/main.rs\0.txt",
+        ] {
+            assert_eq!(
+                resolve_review_comment_path(&repo, blocked),
+                None,
+                "blocked review path must be rejected: {blocked:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.txt"), repo.join("escape_file"))
+                .unwrap();
+            std::os::unix::fs::symlink(&outside, repo.join("escape_dir")).unwrap();
+            assert_eq!(resolve_review_comment_path(&repo, "escape_file"), None);
+            assert_eq!(
+                resolve_review_comment_path(&repo, "escape_dir/secret.txt"),
+                None
+            );
+            assert_eq!(
+                resolve_review_comment_path(&repo, "escape_dir/nonexistent.txt"),
+                None
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

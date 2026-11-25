@@ -7851,3 +7851,88 @@ fn remote_poll_pacing_backs_off_failures_and_sluggish_polls_and_reconnect_resets
     vcx.run_until_parked();
     assert_eq!(polls.load(Ordering::SeqCst), 4);
 }
+
+#[gpui::test]
+fn worktree_rename_ignores_enter_and_escape_during_ime_composition(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let wt = PathBuf::from("/repo/wt-ime");
+    let snap = Snapshot {
+        trees: BTreeMap::from([(PathBuf::from("/repo"), vec![wt.clone()])]),
+        sessions: Vec::new(),
+    };
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut s = Sidebar::new_loaded(None);
+        s.snapshot = snap;
+        s.rebuild(cx);
+        s
+    });
+    vcx.simulate_resize(gpui::size(gpui::px(300.), gpui::px(600.)));
+    vcx.run_until_parked();
+
+    let wt_clone = wt.clone();
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.rename(wt_clone, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.editing.as_ref().unwrap().1.clone();
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "한", None, window, cx,
+                );
+            });
+            assert!(crate::jump::entity_input_is_composing(&input, window, cx));
+        });
+    });
+
+    // Enter while composing must not submit worktree rename (R2A-16).
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            s.editing.is_some(),
+            "PressEnter during IME composition must not finish worktree rename"
+        );
+    });
+
+    // Re-mark composition and verify Escape does not cancel worktree rename.
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.editing.as_ref().unwrap().1.clone();
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "한", None, window, cx,
+                );
+            });
+        });
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            s.editing.is_some(),
+            "Escape during IME composition must not cancel worktree rename"
+        );
+    });
+
+    // Secondary+Shift+Enter must not finish worktree rename (R2A-15).
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.editing.as_ref().unwrap().1.clone();
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::unmark_text(state, window, cx);
+            });
+        });
+    });
+    vcx.simulate_keystrokes("cmd-shift-enter");
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            s.editing.is_some(),
+            "secondary-shift-enter must not commit worktree rename"
+        );
+    });
+}

@@ -152,27 +152,60 @@ pub(super) struct BotUi {
     pub group_chat: super::bot_group_chat::BotGroupUiState,
 }
 
+/// Resolved daemon transport target for a host, distinguishing an offline remote host from a
+/// local host whose target is `None` (default local socket).
+#[derive(Debug, Clone)]
+pub(super) enum ResolvedHostTarget {
+    Offline,
+    Local,
+    Target(Box<krill_app::hosts::HostTarget>),
+}
+
+impl ResolvedHostTarget {
+    pub(super) fn into_target(self) -> Option<krill_app::hosts::HostTarget> {
+        match self {
+            Self::Offline | Self::Local => None,
+            Self::Target(target) => Some(*target),
+        }
+    }
+}
+
 impl Shell {
     /// Bot RPC to the host bots run on (the launch host).
     pub(super) fn bot_rpc(&self) -> Option<krill_app::bots::BotRpcCall> {
         self.bot_rpc_on(&self.launch_host)
     }
 
+    /// Resolves the daemon target for `host`, returning [`ResolvedHostTarget::Offline`] when a
+    /// remote host is disconnected so callers never silently fall back to the local Mac daemon.
+    pub(super) fn resolved_target_for_host(&self, host: &HostId) -> ResolvedHostTarget {
+        match self.target_for_host(host) {
+            Some(target) => ResolvedHostTarget::Target(Box::new(target)),
+            None if host.is_local() => ResolvedHostTarget::Local,
+            None => ResolvedHostTarget::Offline,
+        }
+    }
+
     pub(super) fn bot_rpc_on(&self, host: &HostId) -> Option<krill_app::bots::BotRpcCall> {
         #[cfg(test)]
         {
-            self.bot_rpc_overrides
-                .get(host)
-                .or(self.bot_rpc_override.as_ref())
-                .cloned()
+            if let Some(rpc) = self.bot_rpc_overrides.get(host) {
+                return Some(rpc.clone());
+            }
+            if !host.is_local() && self.target_for_host(host).is_none() {
+                return None;
+            }
+            self.bot_rpc_override.clone()
         }
         #[cfg(not(test))]
         {
-            let target = self.target_for_host(host);
-            if host.is_remote() && target.is_none() {
-                return None;
+            match self.resolved_target_for_host(host) {
+                ResolvedHostTarget::Offline => None,
+                resolved => Some(krill_app::bots::daemon_bot_rpc_for_host(
+                    host,
+                    resolved.into_target(),
+                )),
             }
-            Some(krill_app::bots::daemon_bot_rpc_for_host(host, target))
         }
     }
 
@@ -345,7 +378,9 @@ impl Shell {
                 // Orca expands the section so the new bot's row is visible and active.
                 self.bot_ui.collapsed = false;
                 self.bot_ui.folded.remove(&(host.clone(), bot.id.clone()));
+                self.bot_ui.panel.shown = None;
                 self.bot_ui.panel.settings = None;
+                self.bot_ui.panel.pending_draft = None;
                 self.bot_ui.panel.stale = true;
                 let row = krill_app::bots::rpc::sidebar_snapshot_on(
                     host,
@@ -414,6 +449,18 @@ impl Shell {
         self.start_bot_session_in_on(host, bot_id, kickoff, None, cx);
     }
 
+    fn clear_pending_draft_for(&mut self, host: &HostId, bot_id: &BotId) {
+        if self
+            .bot_ui
+            .panel
+            .pending_draft
+            .as_ref()
+            .is_some_and(|(h, id, _)| h == host && id == bot_id)
+        {
+            self.bot_ui.panel.pending_draft = None;
+        }
+    }
+
     /// Starts a new chat for a bot on `host`, filling `target_pane` in place when present.
     pub(super) fn start_bot_session_in_on(
         &mut self,
@@ -424,6 +471,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let Some(rpc) = self.bot_rpc_on(host) else {
+            self.clear_pending_draft_for(host, &bot_id);
             if let Some(pane) = target_pane {
                 self.clear_split_launcher_launching(pane);
             }
@@ -435,6 +483,7 @@ impl Shell {
             .find(|b| &b.host == host && b.id == bot_id);
         // krilld won't start a paused bot; say so in the app's words.
         if bot.is_some_and(|b| b.paused) && kickoff.is_none() {
+            self.clear_pending_draft_for(host, &bot_id);
             if let Some(pane) = target_pane {
                 self.clear_split_launcher_launching(pane);
             }
@@ -501,6 +550,7 @@ impl Shell {
                             .sidebar_bots
                             .iter_mut()
                             .find(|b| b.host == host && b.id == bot_id)
+                            && !row.sessions.iter().any(|s| s.session_id == session_id)
                         {
                             // krilld lists the Home Chat first, then newest.
                             let at = usize::from(row.home_session().is_some());
@@ -509,6 +559,7 @@ impl Shell {
                         if let Some(entry) = this.bot_ui.hosts.get_mut(&host)
                             && let Some(row) =
                                 entry.snapshot.bots.iter_mut().find(|b| b.id == bot_id)
+                            && !row.sessions.iter().any(|s| s.session_id == session_id)
                         {
                             let at = usize::from(row.home_session().is_some());
                             row.sessions.insert(at, new_summary);
@@ -528,9 +579,13 @@ impl Shell {
                         this.refresh_bots_for_host(&host, true, cx);
                     }
                     Ok(_) => {
+                        this.clear_pending_draft_for(&opening_key.0, &opening_key.1);
                         this.notice = Some(text::NB_CREATED_NOT_OPENED.format(&[("name", &name)]));
                     }
-                    Err(err) => this.notice = Some(err),
+                    Err(err) => {
+                        this.clear_pending_draft_for(&opening_key.0, &opening_key.1);
+                        this.notice = Some(err);
+                    }
                 }
                 cx.notify();
             })
@@ -693,7 +748,9 @@ impl Shell {
         {
             b.paused = paused;
         }
+        self.set_cached_bot_paused(&host_owned, &bot_id, paused);
         cx.notify();
+        let revert_id = bot_id.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -723,11 +780,18 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if let Err(err) = res {
-                    this.notice = Some(err);
-                    cx.notify();
+                match res {
+                    Ok(BotRpcResponse::Bot(updated)) => {
+                        this.set_cached_bot_paused(&host_owned, &revert_id, updated.paused);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        this.set_cached_bot_paused(&host_owned, &revert_id, !paused);
+                        this.notice = Some(err);
+                    }
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
+                cx.notify();
             })
             .ok();
         })
@@ -839,15 +903,10 @@ impl Shell {
             self.bot_ui.panel.shown = None;
             self.bot_ui.panel.settings = None;
         }
-        if self
-            .bot_ui
-            .panel
-            .pending_draft
-            .as_ref()
-            .is_some_and(|(h, id, _)| h == &host_owned && id == &bot_id)
-        {
-            self.bot_ui.panel.pending_draft = None;
+        if self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot_id) {
+            self.bot_ui.panel.home_chrome = super::bot_panel::HomeChrome::default();
         }
+        self.clear_pending_draft_for(&host_owned, &bot_id);
         self.bot_ui.panel.stale = true;
         self.close_panes_for_bot(&host_owned, &sessions, cx);
         cx.notify();
