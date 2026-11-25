@@ -1,8 +1,7 @@
-//! 프로바이더 다계정·사용량(5h/7d)·원클릭 전환 클라이언트 및 읽기 전용 로컬 폴백(MK-107·MK-108).
+//! 프로바이더 다계정·사용량(5h/7d)·원클릭 수동 전환 클라이언트 및 읽기 전용 로컬 폴백(MK-107·MK-108).
 //!
 //! - 데몬(`krilld`)이 연결되어 있으면 `FEAT_USAGE` IPC(`UsageRequest`/`UsageReply`)로 요청한다.
-//! - 자동전환 판정·기록은 krilld 하나만 한다(OWE-697). 로컬 폴백은 `accounts.toml`과 캐시를 읽기만 하고
-//!   자동전환을 평가하지 않는다. 로컬 변이(`request_local`)는 데몬 없는 임시 상태 디렉터리(테스트)용이다.
+//! - 로컬 폴백은 `accounts.toml`과 캐시를 읽기만 하며, 로컬 변이(`request_local`)는 데몬 없는 임시 상태 디렉터리(테스트)용이다.
 //!
 //! OAuth process lifecycle reference: Orca claude-login-session.ts / codex-login-session.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
@@ -26,9 +25,8 @@ use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountInfo, AccountsSnapshot, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, OrphanProfile,
-    ProviderKind, ResetConsumeOutcome, SessionSwitchPlan, Snapshot, UsageReply, UsageRequest,
-    Window,
+    AccountInfo, AccountsSnapshot, AutoSwitchPolicy, FEAT_USAGE, OrphanProfile, ProviderKind,
+    ResetConsumeOutcome, SessionSwitchPlan, Snapshot, UsageReply, UsageRequest, Window,
 };
 
 /// 이 앱(셸·설정 창)이 방금 요청한 기본 계정 전환. 외부 전환 알림이 자기 요청을 외부로 오인하지 않게
@@ -85,7 +83,9 @@ mod status_negotiation_tests {
 
     #[test]
     fn provider_metric_mutation_is_rejected_before_sending_to_legacy_daemon() {
-        use krill_proto::usage::{AutoSwitchMetric, FEAT_USAGE_PROVIDER_METRICS, FEAT_USAGE_RULES};
+        use krill_proto::usage::{
+            AutoSwitchMetric, AutoSwitchRule, FEAT_USAGE_PROVIDER_METRICS, FEAT_USAGE_RULES,
+        };
         let root = std::env::temp_dir().join(format!("acct-metric-gate-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let paths = Paths {
@@ -379,8 +379,6 @@ pub struct StoredAccount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsFile {
     #[serde(default)]
-    pub auto_switch: StoredAutoSwitch,
-    #[serde(default)]
     pub active: BTreeMap<String, String>,
     #[serde(default)]
     pub accounts: Vec<StoredAccount>,
@@ -399,47 +397,10 @@ fn provisioning_default() -> bool {
 impl Default for AccountsFile {
     fn default() -> Self {
         Self {
-            auto_switch: StoredAutoSwitch::default(),
             active: BTreeMap::new(),
             accounts: Vec::new(),
             provisioning: provisioning_default(),
             hidden_accounts: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredAutoSwitch {
-    #[serde(default = "default_switch_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_switch_threshold")]
-    pub threshold_percent: u8,
-    #[serde(default = "default_switch_on_rate_limit")]
-    pub switch_on_rate_limit: bool,
-    #[serde(default)]
-    pub rules: Vec<AutoSwitchRule>,
-}
-
-fn default_switch_enabled() -> bool {
-    AutoSwitchPolicy::default().enabled
-}
-
-fn default_switch_threshold() -> u8 {
-    krill_proto::usage::DEFAULT_AUTO_SWITCH_PERCENT
-}
-
-fn default_switch_on_rate_limit() -> bool {
-    AutoSwitchPolicy::default().switch_on_rate_limit
-}
-
-impl Default for StoredAutoSwitch {
-    fn default() -> Self {
-        let d = AutoSwitchPolicy::default();
-        Self {
-            enabled: d.enabled,
-            threshold_percent: d.threshold_percent,
-            switch_on_rate_limit: d.switch_on_rate_limit,
-            rules: d.rules,
         }
     }
 }
@@ -790,7 +751,10 @@ pub fn request_local(
         UsageRequest::Get
         | UsageRequest::ListAccounts
         | UsageRequest::RefreshUsage
-        | UsageRequest::ListOrphanProfiles => Ok(refresh_local(home, state_dir)),
+        | UsageRequest::ListOrphanProfiles
+        | UsageRequest::SetAutoSwitch(_)
+        | UsageRequest::UpsertAutoSwitchRule(_)
+        | UsageRequest::RemoveAutoSwitchRule { .. } => Ok(refresh_local(home, state_dir)),
         UsageRequest::SwitchAccount {
             provider,
             account_id,
@@ -951,29 +915,6 @@ pub fn request_local(
             for orphan in orphans_local(home, state_dir) {
                 krill_proto::usage::profiles::move_to_trash(home, Path::new(&orphan.dir)).ok();
             }
-            Ok(refresh_local(home, state_dir))
-        }
-        UsageRequest::SetAutoSwitch(policy) => set_auto_switch_local(home, state_dir, policy),
-        UsageRequest::UpsertAutoSwitchRule(rule) => {
-            let mut file = load_file_result(home, state_dir)?;
-            let mut policy = AutoSwitchPolicy {
-                rules: file.auto_switch.rules,
-                ..AutoSwitchPolicy::default()
-            };
-            policy.upsert_rule(rule.clone());
-            file.auto_switch.rules = policy.rules;
-            save_file(home, state_dir, &file)?;
-            Ok(refresh_local(home, state_dir))
-        }
-        UsageRequest::RemoveAutoSwitchRule {
-            provider,
-            from_account_id,
-        } => {
-            let mut file = load_file_result(home, state_dir)?;
-            file.auto_switch
-                .rules
-                .retain(|r| r.provider != *provider || r.from_account_id != *from_account_id);
-            save_file(home, state_dir, &file)?;
             Ok(refresh_local(home, state_dir))
         }
     }
@@ -1527,50 +1468,6 @@ pub fn orphans_local(home: &Path, state_dir: Option<&Path>) -> Vec<OrphanProfile
     krill_proto::usage::profiles::orphans(home, &keep)
 }
 
-/// 데몬 연결을 우선하고 로컬 파일로 폴백한다.
-pub fn upsert_auto_switch_rule(rule: AutoSwitchRule) -> Result<AccountsSnapshot, String> {
-    let paths = Paths::dev().ok();
-    request(paths.as_ref(), &UsageRequest::UpsertAutoSwitchRule(rule))
-}
-
-pub fn remove_auto_switch_rule(
-    provider: ProviderKind,
-    from_account_id: &str,
-) -> Result<AccountsSnapshot, String> {
-    let paths = Paths::dev().ok();
-    request(
-        paths.as_ref(),
-        &UsageRequest::RemoveAutoSwitchRule {
-            provider,
-            from_account_id: from_account_id.to_owned(),
-        },
-    )
-}
-
-pub fn set_auto_switch_local(
-    home: &Path,
-    state_dir: Option<&Path>,
-    policy: &AutoSwitchPolicy,
-) -> io::Result<AccountsSnapshot> {
-    let mut file = load_file_result(home, state_dir)?;
-    let rules = if policy.rules.is_empty() {
-        file.auto_switch.rules
-    } else {
-        policy.rules.clone()
-    };
-    file.auto_switch = StoredAutoSwitch {
-        enabled: policy.enabled,
-        threshold_percent: policy.threshold_percent.clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        ),
-        switch_on_rate_limit: policy.switch_on_rate_limit,
-        rules,
-    };
-    save_file(home, state_dir, &file)?;
-    Ok(refresh_local(home, state_dir))
-}
-
 pub fn default_home() -> PathBuf {
     // 단위 테스트가 실제 사용자 홈(~/.config/krill/profiles 등)을 읽거나
     // 고아 프로필 정리로 휴지통에 옮기지 않게 프로세스별 임시 홈으로 격리한다.
@@ -1675,19 +1572,10 @@ pub fn switch_account(
     Ok(refresh_local(home, state_dir))
 }
 
-/// 읽기 전용 스냅샷. 자동전환을 평가하지도 `accounts.toml`을 쓰지도 않는다(OWE-697) — 판정은 krilld만.
-/// 앱이 데몬이 쓴 파일을 1초 감시로 다시 읽어도 왕복 전환이 생기지 않는다.
+/// 읽기 전용 스냅샷. `accounts.toml`을 쓰지 않는다.
 pub fn refresh_local(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot {
     let file = load_file(home, state_dir);
-    let policy = AutoSwitchPolicy {
-        enabled: file.auto_switch.enabled,
-        threshold_percent: file.auto_switch.threshold_percent.clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        ),
-        switch_on_rate_limit: file.auto_switch.switch_on_rate_limit,
-        rules: file.auto_switch.rules,
-    };
+    let policy = AutoSwitchPolicy::default();
 
     let mut all = Vec::new();
     for provider in ProviderKind::ALL {
@@ -2343,19 +2231,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = request_local(
-            &home,
-            Some(&state),
-            &UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
-                enabled: true,
-                threshold_percent: 80,
-                switch_on_rate_limit: true,
-                rules: Vec::new(),
-            }),
-        )
-        .unwrap();
-
-        // Manual switch to the 95% account must NOT be immediately overridden by auto-switch.
+        // Manual switch to the 95% account stays selected and never triggers automatic switching.
         let snap =
             switch_account(&home, Some(&state), ProviderKind::Claude, "claude-high-max").unwrap();
         assert!(snap.switched.is_empty());
@@ -2579,12 +2455,6 @@ mod as_regression_tests {
                 std::fs::write(backup.join("usage_cache.json"), usage).unwrap();
             }
             let file = AccountsFile {
-                auto_switch: StoredAutoSwitch {
-                    enabled: true,
-                    threshold_percent: 90,
-                    switch_on_rate_limit: on_rate_limit,
-                    rules: Vec::new(),
-                },
                 active: BTreeMap::new(),
                 accounts: vec![StoredAccount {
                     id: "claude-backup".into(),
@@ -2598,6 +2468,11 @@ mod as_regression_tests {
             };
             save_file(&home, Some(&state), &file).unwrap();
             let path = config_path(&home, Some(&state));
+            let legacy = format!(
+                "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = {on_rate_limit}\n\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+            std::fs::write(&path, &legacy).unwrap();
             let before = std::fs::read(&path).unwrap();
             let snap = refresh_local(&home, Some(&state));
             assert!(snap.switched.is_empty(), "{name}: {:?}", snap.switched);
@@ -2753,65 +2628,31 @@ mod as_regression_tests {
 }
 
 #[cfg(test)]
-mod rule_tests {
+mod legacy_config_tests {
     use super::*;
 
-    /// 규칙 저장·삭제와 전역 정책 갱신은 로컬 파일에 그대로 남는다. 평가는 데몬 몫이라 `switched`는 비어 있다.
     #[test]
-    fn per_account_rules_persist_and_survive_global_updates() {
-        use krill_proto::usage::{AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule};
-
-        let root =
-            std::env::temp_dir().join(format!("krill-app-rule-behavior-{}", std::process::id()));
+    fn legacy_accounts_toml_with_auto_switch_and_rules_loads_and_saves_cleanly() {
+        let root = std::env::temp_dir().join(format!("krill-app-legacy-as-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let home = root.join("home");
         let state = root.join("state");
-        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
-            let rule = AutoSwitchRule {
-                provider,
-                from_account_id: format!("{}-host", provider.as_str()),
-                enabled: true,
-                threshold_percent: 90,
-                metric: AutoSwitchMetric::SevenDay,
-                target_account_id: Some(format!("{}-target", provider.as_str())),
-            };
-            let snap = request_local(
-                &home,
-                Some(&state),
-                &UsageRequest::UpsertAutoSwitchRule(rule.clone()),
-            )
-            .unwrap();
-            assert!(snap.switched.is_empty());
-            assert!(snap.auto_switch.rules.contains(&rule));
-            let policy = AutoSwitchPolicy {
-                enabled: false,
-                ..AutoSwitchPolicy::default()
-            };
-            let updated = set_auto_switch_local(&home, Some(&state), &policy).unwrap();
-            assert_eq!(updated.auto_switch.rules, vec![rule.clone()]);
-            assert_eq!(load_file(&home, Some(&state)).auto_switch.rules, vec![rule]);
-            let removed = request_local(
-                &home,
-                Some(&state),
-                &UsageRequest::RemoveAutoSwitchRule {
-                    provider,
-                    from_account_id: format!("{}-host", provider.as_str()),
-                },
-            )
-            .unwrap();
-            assert!(removed.auto_switch.rules.is_empty());
-            assert!(load_file(&home, Some(&state)).auto_switch.rules.is_empty());
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let path = config_path(&home, Some(&state));
+        let raw = "[auto_switch]\nenabled = true\nthreshold_percent = 80\nswitch_on_rate_limit = true\n[[auto_switch.rules]]\nprovider = 'Claude'\nfrom_account_id = 'claude-host'\nenabled = true\nthreshold_percent = 70\nmetric = 'seven_day'\n[advanced_policy]\npredict_exhaustion = true\n";
+        std::fs::write(&path, raw).unwrap();
 
-    #[test]
-    fn legacy_accounts_toml_defaults_rules_to_empty() {
-        let file: AccountsFile = toml::from_str(
-            "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = true\n",
-        )
-        .unwrap();
-        assert!(file.auto_switch.rules.is_empty());
+        let file = load_file_result(&home, Some(&state)).unwrap();
+        assert!(file.accounts.is_empty());
+        let snap = refresh_local(&home, Some(&state));
+        assert!(!snap.auto_switch.enabled);
+        assert!(snap.auto_switch.rules.is_empty());
+        assert!(snap.switched.is_empty());
+
+        save_file(&home, Some(&state), &file).unwrap();
+        assert!(load_file_result(&home, Some(&state)).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 }
 
@@ -2851,7 +2692,7 @@ fn owe699_provisioning_on_by_default_and_survives_app_save() {
     std::fs::write(dir.join(ACCOUNTS_FILE), "provisioning = false\n").unwrap();
     assert!(!provisioning_enabled(&dir, Some(&dir)));
     let mut file = load_file_result(&dir, Some(&dir)).unwrap();
-    file.auto_switch.enabled = false;
+    file.active.insert("claude".into(), "claude-host".into());
     save_file(&dir, Some(&dir), &file).unwrap();
     assert!(!provisioning_enabled(&dir, Some(&dir)), "명시한 꺼짐 유지");
     std::fs::remove_dir_all(dir).unwrap();

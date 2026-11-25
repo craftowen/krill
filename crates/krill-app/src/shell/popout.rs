@@ -15,8 +15,7 @@ use krill_proto::{
     control::AgentState,
     screen::Screen,
     usage::{
-        AccountInfo, AccountStatus, AccountsSnapshot, AutoSwitchMetric, AutoSwitchRule,
-        ProviderKind, UsageRequest,
+        AccountInfo, AccountStatus, AccountsSnapshot, AutoSwitchMetric, ProviderKind, UsageRequest,
     },
 };
 
@@ -324,155 +323,6 @@ fn open_floating(
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
-}
-
-fn account_rule(snap: &AccountsSnapshot, account: &AccountInfo) -> AutoSwitchRule {
-    snap.auto_switch
-        .rule_for(account.provider, &account.id)
-        .cloned()
-        .unwrap_or_else(|| AutoSwitchRule {
-            provider: account.provider,
-            from_account_id: account.id.clone(),
-            enabled: snap.auto_switch.enabled,
-            threshold_percent: snap.auto_switch.threshold_percent.clamp(50, 99),
-            metric: AutoSwitchMetric::Max,
-            target_account_id: None,
-        })
-}
-
-fn rule_item(
-    label: impl Into<gpui::SharedString>,
-    checked: bool,
-    rule: AutoSwitchRule,
-    weak: WeakEntity<Shell>,
-) -> PopupMenuItem {
-    PopupMenuItem::new(label)
-        .checked(checked)
-        .on_click(move |_, _, cx| {
-            weak.update(cx, |shell, cx| shell.upsert_account_rule(rule.clone(), cx))
-                .ok();
-        })
-}
-
-fn append_rule_menu(
-    mut menu: PopupMenu,
-    snap: &AccountsSnapshot,
-    account: &AccountInfo,
-    weak: WeakEntity<Shell>,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    let rule = account_rule(snap, account);
-    let mut toggle = rule.clone();
-    toggle.enabled = !toggle.enabled;
-    menu = menu.item(rule_item(
-        if rule.enabled {
-            provider_text::PROVIDER_RULE_ENABLED.get()
-        } else {
-            provider_text::PROVIDER_RULE_DISABLED.get()
-        },
-        rule.enabled,
-        toggle,
-        weak.clone(),
-    ));
-    let provider = account.provider;
-    let metric_rule = rule.clone();
-    let metric_weak = weak.clone();
-    menu = menu.submenu(
-        format!(
-            "{}: {}",
-            provider_text::PROVIDER_RULE_METRIC.get(),
-            rule.metric.label_for(provider)
-        ),
-        window,
-        cx,
-        move |mut menu, _, _| {
-            for &metric in AutoSwitchMetric::for_provider(provider) {
-                let mut next = metric_rule.clone();
-                next.metric = metric;
-                menu = menu.item(rule_item(
-                    metric.label_for(provider),
-                    metric_rule.metric == metric,
-                    next,
-                    metric_weak.clone(),
-                ));
-            }
-            menu
-        },
-    );
-    let threshold_rule = rule.clone();
-    let threshold_weak = weak.clone();
-    menu = menu.submenu(
-        format!(
-            "{}: {}%",
-            provider_text::PROVIDER_RULE_THRESHOLD.get(),
-            rule.threshold_percent
-        ),
-        window,
-        cx,
-        move |mut menu, _, _| {
-            for threshold in [60, 70, 80, 85, 90, 95] {
-                let mut next = threshold_rule.clone();
-                next.threshold_percent = threshold;
-                menu = menu.item(rule_item(
-                    format!("{threshold}%"),
-                    threshold_rule.threshold_percent == threshold,
-                    next,
-                    threshold_weak.clone(),
-                ));
-            }
-            menu
-        },
-    );
-    let targets: Vec<_> = snap
-        .accounts
-        .iter()
-        .filter(|a| a.provider == account.provider && a.id != account.id)
-        .cloned()
-        .collect();
-    let target_weak = weak.clone();
-    menu = menu.submenu(
-        provider_text::PROVIDER_RULE_TARGET.get(),
-        window,
-        cx,
-        move |mut menu, _, _| {
-            let mut automatic = rule.clone();
-            automatic.target_account_id = None;
-            menu = menu.item(rule_item(
-                provider_text::PROVIDER_TARGET_AUTO.get(),
-                rule.target_account_id.is_none(),
-                automatic,
-                target_weak.clone(),
-            ));
-            for target in &targets {
-                let mut next = rule.clone();
-                next.target_account_id = Some(target.id.clone());
-                menu = menu.item(rule_item(
-                    format!("→ {}", target.label),
-                    rule.target_account_id.as_deref() == Some(target.id.as_str()),
-                    next,
-                    target_weak.clone(),
-                ));
-            }
-            menu
-        },
-    );
-    if snap
-        .auto_switch
-        .rule_for(account.provider, &account.id)
-        .is_some()
-    {
-        let provider = account.provider;
-        let id = account.id.clone();
-        menu = menu.item(
-            PopupMenuItem::new(krill_app::i18n::catalog::settings::ACCOUNTS_RULE_CLEAR.get())
-                .on_click(move |_, _, cx| {
-                    weak.update(cx, |shell, cx| shell.remove_account_rule(provider, &id, cx))
-                        .ok();
-                }),
-        );
-    }
-    menu
 }
 
 /// 이름과 리셋 안내를 서로 다른 flex 항목으로 둬 좁은 창·UI 줌에서는 줄바꿈한다.
@@ -1194,10 +1044,6 @@ impl Shell {
         cx.notify();
     }
 
-    pub(crate) fn upsert_account_rule(&mut self, rule: AutoSwitchRule, cx: &mut Context<Self>) {
-        self.refresh_accounts(UsageRequest::UpsertAutoSwitchRule(rule), cx);
-    }
-
     /// AS-22: 오케스트레이션 질문 응답을 백그라운드에서 저장한다. `mutate`는 파일 잠금
     /// (`flock`) + 쓰기라 UI 스레드에서 하면 CLI가 잠금을 쥐고 있을 때 멈춘다.
     /// 실패하면 배너로 알려준다(조용히 승인된 줄 아는 경우 방지).
@@ -1274,21 +1120,6 @@ impl Shell {
             .ok();
         })
         .detach();
-    }
-
-    pub(crate) fn remove_account_rule(
-        &mut self,
-        provider: ProviderKind,
-        from_account_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.refresh_accounts(
-            UsageRequest::RemoveAutoSwitchRule {
-                provider,
-                from_account_id: from_account_id.to_owned(),
-            },
-            cx,
-        );
     }
 
     pub(super) fn render_status_bar(

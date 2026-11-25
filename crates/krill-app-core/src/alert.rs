@@ -146,7 +146,6 @@ struct AlertState {
     /// 메인 스레드는 요청 상태만 보관하고 OS 핸들은 전용 작업자가 소유한다.
     awake_requested: bool,
     awake: Option<AwakeWorker>,
-    account_switch_sequence: Option<u64>,
 }
 
 impl Global for AlertState {}
@@ -601,27 +600,3 @@ fn basename(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
-
-/// 자동 계정 전환은 진단 로그에만 남긴다. 사용자 조치가 필요하지 않아 알림을 보내지 않는다.
-/// 최초 스냅샷은 기준점으로 삼아 앱 재시작 때 과거 이력을 다시 기록하지 않는다.
-/// 정책 꼬리가 없는 스냅샷(로컬 폴백·구 데몬)은 이력을 모르는 것이라 기준점을 건드리지 않는다.
-pub fn sync_account_switches(advanced: &krill_proto::usage::AccountPolicyState, cx: &mut App) {
-    if !advanced.supported {
-        return;
-    }
-    let history = &advanced.history;
-    ensure_state(cx);
-    let latest = history.last().map_or(0, |r| r.sequence);
-    let previous = cx
-        .global_mut::<AlertState>()
-        .account_switch_sequence
-        .replace(latest);
-    let Some(previous) = previous else { return };
-    for record in history.iter().filter(|r| r.sequence > previous) {
-        tracing::debug!(
-            sequence = record.sequence,
-            provider = record.event.provider.display_name(),
-            "account switched automatically"
-        );
-    }
-}

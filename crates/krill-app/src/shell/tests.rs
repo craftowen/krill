@@ -5062,87 +5062,6 @@ fn status_bar_keeps_provider_controls_left_and_session_tools_right(cx: &mut Test
     }
 }
 
-#[gpui::test]
-fn status_account_rule_helpers_persist_all_fields_and_remove_rule(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind, UsageRequest};
-
-    let layout = state_path("status-account-rules");
-    let state = layout.parent().unwrap().to_path_buf();
-    let (view, cx) = open(cx, layout);
-    let mut rule = AutoSwitchRule {
-        provider: ProviderKind::Codex,
-        from_account_id: "codex-test-source".into(),
-        enabled: true,
-        threshold_percent: 85,
-        metric: AutoSwitchMetric::SevenDay,
-        target_account_id: Some("codex-test-backup".into()),
-    };
-    cx.update(|_, cx| {
-        krill_app::settings::init_at(Some(state.clone()), cx);
-    });
-    cx.run_until_parked();
-    cx.update(|_, cx| {
-        view.update(cx, |shell, cx| {
-            shell.link = Link::Down;
-            shell.paths = Some(krill_proto::daemon::Paths {
-                socket: state.join("run/krilld.sock"),
-                holder: PathBuf::from("/bin/echo"),
-                krilld: PathBuf::from("/bin/echo"),
-            });
-            shell.upsert_account_rule(rule.clone(), cx);
-        });
-    });
-    cx.run_until_parked();
-    assert_eq!(
-        view.read_with(cx, |shell, _| shell
-            .accounts_snapshot
-            .auto_switch
-            .rules
-            .clone()),
-        vec![rule.clone()]
-    );
-    let saved = krill_app::accounts::request_local(
-        &krill_app::accounts::default_home(),
-        Some(&state),
-        &UsageRequest::ListAccounts,
-    )
-    .unwrap();
-    assert_eq!(saved.auto_switch.rules, vec![rule.clone()]);
-
-    rule.threshold_percent = 70;
-    rule.metric = AutoSwitchMetric::FiveHour;
-    rule.target_account_id = None;
-    rule.enabled = false;
-    cx.update(|_, cx| view.update(cx, |shell, cx| shell.upsert_account_rule(rule.clone(), cx)));
-    cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_, cx| view.read(cx).accounts_snapshot.auto_switch.rules.clone()),
-        vec![rule.clone()]
-    );
-    let saved = krill_app::accounts::request_local(
-        &krill_app::accounts::default_home(),
-        Some(&state),
-        &UsageRequest::ListAccounts,
-    )
-    .unwrap();
-    assert_eq!(saved.auto_switch.rules, vec![rule]);
-
-    cx.update(|_, cx| {
-        view.update(cx, |shell, cx| {
-            shell.remove_account_rule(ProviderKind::Codex, "codex-test-source", cx);
-        });
-    });
-    cx.run_until_parked();
-    assert!(cx.update(|_, cx| view.read(cx).accounts_snapshot.auto_switch.rules.is_empty()));
-    let saved = krill_app::accounts::request_local(
-        &krill_app::accounts::default_home(),
-        Some(&state),
-        &UsageRequest::ListAccounts,
-    )
-    .unwrap();
-    assert!(saved.auto_switch.rules.is_empty());
-}
-
 /// 오케스트레이션 메뉴의 [Release]는 디스패치를 놓아 주는 데서 끝나지 않고 krilld에 `Close`를 보낸다.
 #[gpui::test]
 fn orchestration_release_button_closes_worker_session(cx: &mut TestAppContext) {
@@ -6671,7 +6590,8 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
+    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_none());
 
     let back = cx
         .debug_bounds("admin-modal-close")
@@ -6785,8 +6705,7 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
     cx: &mut TestAppContext,
 ) {
     use krill_proto::usage::{
-        AccountInfo, AccountsSnapshot, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule,
-        ProviderKind, Snapshot, Window,
+        AccountInfo, AccountsSnapshot, AutoSwitchPolicy, ProviderKind, Snapshot, Window,
     };
 
     let layout = state_path("provider-usage-menu");
@@ -6852,19 +6771,7 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
                         },
                     },
                 ],
-                auto_switch: AutoSwitchPolicy {
-                    enabled: true,
-                    threshold_percent: 90,
-                    rules: vec![AutoSwitchRule {
-                        provider: ProviderKind::Claude,
-                        from_account_id: "host_default".into(),
-                        enabled: true,
-                        threshold_percent: 85,
-                        metric: AutoSwitchMetric::FiveHour,
-                        target_account_id: Some("work".into()),
-                    }],
-                    ..Default::default()
-                },
+                auto_switch: AutoSwitchPolicy::default(),
                 switched: Vec::new(),
                 // OWE-703 1단계: 상태 꼬리는 데몬 스냅샷에만 있다(테스트 픽스처는 모름).
                 statuses: Vec::new(),
@@ -6930,7 +6837,8 @@ fn status_provider_usage_menu_renders_comparison_columns_and_opens_in_app_accoun
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
     assert!(cx.debug_bounds("admin-center").is_some());
-    assert!(cx.debug_bounds("admin-auto-switch-strip").is_some());
+    assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
+    assert!(cx.debug_bounds("admin-auto-switch-strip").is_none());
 }
 
 /// 상태바 Codex 팝업의 "사용량 초기화" 2단계 확인(무장 → 실행/취소).

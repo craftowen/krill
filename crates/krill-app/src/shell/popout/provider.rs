@@ -6,7 +6,7 @@ use krill_app::i18n::catalog::settings as account_text;
 use krill_proto::usage::{AccountStatus, Window as UsageWindow};
 
 mod options;
-use options::{advanced_notes, append_policy_menu};
+use options::advanced_notes;
 
 #[derive(Default, Clone)]
 struct ProviderPopupState {
@@ -977,13 +977,6 @@ fn render_details(
             ));
         }
     }
-    if let Some(rule) = snap.auto_switch.rule_for(account.provider, &account.id) {
-        profile = profile.child(format!(
-            "{} · {}",
-            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
-            krill_app::settings::rule_summary(rule, &snap.accounts)
-        ));
-    }
     profile = profile.children(
         advanced_notes(snap, account)
             .into_iter()
@@ -1831,23 +1824,8 @@ pub(super) fn provider_usage_menu(
         .disabled(true),
     );
 
-    let policy = snap.auto_switch.clone();
-    let toggle_weak = weak.clone();
-    menu = menu.separator().item(
-        PopupMenuItem::new(provider_text::PROVIDER_GLOBAL_AUTO_SWITCH.get())
-            .checked(policy.enabled)
-            .on_click(move |_, _, cx| {
-                let mut next = policy.clone();
-                next.enabled = !next.enabled;
-                toggle_weak
-                    .update(cx, |shell, cx| {
-                        shell.refresh_accounts(UsageRequest::SetAutoSwitch(next.clone()), cx);
-                    })
-                    .ok();
-            }),
-    );
     let show_in_bar = krill_app::settings::status_provider_visible(provider, cx);
-    menu = menu.item(
+    menu = menu.separator().item(
         PopupMenuItem::element(move |_, _| {
             div()
                 .id(gpui::SharedString::from(format!(
@@ -1862,32 +1840,30 @@ pub(super) fn provider_usage_menu(
             krill_app::settings::set_status_provider_visible(provider, !show_in_bar, cx);
         }),
     );
-    let options_snap = snap.clone();
-    let options_weak = weak.clone();
-    let armed = reset_armed.cloned();
-    menu = menu.submenu(
-        provider_text::PROVIDER_OPTIONS.get(),
-        window,
-        cx,
-        move |menu, window, cx| {
-            let menu = append_policy_menu(
-                menu,
-                &options_snap,
-                active.clone(),
-                &options_weak,
-                window,
-                cx,
-            );
-            append_reset_credit_rows(
-                menu,
-                &options_snap,
-                active.as_ref(),
-                provider,
-                armed.as_ref(),
-                &options_weak,
-            )
-        },
-    );
+    if matches!(provider, ProviderKind::Codex | ProviderKind::Claude)
+        && active
+            .as_ref()
+            .is_some_and(|a| !krill_app::accounts::orca_managed(a))
+    {
+        let options_snap = snap.clone();
+        let options_weak = weak.clone();
+        let armed = reset_armed.cloned();
+        menu = menu.submenu(
+            provider_text::PROVIDER_OPTIONS.get(),
+            window,
+            cx,
+            move |menu, _, _| {
+                append_reset_credit_rows(
+                    menu,
+                    &options_snap,
+                    active.as_ref(),
+                    provider,
+                    armed.as_ref(),
+                    &options_weak,
+                )
+            },
+        );
+    }
     let refresh_weak = weak.clone();
     menu = menu.item(
         PopupMenuItem::new(provider_text::PROVIDER_REFRESH_USAGE.get()).on_click(

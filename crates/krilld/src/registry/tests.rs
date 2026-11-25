@@ -4,109 +4,61 @@ use std::fs;
 
 use krill_proto::agent::Permission;
 
-thread_local! {
-    /// Stands in for the rate-limit account refresh, which can block on `security` indefinitely.
-    pub(super) static AUTO_SWITCH_PROBE: std::cell::Cell<Option<fn(&Registry)>> =
-        const { std::cell::Cell::new(None) };
-}
-
 #[test]
-fn hook_account_refresh_runs_without_blocking_other_daemon_work() {
-    fn other_work_proceeds(reg: &Registry) {
-        assert!(
-            reg.hook_commit.try_lock().is_ok(),
-            "account refresh held hook_commit, stalling Spawn, exits, and new connections"
-        );
-        let spool = reg.spool.as_ref().unwrap();
-        let next = HookEvent {
-            id: hook::EventId {
-                pid: 1,
-                unix_ns: 99,
-            },
-            agent: "claude".into(),
-            ppid: 0,
-            input: hook::Input::Complete,
-            payload: b"{}".to_vec(),
-        };
-        hook::append_spool(
-            spool,
-            &next.encode().unwrap(),
-            Instant::now() + Duration::from_millis(50),
-        )
-        .expect("account refresh held the spool lock, blocking `krill hook` appends");
-    }
+fn legacy_auto_switch_ipc_requests_are_safe_no_ops() {
+    use krill_proto::usage::{
+        AdvancedPolicy, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule, ProviderKind,
+        UsageReply, UsageRequest,
+    };
 
-    let dir = std::env::temp_dir().join(format!("hook-refresh-unlocked-{}", std::process::id()));
-    fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).unwrap();
-    let reg = Registry::new(None, Some(&dir));
-    let id = SessionId(77);
-    let root_pid = std::process::id();
-    let (master, _user) = UnixStream::pair().unwrap();
-    let session = Session::start(
-        id,
-        OwnedFd::from(master),
-        WinSize { cols: 80, rows: 24 },
-        Arc::clone(&reg.look),
-        None,
-    )
-    .unwrap();
-    {
-        let mut st = lock(&reg.state);
-        st.roots.insert(id, root_pid).unwrap();
-        st.sessions.insert(
-            id,
-            Entry {
-                session,
-                pid: root_pid,
-                cwd: dir.clone(),
-                wrapped: false,
-            },
-        );
-    }
-    let event = |unix_ns| HookEvent {
-        id: hook::EventId {
-            pid: root_pid,
-            unix_ns,
+    let root = std::env::temp_dir().join(format!("legacy-autoswitch-ipc-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("accounts.toml");
+    let raw = "[auto_switch]\nenabled = true\nthreshold_percent = 70\n";
+    fs::write(&path, raw).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let requests = [
+        UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
+            enabled: true,
+            threshold_percent: 50,
+            switch_on_rate_limit: true,
+            rules: Vec::new(),
+        }),
+        UsageRequest::UpsertAutoSwitchRule(AutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "claude-host".into(),
+            enabled: true,
+            threshold_percent: 60,
+            metric: AutoSwitchMetric::FiveHour,
+            target_account_id: None,
+        }),
+        UsageRequest::RemoveAutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "claude-host".into(),
         },
-        agent: "claude".into(),
-        ppid: root_pid,
-        input: hook::Input::Complete,
-        payload: br#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#.to_vec(),
-    };
-
-    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
-    let (mut client, server) = UnixStream::pair().unwrap();
-    let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
-    client.write_all(&hello.encode().unwrap()).unwrap();
-    client.write_all(&event(1).encode().unwrap()).unwrap();
-    let server_hello = ServerHello {
-        proto_min: ipc::PROTO_MIN,
-        proto_max: ipc::PROTO_MAX,
-        features: ipc::FEATURES,
-        build: "test".into(),
-        instance_id: 1,
-    };
-    reg.serve(server, &server_hello).unwrap();
-    assert!(
-        AUTO_SWITCH_PROBE.take().is_none(),
-        "socket hook skipped the refresh"
-    );
-
-    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
-    hook::append_spool(
-        reg.spool.as_ref().unwrap(),
-        &event(2).encode().unwrap(),
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
-    reg.drain_spool();
-    assert!(
-        AUTO_SWITCH_PROBE.take().is_none(),
-        "spooled hook skipped the refresh"
-    );
+        UsageRequest::SetAdvancedPolicy(AdvancedPolicy {
+            predict_exhaustion: true,
+            prefer_soonest_reset: true,
+            cooldown_secs: 600,
+        }),
+    ];
+    for req in requests {
+        let reply = reg.on_usage(&peer, Role::Interactive, req);
+        let UsageReply::Accounts(snapshot) = reply else {
+            panic!("expected accounts snapshot, got {reply:?}");
+        };
+        assert!(!snapshot.auto_switch.enabled);
+        assert!(snapshot.auto_switch.rules.is_empty());
+        assert!(snapshot.switched.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
     drop(reg);
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

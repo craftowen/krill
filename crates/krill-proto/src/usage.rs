@@ -1,6 +1,7 @@
-//! 사용량·레이트리밋 조회 및 프로바이더 다계정·자동전환 제어(MK-084·MK-107·MK-108, T1#32).
+//! 사용량·레이트리밋 조회 및 프로바이더 다계정 관리·수동 전환 제어(MK-084·MK-107·MK-108, T1#32).
 //! Hello에서 [`FEAT_USAGE`]를 협상한 뒤 전용 연결에서 요청 하나·응답 하나.
 //! 기본 창은 N-1 호환용 5시간·주간 요약이다. 선택 꼬리는 프로바이더가 보고한 모든 사용량 항목을 담는다.
+//! 과거 자동전환 관련 비트·요청 variant·응답 필드는 N-1 와이어 호환용으로만 유지한다.
 
 use serde::{Deserialize, Serialize};
 
@@ -732,8 +733,11 @@ pub enum UsageRequest {
         provider: ProviderKind,
         account_id: String,
     },
+    /// 구버전 호환용 opcode(프로필 자동전환 제거됨). 새 데몬은 값을 무시하고 현재 스냅샷을 반환한다.
     SetAutoSwitch(AutoSwitchPolicy),
+    /// 구버전 호환용 opcode(프로필 자동전환 제거됨). 새 데몬은 값을 무시하고 현재 스냅샷을 반환한다.
     UpsertAutoSwitchRule(AutoSwitchRule),
+    /// 구버전 호환용 opcode(프로필 자동전환 제거됨). 새 데몬은 값을 무시하고 현재 스냅샷을 반환한다.
     RemoveAutoSwitchRule {
         provider: ProviderKind,
         from_account_id: String,
@@ -757,7 +761,7 @@ pub enum UsageRequest {
     ListOrphanProfiles,
     /// 고아 프로필 폴더(세션이 쓰는 것 제외)를 휴지통으로 옮기고 남은 목록을 돌려준다. [`FEAT_USAGE_MANAGE`].
     PurgeOrphanProfiles,
-    /// OWE-712: 고급 정책만 변경한다. 기존 정책·규칙은 그대로 둔다.
+    /// 구버전 호환용 opcode(프로필 자동전환 제거됨). 새 데몬은 값을 무시하고 현재 스냅샷을 반환한다.
     SetAdvancedPolicy(AdvancedPolicy),
     /// 구버전 호환용 opcode. 새 데몬은 값을 무시하고 항상 사용량을 자동 수집한다.
     SetDirectUsage(bool),

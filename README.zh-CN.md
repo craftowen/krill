@@ -156,7 +156,7 @@
 **其他内置功能：**
 
 - **无界面 `krill` CLI 与远程 SSH 主机**：无需 GUI 即可操作所有会话、worktree 和编排运行（`krill ls`、`new`、`send`、`read`、`wait`、`attach`、`handoff`），也可以跨受支持的远程 Mac 主机操作（`krill --host user@host`）。
-- **账号切换与自动切换（`krill account`）**：切换 Agent 账号，或在达到用量速率限制时自动轮换账号。
+- **多账号管理与手动切换（`krill account`）**：查看多个 Agent 账号的用量，并手动切换当前使用的账号。
 - **定时 Agent 运行（`krill schedule`）**：按 UTC cron 计划运行周期性 Agent 任务（[定时任务文档](docs/SCHEDULING.md)）。
 - **45 款终端主题与一流的韩文输入法支持**：内置 15 款 Krill 主题（包括 **Krill Deep**）和 30 款兼容 Orca 的内置主题（并支持导入 Ghostty/Warp 主题），以及专门的韩文输入法组字状态机。
 - **快速打开与工作区上下文**：跨 worktree、会话、文件、检测到的本地服务器端口（`krill ports`）和已附加的参考 URL（`krill reference`）进行搜索。

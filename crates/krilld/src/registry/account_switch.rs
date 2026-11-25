@@ -1370,7 +1370,7 @@ impl Registry {
             lock(&self.account_handoffs).prune_dead(|id| ended.contains(&id));
         }
         let state_dir = self.state_dir();
-        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
+        let snapshot = accounts::refresh_accounts(home, state_dir.as_deref());
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
@@ -1679,7 +1679,7 @@ impl Registry {
             stored.permission = krill_proto::agent::Permission::Yolo;
         }
         let state_dir = self.state_dir();
-        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
+        let snapshot = accounts::refresh_accounts(home, state_dir.as_deref());
         let target = snapshot
             .accounts
             .iter()
@@ -1689,8 +1689,8 @@ impl Registry {
         let login_deadline = Instant::now() + Duration::from_secs(6);
         while connection == ConnectionStatus::Checking && Instant::now() < login_deadline {
             std::thread::sleep(Duration::from_millis(50));
-            connection = accounts::refresh_accounts_with(home, state_dir.as_deref(), false)
-                .connection_for(account_id);
+            connection =
+                accounts::refresh_accounts(home, state_dir.as_deref()).connection_for(account_id);
         }
         if snapshot.connections.supported
             && matches!(
@@ -2310,7 +2310,7 @@ impl Registry {
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         self.transfer_account_selection(old, new, provider, account_id, || {
-            accounts::refresh_accounts_with(home, state_dir.as_deref(), false)
+            accounts::refresh_accounts(home, state_dir.as_deref())
         })
         .ok();
         Ok(new)

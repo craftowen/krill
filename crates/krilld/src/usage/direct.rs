@@ -2829,7 +2829,7 @@ mod tests {
             Failure::Internal,
         ] {
             mark_failed(&mut lock(&CACHE), &key, Some(123), reason);
-            let snap = accounts::refresh_accounts_with(&home, Some(&state), false);
+            let snap = accounts::refresh_accounts(&home, Some(&state));
             let status = snap.status_for("claude-host").unwrap();
             assert_eq!(status.status, krill_proto::usage::AccountStatus::Error);
             assert_eq!(status.detail.as_deref(), Some(reason.detail().as_str()));

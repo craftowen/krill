@@ -760,53 +760,6 @@ fn notification_sound_gates_beep_count(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn account_switch_history_stays_silent_and_tracks_latest_sequence(cx: &mut TestAppContext) {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = temp_dir("account-switch");
-    init_settings(cx, &dir);
-    let record = |sequence| krill_proto::usage::SwitchRecord {
-        sequence,
-        at: 1000,
-        event: krill_proto::usage::AutoSwitchEvent {
-            provider: krill_proto::usage::ProviderKind::Claude,
-            from_id: "a".into(),
-            from_label: "Personal".into(),
-            to_id: "b".into(),
-            to_label: "Work".into(),
-            reason_percent: 90,
-        },
-        predicted: false,
-    };
-    let state =
-        |records: Vec<krill_proto::usage::SwitchRecord>| krill_proto::usage::AccountPolicyState {
-            supported: true,
-            history: records,
-            ..Default::default()
-        };
-    cx.update(|cx| sync_account_switches(&state(vec![record(1)]), cx));
-    assert!(cx.delivered_system_notifications().is_empty());
-    cx.update(|cx| {
-        // 데몬이 잠깐 안 받아 로컬 폴백(정책 꼬리 미지원, 빈 이력)이 와도 기준점을 0으로 되돌리지 않는다.
-        sync_account_switches(&krill_proto::usage::AccountPolicyState::default(), cx);
-        sync_account_switches(&state(vec![record(1), record(2)]), cx);
-        sync_account_switches(&state(vec![record(1), record(2)]), cx);
-    });
-    assert!(cx.delivered_system_notifications().is_empty());
-    cx.read(|cx| assert_eq!(cx.global::<AlertState>().account_switch_sequence, Some(2)));
-    fs::write(dir.join("settings.toml"), "notifications = false\n").unwrap();
-    cx.update(settings::reload);
-    cx.run_until_parked();
-    cx.update(|cx| {
-        sync_account_switches(&state(vec![record(2), record(3)]), cx);
-    });
-    assert!(cx.delivered_system_notifications().is_empty());
-    cx.read(|cx| assert_eq!(cx.global::<AlertState>().account_switch_sequence, Some(3)));
-    fs::remove_dir_all(dir).ok();
-}
-
-#[gpui::test]
 fn muted_sessions_worktrees_and_orchestration_workers_suppress_notifications(
     cx: &mut TestAppContext,
 ) {

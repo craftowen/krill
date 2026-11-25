@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn agy_profiles_refresh_native_emails_after_login_without_cross_profile_fallback() {
         use super::super::{
-            AccountsFile, RefreshTrigger, StoredAccount, refresh_accounts_authenticated, save_file,
+            AccountsFile, StoredAccount, refresh_accounts_authenticated, save_file,
         };
         let root = std::env::temp_dir().join(format!("agy-native-identity-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
@@ -294,12 +294,7 @@ mod tests {
         FAKE_EXE.with(|e| *e.borrow_mut() = Some(root.join("unused-cli")));
         let emails = || {
             let auth = statuses(&home, Some(&state));
-            let snapshot = refresh_accounts_authenticated(
-                &home,
-                Some(&state),
-                RefreshTrigger::ReadOnly,
-                &auth,
-            );
+            let snapshot = refresh_accounts_authenticated(&home, Some(&state), &auth);
             snapshot
                 .accounts
                 .into_iter()
