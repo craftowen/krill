@@ -20,6 +20,11 @@ pub const FEAT_ACCOUNT_INPUT_RECOVERY: u64 = 1 << 39;
 pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 /// Switch the default only, inspect running sessions, and hand off a chosen subset.
 pub const FEAT_ACCOUNT_SWITCH_CONTROL: u64 = 1 << 43;
+mod antigravity;
+pub use antigravity::{
+    AntigravityAccountOp, AntigravityAccountState, AntigravityAccountSummary,
+    AntigravityCurrentAccount, AntigravityStoredUsage,
+};
 mod switch_plan;
 pub use switch_plan::{
     CantMoveReason, SessionSwitchCandidate, SessionSwitchGroup, SessionSwitchPlan,
@@ -823,6 +828,9 @@ pub enum UsageRequest {
         sessions: Vec<crate::SessionId>,
         interrupt_busy: bool,
     },
+    /// Native Antigravity (`agy`) encrypted account vault operations (Orca `accounts.antigravity*`).
+    /// Never returns credentials over IPC.
+    AntigravityAccounts(AntigravityAccountOp),
 }
 
 impl UsageRequest {
@@ -860,6 +868,7 @@ impl UsageRequest {
                 | Self::ListOrphanProfiles
                 | Self::GetProvisioning
                 | Self::ImportOrcaAntigravity { dry_run: true, .. }
+                | Self::AntigravityAccounts(AntigravityAccountOp::List)
         )
     }
 
@@ -897,6 +906,10 @@ impl UsageRequest {
             }
             Self::ImportOrcaAntigravity { .. } => {
                 features |= FEAT_PROVIDER_DETAILS;
+                Some(ProviderKind::Antigravity)
+            }
+            Self::AntigravityAccounts(_) => {
+                features |= FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL;
                 Some(ProviderKind::Antigravity)
             }
             Self::SetDirectUsage(_) => {
@@ -1085,6 +1098,8 @@ pub enum UsageReply {
     },
     /// [`UsageRequest::InspectSessionSwitches`] 응답. [`FEAT_ACCOUNT_SWITCH_CONTROL`].
     SessionSwitchPlan(SessionSwitchPlan),
+    /// [`UsageRequest::AntigravityAccounts`] 응답. 오류 시 Orca와 동일한 실행 안내 문자열을 돌려준다.
+    AntigravityAccounts(Result<AntigravityAccountState, String>),
 }
 
 /// 등록되지 않은 Krill 관리 프로필 폴더(OWE-704). 이전 버전의 "제거"가 남긴 폴더 등.
@@ -1098,8 +1113,15 @@ impl UsageReply {
     /// Hide extensions that the peer cannot decode; retain the N-1 response prefix.
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
-        if features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 && matches!(self, Self::SessionSwitchPlan(_))
+        if features & FEAT_ACCOUNT_SWITCH_CONTROL == 0
+            && matches!(
+                self,
+                Self::SessionSwitchPlan(_) | Self::AntigravityAccounts(_)
+            )
         {
+            return Self::Failed(crate::control::Failure::BadRequest);
+        }
+        if features & FEAT_USAGE_AGY == 0 && matches!(self, Self::AntigravityAccounts(_)) {
             return Self::Failed(crate::control::Failure::BadRequest);
         }
         if features & FEAT_USAGE_RESET == 0

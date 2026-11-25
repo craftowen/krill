@@ -188,6 +188,10 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     env.push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
                 }
                 ProviderKind::Antigravity => {
+                    env.retain(|(key, _)| {
+                        !key.eq_ignore_ascii_case(b"SSH_CONNECTION")
+                            && !key.eq_ignore_ascii_case(b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE")
+                    });
                     env.push((b"SSH_CONNECTION".to_vec(), b"krill".to_vec()));
                     env.push((b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE".to_vec(), b"1".to_vec()));
                 }

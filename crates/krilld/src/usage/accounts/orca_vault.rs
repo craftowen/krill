@@ -81,6 +81,9 @@ fn apply(
         }
         return Ok(preview);
     }
+    let now_ms = super::agy_native::service::default_now_ms();
+    let mut vault_snapshots = Vec::new();
+    let mut vault_selected = None;
     {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state)?;
@@ -103,6 +106,24 @@ fn apply(
                 &native.join("antigravity-oauth-token"),
                 account.credentials.as_bytes(),
             )?;
+            if let Ok(parsed) =
+                super::agy_native::codec::parse_antigravity_native_credential(&account.credentials)
+            {
+                vault_snapshots.push(super::agy_native::StoredAntigravityAccount {
+                    id: id.clone(),
+                    email: account
+                        .email
+                        .clone()
+                        .or_else(|| parsed.identity.as_ref().and_then(|i| i.email.clone()))
+                        .or(parsed.email_hint),
+                    subject: parsed.identity.map(|i| i.subject),
+                    auth_method: parsed.auth_method,
+                    created_at: now_ms,
+                    updated_at: now_ms,
+                    credentials: parsed.contents,
+                    usage: None,
+                });
+            }
             let label = account
                 .email
                 .clone()
@@ -120,10 +141,21 @@ fn apply(
                 });
             }
             if selected == Some(&account.id) {
-                file.active.insert("agy".into(), id);
+                file.active.insert("agy".into(), id.clone());
+                vault_selected = Some(id);
             }
         }
         save_inner(home, state, &file)?;
+    }
+    if !vault_snapshots.is_empty() {
+        let svc = super::agy_native::AntigravityAccountService::for_host(home, state);
+        if svc
+            .import_snapshots(vault_snapshots, vault_selected.as_deref())
+            .is_ok()
+            && let Some(sel) = vault_selected.as_deref()
+        {
+            drop(svc.select_account(sel));
+        }
     }
     super::agy_native::sync_active_from_disk(home, state);
     Ok(refresh_accounts(home, state))

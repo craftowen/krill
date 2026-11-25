@@ -4,10 +4,9 @@ use super::{
     no_current_model, observe_live_model, set, valid_effort, valid_id,
 };
 use crate::session::lock;
-use crate::usage::{accounts, direct};
+use crate::usage::direct;
 use krill_proto::bots::{BotAgentModel, BotAgentModels};
 use krill_proto::screen::{Color, Flags, Screen};
-use krill_proto::usage::ProviderKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -309,10 +308,9 @@ fn fetch_gated(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, FetchE
         .or_else(|| krill_proto::agent::which("agy", home.join(".local/bin").as_os_str()))
         .ok_or(FetchError::Failed(NOT_INSTALLED))?;
     let gate = direct::agy::enter_listing().map_err(|_| FetchError::Stopped)?;
-    let file_token = accounts::host_default_dir(home, ProviderKind::Antigravity)
-        .join("antigravity-oauth-token")
-        .is_file();
-    let ssh = config.is_some() || file_token;
+    // Native host `agy models` uses the host credential store directly (Orca parity);
+    // only explicit isolated `--gemini_dir` configs enable forced file storage.
+    let ssh = config.is_some();
     match verify_exe_status(&exe, ssh, gate.cancel_flag())? {
         VerifiedExe::Ok => {}
         VerifiedExe::TooOld(_) => return Err(FetchError::Failed(UNVERIFIED)),

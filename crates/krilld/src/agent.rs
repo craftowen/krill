@@ -306,6 +306,11 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         if dir.is_empty() {
             continue;
         }
+        if provider == ProviderKind::Antigravity
+            && Path::new(dir) == accounts::host_default_dir(&home, provider)
+        {
+            continue;
+        }
         if let Some(host_home) = trust_home_for_runtime() {
             match provider {
                 ProviderKind::Antigravity => {
@@ -475,6 +480,27 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
         .transpose()?;
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, selected.as_ref());
+    if (is(profile, "agy") || is(profile, "antigravity"))
+        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+        && let Some(host_home) = trust_home_for_runtime()
+    {
+        let launch_env: std::collections::BTreeMap<String, String> = login
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        crate::usage::accounts::agy_native::prepare_antigravity_account_for_launch(
+            &host_home,
+            state,
+            &launch_env,
+        )
+        .map_err(io::Error::other)?;
+    }
     if bot_mcp.is_some() {
         merge_loopback_no_proxy(&mut login.env);
     }
@@ -757,7 +783,25 @@ fn selected_account(
         .and_then(ProviderKind::parse)
         .ok_or(io::ErrorKind::InvalidInput)?;
     let home = accounts::default_home();
+    if provider == ProviderKind::Antigravity
+        && crate::usage::accounts::agy_native::vault_has_account(&home, state, id)
+    {
+        crate::usage::accounts::agy_native::handle_op(
+            &home,
+            state,
+            &krill_proto::usage::AntigravityAccountOp::Select {
+                account_id: id.to_owned(),
+            },
+        )
+        .map_err(io::Error::other)?;
+        return Ok(LaunchAccount {
+            id: id.to_owned(),
+            env_key: provider.env_var().into(),
+            dir: String::new(),
+        });
+    }
     let snap = accounts::refresh_accounts(&home, state);
+    let host_agy = accounts::host_default_dir(&home, ProviderKind::Antigravity);
     let a = snap
         .accounts
         .iter()
@@ -766,10 +810,12 @@ fn selected_account(
             a.host_default || (!a.profile_dir.is_empty() && Path::new(&a.profile_dir).is_dir())
         })
         .ok_or(io::ErrorKind::NotFound)?;
+    let use_host_native = a.host_default
+        || (provider == ProviderKind::Antigravity && Path::new(&a.profile_dir) == host_agy);
     Ok(LaunchAccount {
         id: a.id.clone(),
         env_key: provider.env_var().into(),
-        dir: if a.host_default {
+        dir: if use_host_native {
             String::new()
         } else {
             a.profile_dir.clone()
@@ -1256,9 +1302,30 @@ fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> 
 
 fn active_account_in(home: &Path, state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
     let provider = ProviderKind::parse(program)?;
-    let (id, dir) = match accounts::active_account_info(home, state, program) {
-        Some((_, active)) => (active.id, active.profile_dir),
-        None => (accounts::host_default_id(provider), String::new()),
+    let (id, dir) = if provider == ProviderKind::Antigravity {
+        if let Some(agy_state) =
+            crate::usage::accounts::agy_native::list_state_for_snapshot(home, state)
+            && let Some(active_id) = agy_state.active_account_id
+        {
+            (active_id, String::new())
+        } else if let Some((_, active)) = accounts::active_account_info(home, state, program) {
+            let host_agy = accounts::host_default_dir(home, ProviderKind::Antigravity);
+            let dir = if Path::new(&active.profile_dir) == host_agy
+                || crate::usage::accounts::agy_native::vault_has_account(home, state, &active.id)
+            {
+                String::new()
+            } else {
+                active.profile_dir
+            };
+            (active.id, dir)
+        } else {
+            (accounts::host_default_id(provider), String::new())
+        }
+    } else {
+        match accounts::active_account_info(home, state, program) {
+            Some((_, active)) => (active.id, active.profile_dir),
+            None => (accounts::host_default_id(provider), String::new()),
+        }
     };
     Some(LaunchAccount {
         id,

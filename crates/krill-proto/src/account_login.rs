@@ -39,6 +39,8 @@ pub fn login_command(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> 
     command.args(args);
     if provider == ProviderKind::Antigravity {
         if let Some(dir) = dir {
+            // agy 1.5.16+ ignores SSH_CONNECTION when macOS Keychain is unlocked;
+            // AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 forces file-based storage into --gemini_dir.
             command.env("SSH_CONNECTION", "krill");
             command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
             let mut arg = std::ffi::OsString::from("--gemini_dir=");

@@ -1603,3 +1603,81 @@ fn session_switch_plan_roundtrips_and_downgrades_for_old_peers() {
         reply
     );
 }
+
+#[test]
+fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
+    let req = UsageRequest::AntigravityAccounts(AntigravityAccountOp::Select {
+        account_id: "acct-1".into(),
+    });
+    let frame = req.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body[0], 25, "appended after SwitchSelectedSessions");
+    assert_eq!(UsageRequest::decode(kind, &body).unwrap(), req);
+    assert!(!req.is_read());
+    assert!(UsageRequest::AntigravityAccounts(AntigravityAccountOp::List).is_read());
+    assert_eq!(
+        req.required_features(),
+        FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL
+    );
+
+    let state = AntigravityAccountState {
+        accounts: vec![AntigravityAccountSummary {
+            id: "acct-1".into(),
+            email: Some("owner@example.test".into()),
+            subject: Some("sub-1".into()),
+            auth_method: "consumer".into(),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_100_000,
+            usage: Some(AntigravityStoredUsage {
+                usage: Snapshot {
+                    five_hour: Some(Window {
+                        percent: 25,
+                        resets_at: Some("2026-11-25T00:00:00Z".into()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 10,
+                        resets_at: None,
+                    }),
+                },
+                meters: vec![],
+                updated_at: 1_700_000_100,
+            }),
+        }],
+        active_account_id: Some("acct-1".into()),
+        current_account: Some(AntigravityCurrentAccount {
+            email: Some("owner@example.test".into()),
+            subject: Some("sub-1".into()),
+            auth_method: "consumer".into(),
+            identity_known: true,
+        }),
+        selected_account_id: Some("acct-1".into()),
+    };
+    assert!(!state.native_account_changed());
+    let mut changed = state.clone();
+    changed.active_account_id = None;
+    assert!(changed.native_account_changed());
+
+    let reply = UsageReply::AntigravityAccounts(Ok(state));
+    let frame = reply.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body[0], 7, "appended after SessionSwitchPlan");
+    assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reply.clone().for_features(
+            FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL
+        ),
+        reply
+    );
+}

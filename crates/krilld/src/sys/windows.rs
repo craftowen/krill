@@ -32,7 +32,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 #[cfg(not(test))]
 use windows_sys::Win32::Security::Credentials::{
-    CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW, CredWriteW,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -619,12 +619,27 @@ pub(crate) fn hostname() -> io::Result<String> {
 /// 읽기만 하고, 없거나 읽을 수 없으면 `None`이다. 복사 뒤 원본 버퍼를 0으로 지우고 푼다.
 #[cfg(not(test))]
 pub(crate) fn generic_credential(target: &str) -> Option<Zeroizing<Vec<u8>>> {
+    generic_credential_result(target).ok().flatten()
+}
+
+/// 자격 증명 관리자의 일반 자격 증명 blob을 읽는다. 항목 없음(`ERROR_NOT_FOUND = 1168`)은
+/// `Ok(None)`, 그 외 Win32 오류는 `Err`로 구분한다(Orca `native-windows-credentials.ts`).
+#[cfg(not(test))]
+pub(crate) fn generic_credential_result(target: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    const ERROR_NOT_FOUND_CODE: i32 = 1168;
     let name: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
     let mut credential: *mut CREDENTIALW = ptr::null_mut();
     // SAFETY: name은 NUL로 끝나는 살아 있는 버퍼이고 credential은 쓰기 위치다. 성공하면 아래에서 CredFree로 푼다.
     let ok = unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut credential) };
-    if ok == 0 || credential.is_null() {
-        return None;
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_NOT_FOUND_CODE) {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    if credential.is_null() {
+        return Ok(None);
     }
     // SAFETY: CredReadW가 성공했으므로 credential은 CredFree 전까지 유효한 CREDENTIALW다.
     let cred = unsafe { &*credential };
@@ -639,7 +654,49 @@ pub(crate) fn generic_credential(target: &str) -> Option<Zeroizing<Vec<u8>>> {
     });
     // SAFETY: CredReadW가 할당한 버퍼를 정확히 한 번 푼다.
     unsafe { CredFree(credential.cast()) };
-    bytes
+    Ok(bytes)
+}
+
+/// 자격 증명 관리자의 일반 자격 증명 blob을 덮어쓴다(Orca `native-windows-credentials.ts`).
+/// Windows CREDENTIALW blob 상한은 2560바이트다.
+#[cfg(not(test))]
+pub(crate) fn write_generic_credential(
+    target: &str,
+    user_name: &str,
+    secret: &[u8],
+) -> io::Result<()> {
+    const MAX_WINDOWS_CREDENTIAL_BYTES: usize = 2560;
+    if secret.len() > MAX_WINDOWS_CREDENTIAL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Antigravity credentials exceed the Windows credential size limit.",
+        ));
+    }
+    let mut target_w: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+    let mut user_w: Vec<u16> = user_name.encode_utf16().chain(Some(0)).collect();
+    let mut blob = Zeroizing::new(secret.to_vec());
+    let size = u32::try_from(blob.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "credential too large"))?;
+    let mut cred = CREDENTIALW {
+        Flags: 0,
+        Type: CRED_TYPE_GENERIC,
+        TargetName: target_w.as_mut_ptr(),
+        Comment: ptr::null_mut(),
+        LastWritten: FILETIME::default(),
+        CredentialBlobSize: size,
+        CredentialBlob: blob.as_mut_ptr(),
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        AttributeCount: 0,
+        Attributes: ptr::null_mut(),
+        TargetAlias: ptr::null_mut(),
+        UserName: user_w.as_mut_ptr(),
+    };
+    // SAFETY: target_w, user_w, blob은 CredWriteW 호출이 끝날 때까지 살아 있는 유효한 버퍼다.
+    let ok = unsafe { CredWriteW(&raw mut cred, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// DPAPI로 봉인한다(현재 사용자 범위, UI 없음). 같은 사용자 로그온에서만 풀 수 있다.
