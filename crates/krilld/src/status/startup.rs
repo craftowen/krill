@@ -7,7 +7,7 @@ use std::time::Duration;
 
 /// Startup files get this long before a launch that still has no agent counts as stuck.
 #[cfg(unix)]
-pub(crate) const STARTUP_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const STARTUP_GRACE: Duration = Duration::from_secs(20);
 #[cfg(unix)]
 const MAX_SHOWN: usize = 120;
 
@@ -24,13 +24,24 @@ fn stall_after(root: u32, grace: Duration) -> Option<String> {
     if !crate::registry::is_wrapper_argv(&argv) || crate::sys::process_age(root).ok()? < grace {
         return None;
     }
-    let children: Vec<_> = crate::sys::child_pids(root)
-        .ok()?
-        .into_iter()
-        .filter_map(|pid| crate::sys::process_args(pid).ok())
-        .filter(|args| !args.is_empty())
-        .collect();
-    stall(&argv, &children)
+    let child_pids = crate::sys::child_pids(root).ok()?;
+    let mut children: Vec<(Vec<String>, Duration)> = Vec::new();
+    for pid in &child_pids {
+        let Ok(args) = crate::sys::process_args(*pid) else {
+            continue;
+        };
+        if args.is_empty() {
+            continue;
+        }
+        let age = crate::sys::process_age(*pid).unwrap_or(Duration::ZERO);
+        children.push((args, age));
+    }
+    // If children exist but none could be inspected (e.g., mid-execve transition),
+    // do not falsely blame the root shell.
+    if !child_pids.is_empty() && children.is_empty() {
+        return None;
+    }
+    stall_with_ages(&argv, &children, grace)
 }
 
 #[cfg(not(unix))]
@@ -41,17 +52,38 @@ pub(crate) fn startup_stall(_root: u32) -> Option<String> {
 /// `root_argv` is a wrapper argv (`agent` starts at index 7). `children` are the
 /// root's direct children. The agent counts as started once a child runs its command:
 /// the forked `( exec "$@" )` subshell, the exec'd agent, or a shebang interpreter.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn stall(root_argv: &[String], children: &[Vec<String>]) -> Option<String> {
+    let aged: Vec<(Vec<String>, Duration)> = children
+        .iter()
+        .cloned()
+        .map(|args| (args, STARTUP_GRACE))
+        .collect();
+    stall_with_ages(root_argv, &aged, STARTUP_GRACE)
+}
+
+/// Like [`stall`], but requires a blamed child command itself to have been running for at least
+/// `grace`. When the shell is actively stepping through startup commands (all children younger than
+/// `grace`), do not report a false stall on whichever command happens to be running at that moment.
+#[cfg(unix)]
+fn stall_with_ages(
+    root_argv: &[String],
+    children: &[(Vec<String>, Duration)],
+    grace: Duration,
+) -> Option<String> {
     let command = root_argv.get(7..).filter(|c| !c.is_empty())?;
-    if children.iter().any(|child| launched(child, command)) {
+    if children.iter().any(|(child, _)| launched(child, command)) {
         return None;
     }
-    Some(match children.first() {
-        Some(child) => describe(child),
-        None => base(root_argv.first()?).trim_start_matches('-').to_owned(),
-    })
-    .filter(|shown| !shown.is_empty())
+    if children.is_empty() {
+        return Some(base(root_argv.first()?).trim_start_matches('-').to_owned())
+            .filter(|shown| !shown.is_empty());
+    }
+    let stuck = children
+        .iter()
+        .filter(|(_, age)| *age >= grace)
+        .max_by_key(|(_, age)| *age)?;
+    Some(describe(&stuck.0)).filter(|shown| !shown.is_empty())
 }
 
 #[cfg(unix)]
@@ -219,5 +251,64 @@ mod tests {
         let shown = stall(&root(), &[long]).unwrap();
         assert_eq!(shown.chars().count(), MAX_SHOWN + 1);
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn progressing_child_younger_than_grace_is_not_reported_as_stuck() {
+        let brew = argv(&[
+            "/bin/bash",
+            "-pu",
+            "/opt/homebrew/bin/brew",
+            "shellenv",
+            "zsh",
+        ]);
+        // Root may have reached grace while stepping through rc commands,
+        // but a fresh child that just started is still making progress.
+        assert_eq!(
+            stall_with_ages(
+                &root(),
+                &[(brew.clone(), Duration::from_secs(3))],
+                STARTUP_GRACE
+            ),
+            None
+        );
+        // Once the same child itself sits for the full grace window, report it.
+        assert_eq!(
+            stall_with_ages(&root(), &[(brew, STARTUP_GRACE)], STARTUP_GRACE).as_deref(),
+            Some("brew shellenv zsh")
+        );
+    }
+
+    #[test]
+    fn fast_shell_wrapper_argv_matches_wrapper_and_agent_detection() {
+        let fast_zsh = argv(&[
+            "/bin/zsh",
+            "-f",
+            "+i",
+            "-c",
+            "PREFLIGHT",
+            crate::agent::WRAPPER_ARG0,
+            "hint",
+            "agy",
+            "--dangerously-skip-permissions",
+        ]);
+        let fast_bash = argv(&[
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "PREFLIGHT",
+            crate::agent::WRAPPER_ARG0,
+            "hint",
+            "agy",
+            "--dangerously-skip-permissions",
+        ]);
+        for wrapper in [&fast_zsh, &fast_bash] {
+            assert!(crate::registry::is_wrapper_argv(wrapper));
+            assert_eq!(
+                stall(wrapper, &[argv(&["agy", "--dangerously-skip-permissions"])]),
+                None
+            );
+        }
     }
 }

@@ -250,6 +250,14 @@ fn connect_bot_stream(target: &HostTarget) -> io::Result<(UnixStream, u64)> {
     Ok((conn.stream, epoch))
 }
 
+fn map_socket_io_error(err: io::Error) -> io::Error {
+    if err.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(io::ErrorKind::TimedOut, "bot RPC timed out")
+    } else {
+        err
+    }
+}
+
 /// Sends one or more `BotRpcRequest` frames on an open control stream.
 /// When every frame fits inside [`MAX_PIPELINE_WRITE_BYTES`], writes all frames in a single
 /// `write_all` so remote hosts pay only one network RTT instead of N sequential RTTs.
@@ -275,9 +283,11 @@ fn exchange_batch_on_stream(
         for frame in &encoded {
             combined.extend_from_slice(frame);
         }
-        sock.write_all(&combined)?;
+        sock.write_all(&combined).map_err(map_socket_io_error)?;
         for _ in 0..encoded.len() {
-            let (kind, body) = ipc::read_frame(sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            let (kind, body) = ipc::read_frame(sock)
+                .map_err(map_socket_io_error)?
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
             match Reply::decode(kind, &body)? {
                 Reply::Bot(resp) => replies.push(Ok(resp)),
                 Reply::Failed(failure) => replies.push(Err(failure.to_string())),
@@ -286,8 +296,10 @@ fn exchange_batch_on_stream(
         }
     } else {
         for frame in &encoded {
-            sock.write_all(frame)?;
-            let (kind, body) = ipc::read_frame(sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            sock.write_all(frame).map_err(map_socket_io_error)?;
+            let (kind, body) = ipc::read_frame(sock)
+                .map_err(map_socket_io_error)?
+                .ok_or(io::ErrorKind::UnexpectedEof)?;
             match Reply::decode(kind, &body)? {
                 Reply::Bot(resp) => replies.push(Ok(resp)),
                 Reply::Failed(failure) => replies.push(Err(failure.to_string())),
@@ -1452,5 +1464,15 @@ mod tests {
             "legacy ListGroups fallback must reuse the same pooled connection"
         );
         invalidate_host_connections(&legacy_host);
+    }
+
+    #[test]
+    fn would_block_socket_error_maps_to_timed_out() {
+        let mapped = map_socket_io_error(io::Error::from(io::ErrorKind::WouldBlock));
+        assert_eq!(mapped.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(mapped.to_string(), "bot RPC timed out");
+
+        let eof = map_socket_io_error(io::Error::from(io::ErrorKind::UnexpectedEof));
+        assert_eq!(eof.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

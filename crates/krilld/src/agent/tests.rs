@@ -2727,3 +2727,105 @@ fn launch_selected_in_with_bot_mcp_cleans_up_claude_files_on_intermediate_failur
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn fast_shell_launch_skips_startup_rc_files_and_keeps_wrapper_contract() {
+    let dir = std::env::temp_dir().join(format!("krill-fast-shell-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Simulate a broken/hanging .zprofile that would stall `-l -i -c` forever.
+    std::fs::write(home.join(".zprofile"), "sleep 60\n").unwrap();
+    let fake_agy = bin.join("agy");
+    std::fs::write(
+        &fake_agy,
+        "#!/bin/sh\nprintf 'AGY_OK ZDOT=%s HERDR=%s TOKEN=%s\\n' \"${ZDOTDIR-unset}\" \"${HERDR_ENV-unset}\" \"${USER_EXPORT-unset}\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let u = User {
+        name: b"owen".to_vec(),
+        home: home.as_os_str().as_bytes().to_vec(),
+        shell: b"/bin/zsh".to_vec(),
+    };
+    let mut login = Shell::Login.launch_with_lang(Some(&u), polluted(), None);
+    login.env.push(kv("MK_PANE_ID", "42"));
+    login.env.push(kv("ZDOTDIR", "/tmp/krill-managed-zdot"));
+    login.env.push(kv("KRILL_ORIG_ZDOTDIR", ""));
+    let agy_profile = profile(&["agy"]);
+
+    // 1. Probed login env succeeds -> uses `zsh -f +i -c` and merges user exports.
+    let probed = vec![
+        kv("PATH", &format!("{}:/usr/bin:/bin", bin.display())),
+        kv("USER_EXPORT", "from-profile"),
+    ];
+    let fast = wrap_account_with_probed_env(
+        &agy_profile,
+        Permission::Manual,
+        login.clone(),
+        None,
+        ProbedLoginEnv::Ready(probed),
+    );
+    let argv: Vec<_> = fast
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect();
+    assert_eq!(argv[..4], ["/bin/zsh", "-f", "+i", "-c"]);
+    assert_eq!(argv[5], WRAPPER_ARG0);
+    assert_eq!(argv[7..], ["agy"]);
+    assert!(crate::registry::is_wrapper_argv(&fast.argv));
+
+    // Actually run the fast-path launch with SHELL=/usr/bin/true (so post-agent exec exits immediately)
+    // and verify it completes without executing the hanging `sleep 60` in .zprofile!
+    let mut exec_env = fast.env.clone();
+    exec_env.retain(|(k, _)| k.as_slice() != b"SHELL");
+    exec_env.push(kv("SHELL", "/usr/bin/true"));
+    let (prog, args) = fast.argv.split_first().unwrap();
+    let started = Instant::now();
+    let out = Command::new(OsStr::from_bytes(prog))
+        .args(args.iter().map(|a| OsStr::from_bytes(a)))
+        .env_clear()
+        .envs(
+            exec_env
+                .iter()
+                .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "fast launch must bypass hanging .zprofile, took {:?}",
+        started.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("AGY_OK ZDOT=unset HERDR=1 TOKEN=from-profile"),
+        "unexpected stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Probed login env failed/timed out (`Unavailable`) -> fallback PATH still finds ~/.local/bin/agy
+    // and launches via `-f +i -c` instead of hanging on .zprofile!
+    let fallback = wrap_account_with_probed_env(
+        &agy_profile,
+        Permission::Manual,
+        login,
+        None,
+        ProbedLoginEnv::Unavailable,
+    );
+    let fb_argv: Vec<_> = fallback
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect();
+    assert_eq!(fb_argv[..4], ["/bin/zsh", "-f", "+i", "-c"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

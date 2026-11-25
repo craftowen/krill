@@ -172,26 +172,17 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             .is_some_and(|s| s == "install" || s == "uninstall");
     if !hook_run && !statusline_run {
         krill_log::init(krill_log::Component::Cli).ok();
-        // 앱의 60초 `errors flush`, 에이전트의 `read` 폴링 같은 호출마다 줄을 남기면 5개 회전 파일이 몇 분 만에 밀려나
-        // 실제 진단이 사라진다(2026-11-05). 사람이 드물게 실행해 되짚을 가치가 있는 명령만 이름과 함께 남긴다.
-        if let Some(command) = [
-            "account",
-            "bot",
-            "doctor",
-            "hook",
-            "import",
-            "mobile",
-            "statusline",
-            "update",
-        ]
-        .into_iter()
-        .find(|command| raw.first().is_some_and(|first| first == command))
-        {
+        // 앱의 60초 `errors flush`, 에이전트의 `read` 폴링, 읽기 전용 `account list` 같은 호출마다 줄을 남기면
+        // 5개 회전 파일이 몇 분 만에 밀려나 실제 진단이 사라진다(2026-11-05). 사람이 드물게 실행해 되짚을 가치가
+        // 있는 명령만 이름과 함께 남긴다.
+        if let Some(command) = logged_cli_command(&raw) {
             tracing::info!(command, "cli starting");
         }
-        // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
+        // Hook/statusline hot paths, read-only polling commands, and isolated runtimes must not
+        // rescan all 8 agent skill roots on every invocation.
         if !cfg!(test)
             && daemon::state_dir_override().is_none()
+            && should_sync_skills_for_command(&raw)
             && let Some(home) = krill_proto::os::home_dir()
         {
             let report = krill_proto::orchestration::sync_builtin_skills_at(&home);
@@ -431,6 +422,43 @@ fn agent_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Return the command name to log for rare/mutating CLI invocations.
+/// Read-only `account` queries (`account`, `account list`, `account history`, `account provisioning status`)
+/// are omitted so periodic polling never rotates out diagnostic logs.
+fn logged_cli_command(raw: &[std::ffi::OsString]) -> Option<&'static str> {
+    let first = raw.first()?.to_str()?;
+    match first {
+        "account" => {
+            let sub = raw.get(1).and_then(|s| s.to_str());
+            let sub2 = raw.get(2).and_then(|s| s.to_str());
+            match (sub, sub2) {
+                (None | Some("list" | "history" | "--help" | "-h"), _)
+                | (Some("provisioning"), Some("status" | "--help" | "-h") | None) => None,
+                _ => Some("account"),
+            }
+        }
+        "bot" => Some("bot"),
+        "doctor" => Some("doctor"),
+        "hook" => Some("hook"),
+        "import" => Some("import"),
+        "mobile" => Some("mobile"),
+        "statusline" => Some("statusline"),
+        "update" => Some("update"),
+        _ => None,
+    }
+}
+
+/// Only run host-wide built-in skill synchronization on setup/lifecycle CLI commands,
+/// avoiding redundant 8-root filesystem scans on every `ls`/`read`/`send`/`account` invocation.
+fn should_sync_skills_for_command(raw: &[std::ffi::OsString]) -> bool {
+    raw.first().and_then(|s| s.to_str()).is_some_and(|cmd| {
+        matches!(
+            cmd,
+            "skills" | "doctor" | "update" | "hook" | "import" | "new"
+        )
+    })
+}
+
 /// Emit at most one privacy-safe summary warning when built-in skill sync skips targets.
 /// `krill-log` forbids filesystem paths and error `Display` strings at `tracing` call sites.
 fn log_skill_sync_failures(failures: &[String]) {
@@ -637,5 +665,39 @@ mod tests {
                 OsString::from("--host=literal"),
             ]
         );
+    }
+
+    #[test]
+    fn readonly_account_queries_skip_cli_start_log_and_skill_sync() {
+        let args = |xs: &[&str]| xs.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(super::logged_cli_command(&args(&["account"])), None);
+        assert_eq!(
+            super::logged_cli_command(&args(&["account", "list", "--json"])),
+            None
+        );
+        assert_eq!(
+            super::logged_cli_command(&args(&["account", "history"])),
+            None
+        );
+        assert_eq!(
+            super::logged_cli_command(&args(&["account", "provisioning", "status"])),
+            None
+        );
+        assert_eq!(
+            super::logged_cli_command(&args(&["account", "switch", "claude", "work"])),
+            Some("account")
+        );
+        assert_eq!(
+            super::logged_cli_command(&args(&["doctor", "--json"])),
+            Some("doctor")
+        );
+
+        assert!(!super::should_sync_skills_for_command(&args(&[
+            "account", "list"
+        ])));
+        assert!(!super::should_sync_skills_for_command(&args(&["ls"])));
+        assert!(super::should_sync_skills_for_command(&args(&["doctor"])));
+        assert!(super::should_sync_skills_for_command(&args(&["skills"])));
+        assert!(super::should_sync_skills_for_command(&args(&["new"])));
     }
 }

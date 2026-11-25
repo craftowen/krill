@@ -2384,7 +2384,11 @@ impl Registry {
         status.startup_stall = (wrapped
             && !exited
             && status.state == control::AgentState::Unknown
-            && status.source.is_none())
+            && status.source.is_none()
+            && status
+                .foreground
+                .as_deref()
+                .is_none_or(|fg| !krill_proto::agent::is_known_agent_process(fg)))
         .then(|| status::startup::startup_stall(root))
         .flatten();
         status.root_shell = (!exited)

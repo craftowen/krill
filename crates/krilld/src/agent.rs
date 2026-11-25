@@ -52,6 +52,11 @@ const PREFLIGHT: &str = r#"
 hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }
 set +m; trap : INT QUIT; trap 'exit 129' HUP; trap 'exit 143' TERM
 (
+if [ -n "${MK_PANE_ID-}" ]; then export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1; fi
+if [ -n "${KRILL_ORIG_ZDOTDIR+x}" ]; then
+  if [ -n "$KRILL_ORIG_ZDOTDIR" ]; then export ZDOTDIR="$KRILL_ORIG_ZDOTDIR"; else unset ZDOTDIR; fi
+  unset KRILL_ORIG_ZDOTDIR
+fi
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
@@ -2697,7 +2702,127 @@ fn wrap(profile: &Profile, permission: Permission, login: Launch) -> Launch {
     wrap_account(profile, permission, login, None)
 }
 
+#[cfg(unix)]
+enum ProbedLoginEnv {
+    /// Keep legacy `-l -i -c` launch without probing (used by unit tests with synthetic shells).
+    Skip,
+    /// Login shell environment probe succeeded.
+    Ready(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Login shell environment probe failed or timed out; try standard fallback PATH before `-l -i -c`.
+    Unavailable,
+}
+
 fn wrap_account(
+    profile: &Profile,
+    permission: Permission,
+    login: Launch,
+    account: Option<&LaunchAccount>,
+) -> Launch {
+    #[cfg(unix)]
+    let fast_env = if cfg!(test) {
+        ProbedLoginEnv::Skip
+    } else {
+        match crate::shell::login_env() {
+            Some(env) => ProbedLoginEnv::Ready(env),
+            None => ProbedLoginEnv::Unavailable,
+        }
+    };
+    #[cfg(unix)]
+    return wrap_account_with_probed_env(profile, permission, login, account, fast_env);
+    #[cfg(not(unix))]
+    wrap_account_inner(profile, permission, login, account)
+}
+
+#[cfg(unix)]
+fn wrap_account_with_probed_env(
+    profile: &Profile,
+    permission: Permission,
+    mut login: Launch,
+    account: Option<&LaunchAccount>,
+    probed_env: ProbedLoginEnv,
+) -> Launch {
+    skills::prepare(Some(profile), &login, account);
+    let hint = format!(
+        "{}: not installed. install: {}",
+        profile.program().unwrap_or_default(),
+        profile.install_command()
+    );
+    let mut agent_argv = profile.argv(permission);
+    if is(profile, "codex")
+        && std::env::var_os("KRILL_CODEX_ISOLATE").is_none_or(|v| v != "0")
+        && !agent_argv.iter().skip(1).any(|a| {
+            matches!(a.as_str(), "--no-daemon" | "agents" | "queue" | "--remote")
+                || a.starts_with("--remote=")
+        })
+        && codex::no_daemon_supported(profile.program())
+    {
+        agent_argv.insert(1, "--no-daemon".to_owned());
+    }
+    let fast_flags = match probed_env {
+        ProbedLoginEnv::Skip => None,
+        ProbedLoginEnv::Ready(env) => prepare_fast_shell(&mut login, profile, Some(env)),
+        ProbedLoginEnv::Unavailable => prepare_fast_shell(&mut login, profile, None),
+    };
+    let Launch { mut argv, env } = login;
+    argv.truncate(1);
+    let (flag1, flag2) = fast_flags.unwrap_or(("-l", "-i"));
+    argv.extend(
+        [flag1, flag2, "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec()),
+    );
+    argv.extend(agent_argv.into_iter().map(String::into_bytes));
+    Launch { argv, env }
+}
+
+/// 캐시된 로그인 셸 환경(또는 폴백 표준 `PATH`에서 에이전트가 바로 확인될 때)을 `login.env`에 병합하고,
+/// 에이전트 시작 시 `.zprofile`·`.zshrc`(`brew shellenv` 등)를 건너뛸 수 있는 2-인자 셸 플래그를 돌려준다.
+/// `argv` 인덱스(`-c`=3, `mk-agent`=5, agent=7..)는 `-l -i -c`와 동일하게 유지된다.
+#[cfg(unix)]
+fn prepare_fast_shell(
+    login: &mut Launch,
+    profile: &Profile,
+    probed: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+) -> Option<(&'static str, &'static str)> {
+    let shell_name = login
+        .argv
+        .first()
+        .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
+        .and_then(|n| n.to_str())?;
+    let flags = match shell_name {
+        "zsh" => ("-f", "+i"),
+        "bash" => ("--noprofile", "--norc"),
+        _ => return None,
+    };
+    if let Some(probed_env) = probed {
+        crate::shell::merge_login_env(&mut login.env, &probed_env);
+        return Some(flags);
+    }
+    // 로그인 셸 탐침이 실패·타임아웃한 경우(예: 깨진 .zprofile 또는 극심한 syspolicyd 부하):
+    // 표준 경로에서 에이전트 실행 파일이 이미 보이면 rc 파일 없이 바로 기동한다.
+    let program = profile.program()?;
+    let home = login
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"HOME")
+        .map(|(_, v)| v.as_slice());
+    let fallback = crate::shell::fallback_agent_path(home);
+    let found = Path::new(program).is_file()
+        || krill_proto::agent::which(program, std::ffi::OsStr::from_bytes(&fallback)).is_some();
+    if found {
+        if let Some((_, v)) = login.env.iter_mut().find(|(k, _)| k.as_slice() == b"PATH") {
+            *v = fallback;
+        } else {
+            login.env.push((b"PATH".to_vec(), fallback));
+        }
+        return Some(flags);
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn wrap_account_inner(
     profile: &Profile,
     permission: Permission,
     login: Launch,
@@ -2720,22 +2845,7 @@ fn wrap_account(
     {
         agent_argv.insert(1, "--no-daemon".to_owned());
     }
-    #[cfg(windows)]
-    {
-        windows::wrap(login, &hint, agent_argv, true)
-    }
-    #[cfg(unix)]
-    {
-        let Launch { mut argv, env } = login;
-        argv.truncate(1);
-        argv.extend(
-            ["-l", "-i", "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
-                .into_iter()
-                .map(|s| s.as_bytes().to_vec()),
-        );
-        argv.extend(agent_argv.into_iter().map(String::into_bytes));
-        Launch { argv, env }
-    }
+    windows::wrap(login, &hint, agent_argv, true)
 }
 
 #[cfg(test)]
