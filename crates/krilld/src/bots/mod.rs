@@ -498,11 +498,8 @@ impl BotsManager {
                     crate::rejoin::recovery::read_chat_auto_continue_setting(&self.state_dir);
                 if auto_continue_enabled {
                     let home = crate::usage::accounts::default_home();
-                    let accounts_snap = crate::usage::accounts::refresh_accounts_with(
-                        &home,
-                        Some(&self.state_dir),
-                        false,
-                    );
+                    let accounts_snap =
+                        crate::usage::accounts::refresh_accounts(&home, Some(&self.state_dir));
                     self.runtime.poll_rate_limit_auto_continues(
                         registry,
                         &self.store,
