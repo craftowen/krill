@@ -416,6 +416,39 @@ fn failed_save_preserves_spool_for_retry() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn best_effort_status_writer_survives_full_disk_and_recovers_automatically() {
+    let dir = tmp("status-recover");
+    let path = dir.join(FILE_NAME);
+    let st = Statuses::open(Some(path.clone()));
+    // Occupy destination with a non-empty directory so atomic rename fails deterministically.
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("occupied"), b"").unwrap();
+
+    // Status transitions still update live in-memory state even while disk writes fail.
+    st.exited(S1);
+    assert_eq!(st.get(S1).state, AgentState::Exited);
+
+    // Clear disk obstruction -> background StateWriter automatically retries and persists!
+    fs::remove_dir_all(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if path.is_file() {
+            let reloaded = Statuses::open(Some(path.clone())).get(S1);
+            if reloaded.state == AgentState::Exited {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background writer did not automatically recover and persist agent-state"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    st.shutdown(Duration::from_secs(1));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// 저장은 끝났지만 spool 비우기 전에 재기동하면 같은 이벤트를 읽어도 상태가 되돌아가지 않는다.
 #[test]
 fn restart_before_spool_truncation_replays_once() {

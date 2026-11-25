@@ -31,6 +31,7 @@ mod hook;
 #[path = "hook_windows.rs"]
 mod hook;
 mod hook_install;
+mod host;
 mod import;
 mod mobile;
 mod orca_import;
@@ -83,8 +84,9 @@ Bots, Orchestration & Automations:
   krill skills list/get/install
   krill artifacts|artifact init|lint|share|update|retention|unshare|status|list|delete
 
-Mobile & Drop:
+Mobile, Hosts & Drop:
   krill mobile pair/devices/revoke/serve/login/logout/status
+  krill host status [<host>] [--json]
   krill drop <file>...|ls|rm <id> [--json]
 
 Accounts, Agents & Hooks:
@@ -246,6 +248,9 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     }
     if raw.first().is_some_and(|s| s == "mobile") {
         return mobile::run(&raw[1..]);
+    }
+    if raw.first().is_some_and(|s| s == "host" || s == "hosts") {
+        return host::run(&raw[1..]);
     }
     if raw.first().is_some_and(|s| s == "drop") {
         return drop::run(&raw[1..]);
@@ -582,6 +587,7 @@ mod tests {
             vec!["update", "--help"],
             vec!["search", "--help"],
             vec!["mobile", "pair", "--help"],
+            vec!["host", "--help"],
             vec!["drop", "--help"],
             vec!["ls", "--help"],
             vec!["new", "--help"],

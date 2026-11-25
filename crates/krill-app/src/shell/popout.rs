@@ -1790,6 +1790,44 @@ impl Shell {
                     .gap_2()
                     .children(krill_app::recording::warning(self.recording, cx))
                     .children({
+                        let sending_count = self.paste_queue.sending_remote_count();
+                        (sending_count > 0).then(|| {
+                            let label = if sending_count == 1 {
+                                krill_app::i18n::catalog::security::REMOTE_SENDING
+                                    .get()
+                                    .to_owned()
+                            } else {
+                                krill_app::i18n::catalog::security::REMOTE_SENDING_COUNT
+                                    .format(&[("count", &sending_count.to_string())])
+                            };
+                            let tip = krill_app::i18n::catalog::security::REMOTE_SENDING_TIP.get();
+                            div()
+                                .id("status-remote-sending")
+                                .debug_selector(|| "status-remote-sending".into())
+                                .h(ui::STATUS_BAR_BUTTON_HEIGHT)
+                                .px(ui::SPACE_2)
+                                .rounded(ui::RADIUS_SM)
+                                .bg(p.muted)
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.foreground)
+                                .flex()
+                                .items_center()
+                                .gap(ui::SPACE_1)
+                                .child(
+                                    gpui_component::Icon::default()
+                                        .data(ui::icons::CIRCLE_ARROW_UP_SVG)
+                                        .xsmall()
+                                        .text_color(p.preserve),
+                                )
+                                .child(label)
+                                .when(tooltips_on, |d| {
+                                    d.tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tip).build(window, cx)
+                                    })
+                                })
+                        })
+                    })
+                    .children({
                         let checks = krill_app::onboarding::snapshot(cx).checks;
                         let failures = krill_app::onboarding::required_failures(&checks);
                         (!failures.is_empty()).then(|| {

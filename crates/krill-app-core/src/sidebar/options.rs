@@ -1826,6 +1826,7 @@ fn host_status_label(status: HostStatus) -> &'static str {
         HostStatus::Connected => text::HOST_CONNECTED.get(),
         HostStatus::Connecting => text::HOST_CONNECTING.get(),
         HostStatus::Disconnected => text::HOST_DISCONNECTED.get(),
+        HostStatus::AuthFailed => text::HOST_NEEDS_LOGIN.get(),
     }
 }
 

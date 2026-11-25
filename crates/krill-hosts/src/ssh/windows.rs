@@ -96,18 +96,40 @@ impl Tunnel {
                 tx.send(result).ok();
                 io::copy(&mut stdout, &mut io::sink()).ok();
             })?;
+        let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let stderr_sink = Arc::clone(&stderr_tail);
         thread::Builder::new()
             .name("ssh-keepalive-stderr".into())
             .spawn(move || {
-                io::copy(&mut stderr, &mut io::sink()).ok();
+                const CAP: usize = 16 * 1024;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stderr.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut collected) = stderr_sink.lock()
+                        && collected.len() < CAP
+                    {
+                        let room = CAP - collected.len();
+                        collected.extend_from_slice(&buf[..n.min(room)]);
+                    }
+                }
             })?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))?
             .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("ssh forwarding to {} failed: {error}", opts.destination),
-                )
+                let detail = stderr_tail
+                    .lock()
+                    .ok()
+                    .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let message = match detail {
+                    Some(detail) => {
+                        format!("ssh forwarding to {} failed: {detail}", opts.destination)
+                    }
+                    None => format!("ssh forwarding to {} failed: {error}", opts.destination),
+                };
+                io::Error::new(error.kind(), message)
             })?;
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);

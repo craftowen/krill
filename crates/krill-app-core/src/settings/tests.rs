@@ -1071,6 +1071,7 @@ fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppC
         home: "/Users/remote".into(),
         version: RemoteVersion::Known("0.1.0".into()),
         socket_bundle: None,
+        linger: krill_hosts::LingerStatus::NotApplicable,
     };
     vcx.update(|window, cx| {
         view.update(cx, |v, _cx| {
@@ -1136,6 +1137,7 @@ fn windows_remote_card_shows_version_without_install() {
             home: String::new(),
             version: RemoteVersion::Known("0.1.44+abc".into()),
             socket_bundle: None,
+            linger: krill_hosts::LingerStatus::NotApplicable,
         }),
         install: RemoteInstallState::Idle,
     };
@@ -1146,6 +1148,68 @@ fn windows_remote_card_shows_version_without_install() {
         line.contains("krill 0.1.44") && !line.contains("+abc"),
         "{line}"
     );
+}
+
+#[gpui::test]
+fn linux_linger_disabled_shows_non_intrusive_warning_and_copies_fix_command(
+    cx: &mut TestAppContext,
+) {
+    use krill_hosts::managed::{
+        LingerStatus, RemoteArch, RemoteInfo, RemoteOs, RemotePlatform, RemoteVersion,
+    };
+    let d = dir("ssh-linger-warn");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Machines, cx);
+            v.ssh_hosts =
+                crate::ssh_hosts::add_host(Some(&d), "DevBox", "ubuntu@devbox.test", None, None)
+                    .unwrap();
+            let id = v.ssh_hosts[0].id.clone();
+            v.machine_open = Some(crate::hosts::HostId::Remote(id.clone()));
+            v.ssh_remote_infos.insert(
+                id,
+                RemoteCardState {
+                    probe: RemoteProbeState::Ready(RemoteInfo {
+                        platform: RemotePlatform {
+                            os: RemoteOs::Linux,
+                            arch: RemoteArch::X86_64,
+                            kernel: "Linux".into(),
+                        },
+                        home: "/home/ubuntu".into(),
+                        version: RemoteVersion::Unmanaged,
+                        socket_bundle: None,
+                        linger: LingerStatus::Disabled {
+                            user: "ubuntu".into(),
+                        },
+                    }),
+                    install: RemoteInstallState::Idle,
+                },
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    let id = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].id.clone());
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let warn = leak(format!("admin-ssh-linger-warn-{id}"));
+    let copy = leak(format!("admin-ssh-linger-copy-{id}"));
+    assert!(
+        vcx.debug_bounds(warn).is_some(),
+        "Linux linger warning must render when linger is disabled"
+    );
+    let copy_bounds = vcx
+        .debug_bounds(copy)
+        .expect("copy fix command button must render");
+    vcx.simulate_click(copy_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let copied = vcx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(
+        copied.as_deref(),
+        Some("sudo loginctl enable-linger ubuntu")
+    );
+    fs::remove_dir_all(d).ok();
 }
 
 #[gpui::test]

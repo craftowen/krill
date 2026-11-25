@@ -887,6 +887,7 @@ impl ServerPanel {
             krill_hosts::HostStatus::Disconnected => {
                 (p.muted_foreground, labels::HOST_DISCONNECTED.get())
             }
+            krill_hosts::HostStatus::AuthFailed => (p.destructive, labels::HOST_NEEDS_LOGIN.get()),
         };
         let outdated = host.status == krill_hosts::HostStatus::Connected
             && host

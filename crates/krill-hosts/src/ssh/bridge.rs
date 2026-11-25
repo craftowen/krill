@@ -83,7 +83,7 @@ pub fn bridge_main(args: &[OsString]) -> ExitCode {
         [] => false,
         [flag] if flag == PROBE_FLAG => true,
         _ => {
-            eprintln!("usage: krill __bridge [--probe]");
+            writeln!(io::stderr(), "usage: krill __bridge [--probe]").ok();
             return ExitCode::from(2);
         }
     };
@@ -112,7 +112,7 @@ pub fn bridge_main(args: &[OsString]) -> ExitCode {
     match stream.and_then(relay_stdio) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("krill __bridge: {e}");
+            writeln!(io::stderr(), "krill __bridge: {e}").ok();
             ExitCode::FAILURE
         }
     }

@@ -27,6 +27,7 @@ use krill_proto::control::{AgentState, AgentStatus, Confidence, Source};
 use krill_proto::hook::{self, EventId, HookEvent};
 use serde::{Deserialize, Serialize};
 
+use crate::registry::persistence::StateWriter;
 use crate::session::lock;
 
 pub mod detect;
@@ -72,6 +73,7 @@ impl Record {
 #[derive(Debug)]
 pub struct Statuses {
     path: Option<PathBuf>,
+    writer: Option<StateWriter>,
     commit: Mutex<()>,
     map: Mutex<BTreeMap<SessionId, Record>>,
     /// 서브에이전트 목록. 저장하지 않는다(krilld 재기동이면 빈 목록).
@@ -81,6 +83,8 @@ pub struct Statuses {
     turn_errors: Mutex<BTreeMap<SessionId, String>>,
 }
 
+const STATUS_SAVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Statuses {
     /// `path`의 저장본을 읽는다. 없거나 읽지 못하면 빈 저장소. `None`이면 메모리에만 둔다.
     pub fn open(path: Option<PathBuf>) -> Self {
@@ -89,12 +93,23 @@ impl Statuses {
             .and_then(|p| fs::read(p).ok())
             .and_then(|b| decode(&b))
             .unwrap_or_default();
+        let writer = path
+            .as_ref()
+            .and_then(|p| StateWriter::new("agent-state", p.clone()).ok());
         Self {
             path,
+            writer,
             commit: Mutex::new(()),
             map: Mutex::new(map),
             subagents: Mutex::default(),
             turn_errors: Mutex::default(),
+        }
+    }
+
+    /// 데몬 종료 시 대기 중인 상태 저장을 제한 시간 내에 비우고 기록 스레드를 정리한다.
+    pub(crate) fn shutdown(&self, timeout: Duration) {
+        if let Some(writer) = &self.writer {
+            writer.shutdown(timeout);
         }
     }
 
@@ -174,7 +189,7 @@ impl Statuses {
             n += 1;
         }
         if n > 0 {
-            self.save(&next)?;
+            self.save_strict(&next)?;
             *lock(&self.map) = next;
             let mut errors = lock(&self.turn_errors);
             for (session, err) in error_updates {
@@ -203,8 +218,8 @@ impl Statuses {
             last_ns: 0,
         });
         r.set(AgentState::Exited, Source::Process, now_ns());
-        self.save(&map).ok();
-        *lock(&self.map) = map;
+        *lock(&self.map) = map.clone();
+        self.save_best_effort(&map);
     }
 
     /// 제목·화면의 보조 근거. hook이 이기며, 대화상자 소실을 확인한 waiting 해제만 예외다.
@@ -242,8 +257,8 @@ impl Statuses {
         r.set(evidence.state, evidence.source, ns);
         r.last_ns = hook_ns;
         r.status.confidence = evidence.confidence;
-        self.save(&map).ok();
-        *lock(&self.map) = map;
+        *lock(&self.map) = map.clone();
+        self.save_best_effort(&map);
     }
 
     /// 새 전경 에이전트가 확인되면 이전 에이전트의 종료 표식을 지운다. 셸 작업에는 호출하지 않는다.
@@ -258,8 +273,8 @@ impl Statuses {
             r.status.source = None;
             r.status.confidence = Confidence::Low;
             r.status.since_unix_ns = now_ns();
-            self.save(&map).ok();
-            *lock(&self.map) = map;
+            *lock(&self.map) = map.clone();
+            self.save_best_effort(&map);
         }
     }
 
@@ -270,8 +285,8 @@ impl Statuses {
         let _commit = lock(&self.commit);
         let mut map = lock(&self.map).clone();
         if map.remove(&session).is_some() {
-            self.save(&map).ok();
-            *lock(&self.map) = map;
+            *lock(&self.map) = map.clone();
+            self.save_best_effort(&map);
         }
     }
 
@@ -283,16 +298,44 @@ impl Statuses {
         let before = map.len();
         map.retain(|id, _| live.contains(id));
         if map.len() != before {
-            self.save(&map).ok();
-            *lock(&self.map) = map;
+            *lock(&self.map) = map.clone();
+            self.save_best_effort(&map);
         }
     }
 
-    fn save(&self, map: &BTreeMap<SessionId, Record>) -> io::Result<()> {
+    /// 엄격 저장(hook용): 디스크 쓰기 실패 시 정직한 오류를 돌려주고 미반영 스냅샷 재시도를 취소해
+    /// 호출자(spool)가 재시도할 수 있게 하면서도 백그라운드 writer 스레드는 살려 둔다.
+    fn save_strict(&self, map: &BTreeMap<SessionId, Record>) -> io::Result<()> {
+        if let Some(writer) = &self.writer {
+            let bytes = encode(map)?;
+            let version = writer.save(bytes);
+            if let Err(err) = writer.flush_saved(Some(version), STATUS_SAVE_TIMEOUT) {
+                writer.discard_if_current(version);
+                return Err(err);
+            }
+            return Ok(());
+        }
         if let Some(p) = &self.path {
             krill_proto::os::write_atomic_0600(p, &encode(map)?)?;
         }
         Ok(())
+    }
+
+    /// 복원력 저장(`exited`/`inferred`/`started`/`remove`/`retain`용): 디스크가 가득 차도
+    /// 세션을 막지 않고 백그라운드 writer가 공간이 돌아오면 자동으로 최신 스냅샷을 기록한다.
+    fn save_best_effort(&self, map: &BTreeMap<SessionId, Record>) {
+        if let Some(writer) = &self.writer {
+            if let Ok(bytes) = encode(map) {
+                writer.save(bytes);
+                writer.flush_observed(Duration::from_millis(200)).ok();
+            }
+            return;
+        }
+        if let Some(p) = &self.path
+            && let Ok(bytes) = encode(map)
+        {
+            krill_proto::os::write_atomic_0600(p, &bytes).ok();
+        }
     }
 }
 

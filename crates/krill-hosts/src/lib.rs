@@ -23,6 +23,7 @@ pub mod managed;
 pub mod manager;
 pub mod ssh;
 
+pub use managed::LingerStatus;
 pub use manager::{ExternalHost, HostConnectionInfo};
 pub use manager::{HostManager, RemoteHostSpec};
 
@@ -74,6 +75,8 @@ pub enum HostStatus {
     #[default]
     Connecting,
     Disconnected,
+    /// SSH 인증 실패(키 미등록·잠긴 ssh-agent·암호 필요). fail2ban/CrowdSec 차단을 막기 위해 느린 백오프로 전환한다.
+    AuthFailed,
 }
 
 type EnsureSocketFn = dyn Fn() -> io::Result<PathBuf> + Send + Sync;

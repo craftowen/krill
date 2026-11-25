@@ -620,6 +620,7 @@ fn machine_status(status: HostStatus, p: &crate::ui::Palette) -> (gpui::Hsla, &'
         HostStatus::Connected => (p.success, labels::HOST_CONNECTED.get()),
         HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
         HostStatus::Disconnected => (p.muted_foreground, labels::HOST_DISCONNECTED.get()),
+        HostStatus::AuthFailed => (p.destructive, labels::HOST_NEEDS_LOGIN.get()),
     }
 }
 

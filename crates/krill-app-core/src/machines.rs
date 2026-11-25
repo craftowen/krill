@@ -59,6 +59,12 @@ impl Machine {
             .any(|r| r.status == HostStatus::Connecting)
         {
             HostStatus::Connecting
+        } else if self
+            .routes
+            .iter()
+            .any(|r| r.status == HostStatus::AuthFailed)
+        {
+            HostStatus::AuthFailed
         } else {
             HostStatus::Disconnected
         }

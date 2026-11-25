@@ -108,10 +108,22 @@ fn main() -> ExitCode {
     };
     // holder가 맡아 둔 소켓이 있으면 이어 쓴다(OWE-491). `Err`: 게시는 고아 krilld에게서 세션을 넘겨받은 뒤에 한다.
     let reused = held.is_some();
+    let foreign_socket = is_foreign_socket(&path);
     let mut lis = match held.map_or_else(|| Listener::bind(&path), |fd| Listener::adopt(&path, fd))
     {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if foreign_socket {
+                use std::io::Write as _;
+                writeln!(
+                    io::stderr(),
+                    "krilld: refusing to take over live socket {} from a different state directory",
+                    path.display()
+                )
+                .ok();
+                tracing::warn!("socket owned by another state dir daemon; refusing takeover");
+                return ExitCode::from(daemon::KRILLD_DUPLICATE);
+            }
             match linked.then(|| Handover::take(&path)) {
                 Some(Ok(h)) => Err(h),
                 // 중복 기동: 건강한 데몬이 소켓을 쥐고 있고 인계 상대도 없다. holder가 재기동하지
@@ -429,6 +441,7 @@ fn main() -> ExitCode {
         if let Some(bots) = registry.bots_if_initialized() {
             bots.shutdown();
         }
+        registry.flush_persistence(std::time::Duration::from_secs(2));
         return ExitCode::FAILURE;
     }
     handed.recv().ok();
@@ -436,6 +449,7 @@ fn main() -> ExitCode {
     if let Some(bots) = registry.bots_if_initialized() {
         bots.shutdown();
     }
+    registry.flush_persistence(std::time::Duration::from_secs(2));
     drop(done);
     tracing::info!("daemon handover complete");
     ExitCode::SUCCESS
@@ -447,6 +461,31 @@ fn main() -> ExitCode {
 fn owns_mobile(socket: &Path) -> bool {
     daemon::state_dir()
         .is_some_and(|dir| daemon::socket_path(&dir).is_ok_and(|path| path == socket))
+}
+
+/// 격리된 `KRILL_STATE_DIR`로 기동한 데몬이 그 상태 디렉터리 바깥(또는 다른 상태 디렉터리를
+/// 가리키는 심볼릭 링크)의 소켓을 넘겨받았는지 판정한다.
+/// 같은 상태 디렉터리 안의 사용자 지정 소켓 이름(예: `run/k.sock`)은 자기 소속이므로 인계를 허용한다.
+fn is_foreign_socket(socket: &Path) -> bool {
+    if !daemon::state_dir_isolated() {
+        return false;
+    }
+    let Some(state_dir) = daemon::state_dir() else {
+        return false;
+    };
+    is_foreign_socket_for_state_dir(&state_dir, socket)
+}
+
+fn is_foreign_socket_for_state_dir(state_dir: &Path, socket: &Path) -> bool {
+    let canon_state = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let canon_socket = std::fs::canonicalize(socket).unwrap_or_else(|_| {
+        match (socket.parent(), socket.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map_or_else(|_| socket.to_path_buf(), |p| p.join(name)),
+            _ => socket.to_path_buf(),
+        }
+    });
+    !canon_socket.starts_with(&canon_state)
 }
 
 fn should_init_log(linked: bool, socket: &Path) -> bool {
@@ -590,5 +629,38 @@ mod tests {
             true,
             &isolated.join("custom.sock")
         ));
+    }
+
+    #[test]
+    fn foreign_socket_distinguishes_same_state_dir_from_foreign_or_symlinked_state_dir() {
+        let root = std::env::temp_dir().join(format!("krilld-foreign-sock-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let state_a = root.join("state-a");
+        let state_b = root.join("state-b");
+        std::fs::create_dir_all(state_a.join("run")).unwrap();
+        std::fs::create_dir_all(state_b.join("run")).unwrap();
+
+        // Same state dir with custom socket name (e.g. integration test `run/k.sock`) is NOT foreign.
+        assert!(!is_foreign_socket_for_state_dir(
+            &state_a,
+            &state_a.join("run/k.sock")
+        ));
+        // Socket in another state directory IS foreign.
+        assert!(is_foreign_socket_for_state_dir(
+            &state_b,
+            &state_a.join("run/krilld.sock")
+        ));
+
+        #[cfg(unix)]
+        {
+            let real = state_a.join("run/krilld.sock");
+            std::fs::write(&real, b"").unwrap();
+            let alias = state_b.join("run/krilld.sock");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            // Symlink inside state_b pointing into state_a IS foreign.
+            assert!(is_foreign_socket_for_state_dir(&state_b, &alias));
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

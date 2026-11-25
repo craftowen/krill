@@ -283,6 +283,37 @@ impl Recorder {
         Ok(recovered)
     }
 
+    /// 디스크 부족 등 일시적 복구 실패 시 기록기를 버리지 않고 열린 파일 없는 상태로 유지해,
+    /// 디스크 공간이 돌아오면 다음 출력부터 자동으로 세그먼트 기록을 재개한다.
+    fn degraded_after_recovery_failure(
+        store: Arc<Store>,
+        id: SessionId,
+        end: u64,
+        size: WinSize,
+    ) -> Self {
+        let generation = store.generation.load(Ordering::Acquire);
+        let pause_epoch = store.record_guard().epoch;
+        let dir = store.session_dir(id);
+        Self {
+            store,
+            dir,
+            id,
+            size,
+            seq: end,
+            open: None,
+            dropping: false,
+            lost: 0,
+            crashed: true,
+            started: true,
+            generation,
+            pause_epoch,
+            snapshots: Snapshots::Allowed,
+            keyframe: Vec::new(),
+            encoded: Vec::new(),
+            last_output: None,
+        }
+    }
+
     /// 창 크기가 바뀌었다. 열린 세그먼트에 `Resize`를 남기고, 없으면 다음 세그먼트 헤더에 담긴다.
     pub fn resize(&mut self, size: WinSize) {
         let store = Arc::clone(&self.store);
@@ -1293,18 +1324,26 @@ fn recover_worker_recorder(
     size: WinSize,
 ) -> Option<Recorder> {
     let recorder = recorder?;
+    let store = Arc::clone(&recorder.store);
+    let id = recorder.id;
     match panic::catch_unwind(AssertUnwindSafe(|| recorder.recover_after_panic(end, size))) {
         Ok(Ok(recovered)) => Some(recovered),
         Ok(Err(error)) => {
             tracing::warn!(
                 kind = ?error.kind(),
-                "pty recorder recovery failed; continuing without recording"
+                "pty recorder recovery failed; keeping writer alive for automatic retry"
             );
-            None
+            Some(Recorder::degraded_after_recovery_failure(
+                store, id, end, size,
+            ))
         }
         Err(_) => {
-            tracing::warn!("pty recorder recovery panicked; continuing without recording");
-            None
+            tracing::warn!(
+                "pty recorder recovery panicked; keeping writer alive for automatic retry"
+            );
+            Some(Recorder::degraded_after_recovery_failure(
+                store, id, end, size,
+            ))
         }
     }
 }
