@@ -384,3 +384,48 @@ fn filtered_socket_environment_reaches_a_real_child() {
         "/private/socket-root\nunset"
     );
 }
+
+#[test]
+fn probe_login_env_and_merge_preserve_exports_and_explicit_overrides() {
+    let dir = std::env::temp_dir().join(format!("krill-login-env-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let rc_bin = home.join("custom-bin");
+    std::fs::create_dir_all(&rc_bin).unwrap();
+    std::fs::write(
+        home.join(".zprofile"),
+        "export HOMEBREW_PREFIX=/opt/homebrew\nexport PATH=\"$HOME/custom-bin:$PATH\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".zshrc"),
+        "export USER_CUSTOM_TOKEN=keep-me\nexport MK_LEAK=should-filter\n",
+    )
+    .unwrap();
+    let user = User {
+        name: b"owen".to_vec(),
+        home: home.as_os_str().as_bytes().to_vec(),
+        shell: b"/bin/zsh".to_vec(),
+    };
+    let mut launch = Shell::Login.launch_with_lang(Some(&user), polluted(), None);
+    let probed = probe_login_env(&launch).expect("login env probe should succeed");
+    launch.env.push(kv("USER_CUSTOM_TOKEN", "explicit-wins"));
+    merge_login_env(&mut launch.env, &probed);
+
+    let path = String::from_utf8_lossy(get(&launch, "PATH").unwrap());
+    assert!(
+        path.split(':').any(|p| p == rc_bin.to_str().unwrap()),
+        "merged PATH must include rc bin: {path}"
+    );
+    assert_eq!(get(&launch, "HOMEBREW_PREFIX"), Some(&b"/opt/homebrew"[..]));
+    assert_eq!(
+        get(&launch, "USER_CUSTOM_TOKEN"),
+        Some(&b"explicit-wins"[..])
+    );
+    assert_eq!(get(&launch, "MK_LEAK"), None);
+    let fallback_bytes = fallback_agent_path(Some(home.as_os_str().as_bytes()));
+    let fallback = String::from_utf8_lossy(&fallback_bytes);
+    assert!(fallback.contains("/.local/bin"));
+    assert!(fallback.contains("/opt/homebrew/bin"));
+    std::fs::remove_dir_all(&dir).ok();
+}
