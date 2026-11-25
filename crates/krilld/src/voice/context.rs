@@ -5,8 +5,9 @@
 //! `transcribe` 시점에는 메모리 스냅샷만 <1ms로 읽는다.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,8 +24,8 @@ const MAX_STORED_TURNS: usize = 6;
 pub const MAX_SURROUNDING_UTF16: usize = 550;
 /// `session_vocab` 최대 단어 수.
 pub const MAX_SESSION_VOCAB: usize = 40;
-/// 워크스페이스 Git 브랜치·변경 파일 비동기 갱신 최소 주기(TTL >= 20초).
-pub const GIT_REFRESH_TTL: Duration = Duration::from_secs(20);
+/// 워크스페이스 Git 브랜치·변경 파일 비동기 갱신 최소 주기(TTL >= 60초).
+pub const GIT_REFRESH_TTL: Duration = Duration::from_secs(60);
 /// Git 변경 파일명 최대 보관 수.
 const MAX_GIT_FILES: usize = 24;
 
@@ -313,47 +314,62 @@ fn evict_if_full(map: &mut HashMap<ContextKey, TargetEntry>, incoming: &ContextK
     }
 }
 
-fn has_git_ancestor(dir: &std::path::Path) -> bool {
-    let mut cur = Some(dir);
-    while let Some(path) = cur {
-        if path.join(".git").exists() {
-            return true;
+fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+    for root in dir.ancestors() {
+        let dot = root.join(".git");
+        if dot.is_dir() {
+            return Some(dot);
         }
-        cur = path.parent();
+        if dot.is_file() {
+            let mut text = String::new();
+            std::fs::File::open(&dot)
+                .ok()?
+                .take(4096)
+                .read_to_string(&mut text)
+                .ok()?;
+            let gitdir = text.strip_prefix("gitdir:")?.trim();
+            if !gitdir.is_empty() {
+                return Some(root.join(gitdir));
+            }
+        }
     }
-    false
+    None
 }
 
-fn collect_git_vocab(dir: &PathBuf) -> Vec<String> {
-    if !has_git_ancestor(dir) {
+fn read_git_head_branch(git_dir: &Path) -> Option<String> {
+    let mut head = String::new();
+    std::fs::File::open(git_dir.join("HEAD"))
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut head)
+        .ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
+    (!branch.is_empty() && branch != "HEAD").then(|| branch.to_owned())
+}
+
+pub(super) fn collect_git_vocab(dir: &Path) -> Vec<String> {
+    let Some(git_dir) = find_git_dir(dir) else {
         return Vec::new();
-    }
+    };
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Ok(branch_out) = Command::new("git")
-        .args(["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(dir)
-        .output()
-        && branch_out.status.success()
-    {
-        let branch = String::from_utf8_lossy(&branch_out.stdout)
-            .trim()
-            .to_owned();
-        if !branch.is_empty() && branch != "HEAD" {
-            if seen.insert(branch.to_lowercase()) {
-                out.push(branch.clone());
-            }
-            for seg in branch.split('/') {
-                if seg.len() >= 2 && seen.insert(seg.to_lowercase()) {
-                    out.push(seg.to_owned());
-                }
+    if let Some(branch) = read_git_head_branch(&git_dir) {
+        if seen.insert(branch.to_lowercase()) {
+            out.push(branch.clone());
+        }
+        for seg in branch.split('/') {
+            if seg.len() >= 2 && seen.insert(seg.to_lowercase()) {
+                out.push(seg.to_owned());
             }
         }
     }
 
-    if let Ok(status_out) = Command::new("git")
+    if let Ok(status_out) = krill_proto::os::background_command("git")
         .args(["--no-optional-locks", "status", "--porcelain"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .current_dir(dir)
         .output()
         && status_out.status.success()
@@ -365,9 +381,7 @@ fn collect_git_vocab(dir: &PathBuf) -> Vec<String> {
                 .rsplit_once(" -> ")
                 .map_or(path_part, |(_, rhs)| rhs)
                 .trim_matches('"');
-            if let Some(file_name) = std::path::Path::new(actual)
-                .file_name()
-                .and_then(|s| s.to_str())
+            if let Some(file_name) = Path::new(actual).file_name().and_then(|s| s.to_str())
                 && !file_name.is_empty()
                 && seen.insert(file_name.to_lowercase())
             {

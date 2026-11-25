@@ -15,6 +15,9 @@ pub(super) struct Cache {
     directories: BTreeMap<SessionId, PathBuf>,
     trees: BTreeMap<PathBuf, (Instant, Option<Vec<u8>>)>,
     repositories: BTreeMap<Vec<u8>, (Instant, RepositoryTrees)>,
+    /// 저장소별 `<common_dir>/worktrees` 디렉터리 지문. 외부 CLI로 워크트리가 추가·삭제되면
+    /// TTL(30초)을 기다리지 않고 다음 사이드바 폴링에서 즉시 재조회한다.
+    worktree_stamps: BTreeMap<Vec<u8>, (PathBuf, u64)>,
     inflight: BTreeMap<PathBuf, Arc<Discovery>>,
     /// cwd별 백그라운드 조회. 요청 스레드는 파일·git IO를 직접 하지 않고 시한까지만 기다린다.
     lookups: BTreeMap<PathBuf, Arc<Discovery>>,
@@ -45,6 +48,7 @@ impl Cache {
         }
         self.trees.clear();
         self.repositories.clear();
+        self.worktree_stamps.clear();
         self.inflight.clear();
         self.lookups.clear();
         self.last.clear();
@@ -55,6 +59,10 @@ impl Cache {
 /// 파일 열기가 멈춰도(예: macOS 개인정보 보호 확인 지연) 응답은 이 안에 나간다.
 const LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
 const MOBILE_LOOKUP_BUDGET: Duration = Duration::from_millis(150);
+/// `git worktree list` 캐시 유효 시간. 워크트리 생성·삭제는 `invalidate()` 또는
+/// `<common_dir>/worktrees` 지문 변화로 즉시 갱신되므로 정상 유휴 상태에서 3초마다 git을 띄우지 않는다.
+const DISCOVERY_TTL: Duration = Duration::from_secs(30);
+const CACHE_RETAIN: Duration = Duration::from_secs(60);
 
 pub(super) fn revision(cache: &Arc<Mutex<Cache>>) -> u64 {
     lock(cache).revision
@@ -178,9 +186,7 @@ fn collect_repositories(
             .homes
             .retain(|id, _| entries.iter().any(|(s, _)| s == id));
     }
-    cache
-        .trees
-        .retain(|_, (at, _)| at.elapsed() < Duration::from_secs(6));
+    cache.trees.retain(|_, (at, _)| at.elapsed() < CACHE_RETAIN);
     let reachable: Vec<_> = cache
         .trees
         .values()
@@ -190,6 +196,9 @@ fn collect_repositories(
     cache
         .repositories
         .retain(|repo, _| reachable.contains(repo));
+    cache
+        .worktree_stamps
+        .retain(|repo, _| reachable.contains(repo));
     let Cache {
         directories, last, ..
     } = &mut *cache;
@@ -198,21 +207,30 @@ fn collect_repositories(
     Ok((sessions, repositories.into_values().collect()))
 }
 
-/// 3초 안의 캐시가 있으면 IO 없이 돌려준다. 바깥 `None`은 캐시 없음, 안쪽 `None`은 저장소가 아님이다.
+/// [`DISCOVERY_TTL`] 안의 캐시가 있고 `<common_dir>/worktrees`가 바뀌지 않았으면 IO 없이 돌려준다.
+/// 바깥 `None`은 캐시 없음, 안쪽 `None`은 저장소가 아님이다.
 #[expect(
     clippy::option_option,
     reason = "캐시 없음과 '저장소 아님' 캐시를 구분한다"
 )]
 fn fresh(cache: &Cache, path: &Path) -> Option<Option<RepositoryTrees>> {
     let (at, repo) = cache.trees.get(path)?;
-    if at.elapsed() >= Duration::from_secs(3) {
+    if at.elapsed() >= DISCOVERY_TTL {
         return None;
     }
     let Some(repo) = repo else {
         return Some(None);
     };
     let (at, trees) = cache.repositories.get(repo)?;
-    (at.elapsed() < Duration::from_secs(3)).then(|| Some(trees.clone()))
+    if at.elapsed() >= DISCOVERY_TTL {
+        return None;
+    }
+    if let Some((common_dir, prev_stamp)) = cache.worktree_stamps.get(repo)
+        && worktrees_stamp(common_dir) != *prev_stamp
+    {
+        return None;
+    }
+    Some(Some(trees.clone()))
 }
 
 /// 요청 스레드용 조회. 파일·git IO는 cwd당 하나의 백그라운드 스레드가 맡고, 여기서는 `deadline`까지만
@@ -357,6 +375,10 @@ fn publish_discovery(
                 cache
                     .repositories
                     .insert(trees.repo.clone(), (completed, trees.clone()));
+                cache.worktree_stamps.insert(
+                    trees.repo.clone(),
+                    (key.to_path_buf(), worktrees_stamp(key)),
+                );
             }
             cache.inflight.remove(key);
         }
@@ -365,6 +387,54 @@ fn publish_discovery(
     // cache or refreshing its TTL after a newer discovery has completed.
     *lock(&flight.result) = DiscoveryResult::Ready(result);
     flight.ready.notify_all();
+}
+
+/// `<common_dir>/worktrees` 디렉터리와 직속 항목(최대 512개)의 이름·mtime 지문.
+/// 외부 `git worktree add/remove`가 일어나면 30초 TTL을 기다리지 않고 즉시 재조회한다.
+fn worktrees_stamp(common_dir: &Path) -> u64 {
+    let dir = common_dir.join("worktrees");
+    let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+        return 0;
+    };
+    let mut entries_info = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten().take(512) {
+            let name = entry.file_name();
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .unwrap_or_default();
+            entries_info.push((
+                name.as_bytes().to_vec(),
+                mtime.as_secs(),
+                mtime.subsec_nanos(),
+            ));
+        }
+    }
+    entries_info.sort();
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    let dir_mtime = dir_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    mix(&dir_mtime.as_secs().to_le_bytes());
+    mix(&dir_mtime.subsec_nanos().to_le_bytes());
+    for (name, secs, nanos) in entries_info {
+        mix(&name);
+        mix(&[0]);
+        mix(&secs.to_le_bytes());
+        mix(&nanos.to_le_bytes());
+    }
+    h.max(1)
 }
 
 fn repository_key(cwd: &Path) -> PathBuf {
@@ -782,6 +852,83 @@ mod tests {
         assert_eq!(revision(&cache), discovered_rev + 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discovery_cache_reuses_within_ttl_and_refreshes_on_external_worktree_change() {
+        let base =
+            std::env::temp_dir().join(format!("krilld-sidebar-stamp-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let base = krill_proto::os::canonicalize(&base).unwrap();
+        let repo = base.join("repo");
+        let wt = base.join("wt-ext");
+        let git = |args: &[&str]| {
+            let ok = krill_proto::os::background_command("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let (r, w) = (repo.to_str().unwrap(), wt.to_str().unwrap());
+        git(&["init", "-q", r]);
+        git(&["-C", r, "commit", "-q", "--allow-empty", "-m", "init"]);
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let first = snapshot(&cache, &[(SessionId(1), Some(repo.clone()))]).unwrap();
+        assert_eq!(first.repositories.len(), 1);
+        assert_eq!(first.repositories[0].worktrees.len(), 1);
+
+        // 캐시 타임스탬프를 옛 TTL(3초)보다 오래된 10초 전으로 되돌려도 새 DISCOVERY_TTL(30초) 안이면 재사용한다.
+        let ten_secs_ago = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        {
+            let mut state = lock(&cache);
+            for (at, _) in state.trees.values_mut() {
+                *at = ten_secs_ago;
+            }
+            for (at, _) in state.repositories.values_mut() {
+                *at = ten_secs_ago;
+            }
+            assert!(
+                fresh(&state, &repo).is_some(),
+                "cache must remain fresh past old 3s TTL while worktrees dir is unchanged"
+            );
+        }
+
+        // 외부 CLI로 워크트리를 추가하면 `<common_dir>/worktrees` 지문이 바뀌어 30초 TTL을 기다리지 않고 즉시 무효화된다.
+        git(&["-C", r, "worktree", "add", "-q", "-b", "ext", w]);
+        {
+            let state = lock(&cache);
+            assert!(
+                fresh(&state, &repo).is_none(),
+                "external git worktree add must immediately invalidate sidebar cache"
+            );
+        }
+
+        let _ = snapshot(&cache, &[(SessionId(1), Some(repo.clone()))]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut discovered = false;
+        while Instant::now() < deadline {
+            let snap = snapshot(&cache, &[(SessionId(1), Some(repo.clone()))]).unwrap();
+            if snap
+                .repositories
+                .first()
+                .is_some_and(|r| r.worktrees.len() == 2)
+            {
+                discovered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_dir_all(&base).ok();
+        assert!(
+            discovered,
+            "sidebar snapshot must discover externally added worktree immediately"
+        );
     }
 }
 

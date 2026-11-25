@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::{
@@ -1298,7 +1298,7 @@ where
     S: AsRef<OsStr>,
 {
     let cwd = krill_proto::os::shell_path(cwd);
-    Command::new("git")
+    krill_proto::os::background_command("git")
         .current_dir(&cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1322,6 +1322,8 @@ fn git_err(out: &Output, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use krill_proto::worktree_space::{CleanupFilter, CleanupPrFilter, filter_cleanup_candidates};
 
     use super::*;

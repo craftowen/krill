@@ -581,3 +581,75 @@ fn base64_roundtrip() {
         assert_eq!(dec, sample);
     }
 }
+
+#[test]
+fn voice_git_vocab_reads_head_and_status_and_skips_auto_refresh_without_pipito() {
+    let dir = temp_dir("git-vocab");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let run_git = |args: &[&str]| {
+        let status = krill_proto::os::background_command("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    run_git(&["init", "-q", "-b", "feat/voice-no-window"]);
+    fs::write(repo.join("tracked.rs"), "fn main() {}\n").unwrap();
+    run_git(&["add", "tracked.rs"]);
+    run_git(&["commit", "-q", "-m", "init"]);
+    fs::write(repo.join("tracked.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+    fs::write(repo.join("untracked_helper.rs"), "pub fn x() {}\n").unwrap();
+
+    // collect_git_vocab은 .git/HEAD 직접 읽기 + background_command("git") status로 브랜치와 변경 파일을 추출한다.
+    let vocab = context::collect_git_vocab(&repo);
+    assert!(
+        vocab.iter().any(|w| w == "feat/voice-no-window"),
+        "expected branch in {vocab:?}"
+    );
+    assert!(
+        vocab.iter().any(|w| w == "voice-no-window"),
+        "expected branch segment in {vocab:?}"
+    );
+    assert!(
+        vocab.iter().any(|w| w == "tracked.rs"),
+        "expected modified file in {vocab:?}"
+    );
+    assert!(
+        vocab.iter().any(|w| w == "untracked_helper.rs"),
+        "expected untracked file in {vocab:?}"
+    );
+
+    // Pipito bridge.json이 없을 때 observe_turns/observe_prompt는 불필요한 백그라운드 git 갱신을 예약하지 않는다.
+    let missing_bridge = dir.join("missing-bridge.json");
+    let svc = VoiceService::with_bridge_override(Some(&dir), Some(missing_bridge));
+    assert!(!svc.bridge.is_installed());
+    svc.observe_turns(
+        VoiceTargetKind::Session,
+        "77",
+        &[("user".to_owned(), "hello".to_owned())],
+        Some(repo.clone()),
+    );
+    svc.observe_prompt(
+        VoiceTargetKind::Session,
+        "77",
+        "check git status",
+        Some(repo.clone()),
+    );
+    thread::sleep(Duration::from_millis(120));
+    let snap = svc
+        .context
+        .snapshot(Some(VoiceTargetKind::Session), Some("77"));
+    assert!(
+        !snap
+            .session_vocab
+            .iter()
+            .any(|w| w == "feat/voice-no-window"),
+        "must not run background git refresh when Pipito is not installed: {:?}",
+        snap.session_vocab
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}

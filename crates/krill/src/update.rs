@@ -7,8 +7,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "linux"))]
-use std::process::Command;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: krill update [--check] [--app <path>] [--state-dir <path>] [--json]";
@@ -208,7 +206,7 @@ fn upgrade_daemon(state_dir: Option<&Path>, check: bool, json: bool) -> ExitCode
 #[cfg(not(target_os = "linux"))]
 fn delegate_to_app(raw: &[OsString], app_bundle: Option<&Path>) -> ExitCode {
     let exe = resolve_krill_app_exe(app_bundle);
-    let mut command = Command::new(&exe);
+    let mut command = krill_proto::os::background_command(&exe);
     command.arg("--update-cli").args(raw);
     #[cfg(windows)]
     let status = match command.output() {

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -300,7 +300,7 @@ fn toml_basic_string(raw: &str) -> String {
 }
 
 pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
-    let mut cmd = Command::new(exe);
+    let mut cmd = krill_proto::os::background_command(exe);
     cmd.arg("--help")
         .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
         .stdin(Stdio::null())

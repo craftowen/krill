@@ -340,3 +340,90 @@ fn status_branch_header_matches_show_current() {
     status.record(b"# branch.head (detached)").unwrap();
     assert_eq!(status.branch, "");
 }
+
+#[test]
+fn numstat_diff_is_skipped_when_no_staged_or_unstaged_changes_exist() {
+    let dir = Dir::new("skip-numstat");
+    dir.git(&["init", "-q"]);
+    fs::write(dir.0.join("a.txt"), "line1\n").unwrap();
+    dir.git(&["add", "a.txt"]);
+    dir.git(&["commit", "-qm", "init"]);
+
+    let log_dir = Dir::new("skip-numstat-log");
+    let log_file = log_dir.0.join("calls.log");
+    let wrapper = log_dir.0.join("counting-git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let q = GitQueue::with_program(wrapper, 1).unwrap();
+    let run_count = || -> (Changes, usize) {
+        fs::remove_file(&log_file).ok();
+        let res = query(&q, dir.0.clone(), Arc::new(AtomicBool::new(false)))
+            .recv()
+            .unwrap()
+            .unwrap();
+        let count = fs::read_to_string(&log_file)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        (res, count)
+    };
+
+    // 1) Clean repo: only `git status` (1 call).
+    let (res, count) = run_count();
+    assert!(res.files.is_empty());
+    assert_eq!(count, 1, "clean repo must run only git status");
+
+    // 2) Untracked-only: only `git status` (1 call; skips both cached & unstaged diff).
+    fs::write(dir.0.join("untracked.txt"), "new\n").unwrap();
+    let (res, count) = run_count();
+    assert_eq!(res.files.len(), 1);
+    assert_eq!(
+        count, 1,
+        "untracked-only repo must skip both git diff calls"
+    );
+    fs::remove_file(dir.0.join("untracked.txt")).unwrap();
+
+    // 3) Unstaged-only: `git status` + `git diff --numstat` (2 calls; skips `--cached`).
+    fs::write(dir.0.join("a.txt"), "line1\nline2\n").unwrap();
+    let (res, count) = run_count();
+    assert_eq!(res.files.len(), 1);
+    assert_eq!(res.files[0].staged, None);
+    assert_eq!(
+        res.files[0].unstaged,
+        Some(Numstat {
+            added: Some(1),
+            deleted: Some(0)
+        })
+    );
+    assert_eq!(count, 2, "unstaged-only repo must skip git diff --cached");
+
+    // 4) Staged-only: `git status` + `git diff --cached --numstat` (2 calls; skips unstaged diff).
+    dir.git(&["add", "a.txt"]);
+    let (res, count) = run_count();
+    assert_eq!(res.files.len(), 1);
+    assert_eq!(
+        res.files[0].staged,
+        Some(Numstat {
+            added: Some(1),
+            deleted: Some(0)
+        })
+    );
+    assert_eq!(res.files[0].unstaged, None);
+    assert_eq!(count, 2, "staged-only repo must skip unstaged git diff");
+
+    // 5) Both staged and unstaged: all 3 calls run and both numstats populate.
+    fs::write(dir.0.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+    let (res, count) = run_count();
+    assert_eq!(res.files.len(), 1);
+    assert!(res.files[0].staged.is_some());
+    assert!(res.files[0].unstaged.is_some());
+    assert_eq!(count, 3, "staged+unstaged repo must run both numstat diffs");
+}

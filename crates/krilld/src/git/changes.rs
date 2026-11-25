@@ -114,7 +114,20 @@ fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<(Changes, Str
     if changes.files.is_empty() {
         return Ok((changes, branch));
     }
-    for staged in [true, false] {
+    // `status`의 [X, Y]를 보고 실제 staged·unstaged 항목이 있는 쪽만 `git diff --numstat`을 호출한다.
+    // untracked(`??`) 전용이나 unstaged 전용 편집에서 불필요한 git 서브프로세스를 생략한다.
+    let has_staged = changes
+        .files
+        .iter()
+        .any(|f| !matches!(f.status[0], b'.' | b'?'));
+    let has_unstaged = changes
+        .files
+        .iter()
+        .any(|f| !matches!(f.status[1], b'.' | b'?'));
+    for (staged, needed) in [(true, has_staged), (false, has_unstaged)] {
+        if !needed {
+            continue;
+        }
         let mut args = vec![
             "-c",
             "diff.autoRefreshIndex=false",

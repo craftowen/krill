@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -278,8 +278,10 @@ fn format_file_insert_text(rel_display: &str) -> String {
 }
 
 fn collect_git_workspace_files(cwd: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = krill_proto::os::background_command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .arg("-C")
         .arg(cwd)
         .args([

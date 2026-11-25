@@ -5,8 +5,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -268,7 +266,7 @@ impl Rpc {
                 })?,
         );
         #[cfg(not(windows))]
-        let mut codex = Command::new("codex");
+        let mut codex = crate::os::background_command("codex");
         if let Some(search) = search {
             codex.env("PATH", search);
         }
