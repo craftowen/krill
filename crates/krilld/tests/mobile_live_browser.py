@@ -13,6 +13,197 @@ import time
 from mobile_browser import until
 
 
+def verify_touch_scroll_ux(config, cli, evidence):
+    """Playwright mobile touch (390x844, has_touch=True) E2E scroll & zero-error gate."""
+    from playwright.sync_api import sync_playwright
+
+    stream_sid = int(
+        cli(
+            'new', '--cwd', config['repo'], '--', '/bin/sh', '-c',
+            "i=1; while [ $i -le 1200 ]; do printf 'LINE_%04d: The quick brown fox jumps over the lazy dog 0123456789\\n' $i; i=$((i+1)); done; "
+            "echo '=== STREAM_READY ==='; "
+            "while true; do i=$((i+1)); printf 'LIVE_%04d: continuous live output while scrolled up\\n' $i; sleep 0.2; done",
+        ).strip()
+    )
+    try:
+        until(lambda: 'STREAM_READY' in cli('read', str(stream_sid)), seconds=20)
+        console_errors = []
+        page_errors = []
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 390, 'height': 844},
+                device_scale_factor=3,
+                is_mobile=True,
+                has_touch=True,
+                user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            )
+            context.add_init_script('localStorage.setItem("krill-mobile-error-reporting-v1","");')
+            page = context.new_page()
+            page.on('console', lambda m: console_errors.append(m.text) if m.type == 'error' else None)
+            page.on('pageerror', lambda e: page_errors.append(str(e)))
+            touch_offer = json.loads(cli('mobile', 'pair', '--address', config['base'].split('://')[1], '--json'))['PairingOffer']['url']
+            page.goto(touch_offer, wait_until='domcontentloaded')
+            page.wait_for_function('() => globalThis.KrillMobile?.store?.connection?.phase === "ready"', timeout=30000)
+            page.evaluate('() => { KrillMobile.install?.dismiss?.(); document.getElementById("action-sheet")?.close?.(); globalThis._unhandled = []; globalThis.addEventListener("unhandledrejection", e => globalThis._unhandled.push(String(e.reason?.stack || e.reason))); globalThis._notices = []; const n = document.getElementById("notice"); new MutationObserver(() => { if (!n.hidden && n.textContent) globalThis._notices.push(n.textContent); }).observe(n, {subtree:true, childList:true, characterData:true, attributes:true}); }')
+
+            def open_session(sid):
+                page.wait_for_function(f'() => KrillMobile.store.sessions.has({sid})', timeout=15000)
+                page.evaluate(f'() => {{ const s = KrillMobile.store.sessions.get({sid}); KrillMobile.app.navigate("/host/local/group/" + encodeURIComponent(s.groupKey) + "/s/{sid}"); }}')
+                page.wait_for_function('() => document.querySelector(".terminal-mount")?.dataset.phase === "ready"', timeout=15000)
+
+            def snap():
+                return page.evaluate('''() => {
+                    const m = document.querySelector('.terminal-mount');
+                    const p = document.querySelector('.terminal-scroll');
+                    const h = document.querySelector('.terminal-history');
+                    const c = document.querySelector('.terminal-grid');
+                    const l = document.querySelector('.terminal-latest');
+                    const r = p?.getBoundingClientRect();
+                    let firstLine = null;
+                    if (p && h && !h.hidden) {
+                        const pr = p.getBoundingClientRect();
+                        for (const ch of h.children) {
+                            const cr = ch.getBoundingClientRect();
+                            if (cr.bottom > pr.top + 2) {
+                                const txt = (ch.textContent || '').trim();
+                                const m1 = txt.match(/(?:LINE_|LIVE_|^)(\\d{4,6})/);
+                                if (m1) { firstLine = Number(m1[1]); break; }
+                            }
+                        }
+                    }
+                    return {
+                        phase: m?.dataset.phase,
+                        liveBottom: m?.dataset.liveBottom,
+                        top: p?.scrollTop,
+                        scrollH: p?.scrollHeight,
+                        clientH: p?.clientHeight,
+                        gap: p ? Math.round(p.scrollHeight - p.scrollTop - p.clientHeight) : null,
+                        rows: h?.children.length || 0,
+                        canvasHidden: !!c?.hidden,
+                        latestHidden: !!l?.hidden,
+                        rect: r ? {top: Math.round(r.top), bottom: Math.round(r.bottom)} : null,
+                        firstLine,
+                        screenText: c?.getAttribute('aria-label') || '',
+                    };
+                }''')
+
+            cdp = context.new_cdp_session(page)
+
+            def touch_drag(y0, y1, steps=12, step_ms=14, settle=0.4):
+                cdp.send('Input.dispatchTouchEvent', {'type': 'touchStart', 'touchPoints': [{'x': 195, 'y': y0, 'id': 1}]})
+                for i in range(1, steps + 1):
+                    time.sleep(step_ms / 1000.0)
+                    y = y0 + (y1 - y0) * i / steps
+                    cdp.send('Input.dispatchTouchEvent', {'type': 'touchMove', 'touchPoints': [{'x': 195, 'y': y, 'id': 1}]})
+                time.sleep(0.02)
+                cdp.send('Input.dispatchTouchEvent', {'type': 'touchEnd', 'touchPoints': []})
+                time.sleep(settle)
+                # Wait for native momentum to settle completely
+                prev_top = snap()['top']
+                for _ in range(15):
+                    time.sleep(0.08)
+                    cur_top = snap()['top']
+                    if abs(cur_top - prev_top) < 1:
+                        break
+                    prev_top = cur_top
+                return snap()
+
+            # 1. Streaming session: initial live bottom -> monotonic upward drags -> pinned during live output & resize -> return to live.
+            open_session(stream_sid)
+            page.wait_for_function('() => document.querySelectorAll(".terminal-history-row").length >= 300', timeout=15000)
+            time.sleep(0.5)
+            s0 = snap()
+            assert s0['phase'] == 'ready' and s0['liveBottom'] == 'true' and s0['latestHidden'], s0
+            page.screenshot(path=str(evidence / 'scroll-initial-bottom.png'))
+            y_top = s0['rect']['top'] + 80
+            y_bot = s0['rect']['bottom'] - 80
+
+            # Monotonic upward touch drags (finger moves down y_top -> y_bot => scrollTop strictly decreases, line numbers strictly decrease).
+            seen_lines = []
+            prev_top = s0['top']
+            for idx in range(5):
+                sk = touch_drag(y_top, y_bot)
+                assert sk['top'] < prev_top - 100, f'drag {idx+1} did not scroll up monotonically: {prev_top} -> {sk["top"]}'
+                assert not sk['latestHidden'], f'Latest button must show while scrolled up: {sk}'
+                if sk['firstLine'] is not None:
+                    if seen_lines:
+                        assert sk['firstLine'] < seen_lines[-1], f'line number jumped forward/teleported: {seen_lines[-1]} -> {sk["firstLine"]}'
+                    seen_lines.append(sk['firstLine'])
+                prev_top = sk['top']
+            assert len(seen_lines) >= 3, f'expected monotonic line numbers while scrolling up: {seen_lines}'
+            page.screenshot(path=str(evidence / 'scroll-up-history-pinned.png'))
+
+            # Stay pinned while continuous live output arrives AND viewport resizes (keyboard / address bar).
+            pinned = snap()
+            time.sleep(1.5)
+            after_live = snap()
+            assert abs(after_live['top'] - pinned['top']) <= 2, f'live output moved pinned scrollTop: {pinned} -> {after_live}'
+            assert after_live['firstLine'] == pinned['firstLine'], f'live output changed visible line: {pinned} -> {after_live}'
+            page.set_viewport_size({'width': 390, 'height': 540})
+            time.sleep(0.4)
+            after_shrink = snap()
+            page.set_viewport_size({'width': 390, 'height': 844})
+            time.sleep(0.4)
+            after_grow = snap()
+            assert abs(after_shrink['top'] - pinned['top']) <= 2 and abs(after_grow['top'] - pinned['top']) <= 2, (pinned, after_shrink, after_grow)
+            assert after_grow['firstLine'] == pinned['firstLine'], (pinned, after_grow)
+
+            # Tap Latest output -> resumes live follow-tail automatically.
+            page.click('.terminal-latest')
+            time.sleep(0.4)
+            live_back = snap()
+            assert live_back['liveBottom'] == 'true' and live_back['latestHidden'] and live_back['gap'] <= 2, live_back
+            before_screen = live_back['screenText']
+            time.sleep(0.8)
+            live_later = snap()
+            assert live_later['liveBottom'] == 'true' and live_later['gap'] <= 2, live_later
+            assert live_later['screenText'] != before_screen or 'LIVE_' in live_later['screenText'], 'live output resumed following'
+            page.screenshot(path=str(evidence / 'scroll-returned-live.png'))
+
+            # 2. 20k-line session: cross Hot -> Cold boundary without duplicate/forward teleportation, then smoothly scroll back down.
+            open_session(config['terminalSession'])
+            page.wait_for_function('() => document.querySelectorAll(".terminal-history-row").length >= 900', timeout=15000)
+            time.sleep(0.4)
+            s20 = snap()
+            first_up = touch_drag(y_top, y_bot)
+            assert first_up['top'] < s20['top'], f'first drag on 20k session jumped backwards: {s20["top"]} -> {first_up["top"]}'
+            cold_lines = []
+            reached_windowed = False
+            for _ in range(24):
+                sk = touch_drag(y_top, y_bot, steps=8, step_ms=10, settle=0.25)
+                if sk['firstLine'] is not None:
+                    if cold_lines:
+                        assert sk['firstLine'] <= cold_lines[-1], f'cold scroll teleported forward: {cold_lines[-1]} -> {sk["firstLine"]}'
+                    cold_lines.append(sk['firstLine'])
+                if sk['canvasHidden']:
+                    reached_windowed = True
+                if reached_windowed and cold_lines and cold_lines[-1] < 19600:
+                    break
+            assert reached_windowed, f'expected to cross into windowed cold history: {cold_lines}'
+            assert cold_lines and cold_lines[-1] < 19600, f'expected deduplicated cold lines below 19600: {cold_lines}'
+            page.screenshot(path=str(evidence / 'scroll-cold-history.png'))
+            # Gently scroll DOWN from windowed cold history: must advance monotonically without teleporting to live bottom.
+            down_start = snap()
+            down_step = touch_drag(y_top + 260, y_top + 100, steps=10, step_ms=14, settle=0.3)
+            assert down_step['firstLine'] is None or down_start['firstLine'] is None or down_step['firstLine'] >= down_start['firstLine'], (down_start, down_step)
+            assert down_step['liveBottom'] != 'true', f'gentle downward drag in windowed history teleported to live bottom: {down_step}'
+
+            unhandled = page.evaluate('() => globalThis._unhandled')
+            notices = page.evaluate('() => globalThis._notices')
+            assert not console_errors, f'console errors: {console_errors}'
+            assert not page_errors, f'page errors: {page_errors}'
+            assert not unhandled, f'unhandled rejections: {unhandled}'
+            assert not notices, f'unexpected notices: {notices}'
+            browser.close()
+        print('PASS: Playwright 390x844 mobile touch scroll E2E (0 errors, monotonic drag, pinned live/resize, cold deduplication, bidirectional window, follow-tail resume)')
+    finally:
+        try:
+            cli('kill', str(stream_sid))
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--address', default='127.0.0.1:0')
@@ -156,6 +347,7 @@ def main():
                 assert measurements['daemon_with_live'] <= 60*1024*1024, measurements
                 if app: assert measurements['app_ten_ptys'] <= 120*1024*1024, measurements
                 print(json.dumps(measurements,indent=2))
+                verify_touch_scroll_ux(config, cli, evidence)
                 print(f'PASS: live snapshot/deltas, ANSI/wide/combining text, 20 keys, Fit release/disconnect restoration, hot+cold history, deep link, {expected_ptys} PTYs; native memory {"not requested" if args.browser_only else "verified"}')
             finally:
                 if app:

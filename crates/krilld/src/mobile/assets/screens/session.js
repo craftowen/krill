@@ -1200,6 +1200,15 @@
       generation = 0,
       owner = null,
       disposed = false;
+    const ignoreDisconnect = (e) => {
+      if (
+        e &&
+        !e.disconnected &&
+        e.message !== "Terminal disconnected" &&
+        !disposed
+      )
+        ctx.error(e);
+    };
     const tabEntries = new Map(),
       // 다녀온 탭의 터미널을 숨긴 채 붙여 둬 되돌아가면 소켓·attach 없이 바로 보인다.
       parked = new Map(),
@@ -1228,7 +1237,7 @@
       entry.el.hidden = true;
       entry.el.remove();
       entry.handle.setInputActive?.(false);
-      Promise.resolve(entry.handle.setVisible?.(false)).catch(ctx.error);
+      Promise.resolve(entry.handle.setVisible?.(false)).catch(ignoreDisconnect);
       parked.set(entry.id, entry);
       entry.parkTimer = setTimeout(() => unpark(entry.id), PARK_MS);
       for (const id of parked.keys()) {
@@ -1242,7 +1251,7 @@
       panels.hidden = inChat;
       chatMount.hidden = !inChat;
       handle?.setQuestionActive?.(inChat);
-      Promise.resolve(handle?.setVisible?.(!inChat)).catch(ctx.error);
+      Promise.resolve(handle?.setVisible?.(!inChat)).catch(ignoreDisconnect);
 
       if (!chatHandle && M.chat?.mount)
         chatHandle = M.chat.mount(chatMount, {
@@ -1639,7 +1648,7 @@
         handle.setInputActive?.(activePane === 0);
         handle.setQuestionActive?.(viewMode === "chat");
         Promise.resolve(handle.setVisible?.(viewMode !== "chat")).catch(
-          ctx.error,
+          ignoreDisconnect,
         );
         if (viewMode !== "chat" && activePane === 0) M.activeTerminal = handle;
         syncSummary();
@@ -2152,7 +2161,7 @@
         handle &&
         terminalPhase === "ready"
       )
-        Promise.resolve(handle.fitToPhone(true, false)).catch(ctx.error);
+        Promise.resolve(handle.fitToPhone(true, false)).catch(ignoreDisconnect);
       activate(activePane);
     }
     primaryPane.addEventListener("pointerdown", () => activate(0), {
