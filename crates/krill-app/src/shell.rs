@@ -3696,7 +3696,7 @@ impl Shell {
     /// 외부 변경 때마다 호출되므로 동기 IO(`~/.codex/sessions` 재귀 stat 등)면 매번
     /// UI 스레드가 멈춘다. 결과는 UI 스레드에서 반영한다.
     /// OWE-697: 데몬이 연결돼 있으면 계정은 데몬 `ListAccounts` 응답만 쓴다. 로컬 파일은 데몬이
-    /// 없을 때 읽기 전용으로만 읽는다(자동전환 판정은 krilld 단독).
+    /// 없을 때 읽기 전용으로만 읽는다.
     fn refresh_local_state(&mut self, cx: &mut Context<Self>) {
         self.local_generation = self.local_generation.wrapping_add(1);
         let generation = self.local_generation;
@@ -4012,6 +4012,7 @@ impl Shell {
         })
     }
 
+    #[cfg(all(test, unix))]
     pub(super) fn refresh_accounts(
         &mut self,
         req: krill_proto::usage::UsageRequest,
@@ -4402,9 +4403,6 @@ impl Shell {
             sidebar.sync_session_accounts(&host, Arc::new(snap.clone()), cx);
         });
         self.prune_stale_account_dismissals(&host, cx);
-        if host.is_local() {
-            krill_app::alert::sync_account_switches(&snap.advanced, cx);
-        }
         let mut input_notices = Vec::new();
         let mut failed_detached = Vec::new();
         for (pane, live) in &mut self.live {

@@ -88,7 +88,7 @@ Mobile & Drop:
   krill drop <file>...|ls|rm <id> [--json]
 
 Accounts, Agents & Hooks:
-  krill account [list|switch|add|rm|auto-switch]
+  krill account [list|switch|add|rm]
   krill agent list
   krill hook <agent>
   krill hook install|uninstall <claude|codex|agy|cursor|opencode|pi>

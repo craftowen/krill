@@ -799,30 +799,6 @@ fn remote_host_provider_popup_switches_remote_profile_and_rebinds_remote_handoff
     std::fs::remove_file(&sock_path).ok();
 }
 
-#[test]
-fn exhaustion_forecasts_use_whole_hours() {
-    let now = krill_app::accounts::display::now();
-    let account = profile("forecast", None);
-    let mut snap = AccountsSnapshot::default();
-    snap.advanced.supported = true;
-    snap.advanced.forecasts = vec![krill_proto::usage::UsageForecast {
-        account_id: account.id.clone(),
-        window: "5h".into(),
-        percent_per_hour: 12,
-        exhausts_at: now + 7_199,
-        resets_at: now + 18_000,
-    }];
-    let notes = advanced_notes(&snap, &account);
-    assert_eq!(
-        notes,
-        vec![krill_app::i18n::catalog::shell::ACCOUNT_FORECAST.format(&[
-            ("window", "5h"),
-            ("hours", "2"),
-            ("rate", "12"),
-        ])]
-    );
-}
-
 #[gpui::test]
 fn remote_model_limits_and_resets_are_visible_without_moving_tab_controls(
     cx: &mut gpui::TestAppContext,

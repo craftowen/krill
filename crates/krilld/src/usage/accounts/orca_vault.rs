@@ -10,8 +10,7 @@ use krill_proto::usage::{AccountInfo, AccountsSnapshot, ProviderKind, Snapshot};
 use zeroize::Zeroizing;
 
 use super::{
-    SAVE_LOCK, StoredAccount, load_writable, lock, refresh_accounts_with, save_inner,
-    write_atomic_0600,
+    SAVE_LOCK, StoredAccount, load_writable, lock, refresh_accounts, save_inner, write_atomic_0600,
 };
 
 struct Account {
@@ -58,7 +57,7 @@ fn apply(
     selected: Option<&str>,
     dry_run: bool,
 ) -> io::Result<AccountsSnapshot> {
-    let mut preview = refresh_accounts_with(home, state, false);
+    let mut preview = refresh_accounts(home, state);
     if dry_run {
         for account in accounts {
             let id = format!("agy-orca-{}", account.id);
@@ -127,7 +126,7 @@ fn apply(
         save_inner(home, state, &file)?;
     }
     super::agy_native::sync_active_from_disk(home, state);
-    Ok(refresh_accounts_with(home, state, false))
+    Ok(refresh_accounts(home, state))
 }
 
 fn profile(home: &Path, id: &str) -> PathBuf {

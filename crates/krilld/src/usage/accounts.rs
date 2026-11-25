@@ -1,4 +1,4 @@
-//! 프로바이더 다계정 레지스트리(`accounts.toml`)·계정별 5h/7d 사용량 측정·원클릭 전환·자동전환 엔진(MK-107·MK-108).
+//! 프로바이더 다계정 레지스트리(`accounts.toml`)·계정별 5h/7d 사용량 측정·원클릭 수동 전환(MK-107·MK-108).
 
 pub(crate) mod agy_native;
 pub(crate) mod codex_home;
@@ -18,10 +18,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::usage::{
-    AUTO_SWITCH_HYSTERESIS, AUTO_SWITCH_THRESHOLD_MAX, AUTO_SWITCH_THRESHOLD_MIN, AccountInfo,
-    AccountStatus, AccountStatusInfo, AccountsSnapshot, AutoSwitchEvent, AutoSwitchMetric,
-    AutoSwitchPolicy, AutoSwitchRule, DEFAULT_AUTO_SWITCH_PERCENT, OrphanProfile, ProviderKind,
-    ResetConsumeOutcome, Snapshot, Window as ProtoWindow,
+    AccountInfo, AccountPolicyState, AccountStatus, AccountStatusInfo, AccountsSnapshot,
+    AutoSwitchPolicy, OrphanProfile, ProviderKind, ResetConsumeOutcome, Snapshot,
+    Window as ProtoWindow,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,14 +38,12 @@ const ORCA_EMAIL_MAX_AGE: u64 = 3600;
 type StatusMeta = (Option<String>, Option<String>, Option<u64>);
 /// `StopFailure` `rate_limit` 감지 계정 기록(OWE-703 2단계 지시·OWE-710).
 /// (프로바이더 키, 계정 id) → 감지 시각(epoch 초). 메모리 전용이라 데몬 재기동이면
-/// 사라진다. OWE-712가 소진 창 리셋 또는 리셋 미상의 15분 뒤 해제한다.
+/// 사라진다. 소진 창 리셋 또는 리셋 미상의 15분 뒤 해제한다.
 /// `SAVE_LOCK`과 중첩하지 않게 `refresh_*`는 시작 때 통째로 복사해 쓴다.
 static RATE_LIMITED: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
-/// 프로바이더별로 전환 조건은 섰는데 고를 계정이 없던 활성 계정. 막힐 때 한 번만 경고한다(리프 잠금).
-static SWITCH_BLOCKED: Mutex<BTreeMap<ProviderKind, String>> = Mutex::new(BTreeMap::new());
 
-/// 한도 도달을 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 전환 평가가 일어난다.
-/// `switch_on_rate_limit=false`·비활성 정책은 그대로 존중되고, 수동 전환(`switch_account`)은 기록을 지운다.
+/// 한도 도달을 기록한다. UI 한도 배지·만료 시각·채팅 한도 배너에 반영되며,
+/// 수동 전환(`switch_account`)이나 리셋 크레딧 소진 시 지워진다.
 pub fn record_rate_limited(provider: ProviderKind, account_id: &str) {
     let now = now_epoch();
     let now = u64::try_from(now).unwrap_or(u64::MAX);
@@ -74,74 +71,7 @@ fn rate_limited_at(
         .copied()
 }
 
-const MAX_MANUAL_PINS: usize = 256;
-
-/// K-12·OWE-770: 수동 전환(`switch_account`)으로 고른 계정의 런타임 고정 상태.
-/// 선택 시점의 사용량·정책이 유지되는 동안 주기 `refresh_accounts`/`ListAccounts` 자동전환에서 제외하며,
-/// 사용량·리셋 시각 변화, 한도(`RATE_LIMITED`) 도달, 자동전환 정책 변경, 데몬 재기동 시 해제된다.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ManualPin {
-    account_id: String,
-    usage: Snapshot,
-    policy: AutoSwitchPolicy,
-    advanced_policy: krill_proto::usage::AdvancedPolicy,
-}
-
-static MANUAL_PINS: Mutex<BTreeMap<(PathBuf, ProviderKind), ManualPin>> =
-    Mutex::new(BTreeMap::new());
-
-fn set_manual_pin(
-    home: &Path,
-    state_dir: Option<&Path>,
-    provider: ProviderKind,
-    account_id: &str,
-    usage: Snapshot,
-    file: &AccountsFile,
-) {
-    let key = (config_path(home, state_dir), provider);
-    let pin = ManualPin {
-        account_id: account_id.to_owned(),
-        usage,
-        policy: AutoSwitchPolicy::from(file.auto_switch.clone()),
-        advanced_policy: file.advanced_policy.clone(),
-    };
-    let mut pins = lock(&MANUAL_PINS);
-    if !pins.contains_key(&key) && pins.len() >= MAX_MANUAL_PINS {
-        pins.pop_first();
-    }
-    pins.insert(key, pin);
-}
-
-fn manually_pinned(
-    home: &Path,
-    state_dir: Option<&Path>,
-    provider: ProviderKind,
-    active_acc: &AccountInfo,
-    limited_active: bool,
-    policy: &AutoSwitchPolicy,
-    advanced_policy: &krill_proto::usage::AdvancedPolicy,
-) -> bool {
-    let key = (config_path(home, state_dir), provider);
-    let mut pins = lock(&MANUAL_PINS);
-    let Some(pin) = pins.get(&key) else {
-        return false;
-    };
-    if pin.account_id != active_acc.id
-        || limited_active
-        || &pin.policy != policy
-        || &pin.advanced_policy != advanced_policy
-    {
-        pins.remove(&key);
-        return false;
-    }
-    if active_acc.usage.is_empty() || pin.usage == active_acc.usage {
-        return true;
-    }
-    pins.remove(&key);
-    false
-}
-/// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
-/// 자동전환 작업 알림은 마지막에 발행하며, 작업 큐 잠금 안에서는 이 잠금을 잡지 않는다.
+/// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09).
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,15 +92,11 @@ impl StoredAccount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsFile {
-    #[serde(default)]
-    pub auto_switch: StoredAutoSwitch,
     /// provider (`"claude"`, `"codex"` 등) → 활성 account `id`.
     #[serde(default)]
     pub active: BTreeMap<String, String>,
     #[serde(default)]
     pub accounts: Vec<StoredAccount>,
-    #[serde(default)]
-    pub advanced_policy: krill_proto::usage::AdvancedPolicy,
     /// OWE-699: 계정 프로필 프로비저닝(`super::provision`). 키가 없으면 켜짐(Orca처럼 스킬·대화 기록 공유,
     /// 오웬 지시 2026-10-22). 명시한 `provisioning = false`는 그대로 존중한다.
     #[serde(default = "provisioning_default")]
@@ -187,10 +113,8 @@ fn provisioning_default() -> bool {
 impl Default for AccountsFile {
     fn default() -> Self {
         Self {
-            auto_switch: StoredAutoSwitch::default(),
             active: BTreeMap::new(),
             accounts: Vec::new(),
-            advanced_policy: krill_proto::usage::AdvancedPolicy::default(),
             provisioning: provisioning_default(),
             hidden_accounts: Vec::new(),
         }
@@ -202,69 +126,6 @@ impl AccountsFile {
         let home = default_home();
         let state = (!state_dir.as_os_str().is_empty()).then_some(state_dir);
         load_file(&home, state)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredAutoSwitch {
-    /// K-03: 필드 누락(부분 쓰기·구버전 파일) 때도 파싱이 깨지지 않게 정책 기본값으로 채운다.
-    #[serde(default = "default_switch_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_switch_threshold")]
-    pub threshold_percent: u8,
-    #[serde(default = "default_switch_on_rate_limit")]
-    pub switch_on_rate_limit: bool,
-    #[serde(default)]
-    pub rules: Vec<AutoSwitchRule>,
-}
-
-fn default_switch_enabled() -> bool {
-    AutoSwitchPolicy::default().enabled
-}
-
-fn default_switch_threshold() -> u8 {
-    DEFAULT_AUTO_SWITCH_PERCENT
-}
-
-fn default_switch_on_rate_limit() -> bool {
-    AutoSwitchPolicy::default().switch_on_rate_limit
-}
-
-impl Default for StoredAutoSwitch {
-    fn default() -> Self {
-        let d = AutoSwitchPolicy::default();
-        Self {
-            enabled: d.enabled,
-            threshold_percent: d.threshold_percent,
-            switch_on_rate_limit: d.switch_on_rate_limit,
-            rules: d.rules,
-        }
-    }
-}
-
-impl From<StoredAutoSwitch> for AutoSwitchPolicy {
-    fn from(s: StoredAutoSwitch) -> Self {
-        Self {
-            enabled: s.enabled,
-            threshold_percent: s
-                .threshold_percent
-                .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-            switch_on_rate_limit: s.switch_on_rate_limit,
-            rules: s.rules,
-        }
-    }
-}
-
-impl From<&AutoSwitchPolicy> for StoredAutoSwitch {
-    fn from(p: &AutoSwitchPolicy) -> Self {
-        Self {
-            enabled: p.enabled,
-            threshold_percent: p
-                .threshold_percent
-                .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-            switch_on_rate_limit: p.switch_on_rate_limit,
-            rules: p.rules.clone(),
-        }
     }
 }
 
@@ -913,72 +774,26 @@ fn classify_account(
 }
 
 /// 호스트 기본 계정 + `orca-usage-cache.json` 감지 계정 + `accounts.toml` 등록 계정을 합쳐
-/// 사용량을 측정하고 필요 시 자동전환(Auto-Switch)까지 수행해 돌려준다.
+/// 사용량과 상태를 읽기 전용으로 측정해 돌려준다.
 pub fn refresh_accounts(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot {
-    refresh_accounts_with(home, state_dir, true)
-}
-
-/// K-12: 수동 전환 직후에는 자동전환 평가·저장을 건너뛰고 저장된 선택을 그대로 보여준다.
-/// `switch_account`가 이 경로로 새로고침한다.
-pub(crate) fn refresh_accounts_with(
-    home: &Path,
-    state_dir: Option<&Path>,
-    allow_auto_switch: bool,
-) -> AccountsSnapshot {
-    let trigger = if allow_auto_switch {
-        RefreshTrigger::Automatic
-    } else {
-        RefreshTrigger::ReadOnly
-    };
-    refresh_accounts_inner(home, state_dir, trigger)
-}
-
-#[derive(Clone, Copy)]
-enum RefreshTrigger {
-    Automatic,
-    ReadOnly,
-    RateLimit,
-}
-
-/// `StopFailure` 전용 평가. 한도 전환 옵션은 같은 `SAVE_LOCK` 안에서 읽어 적용한다.
-pub(crate) fn refresh_accounts_on_rate_limit(
-    home: &Path,
-    state_dir: Option<&Path>,
-) -> AccountsSnapshot {
-    refresh_accounts_inner(home, state_dir, RefreshTrigger::RateLimit)
-}
-
-fn refresh_accounts_inner(
-    home: &Path,
-    state_dir: Option<&Path>,
-    trigger: RefreshTrigger,
-) -> AccountsSnapshot {
     // CLI 프로세스를 기다리는 동안 계정 저장 잠금을 잡지 않는다.
     super::direct::refresh_on_request(home, state_dir);
     let auth = login::statuses(home, state_dir);
-    refresh_accounts_authenticated(home, state_dir, trigger, &auth)
+    refresh_accounts_authenticated(home, state_dir, &auth)
 }
 
 fn refresh_accounts_authenticated(
     home: &Path,
     state_dir: Option<&Path>,
-    trigger: RefreshTrigger,
     auth: &login::Statuses,
 ) -> AccountsSnapshot {
     let save_guard = lock(&SAVE_LOCK);
     // 한도 기록은 잎 잠금이라 여기서 통째로 복사한다(중첩 역전 없음).
     let mut limited: BTreeMap<(String, String), u64> = lock(&RATE_LIMITED).clone();
-    // K-03: 손상된 파일은 기본값 스냅샷만 내보내고 저장하지 않는다(계정·규칙 소실 방지).
+    // K-03: 손상된 파일은 기본값 스냅샷만 내보내고 저장하지 않는다.
     let (mut file, writable) = match load_file_result(home, state_dir) {
         Ok(file) => (file, true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (AccountsFile::default(), true),
         Err(_) => (AccountsFile::default(), false),
-    };
-    let policy = AutoSwitchPolicy::from(file.auto_switch.clone());
-    let allow_auto_switch = match trigger {
-        RefreshTrigger::Automatic => true,
-        RefreshTrigger::ReadOnly => false,
-        RefreshTrigger::RateLimit => policy.switch_on_rate_limit,
     };
 
     let mut all: Vec<AccountInfo> = Vec::new();
@@ -1226,225 +1041,21 @@ fn refresh_accounts_authenticated(
             }
         }
     }
-    let mut runtime = policy::Runtime::load(home, state_dir);
-    let before = runtime.clone();
-    let stamps = meta
-        .iter()
-        .filter_map(|(id, (_, _, stamp))| Some((id.clone(), (*stamp)?)))
-        .collect();
-    runtime.observe(&all, &stamps);
-    let forecasts = runtime.forecasts(now_secs);
-    let mut predicted_switches = std::collections::BTreeSet::new();
-    // 4. 프로바이더별 현재 활성 계정 표시 및 자동전환(Auto-Switch) 평가.
-    let mut switched = Vec::new();
-    let mut dirty = false;
+    // 4. 프로바이더별 현재 활성 계정 표시(수동 선택만 반영).
     let readings: BTreeMap<_, _> = all
         .iter()
         .map(|a| (a.id.clone(), super::meters::read(home, a)))
         .collect();
-    let effective = |a: &AccountInfo, metric: AutoSwitchMetric, now: i64| {
-        readings
-            .get(&a.id)
-            .and_then(|m| m.effective_for_metric(a.provider, metric, &a.usage, now))
-            .or_else(|| metric.effective_percent(&a.usage, now))
-    };
 
     for provider in ProviderKind::ALL {
-        let key = provider.as_str().to_owned();
+        let key = provider.as_str();
         let default_id = host_default_id(provider);
-        let current_id = file
+        let active_id = file
             .active
-            .get(&key)
+            .get(key)
             .filter(|id| all.iter().any(|a| a.provider == provider && a.id == **id))
             .cloned()
-            .unwrap_or_else(|| default_id.clone());
-
-        let mut active_id = current_id.clone();
-
-        // 자동전환 조건 검사: 활성 계정의 기준 창 사용률이 임계치 이상이면 전환한다.
-        // K-27: `switch_on_rate_limit=false`면 100% 도달만으로는 전환하지 않는다(임계치 구간만 전환).
-        // 규칙에는 전용 플래그가 없어 전역 값을 쓴다.
-        // OWE-712 쿨다운은 사용률 왕복만 막는다. 실제 한도 기록이 있는 활성 계정에는 묶어 두지 않는다.
-        if allow_auto_switch
-            && let Some(active_acc) = all
-                .iter()
-                .find(|a| a.provider == provider && a.id == current_id)
-            && !manually_pinned(
-                home,
-                state_dir,
-                provider,
-                active_acc,
-                matches!(trigger, RefreshTrigger::RateLimit)
-                    || rate_limited_at(&limited, provider, &current_id).is_some(),
-                &policy,
-                &file.advanced_policy,
-            )
-            && (file.advanced_policy.cooldown_secs == 0
-                || rate_limited_at(&limited, provider, &current_id).is_some()
-                || !runtime.cooling(provider, now_secs))
-        {
-            let rule_params = |id: &str| {
-                policy.rule_for(provider, id).map_or(
-                    (
-                        policy.enabled,
-                        policy
-                            .threshold_percent
-                            .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-                        AutoSwitchMetric::Max,
-                        None,
-                    ),
-                    |r| {
-                        (
-                            r.enabled,
-                            r.threshold_percent
-                                .clamp(AUTO_SWITCH_THRESHOLD_MIN, AUTO_SWITCH_THRESHOLD_MAX),
-                            r.metric,
-                            r.target_account_id.as_deref(),
-                        )
-                    },
-                )
-            };
-            let (enabled, threshold, metric, target) = rule_params(&current_id);
-            // K-10·K-11: 사용량을 모르면(`None`) 전환을 걸지도 후보로 고르지도 않는다.
-            // 지난 창의 수치(`resets_at` 경과)는 버리고 유효 창만 본다.
-            // Max는 제공자가 보고한 모든 풀을 본다. 5h/7d 명시 규칙은 해당 창만 본다.
-            // OWE-703 2단계 지시: 한도 기록이 있는 활성 계정은 캐시와 무관하게 100%로 보고
-            // 기존 트리거(임계치·`switch_on_rate_limit`·비활성 규칙)를 그대로 탄다.
-            let now = now_epoch();
-            let limited_active = rate_limited_at(&limited, provider, &current_id).is_some();
-            let active_pct = if limited_active {
-                Some(100)
-            } else {
-                effective(active_acc, metric, now)
-            };
-            let predicted = file.advanced_policy.predict_exhaustion
-                && policy::predictive_trigger(&forecasts, &current_id, metric, now_secs);
-            let trigger = active_pct.is_some_and(|pct| {
-                enabled
-                    && (pct >= threshold || predicted)
-                    && (pct < 100 || policy.switch_on_rate_limit)
-            });
-            if trigger && let Some(pct) = active_pct {
-                // K-14: 후보는 활성 계정보다 히스테리시스만큼 확실히 여유로워야 한다.
-                // 지정 타깃이 동률이거나 더 차면 폴백도 막혀 왕복이 멈춘다.
-                // 어느 한 창이라도 소진(100%)이면 후보에서 제외한다(레이트리밋 계정으로 전환 금지).
-                // OWE-703 2단계 지시: 한도 기록 계정도 후보에서 제외한다(캐시 사용량과 무관).
-                let exhaustion_of = |metric| match metric {
-                    AutoSwitchMetric::AntigravityClaudeGptMax
-                    | AutoSwitchMetric::AntigravityClaudeGptFiveHour
-                    | AutoSwitchMetric::AntigravityClaudeGptSevenDay => {
-                        AutoSwitchMetric::AntigravityClaudeGptMax
-                    }
-                    AutoSwitchMetric::AntigravityAllMax => AutoSwitchMetric::AntigravityAllMax,
-                    _ => AutoSwitchMetric::Max,
-                };
-                let exhaustion_metric = exhaustion_of(metric);
-                // Codex는 플랜에 없는 창(Pro의 5h)을 응답에서 뺀다. 그 창 한도는 없으므로 보고된 창의
-                // 최대값으로 본다. 리셋이 지난 창은 여전히 모름이다.
-                let window_value = |a: &AccountInfo, m: AutoSwitchMetric| {
-                    effective(a, m, now).or_else(|| {
-                        let absent = a.provider == ProviderKind::Codex
-                            && !a.usage.is_empty()
-                            && match m {
-                                AutoSwitchMetric::FiveHour => a.usage.five_hour.is_none(),
-                                AutoSwitchMetric::SevenDay => a.usage.seven_day.is_none(),
-                                _ => false,
-                            };
-                        absent
-                            .then(|| effective(a, AutoSwitchMetric::Max, now))
-                            .flatten()
-                    })
-                };
-                let better = |a: &&AccountInfo| -> Option<u8> {
-                    // 갱신에 실패한 계정(만료·회전된 토큰 401 등)은 남은 미터 값이 있어도 후보가 아니다.
-                    if a.stale
-                        || meta.get(&a.id).is_some_and(|(error, _, _)| error.is_some())
-                        || auth
-                            .get(&(a.provider, PathBuf::from(&a.profile_dir)))
-                            .is_some_and(|status| !status.logged_in)
-                        || !runnable(a)
-                        || rate_limited_at(&limited, provider, &a.id).is_some()
-                    {
-                        return None;
-                    }
-                    if effective(a, exhaustion_metric, now).is_none_or(|max| max >= 100) {
-                        return None;
-                    }
-                    let v = window_value(a, metric)?;
-                    // 후보 자신의 규칙이 다음 틱에 지금 계정으로 되돌릴 조합(5h↔7d 같은 비대칭 규칙)이면
-                    // 고르지 않는다. 같은 지표면 히스테리시스가 막고, 지금 계정이 소진·한도 기록이면 못 돌아온다.
-                    let (back_enabled, back_threshold, back_metric, _) = rule_params(&a.id);
-                    let bounces = back_enabled
-                        && !limited_active
-                        && effective(active_acc, exhaustion_of(back_metric), now)
-                            .is_some_and(|max| max < 100)
-                        && window_value(a, back_metric)
-                            .zip(window_value(active_acc, back_metric))
-                            .is_some_and(|(back, current)| {
-                                back >= back_threshold
-                                    && current.saturating_add(AUTO_SWITCH_HYSTERESIS) <= back
-                            });
-                    if bounces {
-                        return None;
-                    }
-                    (v.saturating_add(AUTO_SWITCH_HYSTERESIS) <= pct).then_some(v)
-                };
-                let preferred = target
-                    .and_then(|id| {
-                        all.iter()
-                            .find(|a| a.provider == provider && a.id == id && a.id != current_id)
-                    })
-                    .filter(|a| better(a).is_some());
-                let fallback = || {
-                    all.iter()
-                        .filter(|a| {
-                            a.provider == provider && a.id != current_id && better(a).is_some()
-                        })
-                        .min_by_key(|a| {
-                            let v = better(a).unwrap_or(u8::MAX);
-                            (
-                                // 리셋 우선이어도 임계치 아래 후보가 먼저다(다음 틱 연쇄 전환 방지).
-                                v >= threshold,
-                                if file.advanced_policy.prefer_soonest_reset {
-                                    policy::reset_key(a, now)
-                                } else {
-                                    0
-                                },
-                                v,
-                            )
-                        })
-                };
-                if let Some(candidate) = preferred.or_else(fallback) {
-                    if predicted && pct < threshold {
-                        predicted_switches.insert(provider);
-                    }
-                    active_id.clone_from(&candidate.id);
-                    file.active.insert(key.clone(), active_id.clone());
-                    dirty = true;
-                    switched.push(AutoSwitchEvent {
-                        provider,
-                        from_id: active_acc.id.clone(),
-                        from_label: active_acc.label.clone(),
-                        to_id: candidate.id.clone(),
-                        to_label: candidate.label.clone(),
-                        reason_percent: pct,
-                    });
-                    lock(&SWITCH_BLOCKED).remove(&provider);
-                } else if lock(&SWITCH_BLOCKED)
-                    .insert(provider, current_id.clone())
-                    .is_none_or(|previous| previous != current_id)
-                {
-                    tracing::warn!(
-                        provider = provider.as_str(),
-                        from = %current_id,
-                        percent = pct,
-                        "auto-switch triggered but no eligible account"
-                    );
-                }
-            } else {
-                lock(&SWITCH_BLOCKED).remove(&provider);
-            }
-        }
+            .unwrap_or(default_id);
 
         for acc in all.iter_mut().filter(|a| a.provider == provider) {
             acc.active = acc.id == active_id;
@@ -1453,51 +1064,20 @@ fn refresh_accounts_authenticated(
 
     // K-03: 손상된 파일(`writable=false`)에서는 저장하지 않는다. `SAVE_LOCK`을 쥐고 있어
     // `save_file`이 아니라 `save_inner`를 쓴다.
-    let mut saved_dirty = false;
-    if dirty || email_dirty {
-        if !writable || save_inner(home, state_dir, &file).is_err() {
-            if dirty {
-                // 저장하지 못한 전환을 UI·틱·실행 경로에 성공으로 돌려주지 않는다.
-                tracing::warn!("automatic account switch save failed");
-                for event in &switched {
-                    for account in all.iter_mut().filter(|a| a.provider == event.provider) {
-                        account.active = account.id == event.from_id;
-                    }
-                }
-                switched.clear();
-            }
-        } else if dirty {
-            saved_dirty = true;
-        }
-    }
-
-    for event in &switched {
-        runtime.record(
-            event.clone(),
-            now_secs,
-            &file.advanced_policy,
-            predicted_switches.contains(&event.provider),
-        );
-    }
-    if writable
-        && runtime != before
-        && let Err(error) = runtime.save(home, state_dir)
+    if email_dirty
+        && writable
+        && let Err(error) = save_inner(home, state_dir, &file)
     {
-        tracing::warn!(kind = ?error.kind(), "account policy state save failed");
+        tracing::warn!(kind = ?error.kind(), "account email persist failed");
     }
-    // `agy_native` 키체인/토큰 동기화와 전환 알림은 `SAVE_LOCK` 밖에서 수행한다.
     drop(save_guard);
-    if saved_dirty {
-        agy_native::sync_active_from_disk(home, state_dir);
-    }
-    switch_work::notify(home, state_dir, &switched);
-    let advanced = runtime.snapshot(
-        file.advanced_policy,
-        now_secs,
-        policy::model_windows(home, &all),
+    let advanced = AccountPolicyState {
+        supported: true,
+        model_windows: policy::model_windows(home, &all),
         rate_limits,
-    );
-    // OWE-703 1단계: 계정별 상태 꼬리를 채운다. 판정에는 쓰지 않는다(표시·N-1용).
+        ..AccountPolicyState::default()
+    };
+    // OWE-703 1단계: 계정별 상태 꼬리를 채운다(표시·N-1용).
     // OWE-703 2단계 지시: 한도 기록은 감지 시각을 갱신 시각에 넣는다.
     let details = krill_proto::usage::ProviderDetails {
         supported: true,
@@ -1570,8 +1150,8 @@ fn refresh_accounts_authenticated(
     };
     AccountsSnapshot {
         accounts: all,
-        auto_switch: policy,
-        switched,
+        auto_switch: AutoSwitchPolicy::default(),
+        switched: Vec::new(),
         statuses,
         advanced,
         connections: Box::new(connections),
@@ -1614,8 +1194,7 @@ mod login_regression_tests {
                 identity: None,
             },
         )]);
-        let snap =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let snap = refresh_accounts_authenticated(&home, Some(&state), &auth);
         assert_ne!(
             snap.status_for("claude-host").unwrap().status,
             AccountStatus::NeedsLogin
@@ -1673,8 +1252,7 @@ mod login_regression_tests {
                 },
             ),
         ]);
-        let snap =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::Automatic, &auth);
+        let snap = refresh_accounts_authenticated(&home, Some(&state), &auth);
         assert!(snap.switched.is_empty());
         assert_eq!(
             snap.statuses
@@ -1729,8 +1307,7 @@ mod login_regression_tests {
             },
         )]);
 
-        let snap =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let snap = refresh_accounts_authenticated(&home, Some(&state), &auth);
         let first = snap.status_for("codex-codex-profile-1").unwrap();
         assert_eq!(first.status, AccountStatus::NeedsLogin, "{first:?}");
         assert!(
@@ -1752,8 +1329,7 @@ mod login_regression_tests {
         .unwrap();
         std::fs::write(dir.join(".krill-login-completed"), b"").unwrap();
 
-        let snap2 =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let snap2 = refresh_accounts_authenticated(&home, Some(&state), &auth);
         let second = snap2.status_for("codex-codex-profile-1").unwrap();
         assert_ne!(second.status, AccountStatus::NeedsLogin, "{second:?}");
         assert!(second.detail.is_none(), "{second:?}");
@@ -1785,7 +1361,7 @@ pub fn primary_snapshot(home: &Path, state_dir: Option<&Path>) -> Snapshot {
         .unwrap_or_default()
 }
 
-/// 원클릭 계정 전환(MK-108).
+/// 원클릭 수동 계정 전환(MK-108).
 pub fn switch_account(
     home: &Path,
     state_dir: Option<&Path>,
@@ -1795,9 +1371,7 @@ pub fn switch_account(
     if provider == ProviderKind::Codex {
         codex_home::migrate(home, state_dir)?;
     }
-    // K-12: 존재 확인·최종 새로고침 모두 자동전환 없이 한다. 저장 직후 자동전환이
-    // 사용자 선택을 덮어쓰고 응답만 고른 계정으로 위장하던 결함을 막는다.
-    let snap = refresh_accounts_with(home, state_dir, false);
+    let snap = refresh_accounts(home, state_dir);
     let Some(target) = snap
         .accounts
         .iter()
@@ -1815,26 +1389,23 @@ pub fn switch_account(
             format!("account has no krill profile dir: {account_id}"),
         ));
     }
-    let pinned_usage = target.usage.clone();
     {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
         file.active
             .insert(provider.as_str().to_owned(), account_id.to_owned());
         save_inner(home, state_dir, &file)?;
-        set_manual_pin(home, state_dir, provider, account_id, pinned_usage, &file);
     }
     agy_native::sync_active_from_disk(home, state_dir);
-    // 사용자가 한도 계정을 직접 고르면(예: 모델별 한도라 다른 모델로 쓰려 할 때) 이전 한도 기록이
-    // 고정을 풀고 바로 다른 계정으로 되돌리지 않게 지운다. 다시 한도에 걸리면 훅이 새로 기록한다.
+    // 사용자가 한도 계정을 직접 고르면 이전 한도 기록을 지운다. 다시 한도에 걸리면 훅이 새로 기록한다.
     clear_rate_limited(provider, account_id);
 
-    Ok(refresh_accounts_with(home, state_dir, false))
+    Ok(refresh_accounts(home, state_dir))
 }
 
 /// 리셋 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다. Codex(banked reset)와
 /// Claude(주간 세션 리셋·프로모션 grant)를 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는
-/// 로컬 한도 기록을 지워 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
+/// 로컬 한도 기록을 지우고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
 /// 네트워크·자격증명 실패는 `Err`다(호출자가 자동 재시도하지 않는다: 멱등 키가 호출마다 새 값이라
 /// 재시도가 새 소진이 된다. 타임아웃은 크레딧부터 다시 확인한다).
 pub fn consume_reset_credit(
@@ -1847,7 +1418,7 @@ pub fn consume_reset_credit(
     if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return Err(ResetConsumeError::InvalidTarget);
     }
-    let snap = refresh_accounts_with(home, state_dir, false);
+    let snap = refresh_accounts(home, state_dir);
     let Some(target) = snap
         .accounts
         .iter()
@@ -2176,60 +1747,6 @@ pub fn purge_orphan_profiles(
     Ok(krill_proto::usage::profiles::orphans(home, &registered))
 }
 
-/// 자동전환 정책 변경(MK-108).
-pub fn set_auto_switch(
-    home: &Path,
-    state_dir: Option<&Path>,
-    policy: &AutoSwitchPolicy,
-) -> io::Result<AccountsSnapshot> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state_dir)?;
-        let mut stored = StoredAutoSwitch::from(policy);
-        if stored.rules.is_empty() {
-            stored.rules.clone_from(&file.auto_switch.rules);
-        }
-        file.auto_switch = stored;
-        save_inner(home, state_dir, &file)?;
-    }
-    Ok(refresh_accounts(home, state_dir))
-}
-
-/// 계정별 규칙을 저장하고 즉시 평가한다.
-pub fn upsert_auto_switch_rule(
-    home: &Path,
-    state_dir: Option<&Path>,
-    rule: AutoSwitchRule,
-) -> io::Result<AccountsSnapshot> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state_dir)?;
-        let mut policy = AutoSwitchPolicy::from(file.auto_switch);
-        policy.upsert_rule(rule);
-        file.auto_switch = StoredAutoSwitch::from(&policy);
-        save_inner(home, state_dir, &file)?;
-    }
-    Ok(refresh_accounts(home, state_dir))
-}
-
-/// 계정별 규칙을 삭제해 전역 정책으로 되돌린다.
-pub fn remove_auto_switch_rule(
-    home: &Path,
-    state_dir: Option<&Path>,
-    provider: ProviderKind,
-    from_account_id: &str,
-) -> io::Result<AccountsSnapshot> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state_dir)?;
-        file.auto_switch
-            .rules
-            .retain(|r| r.provider != provider || r.from_account_id != from_account_id);
-        save_inner(home, state_dir, &file)?;
-    }
-    Ok(refresh_accounts(home, state_dir))
-}
-
 /// 에이전트 실행(`krilld::agent::launch_in`·`resume_in`) 시 활성 계정의 격리 프로필 환경 변수를 돌려준다.
 /// `accounts.toml`에 비-기본 활성 계정이 지정되어 있을 때만 `Some((env_key, profile_dir))`을 반환해
 /// 기존 기본 실행 테스트와 충돌하지 않게 한다.
@@ -2433,7 +1950,6 @@ mod policy_regressions {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         let mut file = AccountsFile::default();
-        file.auto_switch.enabled = false;
         file.accounts.push(StoredAccount {
             id: "claude-expiry-regression".into(),
             provider: "claude".into(),
@@ -2448,7 +1964,7 @@ mod policy_regressions {
         )
         .unwrap();
         lock(&RATE_LIMITED).insert(("claude".into(), "claude-expiry-regression".into()), 0);
-        let snap = refresh_accounts_with(&home, Some(&state), false);
+        let snap = refresh_accounts(&home, Some(&state));
         clear_rate_limited(ProviderKind::Claude, "claude-expiry-regression");
         assert_eq!(
             snap.status_for("claude-expiry-regression").unwrap().status,
@@ -2456,21 +1972,80 @@ mod policy_regressions {
         );
         std::fs::remove_dir_all(root).ok();
     }
-}
 
-/// OWE-712: 기존 전역 정책·규칙과 독립적으로 고급 정책을 저장한다.
-pub fn set_advanced_policy(
-    home: &Path,
-    state_dir: Option<&Path>,
-    policy: &krill_proto::usage::AdvancedPolicy,
-) -> io::Result<AccountsSnapshot> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state_dir)?;
-        file.advanced_policy = policy.clone();
-        save_inner(home, state_dir, &file)?;
+    #[test]
+    fn legacy_auto_switch_keys_in_accounts_toml_load_and_save_without_switching() {
+        let root = std::env::temp_dir().join(format!("legacy-autoswitch-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let host_dir = home.join(".claude");
+        let backup_dir = home.join("claude-backup");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            host_dir.join(CLAUDE_CACHE),
+            r#"{"five_hour":{"utilization":100}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            backup_dir.join(CLAUDE_CACHE),
+            r#"{"five_hour":{"utilization":5}}"#,
+        )
+        .unwrap();
+        let raw = format!(
+            "[auto_switch]\nenabled = true\nthreshold_percent = 70\nswitch_on_rate_limit = true\n\n[[auto_switch.rules]]\nprovider = 'Claude'\nfrom_account_id = 'claude-host'\nenabled = true\nthreshold_percent = 50\nmetric = 'five_hour'\ntarget_account_id = 'claude-backup'\n\n[advanced_policy]\npredict_exhaustion = true\nprefer_soonest_reset = true\ncooldown_secs = 300\n\n[active]\nclaude = 'claude-host'\n\n[[accounts]]\nid = 'claude-backup'\nprovider = 'claude'\nlabel = 'Backup'\nprofile_dir = '{}'\n",
+            backup_dir.display()
+        );
+        let path = config_path(&home, Some(&state));
+        std::fs::write(&path, raw).unwrap();
+
+        let loaded = load_file_result(&home, Some(&state)).unwrap();
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(
+            loaded.active.get("claude").map(String::as_str),
+            Some("claude-host")
+        );
+
+        record_rate_limited(ProviderKind::Claude, "claude-host");
+        let snap = refresh_accounts(&home, Some(&state));
+        clear_rate_limited(ProviderKind::Claude, "claude-host");
+        assert!(snap.switched.is_empty());
+        assert!(!snap.auto_switch.enabled);
+        assert!(snap.auto_switch.rules.is_empty());
+        assert!(
+            snap.accounts
+                .iter()
+                .any(|a| a.id == "claude-host" && a.active)
+        );
+
+        // Manual switch and rename save cleanly without deserialization or roundtrip errors.
+        let switched =
+            switch_account(&home, Some(&state), ProviderKind::Claude, "claude-backup").unwrap();
+        assert!(
+            switched
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-backup" && a.active)
+        );
+        let renamed = rename_account(
+            &home,
+            Some(&state),
+            ProviderKind::Claude,
+            "claude-backup",
+            "Backup Renamed",
+            None,
+        )
+        .unwrap();
+        assert!(
+            renamed
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-backup" && a.label == "Backup Renamed")
+        );
+        std::fs::remove_dir_all(root).ok();
     }
-    Ok(refresh_accounts_with(home, state_dir, false))
 }
 
 #[cfg(test)]
@@ -2766,8 +2341,7 @@ mod orca_identity_regressions {
                 },
             ),
         ]);
-        let snap_in =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth_in);
+        let snap_in = refresh_accounts_authenticated(&home, Some(&state), &auth_in);
         let iso_in = snap_in.accounts.iter().find(|a| a.id == acc.id).unwrap();
         assert_eq!(iso_in.email.as_deref(), Some("isolated@example.test"));
 
@@ -2797,12 +2371,7 @@ mod orca_identity_regressions {
                 },
             ),
         ]);
-        let snap_out = refresh_accounts_authenticated(
-            &home,
-            Some(&state),
-            RefreshTrigger::ReadOnly,
-            &auth_out,
-        );
+        let snap_out = refresh_accounts_authenticated(&home, Some(&state), &auth_out);
         let iso_out = snap_out.accounts.iter().find(|a| a.id == acc.id).unwrap();
         assert_eq!(iso_out.email, None);
         assert_eq!(iso_out.label, "isolated@example.test");

@@ -300,7 +300,7 @@ fn main() -> ExitCode {
             .ok();
     }
     if linked {
-        // OWE-702: 앱이 꺼져 있어도 자동전환을 평가한다. 한 바퀴씩 격리한다(K-06).
+        // 앱이 꺼져 있어도 계정 사용량 직접 조회와 수동 전환 대기 작업을 처리한다. 한 바퀴씩 격리한다(K-06).
         let r = Arc::clone(&registry);
         thread::Builder::new()
             .name("usage-tick".to_owned())

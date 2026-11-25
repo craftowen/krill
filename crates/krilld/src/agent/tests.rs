@@ -1012,7 +1012,6 @@ fn selected_account_is_per_session_and_does_not_change_global_selection() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     let mut file = accounts::AccountsFile::default();
-    file.auto_switch.enabled = false;
     file.accounts.push(accounts::StoredAccount {
         id: "codex-selected".into(),
         provider: "codex".into(),

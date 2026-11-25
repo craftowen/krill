@@ -935,280 +935,8 @@ text = "변경 사항을 검토해줘"
 }
 
 #[gpui::test]
-fn account_rule_methods_upsert_persist_and_clear(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-
-    let d = dir("account-rule-methods");
-    init(cx, &d);
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    let rule = AutoSwitchRule {
-        provider: ProviderKind::Claude,
-        from_account_id: "claude-work".into(),
-        enabled: true,
-        threshold_percent: 70,
-        metric: AutoSwitchMetric::FiveHour,
-        target_account_id: Some("claude-backup".into()),
-    };
-    let other = AutoSwitchRule {
-        provider: ProviderKind::Codex,
-        ..rule.clone()
-    };
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.account_error = Some("previous error".into());
-            v.set_account_rule(rule.clone(), cx);
-            assert!(v.account_error.is_none());
-        });
-    });
-    vcx.run_until_parked();
-    assert_eq!(
-        vcx.update(|_, cx| view.read(cx).accounts().auto_switch.rules.clone()),
-        vec![rule.clone()]
-    );
-    let mut updated = rule.clone();
-    updated.enabled = false;
-    updated.threshold_percent = 85;
-    updated.metric = AutoSwitchMetric::SevenDay;
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.set_account_rule(other.clone(), cx);
-            v.set_account_rule(updated.clone(), cx);
-        });
-    });
-    vcx.run_until_parked();
-    let persisted = crate::accounts::refresh_local(&d, Some(&d));
-    assert_eq!(persisted.auto_switch.rules.len(), 2);
-    assert!(persisted.auto_switch.rules.contains(&updated));
-    assert!(persisted.auto_switch.rules.contains(&other));
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.clear_account_rule(rule.provider, &rule.from_account_id, cx);
-            v.clear_account_rule(rule.provider, &rule.from_account_id, cx);
-        });
-    });
-    vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        assert_eq!(
-            view.read(cx).accounts().auto_switch.rules,
-            vec![other.clone()]
-        );
-    });
-    assert_eq!(
-        crate::accounts::refresh_local(&d, Some(&d))
-            .auto_switch
-            .rules,
-        vec![other]
-    );
-    fs::remove_dir_all(d).unwrap();
-}
-
-#[gpui::test]
-fn account_rule_controls_toggle_threshold_metric_target_and_reset(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AutoSwitchMetric, ProviderKind, UsageRequest};
-
-    let d = dir("account-rule-controls");
-    init(cx, &d);
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(1400.), px(6000.)));
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Accounts, cx);
-            for (provider, label) in [
-                (ProviderKind::Claude, "Work"),
-                (ProviderKind::Claude, "Backup"),
-                (ProviderKind::Codex, "Other Provider"),
-            ] {
-                v.apply_account_request(
-                    UsageRequest::AddAccount {
-                        provider,
-                        label: label.into(),
-                        email: None,
-                        profile_dir: d.join(provider.as_str()).join(label).display().to_string(),
-                    },
-                    cx,
-                );
-            }
-        });
-    });
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-rule-clear-claude-work").is_none());
-    assert!(
-        vcx.debug_bounds("admin-rule-target-claude-work-claude-work")
-            .is_none()
-    );
-    assert!(
-        vcx.debug_bounds("admin-rule-target-claude-work-codex-other-provider")
-            .is_none()
-    );
-    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
-        let bounds = vcx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("missing {selector}"));
-        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-    };
-    // 계정별 규칙은 자동 전환 띠를 펼친 안에 제공자 구분 없이 모여 있고, 행마다 따로 편집을 연다.
-    assert!(vcx.debug_bounds("admin-rule-row-claude-work").is_none());
-    click(vcx, "admin-auto-switch-strip");
-    assert!(vcx.debug_bounds("admin-rule-row-claude-work").is_some());
-    assert!(
-        vcx.debug_bounds("admin-rule-row-codex-other-provider")
-            .is_some()
-    );
-    assert!(vcx.debug_bounds("admin-rule-toggle-claude-work").is_none());
-    assert!(vcx.debug_bounds("admin-rule-current-claude-work").is_none());
-    click(vcx, "admin-rule-open-claude-work");
-    assert!(vcx.debug_bounds("admin-rule-current-claude-work").is_some());
-    assert!(
-        vcx.debug_bounds("admin-rule-current-claude-backup")
-            .is_none()
-    );
-    assert!(
-        vcx.debug_bounds("admin-rule-current-codex-other-provider")
-            .is_none()
-    );
-    // 계정 카드 프리셋은 전역과 같은 공유 목록이다(60%는 없음).
-    for pct in krill_proto::usage::AUTO_SWITCH_PRESETS {
-        let card: &'static str = format!("admin-rule-threshold-claude-work-{pct}").leak();
-        let global: &'static str = format!("admin-threshold-{pct}").leak();
-        assert!(vcx.debug_bounds(card).is_some(), "{card}");
-        assert!(vcx.debug_bounds(global).is_some(), "{global}");
-    }
-    assert!(
-        vcx.debug_bounds("admin-rule-threshold-claude-work-60")
-            .is_none()
-    );
-    click(vcx, "admin-rule-toggle-claude-work");
-    vcx.update(|_, cx| {
-        assert!(
-            view.read(cx)
-                .accounts()
-                .auto_switch
-                .rule_for(ProviderKind::Claude, "claude-work")
-                .unwrap()
-                .enabled
-        );
-    });
-    for (selector, expected) in [
-        ("admin-rule-threshold-claude-work-70", 70),
-        ("admin-rule-threshold-claude-work-85", 85),
-    ] {
-        click(vcx, selector);
-        vcx.update(|_, cx| {
-            assert_eq!(
-                view.read(cx)
-                    .accounts()
-                    .auto_switch
-                    .rule_for(ProviderKind::Claude, "claude-work")
-                    .unwrap()
-                    .threshold_percent,
-                expected
-            );
-        });
-    }
-    for (selector, expected) in [
-        (
-            "admin-rule-metric-claude-work-5h",
-            AutoSwitchMetric::FiveHour,
-        ),
-        (
-            "admin-rule-metric-claude-work-7d",
-            AutoSwitchMetric::SevenDay,
-        ),
-        ("admin-rule-metric-claude-work-max", AutoSwitchMetric::Max),
-    ] {
-        click(vcx, selector);
-        vcx.update(|_, cx| {
-            assert_eq!(
-                view.read(cx)
-                    .accounts()
-                    .auto_switch
-                    .rule_for(ProviderKind::Claude, "claude-work")
-                    .unwrap()
-                    .metric,
-                expected
-            );
-        });
-    }
-    let backup_index = vcx.update(|_, cx| {
-        view.read(cx)
-            .accounts()
-            .accounts
-            .iter()
-            .filter(|account| {
-                account.provider == ProviderKind::Claude && account.id != "claude-work"
-            })
-            .position(|account| account.id == "claude-backup")
-            .expect("eligible backup account")
-            + 1 // Auto precedes eligible accounts, including the host default.
-    });
-    click(vcx, "admin-rule-target-claude-work");
-    for _ in 0..=backup_index {
-        vcx.simulate_keystrokes("down");
-    }
-    vcx.simulate_keystrokes("enter");
-    vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        assert_eq!(
-            view.read(cx)
-                .accounts()
-                .auto_switch
-                .rule_for(ProviderKind::Claude, "claude-work")
-                .unwrap()
-                .target_account_id
-                .as_deref(),
-            Some("claude-backup")
-        );
-    });
-    click(vcx, "admin-rule-target-claude-work");
-    vcx.simulate_keystrokes("down enter");
-    vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        assert!(
-            view.read(cx)
-                .accounts()
-                .auto_switch
-                .rule_for(ProviderKind::Claude, "claude-work")
-                .unwrap()
-                .target_account_id
-                .is_none()
-        );
-    });
-    click(vcx, "admin-rule-toggle-claude-work");
-    vcx.update(|_, cx| {
-        let rule = view
-            .read(cx)
-            .accounts()
-            .auto_switch
-            .rule_for(ProviderKind::Claude, "claude-work")
-            .unwrap();
-        assert!(!rule.enabled);
-        assert_eq!(rule.threshold_percent, 85);
-        assert_eq!(rule.metric, AutoSwitchMetric::Max);
-    });
-    click(vcx, "admin-rule-clear-claude-work");
-    vcx.update(|_, cx| {
-        assert!(
-            view.read(cx)
-                .accounts()
-                .auto_switch
-                .rule_for(ProviderKind::Claude, "claude-work")
-                .is_none()
-        );
-    });
-    assert!(vcx.debug_bounds("admin-rule-clear-claude-work").is_none());
-    assert!(
-        crate::accounts::refresh_local(&d, Some(&d))
-            .auto_switch
-            .rules
-            .is_empty()
-    );
-    fs::remove_dir_all(d).unwrap();
-}
-
-#[gpui::test]
-fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind, UsageRequest};
+fn admin_center_tabs_accounts_and_ssh_hosts(cx: &mut TestAppContext) {
+    use krill_proto::usage::{ProviderKind, UsageRequest};
 
     let d = dir("admin-center");
     init(cx, &d);
@@ -1223,7 +951,7 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
         });
     }
 
-    // Add a Claude account, switch to it, and configure Auto-Switch policy.
+    // Add a Claude account and manually switch to it.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.set_tab(AdminTab::Accounts, cx);
@@ -1243,15 +971,6 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
                 },
                 cx,
             );
-            v.apply_account_request(
-                UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
-                    enabled: true,
-                    threshold_percent: 80,
-                    switch_on_rate_limit: true,
-                    rules: Vec::new(),
-                }),
-                cx,
-            );
         });
         window.draw(cx).clear(cx);
     });
@@ -1259,8 +978,6 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
 
     vcx.update(|_, cx| {
         let snap = view.read(cx).accounts();
-        assert!(snap.auto_switch.enabled);
-        assert_eq!(snap.auto_switch.threshold_percent, 80);
         let active = snap
             .accounts
             .iter()
@@ -2817,18 +2534,21 @@ fn fake_rule_transport(
 /// 반환된 스냅샷을 실제로 반영하는지 파일 폴링 없이 검증한다.
 #[gpui::test]
 fn account_rule_transport_applies_in_memory_success_snapshot(cx: &mut TestAppContext) {
-    use krill_proto::usage::{AccountsSnapshot, AutoSwitchMetric, AutoSwitchRule, ProviderKind};
+    use krill_proto::usage::{AccountInfo, AccountsSnapshot, ProviderKind, Snapshot};
     let view = cx.new(SettingsView::new);
     let mut snapshot = AccountsSnapshot::default();
-    snapshot.auto_switch.rules.push(AutoSwitchRule {
+    snapshot.accounts.push(AccountInfo {
+        id: "in-memory".into(),
         provider: ProviderKind::Claude,
-        from_account_id: "in-memory".into(),
-        enabled: true,
-        threshold_percent: 85,
-        metric: AutoSwitchMetric::SevenDay,
-        target_account_id: None,
+        label: "In Memory".into(),
+        email: None,
+        profile_dir: "/tmp/in-memory".into(),
+        active: true,
+        host_default: false,
+        stale: false,
+        usage: Snapshot::default(),
     });
-    let expected = snapshot.auto_switch.rules.clone();
+    let expected = snapshot.accounts.clone();
     view.update(cx, |v, cx| {
         v.spawn_account_rule_request(async move { Ok(snapshot) }, cx);
         assert!(v.account_rule_pending);
@@ -2838,7 +2558,7 @@ fn account_rule_transport_applies_in_memory_success_snapshot(cx: &mut TestAppCon
         let v = view.read(cx);
         assert!(!v.account_rule_pending);
         assert!(v.account_error.is_none());
-        assert_eq!(v.accounts().auto_switch.rules, expected);
+        assert_eq!(v.accounts().accounts, expected);
     });
 }
 
@@ -2853,7 +2573,9 @@ fn account_rule_transport_timeout_preserves_snapshot_and_allows_retry(cx: &mut T
 }
 
 fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind, UsageRequest};
+    use krill_proto::usage::{
+        AccountConnection, ConnectionStatus, ConnectionsSnapshot, ProviderKind, UsageRequest,
+    };
     let d = dir(if timeout {
         "rule-transport-timeout"
     } else {
@@ -2862,30 +2584,35 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
-    let rule = AutoSwitchRule {
-        provider: ProviderKind::Claude,
-        from_account_id: "claude-work".into(),
-        enabled: true,
-        threshold_percent: 70,
-        metric: AutoSwitchMetric::Max,
-        target_account_id: None,
-    };
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.set_tab(AdminTab::Accounts, cx);
+            v.not_installed_open = true;
             v.apply_account_request(
                 UsageRequest::AddAccount {
                     provider: ProviderKind::Claude,
                     label: "Work".into(),
-                    email: None,
+                    email: Some("work@example.com".into()),
                     profile_dir: d.join("profile").display().to_string(),
                 },
                 cx,
             );
-            v.set_account_rule(rule.clone(), cx);
-            v.auto_switch_open = true;
-            v.rule_open = Some("claude-work".to_owned());
         });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            *v.accounts_snapshot.connections = ConnectionsSnapshot {
+                supported: true,
+                direct_usage: true,
+                accounts: vec![AccountConnection {
+                    account_id: "claude-work".into(),
+                    status: ConnectionStatus::Connected,
+                }],
+            };
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
     let reply = std::sync::Arc::new(std::sync::Mutex::new(RuleTransportReply::default()));
@@ -2896,31 +2623,25 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
             assert!(v.account_rule_pending);
             assert!(v.account_error.is_none());
             v.spawn_account_rule_request(async { panic!("duplicate transport executed") }, cx);
-            let mut changed = rule.clone();
-            changed.threshold_percent = 95;
-            v.set_account_rule(changed, cx);
-            v.clear_account_rule(rule.provider, &rule.from_account_id, cx);
+            v.switch_default_account(ProviderKind::Claude, "claude-work".into(), cx);
         });
     });
     vcx.run_until_parked();
-    for selector in [
-        "admin-rule-toggle-claude-work",
-        "admin-rule-threshold-claude-work-95",
-        "admin-rule-metric-claude-work-5h",
-        "admin-rule-target-claude-work",
-        "admin-rule-clear-claude-work",
-    ] {
-        let bounds = vcx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("missing {selector}"));
-        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-        vcx.update(|_, cx| {
-            let v = view.read(cx);
-            assert!(v.account_rule_pending);
-            assert_eq!(v.accounts().auto_switch.rules, vec![rule.clone()]);
-        });
-    }
+    let bounds = vcx
+        .debug_bounds("admin-switch-account-claude-work")
+        .expect("missing admin-switch-account-claude-work");
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.account_rule_pending);
+        assert!(
+            !v.accounts()
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-work" && a.active)
+        );
+    });
     let snapshot = vcx.update(|_, cx| view.read(cx).accounts_snapshot.clone());
     let waker = {
         let mut reply = reply.lock().unwrap();
@@ -2936,7 +2657,6 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             assert!(!v.account_rule_pending);
-            assert_eq!(v.accounts().auto_switch.rules, vec![rule.clone()]);
             assert_eq!(v.account_error.is_some(), timeout);
             if timeout {
                 assert!(v.account_error.as_ref().unwrap().contains("timed out"));
@@ -2953,11 +2673,21 @@ fn exercise_account_rule_transport(cx: &mut TestAppContext, timeout: bool) {
         assert!(!view.read(cx).account_rule_pending);
         assert!(view.read(cx).account_error.is_none());
     });
-    // 완료 후 버튼이 다시 동작한다.
-    let bounds = vcx.debug_bounds("admin-rule-clear-claude-work").unwrap();
+    // 완료 후 수동 전환 버튼이 다시 동작한다.
+    let bounds = vcx
+        .debug_bounds("admin-switch-account-claude-work")
+        .unwrap();
     vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    vcx.update(|_, cx| assert!(view.read(cx).accounts().auto_switch.rules.is_empty()));
+    vcx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .accounts()
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-work" && a.active)
+        );
+    });
     fs::remove_dir_all(d).unwrap();
 }
 
@@ -4828,23 +4558,6 @@ fn login_pending_without_outcome_times_out(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-708: 접힌 규칙 요약 한 줄은 지표·임계치·대상·꺼짐을 담는다.
-#[test]
-fn rule_summary_names_metric_threshold_target_and_off() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-    let mut rule = AutoSwitchRule {
-        provider: ProviderKind::Claude,
-        from_account_id: "claude-work".into(),
-        enabled: true,
-        threshold_percent: 85,
-        metric: AutoSwitchMetric::Max,
-        target_account_id: Some("claude-missing".into()),
-    };
-    assert_eq!(rule_summary(&rule, &[]), "Max ≥ 85% → claude-missing");
-    rule.enabled = false;
-    assert!(rule_summary(&rule, &[]).ends_with(text::OFF.get()));
-}
-
 /// OWE-704: 계정 제거는 첫 클릭에 무장(안내 문구)만 하고, 두 번째 클릭에 삭제한다.
 /// OWE-705: 이름 변경은 라벨만 바꾸고 id·프로필 폴더를 유지한다.
 #[gpui::test]
@@ -5566,7 +5279,7 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
 
 /// OWE-719 QA D4 + OWE-793: "자동 계정 전환"이 다른 불리언 설정과 같은
 /// `ui::switch` 트랙·썸 스위치로 렌더링되며 클릭할 때마다 상태와 썸 위치가 전환된다.
-/// 계정 A안: 자동 전환은 맨 위 한 줄로 접히고, 행에는 막대 둘만 두며, 사용량 초기화는 메뉴에서 시작해 행에서 확인한다.
+/// 계정 A안: 새로고침·설정 파일 버튼이 위에 바로 보이고, 행에는 막대 둘만 두며, 사용량 초기화는 메뉴에서 시작해 행에서 확인한다.
 #[gpui::test]
 fn accounts_strip_comes_first_and_rows_fold_extra_meters(cx: &mut TestAppContext) {
     use krill_proto::usage::{AccountMeters, ProviderKind, UsageMeter, UsageRequest};
@@ -5628,22 +5341,17 @@ fn accounts_strip_comes_first_and_rows_fold_extra_meters(cx: &mut TestAppContext
     });
     vcx.run_until_parked();
 
-    // 자동 전환 띠가 첫 제공자 위에 있고, 펼쳐야 세부 설정이 보인다.
-    let strip = vcx.debug_bounds("admin-auto-switch-strip").unwrap();
+    // 자동 전환 띠는 제거되었고, 새로고침·설정 파일 버튼이 첫 제공자 위에 바로 보인다.
+    assert!(vcx.debug_bounds("admin-auto-switch-strip").is_none());
+    let refresh = vcx.debug_bounds("admin-accounts-refresh").unwrap();
     assert!(
-        strip.bottom()
+        refresh.bottom()
             <= vcx
                 .debug_bounds("admin-accounts-subheader-claude")
                 .unwrap()
                 .top()
     );
-    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
-    assert!(vcx.debug_bounds("admin-accounts-refresh").is_none());
-    click(vcx, "admin-auto-switch-strip");
-    assert!(vcx.debug_bounds("admin-threshold-85").is_some());
-    assert!(vcx.debug_bounds("admin-accounts-refresh").is_some());
-    click(vcx, "admin-auto-switch-strip");
-    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
+    assert!(vcx.debug_bounds("admin-open-accounts-toml").is_some());
 
     // 막대 둘만 행에 있고 나머지는 +숫자로 펼친다. 펼침을 눌러도 계정이 전환되지 않는다.
     assert!(vcx.debug_bounds("admin-usage-label-five").is_some());
@@ -5680,10 +5388,6 @@ fn accounts_strip_comes_first_and_rows_fold_extra_meters(cx: &mut TestAppContext
     assert!(vcx.debug_bounds("admin-reset-usage-claude-work").is_some());
     click(vcx, "admin-accounts-active-hint");
     assert!(vcx.debug_bounds("admin-reset-usage-claude-work").is_none());
-
-    // 스위치를 눌러도 띠가 펼쳐지지 않는다.
-    click(vcx, "admin-auto-switch-toggle");
-    assert!(vcx.debug_bounds("admin-threshold-85").is_none());
     fs::remove_dir_all(d).ok();
 }
 
@@ -5869,57 +5573,6 @@ fn project_sections_and_single_save(cx: &mut TestAppContext) {
     let status = vcx.debug_bounds("admin-worktree-symlink-status").unwrap();
     let card = vcx.debug_bounds("admin-worktree-symlinks-card").unwrap();
     assert!(input.bottom() <= status.top() && status.bottom() <= card.bottom());
-    fs::remove_dir_all(d).ok();
-}
-
-#[gpui::test]
-fn account_auto_switch_uses_switch_primitive(cx: &mut TestAppContext) {
-    use krill_proto::usage::ConnectionsSnapshot;
-
-    let d = dir("owe719-segments");
-    init(cx, &d);
-    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(1400.), px(4000.)));
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.set_tab(AdminTab::Accounts, cx);
-            *v.accounts_snapshot.connections = ConnectionsSnapshot {
-                supported: true,
-                direct_usage: false,
-                accounts: Vec::new(),
-            };
-            cx.notify();
-        });
-    });
-    vcx.run_until_parked();
-    for id in ["admin-auto-switch-toggle", "admin-auto-switch-toggle-thumb"] {
-        assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
-    }
-    let enabled = |vcx: &mut gpui::VisualTestContext| {
-        vcx.update(|_, cx| view.read(cx).accounts().auto_switch.enabled)
-    };
-    let initial = enabled(vcx);
-    let thumb_before = vcx
-        .debug_bounds("admin-auto-switch-toggle-thumb")
-        .unwrap()
-        .origin
-        .x;
-    let at = vcx
-        .debug_bounds("admin-auto-switch-toggle")
-        .unwrap()
-        .center();
-    vcx.simulate_click(at, gpui::Modifiers::default());
-    vcx.run_until_parked();
-    assert_eq!(enabled(vcx), !initial);
-    let thumb_after = vcx
-        .debug_bounds("admin-auto-switch-toggle-thumb")
-        .unwrap()
-        .origin
-        .x;
-    assert_ne!(
-        thumb_before, thumb_after,
-        "switch thumb must move on toggle"
-    );
     fs::remove_dir_all(d).ok();
 }
 
@@ -8946,7 +8599,7 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
 }
 
 /// OWE-797: AI 제공자 계정(Accounts) 탭에서 프로바이더 상태 배지, 계정 행 배지(사용 중·로그인 필요·한도 도달),
-/// 5h/7d 초기화 시각 메타, 비활성 계정 행 클릭 즉시 전환, 자동전환 및 고급 정책 `ui::switch`/`ui::segmented_control`이
+/// 5h/7d 초기화 시각 메타, 비활성 계정 행 클릭 즉시 전환, 오류 배너가
 /// 동작하며 좁은 창(820px)에서도 우측 경계를 넘지 않는다.
 #[gpui::test]
 fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut TestAppContext) {
@@ -9146,78 +8799,9 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
         vcx.debug_bounds("admin-account-in-use-claude-primary")
             .is_some()
     );
+    assert!(vcx.debug_bounds("admin-auto-switch-strip").is_none());
 
-    // 3) 자동전환 & 고급 정책 스위치(`ui::switch`) 및 쿨다운 세그먼트(`ui::segmented_control`) 검증
-    click(vcx, "admin-auto-switch-strip");
-    for switch_sel in [
-        "admin-auto-switch-toggle",
-        "admin-rate-limit-toggle",
-        "admin-predict-exhaustion-toggle",
-        "admin-prefer-soonest-reset-toggle",
-    ] {
-        let b = bounds(vcx, switch_sel);
-        assert_eq!(b.size.width, crate::ui::SWITCH_WIDTH, "{switch_sel}");
-        assert_eq!(b.size.height, crate::ui::SWITCH_HEIGHT, "{switch_sel}");
-        assert!(
-            b.right() <= column.right() + px(0.5),
-            "switch {switch_sel} ({b:?}) overflowed column ({column:?})"
-        );
-    }
-
-    let rl_before = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
-    let rl_thumb_before = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
-    click(vcx, "admin-rate-limit-toggle");
-    let rl_after = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
-    let rl_thumb_after = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
-    assert_eq!(rl_after, !rl_before);
-    assert_ne!(rl_thumb_before, rl_thumb_after);
-
-    let pred_before =
-        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion);
-    click(vcx, "admin-predict-exhaustion-toggle");
-    assert_eq!(
-        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion),
-        !pred_before
-    );
-
-    let soon_before = vcx.update(|_, cx| {
-        view.read(cx)
-            .accounts()
-            .advanced
-            .policy
-            .prefer_soonest_reset
-    });
-    click(vcx, "admin-prefer-soonest-reset-toggle");
-    assert_eq!(
-        vcx.update(|_, cx| {
-            view.read(cx)
-                .accounts()
-                .advanced
-                .policy
-                .prefer_soonest_reset
-        }),
-        !soon_before
-    );
-
-    for cd_sel in [
-        "admin-cooldown-0m",
-        "admin-cooldown-5m",
-        "admin-cooldown-15m",
-        "admin-cooldown-30m",
-    ] {
-        let b = bounds(vcx, cd_sel);
-        assert!(
-            b.right() <= column.right() + px(0.5),
-            "cooldown segment {cd_sel} ({b:?}) overflowed column ({column:?})"
-        );
-    }
-    click(vcx, "admin-cooldown-15m");
-    assert_eq!(
-        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.cooldown_secs),
-        15 * 60
-    );
-
-    // 4) 계정 오류 배너(`ui::error_banner`) 노출 검증
+    // 3) 계정 오류 배너(`ui::error_banner`) 노출 검증
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.account_error = Some("account sync failed".into());

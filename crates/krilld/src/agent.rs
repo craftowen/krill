@@ -757,7 +757,7 @@ fn selected_account(
         .and_then(ProviderKind::parse)
         .ok_or(io::ErrorKind::InvalidInput)?;
     let home = accounts::default_home();
-    let snap = accounts::refresh_accounts_with(&home, state, false);
+    let snap = accounts::refresh_accounts(&home, state);
     let a = snap
         .accounts
         .iter()

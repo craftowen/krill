@@ -293,10 +293,7 @@ impl Registry {
             git_watch: Mutex::default(),
             upgrading: Mutex::new(false),
             resuming: Mutex::default(),
-            account_work: crate::usage::accounts::switch_work::subscribe(
-                &crate::usage::accounts::default_home(),
-                dir,
-            ),
+            account_work: Arc::new(crate::usage::accounts::switch_work::SwitchWork::default()),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
             account_processing: std::sync::atomic::AtomicBool::new(false),
@@ -460,7 +457,6 @@ impl Registry {
         .ok();
         drop(commit);
         for (id, e) in &hooked {
-            self.auto_switch_from_hook(*id, e);
             self.maybe_rename_from_hook(*id, &e.payload, e.id);
             if let Some(bots) = self.bots_if_initialized() {
                 bots.on_hook_event(self, *id, e);
@@ -889,7 +885,6 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
-                self.auto_switch_from_hook(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
                 if let Some(bots) = self.bots_if_initialized() {
                     bots.on_hook_event(self, id, &e);
@@ -2693,10 +2688,8 @@ impl Registry {
                 tap.agent_done(status.since_unix_ns);
             }
         }
-        // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다.
-        // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
-        // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
-        // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
+        // 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로 기록해
+        // UI 한도 배지·만료 시각·채팅 한도 배너에 반영한다.
         if status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload) {
             if !is_subagent_or_foreign {
                 self.agents.mark_rate_limited(id);
@@ -2724,155 +2717,6 @@ impl Registry {
             }
         }
         Ok(!is_subagent_or_foreign)
-    }
-
-    // Account evaluation wakes the session worker. Release `state` first: the worker's
-    // final handoff holds its queue lock while retiring the old session. This also runs account
-    // CLIs and the keychain without a deadline, so callers must not hold `hook_commit` or the spool lock.
-    fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
-        #[cfg(all(test, unix))]
-        if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
-            return probe(self);
-        }
-        self.auto_switch_from_hook_in(&crate::usage::accounts::default_home(), id, e);
-    }
-
-    fn auto_switch_from_hook_in(&self, home: &Path, id: SessionId, e: &HookEvent) {
-        let state_dir = self.state_dir();
-        if let Some(switched) =
-            status::auto_switch_on_rate_limit(home, state_dir.as_deref(), &e.agent, &e.payload)
-        {
-            if switched.is_empty() {
-                self.requeue_straggler_rate_limited_session(
-                    home,
-                    state_dir.as_deref(),
-                    id,
-                    &e.agent,
-                );
-            } else {
-                for s in &switched {
-                    tracing::info!(
-                        session = id.0,
-                        provider = s.provider.as_str(),
-                        from = %s.from_id,
-                        to = %s.to_id,
-                        percent = s.reason_percent,
-                        "stop failure rate limit auto-switched account"
-                    );
-                }
-            }
-        }
-    }
-
-    fn requeue_straggler_rate_limited_session(
-        &self,
-        home: &Path,
-        state_dir: Option<&Path>,
-        id: SessionId,
-        event_agent: &str,
-    ) {
-        use krill_proto::usage::{AccountStatus, AutoSwitchMetric, ConnectionStatus, ProviderKind};
-
-        let Some(provider) = ProviderKind::parse(event_agent) else {
-            return;
-        };
-        let stored = self
-            .live_agent_for_switch_in(id, home)
-            .or_else(|| self.agents.stored(id).ok().flatten());
-        if let Some(stored_provider) = stored.as_ref().and_then(|s| {
-            self.provider_for_profile(&s.profile)
-                .or_else(|| ProviderKind::parse(&s.profile))
-        }) && stored_provider != provider
-        {
-            return;
-        }
-        if lock(&self.account_handoffs)
-            .get(&id)
-            .is_some_and(|h| h.to.is_some())
-        {
-            return;
-        }
-        let session_account_id = self.resolve_session_account_id(home, provider, stored.as_ref());
-        let snapshot = crate::usage::accounts::refresh_accounts_with(home, state_dir, false);
-        let policy = &snapshot.auto_switch;
-        let rule_enabled = policy
-            .rule_for(provider, &session_account_id)
-            .map_or(policy.enabled, |rule| rule.enabled);
-        if !policy.switch_on_rate_limit || !rule_enabled {
-            return;
-        }
-        let Some(selected) = snapshot
-            .accounts
-            .iter()
-            .find(|a| a.provider == provider && a.active)
-        else {
-            return;
-        };
-        if selected.id == session_account_id
-            || (!selected.host_default && !Path::new(&selected.profile_dir).is_dir())
-        {
-            return;
-        }
-        if snapshot.status_for(&selected.id).is_some_and(|s| {
-            matches!(
-                s.status,
-                AccountStatus::RateLimited | AccountStatus::NeedsLogin | AccountStatus::Error
-            )
-        }) {
-            return;
-        }
-        if snapshot.connections.supported
-            && matches!(
-                snapshot.connection_for(&selected.id),
-                ConnectionStatus::NeedsLogin | ConnectionStatus::CheckFailed
-            )
-        {
-            return;
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .unwrap_or(0);
-        if AutoSwitchMetric::Max
-            .effective_percent(&selected.usage, now)
-            .is_some_and(|pct| pct >= 100)
-        {
-            return;
-        }
-        let handoff = lock(&self.account_handoffs).get(&id).cloned();
-        let already_pending_or_active = handoff
-            .as_ref()
-            .is_some_and(|h| h.to.is_some() || (h.error.is_none() && h.account_id == selected.id))
-            || (handoff.as_ref().is_none_or(|h| h.error.is_none())
-                && lock(&self.account_work.pending)
-                    .get(&crate::usage::accounts::switch_work::SwitchScope::Session(
-                        id, provider,
-                    ))
-                    .is_some_and(|t| t.account_id == selected.id && t.not_before.is_none()));
-        if already_pending_or_active {
-            return;
-        }
-        if let Err(error) =
-            self.queue_session_account_switch_in(id, provider, &selected.id, &snapshot, home)
-        {
-            tracing::debug!(
-                session = id.0,
-                provider = provider.as_str(),
-                to = %selected.id,
-                ?error,
-                "straggler rate-limit re-queue skipped"
-            );
-        } else {
-            lock(&self.account_switch_opt_out).remove(&id);
-            tracing::info!(
-                session = id.0,
-                provider = provider.as_str(),
-                from = %session_account_id,
-                to = %selected.id,
-                "straggler rate-limited session queued to selected account"
-            );
-        }
     }
 
     fn close(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
@@ -3134,7 +2978,7 @@ impl Registry {
                 previous_account_id,
                 target_account_id,
             } => {
-                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                let snapshot = accounts::refresh_accounts(&home, state_ref);
                 match self.inspect_session_switches_in(
                     &home,
                     provider,
@@ -3152,7 +2996,7 @@ impl Registry {
                 sessions,
                 interrupt_busy,
             } => {
-                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                let snapshot = accounts::refresh_accounts(&home, state_ref);
                 match self.queue_selected_account_switches_in(
                     &sessions,
                     provider,
@@ -3203,15 +3047,13 @@ impl Registry {
                 Ok(enabled) => UsageReply::Provisioning(enabled),
                 Err(e) => UsageReply::Failed(os(&e)),
             },
-            // 구버전 요청의 opcode는 유지한다. 사용량 자동 수집은 끌 수 없다.
-            UsageRequest::SetDirectUsage(_) => {
-                UsageReply::Accounts(accounts::refresh_accounts_with(&home, state_ref, false))
-            }
-            UsageRequest::SetAdvancedPolicy(policy) => {
-                match accounts::set_advanced_policy(&home, state_ref, &policy) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
+            // 구버전 요청의 opcode는 유지한다. 사용량 자동 수집은 끌 수 없고, 프로필 자동전환은 제거됐다.
+            UsageRequest::SetDirectUsage(_)
+            | UsageRequest::SetAdvancedPolicy(_)
+            | UsageRequest::SetAutoSwitch(_)
+            | UsageRequest::UpsertAutoSwitchRule(_)
+            | UsageRequest::RemoveAutoSwitchRule { .. } => {
+                UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
             }
             UsageRequest::Get => UsageReply::Current(accounts::primary_snapshot(&home, state_ref)),
             UsageRequest::ListAccounts => {
@@ -3225,9 +3067,9 @@ impl Registry {
                     UsageReply::Failed(Failure::BadRequest)
                 } else {
                     match self.cancel_failed_account_switch(session) {
-                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
-                            &home, state_ref, false,
-                        )),
+                        Ok(()) => {
+                            UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                        }
                         Err(error) => UsageReply::Failed(error),
                     }
                 }
@@ -3240,9 +3082,9 @@ impl Registry {
                     UsageReply::Failed(Failure::BadRequest)
                 } else {
                     match self.recover_failed_account_input(session, &account_id) {
-                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
-                            &home, state_ref, false,
-                        )),
+                        Ok(()) => {
+                            UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                        }
                         Err(error) => UsageReply::Failed(error),
                     }
                 }
@@ -3259,7 +3101,7 @@ impl Registry {
                 let required = krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
                     | krill_proto::usage::FEAT_PROVIDER_DETAILS;
                 if features & required == required {
-                    let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                    let snapshot = accounts::refresh_accounts(&home, state_ref);
                     match self.queue_session_account_switch(
                         session,
                         provider,
@@ -3304,26 +3146,6 @@ impl Registry {
                 Ok(snap) => UsageReply::Accounts(snap),
                 Err(e) => UsageReply::Failed(os(&e)),
             },
-            UsageRequest::UpsertAutoSwitchRule(rule) => {
-                match accounts::upsert_auto_switch_rule(&home, state_ref, rule) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
-            UsageRequest::RemoveAutoSwitchRule {
-                provider,
-                from_account_id,
-            } => {
-                match accounts::remove_auto_switch_rule(
-                    &home,
-                    state_ref,
-                    provider,
-                    &from_account_id,
-                ) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
             UsageRequest::ConsumeResetCredit {
                 provider,
                 account_id,
@@ -3335,12 +3157,6 @@ impl Registry {
                 },
                 Err(e) => UsageReply::Failed(e.to_failure()),
             },
-            UsageRequest::SetAutoSwitch(policy) => {
-                match accounts::set_auto_switch(&home, state_ref, &policy) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
             UsageRequest::RenameAccount {
                 provider,
                 account_id,

@@ -156,7 +156,7 @@ Publish agent-generated HTML reports, architecture diagrams, and Markdown docume
 **Also in the box:**
 
 - **Headless `krill` CLI &amp; Remote SSH Hosts** — Drive every session, worktree, and orchestration run without the GUI (`krill ls`, `new`, `send`, `read`, `wait`, `attach`, `handoff`) or across supported remote Mac hosts (`krill --host user@host`).
-- **Account Switcher &amp; Auto-Switch (`krill account`)** — Switch agent accounts or automatically rotate accounts when usage rate limits are reached.
+- **Account Switcher (`krill account`)** — Manage multiple agent accounts, inspect usage, and manually switch accounts across sessions.
 - **Scheduled Agent Runs (`krill schedule`)** — Run recurring agent tasks on a UTC cron schedule ([Scheduling docs](docs/SCHEDULING.md)).
 - **45 Terminal Themes &amp; First-Class Korean IME** — Ships with 15 Krill themes (including **Krill Deep**) plus 30 Orca-compatible built-in themes (and Ghostty/Warp theme import) and a dedicated Hangul IME composition state machine.
 - **Quick Open &amp; Workspace Context** — Search across worktrees, sessions, files, detected local server ports (`krill ports`), and attached reference URLs (`krill reference`).
