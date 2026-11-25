@@ -34,8 +34,9 @@ pub const BOT_REPLY: u8 = 0x68;
 
 /// Maximum `.zip` payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
 pub const MAX_RPC_ZIP_BYTES: usize = 768 * 1024;
-/// Maximum PNG avatar payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
-pub const MAX_RPC_AVATAR_PNG_BYTES: usize = 768 * 1024;
+/// Maximum PNG avatar payload transferred inside a single IPC frame (512 KiB, leaving headroom
+/// for Store-mode ZIP export within `MAX_RPC_ZIP_BYTES` and Mobile base64 within `ipc::MAX_FRAME`).
+pub const MAX_RPC_AVATAR_PNG_BYTES: usize = super::MAX_AVATAR_PNG_BYTES;
 
 /// Parameters for creating a new bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1589,47 +1590,12 @@ impl fmt::Debug for BotRpcResponse {
     }
 }
 
-/// Frozen v0.3.22 4-field postcard layout of [`BotScheduleUpcoming`].
-/// `last_error` and `last_refusal` travel as postcard trailing extensions so N-1 peers
-/// can decode the first 4 fields cleanly while JSON still serializes all 6 fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct BotScheduleUpcomingV1 {
-    id: String,
-    #[serde(default)]
-    next_ms: Option<u64>,
-    #[serde(default)]
-    last_ms: Option<u64>,
-    #[serde(default)]
-    running: bool,
-}
-
-/// Frozen v0.3.22 postcard layout of [`BotUpcoming`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct BotUpcomingV1 {
-    #[serde(default)]
-    look_around_last_ms: Option<u64>,
-    #[serde(default)]
-    look_around_next_ms: Option<u64>,
-    #[serde(default)]
-    tidy_last_ms: Option<u64>,
-    #[serde(default)]
-    tidy_next_ms: Option<u64>,
-    #[serde(default)]
-    schedules: Vec<BotScheduleUpcomingV1>,
-    #[serde(default)]
-    up_next_seen_ms: u64,
-    #[serde(default)]
-    items_seen_event_id: u64,
-}
-
 /// Postcard variant discriminant for [`BotRpcResponse::Items`] (0-indexed variant 10).
 pub(crate) const ITEMS_RESPONSE_TAG: u8 = 10;
 /// Postcard variant discriminant for [`BotRpcResponse::Item`] (0-indexed variant 11).
 pub(crate) const ITEM_RESPONSE_TAG: u8 = 11;
 /// Postcard variant discriminant for [`BotRpcResponse::ItemsPage`] (0-indexed variant 25).
 pub(crate) const ITEMS_PAGE_RESPONSE_TAG: u8 = 25;
-/// Postcard variant discriminant for [`BotRpcResponse::Upcoming`] (0-indexed variant 39).
-pub(crate) const UPCOMING_RESPONSE_TAG: u8 = 39;
 
 fn item_has_waiting_meta(item: &BotItem) -> bool {
     item.waiting_reason.is_some() || item.waiting_since_ms.is_some()
@@ -1655,51 +1621,10 @@ fn decode_waiting_meta<'a>(
 }
 
 impl BotRpcResponse {
-    /// Encodes this response into postcard body bytes, preserving frozen v0.3.17/v0.3.22
-    /// layouts while appending trailing extensions (`last_error`/`last_refusal` on `Upcoming`,
-    /// and `waiting_reason`/`waiting_since_ms` on `Item`/`Items`/`ItemsPage`) only when set.
+    /// Encodes this response into postcard body bytes, preserving frozen v0.3.17/v0.3.23
+    /// layouts while appending trailing extensions (`waiting_reason`/`waiting_since_ms` on
+    /// `Item`/`Items`/`ItemsPage`) only when set.
     pub(crate) fn encode_wire_body(&self) -> Result<Vec<u8>, crate::ipc::Error> {
-        if let Self::Upcoming(up) = self {
-            let v1 = BotUpcomingV1 {
-                look_around_last_ms: up.look_around_last_ms,
-                look_around_next_ms: up.look_around_next_ms,
-                tidy_last_ms: up.tidy_last_ms,
-                tidy_next_ms: up.tidy_next_ms,
-                schedules: up
-                    .schedules
-                    .iter()
-                    .map(|s| BotScheduleUpcomingV1 {
-                        id: s.id.clone(),
-                        next_ms: s.next_ms,
-                        last_ms: s.last_ms,
-                        running: s.running,
-                    })
-                    .collect(),
-                up_next_seen_ms: up.up_next_seen_ms,
-                items_seen_event_id: up.items_seen_event_id,
-            };
-            let mut body =
-                postcard::to_stdvec(&UPCOMING_RESPONSE_TAG).map_err(crate::ipc::Error::Codec)?;
-            body.extend(postcard::to_stdvec(&v1).map_err(crate::ipc::Error::Codec)?);
-            let has_refusal = up.schedules.iter().any(|s| s.last_refusal.is_some());
-            let has_error = has_refusal || up.schedules.iter().any(|s| s.last_error.is_some());
-            if has_error {
-                for sched in &up.schedules {
-                    body.extend(
-                        postcard::to_stdvec(&sched.last_error).map_err(crate::ipc::Error::Codec)?,
-                    );
-                }
-            }
-            if has_refusal {
-                for sched in &up.schedules {
-                    body.extend(
-                        postcard::to_stdvec(&sched.last_refusal)
-                            .map_err(crate::ipc::Error::Codec)?,
-                    );
-                }
-            }
-            return Ok(body);
-        }
         let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
         match self {
             Self::Item(item) if item_has_waiting_meta(item) => {
@@ -1722,50 +1647,6 @@ impl BotRpcResponse {
 
     /// Decodes postcard body bytes produced by either this build or N-1 releases.
     pub(crate) fn decode_wire_body(body: &[u8]) -> Result<Self, crate::ipc::Error> {
-        if body.first() == Some(&UPCOMING_RESPONSE_TAG) {
-            let (_, rest) =
-                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
-            let (v1, mut tail) = postcard::take_from_bytes::<BotUpcomingV1>(rest)
-                .map_err(crate::ipc::Error::Codec)?;
-            let mut schedules: Vec<BotScheduleUpcoming> = v1
-                .schedules
-                .into_iter()
-                .map(|s| BotScheduleUpcoming {
-                    id: s.id,
-                    next_ms: s.next_ms,
-                    last_ms: s.last_ms,
-                    running: s.running,
-                    last_error: None,
-                    last_refusal: None,
-                })
-                .collect();
-            if !tail.is_empty() {
-                for sched in &mut schedules {
-                    let (err, next) = postcard::take_from_bytes::<Option<String>>(tail)
-                        .map_err(crate::ipc::Error::Codec)?;
-                    sched.last_error = err;
-                    tail = next;
-                }
-            }
-            if !tail.is_empty() {
-                for sched in &mut schedules {
-                    let (refusal, next) =
-                        postcard::take_from_bytes::<Option<super::BotSessionRefusal>>(tail)
-                            .map_err(crate::ipc::Error::Codec)?;
-                    sched.last_refusal = refusal;
-                    tail = next;
-                }
-            }
-            return Ok(Self::Upcoming(BotUpcoming {
-                look_around_last_ms: v1.look_around_last_ms,
-                look_around_next_ms: v1.look_around_next_ms,
-                tidy_last_ms: v1.tidy_last_ms,
-                tidy_next_ms: v1.tidy_next_ms,
-                schedules,
-                up_next_seen_ms: v1.up_next_seen_ms,
-                items_seen_event_id: v1.items_seen_event_id,
-            }));
-        }
         if matches!(
             body.first().copied(),
             Some(ITEMS_RESPONSE_TAG | ITEM_RESPONSE_TAG | ITEMS_PAGE_RESPONSE_TAG)

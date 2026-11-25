@@ -314,6 +314,47 @@ fn account_request(action: &str) -> io::Result<serde_json::Value> {
     }
     Ok(reply.get("data").cloned().unwrap_or_default())
 }
+fn validate_approval_url(raw: &str) -> io::Result<&str> {
+    let rest = if raw
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        raw.get(8..)
+    } else if raw
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        raw.get(7..)
+    } else {
+        None
+    };
+    let Some(rest) = rest else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid approval URL",
+        ));
+    };
+    if raw.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || krill_proto::screen::is_bidi_control(c)
+            || matches!(c, '"' | '\'' | '<' | '>')
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid approval URL",
+        ));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid approval URL",
+        ));
+    }
+    Ok(raw)
+}
+
 fn account(action: &str, json: bool) -> io::Result<()> {
     let data = account_request(match action {
         "login" => "relay_auth_start",
@@ -321,10 +362,11 @@ fn account(action: &str, json: bool) -> io::Result<()> {
         _ => "relay_auth_status",
     })?;
     if action == "login" {
-        let url = data
-            .get("verification_uri_complete")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| io::Error::other("missing approval URL"))?;
+        let url = validate_approval_url(
+            data.get("verification_uri_complete")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other("missing approval URL"))?,
+        )?;
         if json {
             println!("{data}");
         } else {
@@ -490,6 +532,35 @@ mod tests {
             vec!["serve", "--json"],
         ] {
             assert!(parse(&args(&a)).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_approval_url_accepts_clean_http_and_rejects_unsanitized_urls() {
+        for good in [
+            "https://relay.krill.sh/auth/device?user_code=ABCD-1234",
+            "http://127.0.0.1:8787/auth/device?code=abc_123&next=%2Fok",
+            "HTTPS://relay.krill.sh/auth/device?code=1",
+        ] {
+            assert_eq!(validate_approval_url(good).unwrap(), good);
+        }
+        for bad in [
+            "",
+            "https://relay.krill.sh/auth/device?code=1\r\nfoo",
+            "https://relay.krill.sh/auth/device?code=\x1b[31mred",
+            "https://relay.krill.sh/auth/device?code=1 two",
+            " https://relay.krill.sh/auth/device?code=1",
+            "https://relay.krill.sh/auth/device?code=\"quoted\"",
+            "https://relay.krill.sh/auth/device?code='quoted'",
+            "https://relay.krill.sh/auth/device?code=\u{202e}spoof",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https:///path",
+            "https://:8080/auth/device?code=1",
+        ] {
+            let err = validate_approval_url(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "url={bad:?}");
         }
     }
 }

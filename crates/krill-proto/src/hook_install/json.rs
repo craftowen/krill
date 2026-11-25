@@ -79,10 +79,20 @@ pub fn undo(current: &mut Value, before: Option<&Value>, installed: &Value) {
                             .is_some_and(|hooks| owned.iter().any(|h| hooks.contains(h)))
                     })
                 {
-                    // A user added a matcher or another hook inside our group. Remove the
-                    // unchanged handler and preserve the user's group fields and handlers.
-                    if let Some(group) = now.get_mut(i) {
-                        undo(group, None, item);
+                    // A user added a matcher or another hook inside our group. Remove only the
+                    // unchanged Krill handler(s) from `hooks`, preserve sibling group fields
+                    // (such as `matcher`), and drop the group if no handlers remain.
+                    let remove_group = if let Some(group) = now.get_mut(i)
+                        && let Some(item_hooks) = item.get("hooks")
+                        && let Some(group_hooks) = group.get_mut("hooks")
+                    {
+                        undo(group_hooks, None, item_hooks);
+                        group_hooks.as_array().is_some_and(Vec::is_empty)
+                    } else {
+                        false
+                    };
+                    if remove_group {
+                        now.remove(i);
                     }
                 }
             }
@@ -126,5 +136,54 @@ mod tests {
             expected.as_object_mut().unwrap().insert("later".to_owned(), json!(later));
             proptest::prop_assert_eq!(parse(Some(&removed)).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn uninstall_preserves_matcher_on_user_extended_agy_group_and_drops_empty_claude_group() {
+        // Antigravity: user appends a custom handler inside Krill's `PreToolUse` group (`matcher: "*"`).
+        let agy_after = install(None, Agent::Agy, "krill hook agy").unwrap();
+        let mut agy_current: Value = serde_json::from_str(&agy_after).unwrap();
+        let user_handler = json!({"type": "command", "command": "user-pre-tool", "timeout": 5});
+        agy_current["krill"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(user_handler.clone());
+        let agy_removed = uninstall(&agy_current.to_string(), None, &agy_after).unwrap();
+        let agy_final = parse(Some(&agy_removed)).unwrap();
+        assert_eq!(
+            agy_final["krill"]["PreToolUse"],
+            json!([{"matcher": "*", "hooks": [user_handler]}])
+        );
+
+        // Claude: user adds `matcher: "Bash"` to Krill's group with no custom handler ->
+        // group must be removed instead of leaving a matcher-only object without `hooks`.
+        let claude_after =
+            crate::agent::hooks::install_claude_json(None, "krill hook claude").unwrap();
+        let mut claude_matcher_only: Value = serde_json::from_str(&claude_after).unwrap();
+        claude_matcher_only["hooks"]["PreToolUse"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("matcher".to_owned(), json!("Bash"));
+        let claude_removed =
+            uninstall(&claude_matcher_only.to_string(), None, &claude_after).unwrap();
+        assert_eq!(parse(Some(&claude_removed)).unwrap(), json!({}));
+
+        // Claude: user adds both `matcher: "Bash"` and a custom handler -> both survive.
+        let mut claude_extended: Value = serde_json::from_str(&claude_after).unwrap();
+        let group = claude_extended["hooks"]["PreToolUse"][0]
+            .as_object_mut()
+            .unwrap();
+        group.insert("matcher".to_owned(), json!("Bash"));
+        let custom_claude = json!({"type": "command", "command": "user-bash-hook"});
+        group["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(custom_claude.clone());
+        let claude_kept = uninstall(&claude_extended.to_string(), None, &claude_after).unwrap();
+        let claude_final = parse(Some(&claude_kept)).unwrap();
+        assert_eq!(
+            claude_final["hooks"]["PreToolUse"],
+            json!([{"matcher": "Bash", "hooks": [custom_claude]}])
+        );
     }
 }

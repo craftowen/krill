@@ -402,8 +402,8 @@ impl Panel {
                         }
                     }
                     Err(reason) => {
-                        this.checks.action_error = Some(reason.to_owned());
-                        this.checks.fix_status = Some(text::ACTION_FAILED);
+                        this.checks.action_error =
+                            Some(text::ACTION_FAILED.format(&[("reason", reason)]));
                     }
                 }
                 cx.notify();
@@ -431,11 +431,10 @@ impl Panel {
     }
 
     pub(super) fn open_external_url(url: &str, cx: &mut Context<Self>) {
-        let url = url.trim();
-        if url.is_empty() {
+        let Some(clean) = sanitized_external_url(url) else {
             return;
-        }
-        cx.open_url(url);
+        };
+        cx.open_url(&clean);
     }
 
     pub(super) fn open_review_comment_location(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -1523,6 +1522,17 @@ fn resolve_review_comment_path(repo: &Path, raw: &str) -> Option<std::path::Path
     Some(joined)
 }
 
+fn sanitized_external_url(url: &str) -> Option<String> {
+    let clean = crate::terminal::path_link::sanitize_external_url(url)?;
+    let is_http = clean
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || clean
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    is_http.then_some(clean)
+}
+
 #[cfg(test)]
 mod checks_tests {
     use super::*;
@@ -1583,5 +1593,113 @@ mod checks_tests {
         }
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    use crate::pull_request::{Action, Runner, Service};
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    struct DraftRunner {
+        fail: Mutex<bool>,
+    }
+
+    impl Runner for DraftRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::Open)
+        }
+
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            Ok(PrInspection {
+                status: Status::Draft,
+                number: Some(7),
+                title: "Draft toggle".into(),
+                url: "https://github.com/acme/krill/pull/7".into(),
+                ..PrInspection::default()
+            })
+        }
+
+        fn set_pr_draft(&self, _: &Path, _: &str, _: bool) -> io::Result<()> {
+            if *self.fail.lock().unwrap() {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn toggle_pr_draft_formats_action_error_and_clears_on_retry(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| crate::i18n::set_language(crate::i18n::Language::En, cx));
+        let runner = Arc::new(DraftRunner {
+            fail: Mutex::new(true),
+        });
+        let service = Arc::new(Service::new(runner.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = Panel::unconnected(PathBuf::from("/fake/worktree"), cx);
+            panel.set_pr_service(service);
+            panel.set_checks_branch("feature/draft");
+            panel.checks.inspection = Some(PrInspection {
+                status: Status::Open,
+                number: Some(7),
+                title: "Draft toggle".into(),
+                url: "https://github.com/acme/krill/pull/7".into(),
+                ..PrInspection::default()
+            });
+            panel.tab = PanelTab::Checks;
+            panel
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| view.update(cx, Panel::toggle_pr_draft));
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.checks.fix_status.is_none());
+            let err = panel.checks.action_error.as_deref().unwrap();
+            assert!(
+                !err.contains("{reason}"),
+                "placeholder must be formatted: {err}"
+            );
+            assert!(err.contains(text::TIMED_OUT.get()), "{err}");
+        });
+
+        *runner.fail.lock().unwrap() = false;
+        cx.update(|_, cx| view.update(cx, Panel::toggle_pr_draft));
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.checks.action_error.is_none(),
+                "starting a retry must clear the stale action error immediately"
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.checks.action_error.is_none());
+            assert_eq!(panel.checks.fix_status, Some(text::ACTION_SUCCESS));
+        });
+    }
+
+    #[test]
+    fn sanitized_external_url_allows_only_safe_http_urls() {
+        assert_eq!(
+            sanitized_external_url("  https://github.com/acme/krill/pull/42  ").as_deref(),
+            Some("https://github.com/acme/krill/pull/42")
+        );
+        assert_eq!(
+            sanitized_external_url("http://example.com/checks/1").as_deref(),
+            Some("http://example.com/checks/1")
+        );
+        for blocked in [
+            "",
+            "   ",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>alert(1)</script>",
+            "mailto:attacker@example.com",
+            "https://github.com/acme/krill\nnewline",
+            "https://github.com/acme/\u{202E}krill",
+        ] {
+            assert_eq!(sanitized_external_url(blocked), None, "{blocked:?}");
+        }
     }
 }

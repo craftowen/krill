@@ -41,10 +41,10 @@ impl Settings {
         session: SessionId,
         version: Option<&str>,
     ) -> io::Result<Self> {
-        Self::create_named(state, krill, session, version, false)
+        Self::create_named(state, krill, session, version, None)
     }
 
-    /// `--session-id`를 주입하지 않는 실행(`--fork-session`·ID 없는 `--resume`)용 설정 파일.
+    /// `--session-id`를 주입하지 않는 실행(`--fork-session`)용 설정 파일.
     /// 파일 이름을 `<세션 id>-fork-<uuid>.json`으로 두어 [`discard`]·[`sweep`]은 세션 소유로 정리하되
     /// [`session_id`] 폴백은 미주입 UUID를 반환하지 않는다(OWE-752).
     pub(crate) fn create_for_fork(
@@ -53,7 +53,19 @@ impl Settings {
         session: SessionId,
         version: Option<&str>,
     ) -> io::Result<Self> {
-        Self::create_named(state, krill, session, version, true)
+        Self::create_named(state, krill, session, version, Some("fork"))
+    }
+
+    /// `--session-id`를 주입하지 않는 `--resume` 실행용 설정 파일.
+    /// 파일 이름을 `<세션 id>-resume-<uuid>.json`으로 두어 [`discard`]·[`sweep`]은 세션 소유로 정리하되
+    /// [`session_id`] 폴백은 미주입 UUID를 반환하지 않는다.
+    pub(crate) fn create_for_resume(
+        state: &Path,
+        krill: &Path,
+        session: SessionId,
+        version: Option<&str>,
+    ) -> io::Result<Self> {
+        Self::create_named(state, krill, session, version, Some("resume"))
     }
 
     fn create_named(
@@ -61,7 +73,7 @@ impl Settings {
         krill: &Path,
         session: SessionId,
         version: Option<&str>,
-        fork_only: bool,
+        kind_tag: Option<&str>,
     ) -> io::Result<Self> {
         let dir = state.join(DIR);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
@@ -107,10 +119,9 @@ impl Settings {
         }
         let bytes = serde_json::to_vec(&serde_json::Value::Object(root))?;
         let id = uuid()?;
-        let filename = if fork_only {
-            format!("{}-fork-{id}.json", session.0)
-        } else {
-            format!("{}-{id}.json", session.0)
+        let filename = match kind_tag {
+            Some(tag) => format!("{}-{tag}-{id}.json", session.0),
+            None => format!("{}-{id}.json", session.0),
         };
         let path = state.join(DIR).join(filename);
         let mut file = OpenOptions::new()
@@ -164,13 +175,23 @@ impl Settings {
     }
 
     pub(crate) fn resume(
-        self,
+        mut self,
         profile: &Profile,
         permission: Permission,
         login: Launch,
         session_id: Option<&str>,
     ) -> io::Result<Launch> {
         self.check_profile(profile, permission)?;
+        if let Some(name) = self.path.file_name().and_then(OsStr::to_str)
+            && let Some((sid, rest)) = name.strip_suffix(".json").and_then(|s| s.split_once('-'))
+            && is_uuid(rest)
+            && let Some(parent) = self.path.parent()
+        {
+            let resume_path = parent.join(format!("{sid}-resume-{rest}.json"));
+            if std::fs::rename(&self.path, &resume_path).is_ok() {
+                self.path = resume_path;
+            }
+        }
         let mut launch = wrap(profile, permission, login);
         launch.argv.extend([
             b"--settings".to_vec(),
@@ -249,7 +270,10 @@ pub(crate) fn session_id(state: &Path, id: SessionId) -> Option<String> {
     for entry in dir.flatten() {
         let name = entry.file_name();
         if owner(&name) == Some(id)
-            && let Some((_, uuid)) = name.to_str()?.strip_suffix(".json")?.split_once('-')
+            && let Some((_, uuid)) = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".json"))
+                .and_then(|s| s.split_once('-'))
             && is_uuid(uuid)
         {
             return Some(uuid.to_owned());
@@ -420,6 +444,7 @@ fn owner(name: &OsStr) -> Option<SessionId> {
         let (sid, rest) = stem.split_once('-')?;
         let uuid = rest
             .strip_prefix("fork-")
+            .or_else(|| rest.strip_prefix("resume-"))
             .or_else(|| rest.strip_prefix("mcp-"))
             .unwrap_or(rest);
         (sid, uuid)
@@ -513,10 +538,14 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
 
 /// 실제와 같은 login/interactive 셸의 PATH·환경에서 버전을 읽는다. 5초 안에 못 읽으면 보수적 집합.
 fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
+    probe_now_with_timeout(profile, login, Duration::from_secs(5))
+}
+
+fn probe_now_with_timeout(profile: &Profile, login: &Launch, timeout: Duration) -> Option<String> {
     let mut profile = profile.clone();
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
     #[cfg(unix)]
-    let launch = wrap(&profile, Permission::Manual, login.clone());
+    let launch = super::wrap_probe(&profile, login.clone());
     #[cfg(unix)]
     let (program, args) = launch.argv.split_first()?;
     #[cfg(unix)]
@@ -525,11 +554,6 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
     let mut command = super::windows::command(OsStr::new(profile.program()?), login.env.clone())?;
     #[cfg(windows)]
     command.arg("--version");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     #[cfg(unix)]
     command
         .args(args.iter().map(|a| OsStr::from_bytes(a)))
@@ -540,12 +564,12 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
                 .iter()
                 .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
         );
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    let deadline = Instant::now() + timeout;
+    let mut child = crate::child::spawn(crate::child::own_group(&mut command)).ok()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -553,16 +577,24 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
         tx.send(stdout.take(4096).read_to_string(&mut text).map(|_| text))
             .ok();
     });
-    let out = rx.recv_timeout(Duration::from_secs(5));
-    let status = child.try_wait().ok().flatten();
-    child.kill().ok();
-    child.wait().ok();
-    if status.is_some_and(|s| !s.success()) {
+    let out = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let Ok(Ok(text)) = out else {
+        return None;
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => break None,
+        }
+    };
+    drop(child);
+    if !status.is_some_and(|s| s.success()) {
         return None;
     }
-    out.ok()?
-        .ok()?
-        .lines()
+    text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_owned)

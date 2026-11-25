@@ -578,7 +578,7 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
         krill_app::keys::bind("cmd-c", Copy, ctx),
         krill_app::keys::bind("cmd-shift-c", CopyClean, ctx),
-        krill_app::keys::bind("cmd-shift-l", QuoteChat, ctx),
+        krill_app::keys::bind("cmd-alt-l", QuoteChat, ctx),
         krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
     #[cfg(target_os = "windows")]
@@ -2677,6 +2677,8 @@ impl Shell {
             _ => None,
         };
         self.jump = None;
+        let focus_before = window.focused(cx);
+        let mut refocus_shell = true;
         match *event {
             jump::Event::Confirm(id) => self.open_session(id, cx),
             jump::Event::ConfirmOn(ref host, id) => self.open_session_on(host.clone(), id, cx),
@@ -2685,7 +2687,17 @@ impl Shell {
                     self.open_palette_worktree(&entry, cx);
                 }
             }
-            jump::Event::Action(kind) => self.run_palette_action(kind, window, cx),
+            jump::Event::Action(kind) => {
+                let wants_shell_focus = self.run_palette_action(kind, window, cx);
+                let opened_surface = self.has_blocking_overlay()
+                    || self.modal.is_some()
+                    || self.onboarding.is_some()
+                    || self.pending.onboarding.is_some()
+                    || self.continue_session.is_some()
+                    || self.add_project.is_some();
+                refocus_shell =
+                    wants_shell_focus || (!opened_surface && window.focused(cx) == focus_before);
+            }
             jump::Event::ResumeVault { .. } => {
                 if let Some((target, context)) = vault_target {
                     self.history.update(cx, |h, cx| {
@@ -2697,7 +2709,9 @@ impl Shell {
             }
             jump::Event::Dismiss => {}
         }
-        window.focus(&self.focus, cx);
+        if refocus_shell {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
     }
 
@@ -2712,36 +2726,68 @@ impl Shell {
     }
 
     /// OWE-865: 팔레트 빠른 액션 실행. 모두 이미 구현된 기능만 둔다.
+    /// Returns `true` when focus should return to the shell terminal after running the action.
     fn run_palette_action(
         &mut self,
         kind: jump::ActionKind,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         match kind {
-            jump::ActionKind::NewWorktree => self.open_new_worktree_dialog(window, cx),
-            jump::ActionKind::NewTab => self.new_tab_on_launch_host(cx),
-            jump::ActionKind::SplitRight => self.split_active(Axis::Horizontal, cx),
-            jump::ActionKind::SplitDown => self.split_active(Axis::Vertical, cx),
+            jump::ActionKind::NewWorktree => {
+                self.open_new_worktree_dialog(window, cx);
+                false
+            }
+            jump::ActionKind::NewTab => {
+                self.new_tab_on_launch_host(cx);
+                true
+            }
+            jump::ActionKind::SplitRight => {
+                self.split_active(Axis::Horizontal, cx);
+                true
+            }
+            jump::ActionKind::SplitDown => {
+                self.split_active(Axis::Vertical, cx);
+                true
+            }
             jump::ActionKind::OpenSettings => {
                 self.open_settings(krill_app::settings::AdminTab::Appearance, Some(window), cx);
+                false
             }
-            jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
-            jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
-            jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
-            jump::ActionKind::ToggleChatView => self.toggle_chat_view_with_focus(window, cx),
-            jump::ActionKind::OpenChecks => krill_app::onboarding::open_checks_current(cx),
+            jump::ActionKind::ToggleSidebar => {
+                self.toggle_sidebar(cx);
+                true
+            }
+            jump::ActionKind::ToggleExplorer => {
+                self.toggle_explorer(window, cx);
+                false
+            }
+            jump::ActionKind::ToggleSearch => {
+                self.toggle_workspace_search(window, cx);
+                false
+            }
+            jump::ActionKind::ToggleChatView => {
+                self.toggle_chat_view_with_focus(window, cx);
+                false
+            }
+            jump::ActionKind::OpenChecks => {
+                krill_app::onboarding::open_checks_current(cx);
+                false
+            }
             jump::ActionKind::OpenDisk => {
                 self.open_settings(krill_app::settings::AdminTab::Disk, Some(window), cx);
+                false
             }
             jump::ActionKind::OpenAutomations => {
                 // 사이드바에서 숨긴 자동화를 되돌리는 경로이기도 하다.
                 krill_app::settings::edit(cx, |s| s.show_automations_button = true);
                 self.open_automations(Some(window), cx);
+                false
             }
             jump::ActionKind::OpenMobile => {
                 // 사용자가 사이드바에서 숨긴 설정은 유지한 채 모바일 페이지만 연다.
                 self.open_mobile_page(Some(window), cx);
+                false
             }
             jump::ActionKind::EditQuickCommands => {
                 self.open_settings(
@@ -2749,6 +2795,7 @@ impl Shell {
                     Some(window),
                     cx,
                 );
+                false
             }
             jump::ActionKind::ImportTerminalThemes => {
                 let imported = krill_app::settings::import_terminal_themes(cx);
@@ -2761,6 +2808,7 @@ impl Shell {
                     .ok();
                 })
                 .detach();
+                true
             }
             jump::ActionKind::QuickCommand(index) => {
                 if let Some(command) = krill_app::settings::current(cx)
@@ -2770,6 +2818,7 @@ impl Shell {
                 {
                     self.inject_command(&command, window, cx);
                 }
+                true
             }
         }
     }
@@ -3099,6 +3148,9 @@ impl Shell {
     /// Every manager API may lock a slot owned by an SSH connection attempt.
     /// UI code reads only these accepted snapshots; backend updates are ordered.
     fn sync_hosts_after_reconnect(&mut self, reconnect: Option<String>, cx: &mut Context<Self>) {
+        if self.role == WindowRole::Floating {
+            return;
+        }
         let hosts = self.ssh_hosts.clone();
         let specs = krill_app::hosts::specs_from_ssh_hosts(&hosts);
         let external = self.external_hosts.clone();
@@ -6161,7 +6213,7 @@ impl Shell {
             }
             return;
         }
-        if self.has_blocking_overlay() || !self.focus.is_focused(window) {
+        if !self.focus.is_focused(window) {
             return;
         }
         if self.confirm_close_tab.is_some() {
@@ -6181,6 +6233,9 @@ impl Shell {
                 _ => {}
             }
             cx.stop_propagation();
+            return;
+        }
+        if self.has_blocking_overlay() {
             return;
         }
         // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
@@ -10173,6 +10228,9 @@ impl Shell {
             || self.bot_ui.delete.is_some()
             || self.bot_ui.delete_group.is_some()
             || self.has_chat_image_viewer()
+            || self.confirm_close_tab.is_some()
+            || self.pending_running_close.is_some()
+            || self.session_switch.is_some()
     }
 
     pub(super) fn has_blocking_overlay(&self) -> bool {
@@ -10184,6 +10242,18 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.session_switch.is_some() {
+            self.close_session_switch_modal(cx);
+            return true;
+        }
+        if self.pending_running_close.is_some() {
+            self.cancel_running_close(cx);
+            return true;
+        }
+        if self.confirm_close_tab.is_some() {
+            self.cancel_close_pinned_tab(cx);
+            return true;
+        }
         if self.has_chat_image_viewer() {
             self.close_chat_image_viewer(window, cx);
             return true;

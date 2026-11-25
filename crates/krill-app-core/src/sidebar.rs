@@ -4580,7 +4580,9 @@ impl Sidebar {
     }
 
     fn toggle_pin_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.cursor_worktree() {
+        if self.cursor.is_some_and(|c| self.row_host(c).is_local())
+            && let Some(path) = self.cursor_worktree()
+        {
             self.toggle_pin(path, cx);
         }
     }
@@ -4889,7 +4891,9 @@ impl Sidebar {
     }
 
     fn rename_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.cursor_worktree() {
+        if self.cursor.is_some_and(|c| self.row_host(c).is_local())
+            && let Some(path) = self.cursor_worktree()
+        {
             self.rename(path, window, cx);
         }
     }
@@ -5649,8 +5653,9 @@ impl Sidebar {
         if self.bot_sessions.get(&host) == Some(&sessions) {
             return;
         }
+        let is_local = host.is_local();
         self.bot_sessions.insert(host, sessions);
-        if self.bot_worktrees.is_some() {
+        if is_local && self.bot_worktrees.is_some() {
             self.rebuild(cx);
         } else {
             cx.notify();
@@ -5665,11 +5670,15 @@ impl Sidebar {
         meta: krill_ui::bot_types::BotSessionMeta,
         cx: &mut Context<Self>,
     ) {
-        self.bot_sessions
-            .entry(host)
-            .or_default()
-            .insert(session_id, meta);
-        cx.notify();
+        let is_local = host.is_local();
+        let entry = self.bot_sessions.entry(host).or_default();
+        let changed = entry.get(&session_id) != Some(&meta);
+        entry.insert(session_id, meta);
+        if is_local && changed && self.bot_worktrees.is_some() {
+            self.rebuild(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Rebinds cached bot identity metadata when a live bot session switches accounts in place.

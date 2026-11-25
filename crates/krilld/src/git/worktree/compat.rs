@@ -227,35 +227,92 @@ struct ImportedProjectHooks {
     symlink_paths: Vec<String>,
 }
 
+fn strip_windows_verbatim_str(raw: &str) -> std::borrow::Cow<'_, str> {
+    for prefix in [r"\\?\", "//?/"] {
+        if let Some(after) = raw.strip_prefix(prefix) {
+            if let Some((unc, rest)) = after.split_at_checked(4)
+                && (unc.eq_ignore_ascii_case(r"unc\") || unc.eq_ignore_ascii_case("unc/"))
+            {
+                return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+            }
+            return std::borrow::Cow::Borrowed(after);
+        }
+    }
+    std::borrow::Cow::Borrowed(raw)
+}
+
+fn looks_like_windows_path(raw: &str) -> bool {
+    matches!(raw.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        || raw.starts_with(r"\\")
+        || raw.starts_with("//?/")
+}
+
+fn normalize_project_path(raw: &str) -> (String, bool) {
+    let stripped = strip_windows_verbatim_str(raw);
+    let win = cfg!(windows) || looks_like_windows_path(&stripped);
+    if win {
+        let mut s = stripped.replace('/', r"\");
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+        (s, true)
+    } else {
+        let mut s = stripped.into_owned();
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+        (s, false)
+    }
+}
+
+fn project_paths_match(a: &str, b: &str) -> bool {
+    let (na, wa) = normalize_project_path(a);
+    let (nb, wb) = normalize_project_path(b);
+    if wa || wb {
+        na.eq_ignore_ascii_case(&nb)
+    } else {
+        na == nb
+    }
+}
+
 fn repo_hook_config(repo_top: &Path, state_dir: Option<&Path>) -> Option<ImportedProjectHooks> {
     let state_dir = state_dir?;
     let raw = read(&state_dir.join("projects.toml")).ok()??;
     let parsed: ImportedProjectsFile = toml::from_str(&raw).ok()?;
     let mut aliases = vec![repo_top.to_string_lossy().into_owned()];
-    if let Ok(canon) = std::fs::canonicalize(repo_top) {
-        let s = canon.to_string_lossy().into_owned();
+    let mut push_alias = |s: String| {
         if !aliases.contains(&s) {
             aliases.push(s);
         }
+    };
+    push_alias(
+        krill_proto::os::shell_path(repo_top)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    if let Ok(canon) = std::fs::canonicalize(repo_top) {
+        push_alias(canon.to_string_lossy().into_owned());
+        push_alias(
+            krill_proto::os::shell_path(&canon)
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     if let Ok(rest) = repo_top.strip_prefix("/private") {
-        let s = Path::new("/").join(rest).to_string_lossy().into_owned();
-        if !aliases.contains(&s) {
-            aliases.push(s);
-        }
+        push_alias(Path::new("/").join(rest).to_string_lossy().into_owned());
     } else if let Ok(rest) = repo_top.strip_prefix("/") {
-        let s = Path::new("/private")
-            .join(rest)
-            .to_string_lossy()
-            .into_owned();
-        if !aliases.contains(&s) {
-            aliases.push(s);
-        }
+        push_alias(
+            Path::new("/private")
+                .join(rest)
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
-    parsed
-        .projects
-        .into_iter()
-        .find(|p| !p.archived && p.host_id.is_none() && aliases.iter().any(|c| c == &p.path))
+    parsed.projects.into_iter().find(|p| {
+        !p.archived
+            && p.host_id.is_none()
+            && aliases.iter().any(|c| project_paths_match(c, &p.path))
+    })
 }
 
 pub(super) fn project_destination(

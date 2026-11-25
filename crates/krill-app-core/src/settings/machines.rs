@@ -517,7 +517,24 @@ impl SettingsView {
             .flex()
             .flex_col();
         let catalog = self.machine_catalog(cx);
-        let remote: Vec<&Machine> = catalog.iter().filter(|m| !m.is_local()).collect();
+        let remote: Vec<Machine> = catalog
+            .iter()
+            .filter_map(|machine| {
+                if !machine.is_local() {
+                    return Some(machine.clone());
+                }
+                let routes: Vec<MachineRoute> = machine
+                    .routes
+                    .iter()
+                    .filter(|r| r.kind != RouteKind::Local)
+                    .cloned()
+                    .collect();
+                (!routes.is_empty()).then(|| Machine {
+                    key: machine.key.clone(),
+                    routes,
+                })
+            })
+            .collect();
         if remote.is_empty() {
             list = list.child(
                 div()
@@ -530,12 +547,12 @@ impl SettingsView {
                     .child(text::MACHINES_EMPTY_REMOTE.get()),
             );
         }
-        for machine in remote {
+        for machine in &remote {
             list = list.child(self.render_machine_row(machine, window, cx));
         }
 
         let add_panel = adding.map(|method| self.render_machine_add(method, window, cx));
-        let status = adding.is_none().then(|| self.render_ssh_status(cx));
+        let status = (adding != Some(AddMethod::Ssh)).then(|| self.render_ssh_status(cx));
         div()
             .flex()
             .flex_col()
@@ -612,4 +629,130 @@ fn home_relative(summary: &str) -> String {
         .and_then(|home| home.to_str().map(str::to_owned))
         .filter(|home| home.len() > 1)
         .map_or_else(|| summary.to_owned(), |home| summary.replace(&home, "~"))
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use krill_proto::ipc::MachineIdentity;
+
+    #[gpui::test]
+    fn loopback_ssh_route_with_local_identity_stays_visible_and_editable(cx: &mut TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-machines-loopback-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+        vcx.simulate_resize(gpui::size(px(1400.), px(1600.)));
+        let host_id = vcx.update(|window, cx| {
+            let pairing = cx.new(|cx| {
+                crate::link_ui::PairingView::new(
+                    std::sync::Arc::new(crate::link_ui::MockLinkBackend::new()),
+                    window,
+                    cx,
+                )
+            });
+            view.update(cx, |v, cx| {
+                v.remote_krill = Some(pairing);
+                v.ssh_hosts = crate::ssh_hosts::add_host(
+                    Some(&dir),
+                    "Loopback Mac",
+                    "owen@127.0.0.1",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let id = v.ssh_hosts[0].id.clone();
+                let ssh_host = HostId::Remote(id.clone());
+                v.sync_machine_observations(
+                    std::collections::BTreeMap::from([
+                        (HostId::Local, MachineIdentity([9; 16])),
+                        (ssh_host.clone(), MachineIdentity([9; 16])),
+                    ]),
+                    cx,
+                );
+                let catalog = v.machine_catalog(cx);
+                assert_eq!(catalog.len(), 1, "loopback route merges into local machine");
+                assert!(catalog[0].is_local());
+                assert_eq!(catalog[0].routes.len(), 2);
+                v.machine_open = Some(ssh_host);
+                v.set_tab(AdminTab::Machines, cx);
+                id
+            })
+        });
+        vcx.run_until_parked();
+
+        assert_eq!(host_id, "ssh-loopback-mac");
+        assert!(vcx.debug_bounds("admin-machine-local").is_some());
+        assert!(
+            vcx.debug_bounds("admin-machine-ssh-loopback-mac").is_some(),
+            "loopback SSH row must still render in remote list"
+        );
+        assert!(
+            vcx.debug_bounds("admin-ssh-edit-ssh-loopback-mac")
+                .is_some(),
+            "loopback SSH route must remain editable"
+        );
+        assert!(
+            vcx.debug_bounds("admin-ssh-remove-ssh-loopback-mac")
+                .is_some(),
+            "loopback SSH route must remain removable"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn ssh_status_renders_while_invite_add_panel_is_open(cx: &mut TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-machines-ssh-status-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+        vcx.simulate_resize(gpui::size(px(1400.), px(1600.)));
+        vcx.update(|window, cx| {
+            let pairing = cx.new(|cx| {
+                crate::link_ui::PairingView::new(
+                    std::sync::Arc::new(crate::link_ui::MockLinkBackend::new()),
+                    window,
+                    cx,
+                )
+            });
+            view.update(cx, |v, cx| {
+                v.remote_krill = Some(pairing);
+                v.ssh_status = Some("SSH test failed".into());
+                v.show_machine_add(AddMethod::Invite, cx);
+            });
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("admin-ssh-status").is_some(),
+            "SSH status banner must remain visible while Invite add panel is open"
+        );
+
+        // Switching to AddMethod::Ssh keeps a single SSH status banner without duplicate IDs.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.show_machine_add(AddMethod::Ssh, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("admin-ssh-status").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

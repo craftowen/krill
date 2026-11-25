@@ -195,6 +195,11 @@ pub struct Registry {
     upgrading: Mutex<bool>,
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
+    /// Serializes concurrent `AgentHistory::Resume`/`ResumeVault` calls for the same conversation.
+    resuming_conversations: (
+        Mutex<HashSet<(krill_proto::agent_history::VaultAgent, String)>>,
+        std::sync::Condvar,
+    ),
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
     account_handoffs: Mutex<account_switch::ledger::HandoffLedger>,
     account_recovered: std::sync::atomic::AtomicBool,
@@ -293,6 +298,7 @@ impl Registry {
             git_watch: Mutex::default(),
             upgrading: Mutex::new(false),
             resuming: Mutex::default(),
+            resuming_conversations: (Mutex::default(), std::sync::Condvar::new()),
             account_work: Arc::new(crate::usage::accounts::switch_work::SwitchWork::default()),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
@@ -457,6 +463,7 @@ impl Registry {
         .ok();
         drop(commit);
         for (id, e) in &hooked {
+            self.discover_hook_identity(*id, e);
             self.maybe_rename_from_hook(*id, &e.payload, e.id);
             if let Some(bots) = self.bots_if_initialized() {
                 bots.on_hook_event(self, *id, e);
@@ -745,18 +752,16 @@ impl Registry {
             let _commit = lock(&self.hook_commit);
             Peer::of(&s, &lock(&self.state).roots)
         };
-        // 서명 정책이 강제되면 전체 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096). 닫힌 피어의 토큰
-        // 조회도 실패하므로 먼저 읽은 토큰으로 검증하고, 못 넘기면 접속 자체를 거부한다.
-        if !mobile && peer.scope.full() {
-            let policy = scope::SigningPolicy::load(self.dir.as_deref());
-            if policy.enforced() {
-                let sign = crate::sys::peer_token(s.as_fd())
+        // 서명 정책이 강제되면 모든 로컬 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096).
+        // 계보 조회에 실패한 Scope::Restricted 피어도 강제 정책을 우회할 수 없다.
+        if !mobile
+            && self.gate_connection_signing(&mut peer, || {
+                crate::sys::peer_token(s.as_fd())
                     .ok()
-                    .map(|token| crate::sys::verify_audit_token(&token));
-                if peer.gate_signing(&policy, sign.as_ref(), &self.audit) {
-                    return Ok(());
-                }
-            }
+                    .map(|token| crate::sys::verify_audit_token(&token))
+            })
+        {
+            return Ok(());
         }
         let (client, n) = crate::ipc::handshake(&mut s, hello)?;
         if peer.scope.full()
@@ -886,6 +891,7 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
+                self.discover_hook_identity(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
                 if let Some(bots) = self.bots_if_initialized() {
                     bots.on_hook_event(self, id, &e);
@@ -1686,7 +1692,27 @@ impl Registry {
         Ok((canonical.to_owned(), profile, agents.permission))
     }
 
+    fn gate_connection_signing(
+        &self,
+        peer: &mut Peer,
+        sign: impl FnOnce() -> Option<crate::sys::CodeSign>,
+    ) -> bool {
+        let policy = scope::SigningPolicy::load(self.dir.as_deref());
+        if !policy.enforced() {
+            return false;
+        }
+        if !peer.scope.full() {
+            peer.deny("peer-sign", &self.audit);
+            return true;
+        }
+        let sign = sign();
+        peer.gate_signing(&policy, sign.as_ref(), &self.audit)
+    }
+
     fn create(&self, peer: &Peer, mut c: Create) -> Result<Reply, Failure> {
+        if !peer.authorize("create", SessionId(0), &self.audit) {
+            return Err(Failure::Denied);
+        }
         sanitize_spawn_cwd(&mut c.cwd);
         if c.account.is_some() && !matches!(c.program, Program::Agent { .. }) {
             return Err(Failure::BadRequest);
@@ -2077,12 +2103,32 @@ impl Registry {
         &self,
         holder: &Holder,
         id: SessionId,
+        argv: Vec<Vec<u8>>,
+        env: Vec<(Vec<u8>, Vec<u8>)>,
+        cwd: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(SessionId, u32), Failure> {
+        self.spawn_holder_outcome(holder, id, argv, env, cwd, cols, rows)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Returns `(failure, definitively_not_spawned)` on error so callers can distinguish
+    /// a definitive `FromHolder::Failed` rejection from uncertain spawn outcomes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "holder Spawn 요청에 필요한 세션·프로세스·화면 인자를 한 번에 넘긴다"
+    )]
+    fn spawn_holder_outcome(
+        &self,
+        holder: &Holder,
+        id: SessionId,
         mut argv: Vec<Vec<u8>>,
         mut env: Vec<(Vec<u8>, Vec<u8>)>,
         mut cwd: Vec<u8>,
         cols: u16,
         rows: u16,
-    ) -> Result<(SessionId, u32), Failure> {
+    ) -> Result<(SessionId, u32), (Failure, bool)> {
         use krill_proto::os::ffi::OsStrExt as _;
         sanitize_spawn_cwd(&mut cwd);
         let wrapped = is_wrapper_argv(&argv);
@@ -2106,7 +2152,7 @@ impl Registry {
         }) else {
             self.discard_settings(id);
             self.agents.forget(id);
-            return Err(Failure::NoHolder);
+            return Err((Failure::NoHolder, false));
         };
         if matches!(
             reply,
@@ -2125,7 +2171,7 @@ impl Registry {
             }) else {
                 self.discard_settings(id);
                 self.agents.forget(id);
-                return Err(Failure::NoHolder);
+                return Err((Failure::NoHolder, false));
             };
             reply = next_reply;
         }
@@ -2152,7 +2198,7 @@ impl Registry {
                     holder.notify(|req| ToHolder::Release { req, id }).ok();
                     self.discard_settings(id);
                     self.agents.forget(id);
-                    os(&e)
+                    (os(&e), false)
                 })?;
                 if let Some(store) = &self.store {
                     store.remember_cwd(id, &initial_cwd);
@@ -2193,7 +2239,7 @@ impl Registry {
                     file!(),
                     line!(),
                 );
-                Err(Failure::from_holder_errno(errno))
+                Err((Failure::from_holder_errno(errno), true))
             }
             _ => {
                 tracing::warn!(id = id.0, wrapped, "unexpected holder spawn reply");
@@ -2211,7 +2257,7 @@ impl Registry {
                     file!(),
                     line!(),
                 );
-                Err(Failure::Os(libc::EIO))
+                Err((Failure::Os(libc::EIO), false))
             }
         }
     }
@@ -2635,47 +2681,6 @@ impl Registry {
             };
             self.agents.bind_switch_identity(id, &yolo).ok();
         }
-        if !is_subagent_or_foreign
-            && let Ok(Some(stored)) = self.agents.stored(id)
-            && (stored.session_id.is_none() || stored.transcript_path.is_none())
-        {
-            let root_pid = lock(&self.state)
-                .sessions
-                .get(&id)
-                .map_or(0, |entry| entry.pid);
-            let fg_pid = (e.ppid > 1).then_some(e.ppid).or_else(|| {
-                account_switch::effective_foreground_pid(
-                    root_pid,
-                    tap.and_then(Tap::foreground),
-                    false,
-                )
-            });
-            let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
-                .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
-            if let Some(provider) = provider
-                && root_pid > 1
-            {
-                let discovered = self
-                    .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
-                    .ok()
-                    .flatten()
-                    .map(|found| (found.id, found.path))
-                    .or_else(|| {
-                        (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
-                            crate::agent_history::vault::discover_live_agy_identity(
-                                root_pid, fg_pid,
-                            )
-                            .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
-                            .map(|(_, conv_id, path)| (conv_id, path))
-                        })?
-                    });
-                if let Some((conv_id, path)) = discovered {
-                    self.agents
-                        .bind_discovered_session(id, &conv_id, Some(&path));
-                    self.agents.observe_account_resume(id, &conv_id);
-                }
-            }
-        }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         let allow_status_hook = !is_subagent_or_foreign
             || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
@@ -2722,6 +2727,72 @@ impl Registry {
             }
         }
         Ok(!is_subagent_or_foreign)
+    }
+
+    /// Slow live-process identity discovery (open vnodes, `/bin/ps`, transcript walks).
+    /// Must run after releasing `hook_commit` / spool lock and after `hook::ack()`.
+    fn discover_hook_identity(&self, id: SessionId, e: &HookEvent) {
+        self.discover_hook_identity_in(&crate::usage::accounts::default_home(), id, e);
+    }
+
+    fn discover_hook_identity_in(&self, home: &Path, id: SessionId, e: &HookEvent) {
+        let Ok(Some(stored)) = self.agents.stored(id) else {
+            return;
+        };
+        if stored.session_id.is_some() && stored.transcript_path.is_some() {
+            return;
+        }
+        let Some((root_pid, tap)) = ({
+            let st = lock(&self.state);
+            (!st.exited.contains_key(&id))
+                .then(|| {
+                    st.sessions
+                        .get(&id)
+                        .map(|entry| (entry.pid, entry.session.tap()))
+                })
+                .flatten()
+        }) else {
+            return;
+        };
+        if root_pid <= 1 {
+            return;
+        }
+        let fg_pid = (e.ppid > 1).then_some(e.ppid).or_else(|| {
+            account_switch::effective_foreground_pid(root_pid, tap.foreground(), false)
+        });
+        let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
+            .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
+        let Some(provider) = provider else {
+            return;
+        };
+        let discovered = self
+            .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
+            .ok()
+            .flatten()
+            .map(|found| (found.id, found.path))
+            .or_else(|| {
+                (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
+                    crate::agent_history::vault::discover_live_agy_identity(root_pid, fg_pid)
+                        .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
+                        .map(|(_, conv_id, path)| (conv_id, path))
+                })?
+            });
+        if let Some((conv_id, path)) = discovered {
+            let _commit = lock(&self.hook_commit);
+            let still_live = {
+                let st = lock(&self.state);
+                !st.exited.contains_key(&id)
+                    && st
+                        .sessions
+                        .get(&id)
+                        .is_some_and(|entry| entry.pid == root_pid)
+            };
+            if still_live {
+                self.agents
+                    .bind_discovered_session(id, &conv_id, Some(&path));
+                self.agents.observe_account_resume(id, &conv_id);
+            }
+        }
     }
 
     fn close(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
@@ -3663,10 +3734,7 @@ impl Registry {
         } else {
             bytes
         };
-        let is_control_seq = payload.starts_with(b"\x1b")
-            || payload
-                .iter()
-                .any(|&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t');
+        let is_control_seq = is_terminal_control_seq(payload);
         let use_bracketed = bracketed
             && !payload.is_empty()
             && !is_control_seq
@@ -3700,12 +3768,7 @@ impl Registry {
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
-            let mut rest = payload;
-            while let Some(pos) = rest.windows(6).position(|w| w == b"\x1b[201~") {
-                framed.extend_from_slice(rest.get(..pos).unwrap_or_default());
-                rest = rest.get(pos + 6..).unwrap_or_default();
-            }
-            framed.extend_from_slice(rest);
+            Self::strip_bracketed_paste_end(payload, &mut framed);
             framed.extend_from_slice(b"\x1b[201~");
             if !write_checked(&framed)? {
                 return Ok(false);
@@ -3725,6 +3788,19 @@ impl Registry {
             }
         }
         Ok(true)
+    }
+
+    /// Strips `ESC [ 201 ~` (bracketed-paste end) to a fixed point in linear time so nested
+    /// sequences like `\x1b[\x1b[201~201~` cannot splice back into a literal terminator.
+    fn strip_bracketed_paste_end(payload: &[u8], out: &mut Vec<u8>) {
+        const PASTE_END: &[u8] = b"\x1b[201~";
+        let body_start = out.len();
+        for &byte in payload {
+            out.push(byte);
+            while out.len() >= body_start + PASTE_END.len() && out.ends_with(PASTE_END) {
+                out.truncate(out.len() - PASTE_END.len());
+            }
+        }
     }
 
     fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {
@@ -4864,8 +4940,11 @@ impl Registry {
                 }
                 continue;
             }
-            // Avoid interpreting names as shell fragments, even for a login shell.
-            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            // Avoid interpreting names as shell fragments or raw terminal controls, even for a login shell.
+            let quote = |s: &str| {
+                let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+                format!("'{}'", clean.replace('\'', "'\\''"))
+            };
             let run_flag = run_id
                 .as_deref()
                 .map(|id| format!(" --run {}", quote(id)))
@@ -5112,14 +5191,24 @@ impl Registry {
                 })
             }
             OrchAction::SendMessage(params) => {
-                OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
-                    self.notify_orch();
-                    // Mail is committed even when a best-effort PTY pointer cannot be sent.
-                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
-                        tracing::warn!(kind = ?error.kind(), "orchestration idle mail notification failed");
-                    }
-                    OrchResponse::Messages(msgs)
-                })
+                if has_control_chars(&params.from)
+                    || has_control_chars(&params.to)
+                    || params.run_id.as_deref().is_some_and(has_control_chars)
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "orchestration message identifiers must not contain control characters",
+                    ))
+                } else {
+                    OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
+                        self.notify_orch();
+                        // Mail is committed even when a best-effort PTY pointer cannot be sent.
+                        if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                            tracing::warn!(kind = ?error.kind(), "orchestration idle mail notification failed");
+                        }
+                        OrchResponse::Messages(msgs)
+                    })
+                }
             }
             OrchAction::CheckMessages {
                 recipient,
@@ -5148,7 +5237,9 @@ impl Registry {
                     let checked = self.orchestration_snapshot().and_then(|mut snapshot| {
                         let preview = check(&mut snapshot)?;
                         if !preview.1.is_empty() || delivery_id.is_some() {
-                            OrchestrationStore::mutate(&dir, check)
+                            let result = OrchestrationStore::mutate(&dir, check)?;
+                            self.notify_orch();
+                            Ok(result)
                         } else {
                             Ok(preview)
                         }
@@ -5156,12 +5247,14 @@ impl Registry {
                     match checked {
                         Ok((delivery, messages)) => {
                             let now = Instant::now();
-                            if !messages.is_empty() || now >= deadline {
-                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
-                                    OrchResponse::Messages(messages)
-                                } else {
-                                    OrchResponse::Delivery { delivery, messages }
-                                });
+                            if delivery_id.is_some() || !messages.is_empty() || now >= deadline {
+                                break Ok(
+                                    if !v2 || (ack && delivery_id.is_none() && delivery.is_none()) {
+                                        OrchResponse::Messages(messages)
+                                    } else {
+                                        OrchResponse::Delivery { delivery, messages }
+                                    },
+                                );
                             }
                             let rem = deadline.saturating_duration_since(now);
                             if rem.is_zero() {
@@ -5270,17 +5363,28 @@ impl Registry {
                 question_id,
                 from,
                 body,
-            } => OrchestrationStore::mutate(&dir, |s| s.reply_message(&question_id, &from, &body))
-                .map(|m| {
-                    self.notify_orch();
-                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
-                        tracing::warn!(
-                            kind = ?error.kind(),
-                            "orchestration idle mail notification failed"
-                        );
-                    }
-                    OrchResponse::Message(m)
-                }),
+            } => {
+                if has_control_chars(&from) {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "orchestration message identifiers must not contain control characters",
+                    ))
+                } else {
+                    OrchestrationStore::mutate(&dir, |s| {
+                        s.reply_message(&question_id, &from, &body)
+                    })
+                    .map(|m| {
+                        self.notify_orch();
+                        if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                            tracing::warn!(
+                                kind = ?error.kind(),
+                                "orchestration idle mail notification failed"
+                            );
+                        }
+                        OrchResponse::Message(m)
+                    })
+                }
+            }
             OrchAction::CreateGate {
                 from,
                 question,
@@ -5746,6 +5850,42 @@ fn fallback_spawn_on_enoent(
     changed
 }
 
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
+fn is_terminal_control_seq(payload: &[u8]) -> bool {
+    if payload.is_empty() || payload.contains(&b'\n') || payload.contains(&b'\r') {
+        return false;
+    }
+    if payload
+        .iter()
+        .all(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+    {
+        return true;
+    }
+    if payload.len() <= 16 && payload.first() == Some(&0x1b) {
+        if payload.len() <= 2 {
+            return true;
+        }
+        if payload == b"\x1b[200~" || payload == b"\x1b[201~" {
+            return false;
+        }
+        if let Some(rest) = payload.strip_prefix(b"\x1b[")
+            && let Some((&final_byte, params)) = rest.split_last()
+        {
+            return (0x40..=0x7e).contains(&final_byte)
+                && params.iter().all(|&b| (0x20..=0x3f).contains(&b));
+        }
+        if let Some(rest) = payload.strip_prefix(b"\x1bO")
+            && let [final_byte] = rest
+        {
+            return (0x40..=0x7e).contains(final_byte);
+        }
+    }
+    false
+}
+
 fn read_only(req: &Request) -> bool {
     matches!(
         req,
@@ -5772,11 +5912,6 @@ fn read_only(req: &Request) -> bool {
                 krill_proto::orchestration::OrchAction::Snapshot
                     | krill_proto::orchestration::OrchAction::SnapshotV2
                     | krill_proto::orchestration::OrchAction::SnapshotPage { .. }
-                    | krill_proto::orchestration::OrchAction::CheckMessagesLegacy {
-                        ack: false,
-                        ..
-                    }
-                    | krill_proto::orchestration::OrchAction::CheckMessages { ack: false, .. }
                     | krill_proto::orchestration::OrchAction::CheckMessagesFiltered {
                         ack: false,
                         ..
@@ -6640,6 +6775,299 @@ mod orchestration_delivery_tests {
         assert_eq!(stored_log, expected_log);
 
         drop(child2);
+        drop(reg);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn observer_cannot_call_check_messages_and_acked_delivery_returns_immediately() -> io::Result<()>
+    {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        use std::io::Write as _;
+
+        // DC-18: CheckMessages / CheckMessagesLegacy persist deliveries so they are not read_only.
+        let check_v2 = OrchAction::CheckMessages {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+            run_id: None,
+            delivery_id: None,
+        };
+        let check_legacy = OrchAction::CheckMessagesLegacy {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+        };
+        let check_filtered = OrchAction::CheckMessagesFiltered {
+            recipient: Some("worker-1".into()),
+            run_id: None,
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+        };
+        assert!(!read_only(&Request::Orchestration(check_v2.clone())));
+        assert!(!read_only(&Request::Orchestration(check_legacy)));
+        assert!(read_only(&Request::Orchestration(check_filtered)));
+
+        let dir = std::env::temp_dir().join(format!("krill-dc18-dc19-orch-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("dc18-19", None))?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        reg.orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "coordinator".into(),
+                to: "worker-1".into(),
+                msg_type: MessageType::Status,
+                summary: "hi".into(),
+                body: String::new(),
+                run_id: Some(run.id.clone()),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+        let before = stamp(&dir.join(ORCH_FILE));
+
+        // Wire Role::Observer is denied CheckMessages { ack: false } without mutating orchestration.json.
+        let (mut client, server) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let reg_srv = Arc::clone(&reg);
+        let srv = std::thread::spawn(move || {
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            reg_srv.serve(server, &hello).unwrap();
+        });
+        ipc::read_frame(&mut client)?.unwrap();
+        let hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "observer-test");
+        client.write_all(&hello.encode().unwrap())?;
+        client.write_all(&roles::Request::Set(Role::Observer).encode().unwrap())?;
+        let (k, body) = ipc::read_frame(&mut client)?.unwrap();
+        assert_eq!(Ack::decode(k, &body).unwrap(), Ack::Applied);
+        client.write_all(&Request::Orchestration(check_v2.clone()).encode().unwrap())?;
+        let (k, body) = ipc::read_frame(&mut client)?.unwrap();
+        assert_eq!(
+            Reply::decode(k, &body).unwrap(),
+            Reply::Failed(Failure::Denied)
+        );
+        drop(client);
+        srv.join().unwrap();
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        assert!(OrchestrationStore::load(&dir)?.deliveries.is_empty());
+
+        // DC-19: mutating CheckMessages bumps orch_signal, and an already-acked delivery with
+        // wait_ms > 0 returns immediately instead of spinning until deadline.
+        let gen_before = *lock(&reg.orch_signal.0);
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(batch),
+            messages,
+        }) = reg.orchestration(&peer, check_v2).unwrap()
+        else {
+            panic!("expected delivery batch");
+        };
+        assert_eq!(messages.len(), 1);
+        assert!(*lock(&reg.orch_signal.0) > gen_before);
+        // Ack the batch once, then re-ack with wait_ms = 5000.
+        let ack_action = OrchAction::CheckMessages {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: true,
+            wait_ms: 5_000,
+            run_id: Some(run.id.clone()),
+            delivery_id: Some(batch.id.clone()),
+        };
+        reg.orchestration(&peer, ack_action.clone()).unwrap();
+        // Force the acked batch to have empty messages (as when messages are pruned or already acked)
+        // by clearing its message_ids so check_delivery returns Ok((Some(delivery), [])).
+        OrchestrationStore::mutate(&dir, |s| {
+            for d in &mut s.deliveries {
+                if d.id == batch.id {
+                    d.message_ids.clear();
+                }
+            }
+            Ok(())
+        })?;
+        let started = Instant::now();
+        let reply = reg.orchestration(&peer, ack_action).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "delivery_id check must return immediately instead of waiting for wait_ms, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            reply,
+            Reply::Orchestration(OrchResponse::Delivery {
+                delivery: Some(_),
+                messages
+            }) if messages.is_empty()
+        ));
+        drop(reg);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_brackets_multiline_esc_and_sanitizes_orchestration_mail_controls()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        // DC-22a: unit assertions on is_terminal_control_seq
+        assert!(is_terminal_control_seq(b"\x03"));
+        assert!(is_terminal_control_seq(b"\x1b"));
+        assert!(is_terminal_control_seq(b"\x1b[A"));
+        assert!(is_terminal_control_seq(b"\x1b[1;5C"));
+        assert!(is_terminal_control_seq(b"\x1bOP"));
+        assert!(!is_terminal_control_seq(b""));
+        assert!(!is_terminal_control_seq(b"\x1b[200~"));
+        assert!(!is_terminal_control_seq(b"\x1b[201~"));
+        assert!(!is_terminal_control_seq(b"line1\n\x1b[31mred\x1b[0m"));
+        assert!(!is_terminal_control_seq(b"hello \x1b[201~ world"));
+
+        // Bracketed paste wraps multiline payload containing \x1b[201~ and strips the escape.
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(419),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            look,
+            None,
+        )?;
+        let tap = session.tap();
+        terminal.write_all(b"\x1b[?2004h")?;
+        tap.wait_timeout(Duration::from_secs(1), |p| p.end >= 8);
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"> pasted")?;
+            let n2 = terminal.read(&mut buf)?;
+            Ok((first, buf[..n2].to_vec()))
+        });
+        Registry::deliver_input_to_tap(&tap, b"line1\n\x1b[201~injected\nline2", true)?;
+        let (first, second) = tui.join().unwrap()?;
+        assert_eq!(first, b"\x1b[200~line1\ninjected\nline2\x1b[201~");
+        assert_eq!(second, b"\r");
+        drop(session);
+
+        // DC-22b: SendMessage rejects control chars in from/to/run_id, and
+        // notify_idle_orchestration_mail_for strips control chars from on-disk records.
+        let dir =
+            std::env::temp_dir().join(format!("krill-dc22-mail-controls-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let bad = reg
+            .orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "evil\x03\nworker".into(),
+                    to: "coordinator".into(),
+                    msg_type: MessageType::Status,
+                    summary: "hi".into(),
+                    body: String::new(),
+                    run_id: None,
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            bad,
+            Reply::Orchestration(krill_proto::orchestration::OrchResponse::Error(_))
+        ));
+
+        // Legacy on-disk message with control chars in sender/run_id must be stripped before PTY write.
+        let id = SessionId(420);
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let root_pid = std::process::id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, root_pid).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: root_pid,
+                    cwd: PathBuf::from("/tmp"),
+                    wrapped: false,
+                },
+            );
+        }
+        let done_ev = HookEvent {
+            id: hook::EventId {
+                pid: root_pid,
+                unix_ns: status::now_ns(),
+            },
+            agent: "claude".into(),
+            ppid: root_pid,
+            input: hook::Input::Complete,
+            payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+        };
+        reg.status.hook(&[(id, &done_ev)])?;
+        OrchestrationStore::mutate(&dir, |s| {
+            let run = s.create_run("dc22", Some(id.0))?;
+            s.send_message(&SendParams {
+                from: "w\x03\x1b\n1".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Status,
+                summary: "hi".into(),
+                body: String::new(),
+                run_id: Some(run.id),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })?;
+            Ok(())
+        })?;
+        let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut buf = [0_u8; 512];
+            let n = terminal.read(&mut buf)?;
+            Ok(buf[..n].to_vec())
+        });
+        reg.notify_idle_orchestration_mail_for(&dir, Some(id))?;
+        let sent = reader.join().unwrap()?;
+        assert!(
+            !sent.contains(&0x03) && !sent.contains(&0x1b) && !sent.contains(&b'\n'),
+            "control characters leaked into PTY mail pointer: {sent:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&sent).contains("'w1'"),
+            "expected sanitized sender in pointer: {}",
+            String::from_utf8_lossy(&sent)
+        );
         drop(reg);
         std::fs::remove_dir_all(dir)
     }

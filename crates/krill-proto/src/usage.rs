@@ -1113,16 +1113,22 @@ impl UsageReply {
     /// Hide extensions that the peer cannot decode; retain the N-1 response prefix.
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
-        if features & FEAT_ACCOUNT_SWITCH_CONTROL == 0
-            && matches!(
-                self,
-                Self::SessionSwitchPlan(_) | Self::AntigravityAccounts(_)
-            )
+        let allow_provider = |provider: ProviderKind| {
+            provider != ProviderKind::Gemini
+                && (features & FEAT_USAGE_AGY != 0 || provider != ProviderKind::Antigravity)
+        };
+        if matches!(self, Self::AntigravityAccounts(_))
+            && (features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 || features & FEAT_USAGE_AGY == 0)
         {
             return Self::Failed(crate::control::Failure::BadRequest);
         }
-        if features & FEAT_USAGE_AGY == 0 && matches!(self, Self::AntigravityAccounts(_)) {
+        if let Self::SessionSwitchPlan(plan) = &self
+            && (features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 || !allow_provider(plan.provider))
+        {
             return Self::Failed(crate::control::Failure::BadRequest);
+        }
+        if let Self::Orphans(orphans) = &mut self {
+            orphans.retain(|orphan| allow_provider(orphan.provider));
         }
         if features & FEAT_USAGE_RESET == 0
             && let Self::ResetConsumed { snapshot, .. } = self
@@ -1146,31 +1152,28 @@ impl UsageReply {
             }
             snapshot
                 .accounts
-                .retain(|account| account.provider != ProviderKind::Gemini);
+                .retain(|account| allow_provider(account.provider));
             snapshot
                 .switched
-                .retain(|event| event.provider != ProviderKind::Gemini);
+                .retain(|event| allow_provider(event.provider));
             snapshot
                 .auto_switch
                 .rules
-                .retain(|rule| rule.provider != ProviderKind::Gemini);
+                .retain(|rule| allow_provider(rule.provider));
             if features & FEAT_ACCOUNT_CONNECTION == 0 {
                 *snapshot.connections = ConnectionsSnapshot::default();
             }
             if features & FEAT_ACCOUNT_POLICY == 0 {
                 snapshot.advanced = AccountPolicyState::default();
-            }
-            if features & FEAT_USAGE_AGY == 0 {
+            } else {
                 snapshot
-                    .accounts
-                    .retain(|account| account.provider != ProviderKind::Antigravity);
+                    .advanced
+                    .cooldowns
+                    .retain(|cooldown| allow_provider(cooldown.provider));
                 snapshot
-                    .switched
-                    .retain(|event| event.provider != ProviderKind::Antigravity);
-                snapshot
-                    .auto_switch
-                    .rules
-                    .retain(|rule| rule.provider != ProviderKind::Antigravity);
+                    .advanced
+                    .history
+                    .retain(|record| allow_provider(record.event.provider));
             }
             if features & FEAT_USAGE_RULES == 0 {
                 snapshot.auto_switch.rules.clear();

@@ -668,8 +668,28 @@ fn zip_reader_rejects_zip_slip_disallowed_paths_and_crc_tampering() {
         "\\windows\\system32",
         "C:evil.txt",
         "skills/a/b\0c",
+        "skills/demo/SKILL.md:hidden",
+        "skills/demo/C:evil",
+        "skills/demo/SKILL.md.",
+        "skills/demo/SKILL.md ",
+        "skills/demo/CON.md",
+        "skills/demo/CON .md",
+        "skills/demo/NUL",
+        "skills/demo/com1.txt",
+        "skills/demo/lpt¹.md",
+        "skills/demo/a?b.md",
+        "skills/demo/a*b.md",
+        "skills/demo/a<b.md",
+        "skills/demo/sub./SKILL.md",
     ] {
-        assert!(validate_zip_entry_path(unsafe_path).is_err());
+        assert!(
+            validate_zip_entry_path(unsafe_path).is_err(),
+            "expected unsafe zip entry path to be rejected: {unsafe_path:?}"
+        );
+        assert!(
+            validate_bot_package_path(unsafe_path).is_err(),
+            "expected unsafe bot package path to be rejected: {unsafe_path:?}"
+        );
     }
 
     // Disallowed non-bot path inside an otherwise valid zip must be rejected by import_bot_zip.
@@ -1987,6 +2007,33 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
     );
 
     // Bounded deserialization on UploadBotAvatar and ImportBotZipV2
+    let max_avatar_req = BotRpcRequest::UploadBotAvatar {
+        bot_id: bot_id.clone(),
+        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES],
+    };
+    let max_avatar_frame = max_avatar_req
+        .encode()
+        .expect("max-size UploadBotAvatar must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_frame.len() <= crate::ipc::MAX_FRAME + 5);
+    let max_avatar_ctrl = crate::control::Request::Bot(max_avatar_req)
+        .encode()
+        .expect("max-size control Request::Bot(UploadBotAvatar) must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_ctrl.len() <= crate::ipc::MAX_FRAME + 5);
+
+    let max_avatar_resp = BotRpcResponse::BotAvatar(BotAvatarData {
+        bot_id: bot_id.clone(),
+        mime: "image/png".to_owned(),
+        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES],
+    });
+    let max_avatar_resp_frame = max_avatar_resp
+        .encode()
+        .expect("max-size BotAvatar reply must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_resp_frame.len() <= crate::ipc::MAX_FRAME + 5);
+    let max_avatar_ctrl_reply = crate::control::Reply::Bot(max_avatar_resp)
+        .encode()
+        .expect("max-size control Reply::Bot(BotAvatar) must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_ctrl_reply.len() <= crate::ipc::MAX_FRAME + 5);
+
     let oversize_avatar = BotRpcRequest::UploadBotAvatar {
         bot_id,
         png_bytes: vec![0u8; MAX_RPC_AVATAR_PNG_BYTES.saturating_add(1)],
@@ -2615,32 +2662,33 @@ fn bot_session_refusal_formats_versions_and_host_names() {
 }
 
 #[test]
-fn upcoming_schedule_wire_encoding_is_n_minus_1_compatible_and_preserves_json() {
+fn upcoming_schedule_wire_encoding_matches_v0323_and_preserves_json() {
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    struct LegacyScheduleUpcoming {
+    struct V0323ScheduleUpcoming {
         id: String,
         next_ms: Option<u64>,
         last_ms: Option<u64>,
         running: bool,
+        last_error: Option<String>,
+        last_refusal: Option<BotSessionRefusal>,
     }
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    struct LegacyUpcoming {
+    struct V0323Upcoming {
         look_around_last_ms: Option<u64>,
         look_around_next_ms: Option<u64>,
         tidy_last_ms: Option<u64>,
         tidy_next_ms: Option<u64>,
-        schedules: Vec<LegacyScheduleUpcoming>,
+        schedules: Vec<V0323ScheduleUpcoming>,
         up_next_seen_ms: u64,
         items_seen_event_id: u64,
     }
 
-    // Verify variant tag constant matches postcard's derived discriminant.
+    const UPCOMING_TAG: u8 = 39;
+
+    // Verify variant tag 39 matches postcard's derived discriminant.
     let empty_up = BotRpcResponse::Upcoming(BotUpcoming::default());
-    assert_eq!(
-        postcard::to_stdvec(&empty_up).unwrap()[0],
-        super::rpc::UPCOMING_RESPONSE_TAG
-    );
+    assert_eq!(postcard::to_stdvec(&empty_up).unwrap()[0], UPCOMING_TAG);
 
     let full = BotUpcoming {
         look_around_last_ms: Some(100),
@@ -2680,47 +2728,141 @@ fn upcoming_schedule_wire_encoding_is_n_minus_1_compatible_and_preserves_json() 
     let (ck, cbody) = read_frame(&mut ctrl_frame.as_slice()).unwrap().unwrap();
     assert_eq!(Reply::decode(ck, &cbody).unwrap(), ctrl);
 
-    // 2. Old v0.3.22 reader decodes new bytes (with trailing error/refusal extensions) cleanly.
-    assert_eq!(bbody[0], super::rpc::UPCOMING_RESPONSE_TAG);
-    let legacy_decoded: LegacyUpcoming = postcard::from_bytes(&bbody[1..]).unwrap();
-    assert_eq!(legacy_decoded.schedules.len(), 2);
-    assert_eq!(legacy_decoded.schedules[0].id, "nightly");
-    assert!(legacy_decoded.schedules[0].running);
-    assert_eq!(legacy_decoded.schedules[1].id, "clean");
-    assert_eq!(legacy_decoded.up_next_seen_ms, 55);
-    assert_eq!(legacy_decoded.items_seen_event_id, 77);
+    // 2. Released v0.3.23 (N-1) 6-field inline postcard reader decodes HEAD bytes identically.
+    assert_eq!(bbody[0], UPCOMING_TAG);
+    let v0323_decoded: V0323Upcoming = postcard::from_bytes(&bbody[1..]).unwrap();
+    assert_eq!(v0323_decoded.schedules.len(), 2);
+    assert_eq!(v0323_decoded.schedules[0].id, "nightly");
+    assert!(v0323_decoded.schedules[0].running);
+    assert_eq!(
+        v0323_decoded.schedules[0].last_error.as_deref(),
+        Some("CLI too old")
+    );
+    assert_eq!(
+        v0323_decoded.schedules[0].last_refusal,
+        Some(BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0"))
+    );
+    assert_eq!(v0323_decoded.schedules[1].id, "clean");
+    assert_eq!(v0323_decoded.schedules[1].last_error, None);
+    assert_eq!(v0323_decoded.schedules[1].last_refusal, None);
+    assert_eq!(v0323_decoded.up_next_seen_ms, 55);
+    assert_eq!(v0323_decoded.items_seen_event_id, 77);
 
-    // 3. Old v0.3.22 writer -> New decoder yields None for last_error / last_refusal.
-    let mut legacy_body = vec![super::rpc::UPCOMING_RESPONSE_TAG];
-    legacy_body.extend(postcard::to_stdvec(&legacy_decoded).unwrap());
-    let decoded_from_old = BotRpcResponse::decode(BOT_REPLY, &legacy_body).unwrap();
-    let BotRpcResponse::Upcoming(up_from_old) = decoded_from_old else {
+    // 3. Released v0.3.23 (N-1) writer -> HEAD decoder roundtrips byte-for-byte,
+    // including the R2P-01 corruption edge case (1 schedule, up_next_seen_ms == 1, items_seen == 0).
+    let edge_v0323 = V0323Upcoming {
+        look_around_last_ms: None,
+        look_around_next_ms: None,
+        tidy_last_ms: None,
+        tidy_next_ms: None,
+        schedules: vec![V0323ScheduleUpcoming {
+            id: "only".to_owned(),
+            next_ms: Some(1_000),
+            last_ms: None,
+            running: false,
+            last_error: None,
+            last_refusal: None,
+        }],
+        up_next_seen_ms: 1,
+        items_seen_event_id: 0,
+    };
+    let mut v0323_body = vec![UPCOMING_TAG];
+    v0323_body.extend(postcard::to_stdvec(&edge_v0323).unwrap());
+    let decoded_edge = BotRpcResponse::decode(BOT_REPLY, &v0323_body).unwrap();
+    let BotRpcResponse::Upcoming(up_edge) = decoded_edge else {
         panic!("expected Upcoming");
     };
-    assert_eq!(up_from_old.schedules.len(), 2);
-    assert_eq!(up_from_old.schedules[0].id, "nightly");
-    assert_eq!(up_from_old.schedules[0].last_error, None);
-    assert_eq!(up_from_old.schedules[0].last_refusal, None);
-    assert_eq!(up_from_old.items_seen_event_id, 77);
+    assert_eq!(up_edge.schedules.len(), 1);
+    assert_eq!(up_edge.schedules[0].last_error, None);
+    assert_eq!(up_edge.schedules[0].last_refusal, None);
+    assert_eq!(up_edge.up_next_seen_ms, 1);
+    assert_eq!(up_edge.items_seen_event_id, 0);
 
-    // Also via Reply::Bot (tag 33 + legacy_body).
-    let mut legacy_ctrl_body = vec![33_u8];
-    legacy_ctrl_body.extend_from_slice(&legacy_body);
-    let ctrl_from_old = Reply::decode(crate::control::kind::REPLY, &legacy_ctrl_body).unwrap();
+    // Also via Reply::Bot (tag 33 + v0323_body).
+    let mut v0323_ctrl_body = vec![33_u8];
+    v0323_ctrl_body.extend_from_slice(&v0323_body);
+    let ctrl_from_v0323 = Reply::decode(crate::control::kind::REPLY, &v0323_ctrl_body).unwrap();
     assert_eq!(
-        ctrl_from_old,
-        Reply::Bot(BotRpcResponse::Upcoming(up_from_old.clone()))
+        ctrl_from_v0323,
+        Reply::Bot(BotRpcResponse::Upcoming(up_edge.clone()))
     );
 
-    // 4. When no schedule has last_error or last_refusal, encoded bytes match v0.3.22 exactly.
-    let no_ext_frame = BotRpcResponse::Upcoming(up_from_old).encode().unwrap();
-    let (_, no_ext_body) = read_frame(&mut no_ext_frame.as_slice()).unwrap().unwrap();
-    assert_eq!(no_ext_body, legacy_body);
+    // Wire bytes match v0.3.23 byte-for-byte.
+    let reencoded = BotRpcResponse::Upcoming(up_edge).encode().unwrap();
+    let (_, reencoded_body) = read_frame(&mut reencoded.as_slice()).unwrap().unwrap();
+    assert_eq!(reencoded_body, v0323_body);
 
-    // 5. JSON serialization still preserves all 6 fields.
+    // 4. JSON serialization preserves all 6 fields.
     let json = serde_json::to_string(&full).unwrap();
     let json_rt: BotUpcoming = serde_json::from_str(&json).unwrap();
     assert_eq!(json_rt, full);
+}
+
+#[test]
+fn avatar_cap_leaves_headroom_for_store_zip_and_mobile_base64() {
+    assert_eq!(MAX_AVATAR_PNG_BYTES, 512 * 1024);
+    assert_eq!(MAX_RPC_AVATAR_PNG_BYTES, 512 * 1024);
+    // Base64 of max avatar + JSON-RPC envelope must fit comfortably under ipc::MAX_FRAME (1 MiB).
+    let base64_len = MAX_AVATAR_PNG_BYTES.div_ceil(3) * 4;
+    assert!(
+        base64_len + 4096 < crate::ipc::MAX_FRAME,
+        "base64 avatar ({base64_len} B) leaves insufficient mobile frame headroom"
+    );
+
+    // Construct a valid PNG right at MAX_AVATAR_PNG_BYTES by padding an IDAT chunk.
+    let ihdr_data: [u8; 13] = [
+        0, 0, 0, 1, 0, 0, 0, 1, // 1x1
+        8, 2, 0, 0, 0, // 8-bit RGB
+    ];
+    let make_chunk = |ctype: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + payload.len());
+        out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(ctype);
+        out.extend_from_slice(payload);
+        // CRC32 over ctype + payload
+        let mut crc: u32 = 0xffff_ffff;
+        for &b in ctype.iter().chain(payload.iter()) {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        out.extend_from_slice(&(!crc).to_be_bytes());
+        out
+    };
+    let ihdr = make_chunk(b"IHDR", &ihdr_data);
+    let iend = make_chunk(b"IEND", &[]);
+    let idat_payload_len = MAX_AVATAR_PNG_BYTES - 8 - ihdr.len() - iend.len() - 12;
+    let idat = make_chunk(b"IDAT", &vec![0u8; idat_payload_len]);
+    let mut max_png = Vec::with_capacity(MAX_AVATAR_PNG_BYTES);
+    max_png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    max_png.extend_from_slice(&ihdr);
+    max_png.extend_from_slice(&idat);
+    max_png.extend_from_slice(&iend);
+    assert_eq!(max_png.len(), MAX_AVATAR_PNG_BYTES);
+
+    let zip = export_bot_zip(
+        &sample_bot_config(),
+        "# Soul\n",
+        &BTreeMap::new(),
+        Some("# Memory\n"),
+        &BTreeMap::new(),
+        Some(&max_png),
+        BotPackageExportOptions {
+            include_memory: true,
+            include_avatar: true,
+        },
+    )
+    .expect("export_bot_zip must accept a max-size avatar PNG");
+    assert!(
+        zip.len() <= MAX_RPC_ZIP_BYTES,
+        "Store-mode ZIP ({} B) with max avatar must fit inside MAX_RPC_ZIP_BYTES ({MAX_RPC_ZIP_BYTES} B)",
+        zip.len()
+    );
 }
 
 #[test]

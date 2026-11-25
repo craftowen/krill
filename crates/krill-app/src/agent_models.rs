@@ -55,9 +55,10 @@ const CODEX: &[BuiltinModel] = &[
 #[must_use]
 pub fn builtin(agent: &str) -> (&'static [BuiltinModel], &'static [&'static str]) {
     match agent.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claudecode" => (CLAUDE, LMHXM),
         "codex" => (CODEX, LMHX),
         "gemini" | "agy" | "antigravity" => (&[], LMHXM),
-        _ => (CLAUDE, LMHXM),
+        _ => (&[], &[]),
     }
 }
 
@@ -66,4 +67,30 @@ pub fn builtin(agent: &str) -> (&'static [BuiltinModel], &'static [&'static str]
 #[must_use]
 pub fn prefers_discovered(agent: &str) -> bool {
     !agent.eq_ignore_ascii_case("claude")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_returns_empty_for_unknown_or_other_agents() {
+        for claude in ["claude", "Claude", "claude-code", "claudecode"] {
+            let (models, efforts) = builtin(claude);
+            assert_eq!(models, CLAUDE, "{claude}");
+            assert_eq!(efforts, LMHXM, "{claude}");
+        }
+        assert_eq!(builtin("codex"), (CODEX, LMHX));
+        assert_eq!(builtin("Codex"), (CODEX, LMHX));
+        for agy in ["gemini", "agy", "antigravity", "Antigravity"] {
+            assert_eq!(builtin(agy), (&[][..], LMHXM), "{agy}");
+        }
+        for other in ["opencode", "cursor", "pi", "custom-agent", ""] {
+            assert_eq!(
+                builtin(other),
+                (&[][..], &[][..]),
+                "unknown agent {other:?} must not fall back to Claude models"
+            );
+        }
+    }
 }

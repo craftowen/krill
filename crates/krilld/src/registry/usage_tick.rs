@@ -97,4 +97,19 @@ mod tests {
         fs::remove_dir_all(&home).ok();
         fs::remove_dir_all(&state).ok();
     }
+
+    #[test]
+    fn redacted_account_id_never_leaks_plaintext_email() {
+        let email_id = "claude-alice@example.com";
+        let redacted = accounts::redacted_account_id(email_id);
+        assert!(!redacted.is_empty());
+        assert!(!redacted.contains("alice"));
+        assert!(!redacted.contains("example.com"));
+        assert!(!redacted.contains('@'));
+        assert_eq!(redacted, accounts::redacted_account_id(email_id));
+        assert_ne!(
+            redacted,
+            accounts::redacted_account_id("claude-bob@example.com")
+        );
+    }
 }

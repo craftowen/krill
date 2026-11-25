@@ -1,16 +1,17 @@
 //! 번들 2단계 원자 교체·단계별 저널·별도 relauncher·health 확인·롤백·시작 대화상자(MK-063).
 
 use std::fs::{self, DirBuilder};
-use std::io;
+use std::io::{self, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, PromptLevel, Window};
-use krill_proto::os::fs::DirBuilderExt as _;
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process};
 use serde::{Deserialize, Serialize};
@@ -119,12 +120,76 @@ impl Journal {
         let dir = state_dir.join(UPDATE_DIR);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let path = journal_path(state_dir);
-        let tmp = append_ext(&path, "tmp");
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| Error::Json(e.to_string()))?;
-        write_private_file(&tmp, &bytes)?;
-        fs::rename(tmp, path)?;
+        let (tmp, mut file) = create_unique_journal_tmp(&path)?;
+        let written = (|| -> io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            rename_journal_file(&tmp, &path)
+        })();
+        if let Err(error) = written {
+            fs::remove_file(&tmp).ok();
+            return Err(Error::Io(error));
+        }
+        #[cfg(unix)]
+        if let Ok(parent) = fs::File::open(&dir) {
+            parent.sync_all().ok();
+        }
         Ok(())
     }
+}
+
+static JOURNAL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_journal_tmp(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    for _ in 0..32 {
+        let seq = JOURNAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = append_ext(path, &format!("tmp.{}.{seq}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate unique journal temp file",
+    ))
+}
+
+fn rename_journal_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const RETRY_DELAYS: [Duration; 6] = [
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(80),
+            Duration::from_millis(150),
+            Duration::from_millis(250),
+        ];
+        for delay in RETRY_DELAYS {
+            match fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        || matches!(error.raw_os_error(), Some(5 | 32 | 33)) =>
+                {
+                    thread::sleep(delay);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        fs::rename(from, to)
+    }
+    #[cfg(not(windows))]
+    fs::rename(from, to)
 }
 
 /// 번들 교체 방식.
@@ -580,7 +645,7 @@ pub fn relaunch_and_verify(
         Err(error) => {
             // 구 앱은 이미 끝났다. 새 앱을 띄우지 못한 채 끝나면 아무 앱도 없이 새 번들만 남는다.
             let reason = format!("new app exited before ready ({error})");
-            rollback_from(MODE, app_bundle, state_dir, &reason, Backup::Complete)?;
+            rollback_complete_locked(app_bundle, state_dir, &reason)?;
             let restored = spawn_bundle_app(app_bundle, state_dir, None)?;
             return Ok(RelaunchOutcome::RolledBack { reason, restored });
         }
@@ -612,12 +677,21 @@ pub fn relaunch_and_verify(
     child.kill().ok();
     child.wait().ok();
     // `swap_bundles`가 성공했으므로 `.prev`는 완결된 백업이다. 저널 읽기에 기대지 않는다.
-    rollback_from(MODE, app_bundle, state_dir, &fail_reason, Backup::Complete)?;
+    rollback_complete_locked(app_bundle, state_dir, &fail_reason)?;
     let restored = spawn_bundle_app(app_bundle, state_dir, None)?;
     Ok(RelaunchOutcome::RolledBack {
         reason: fail_reason,
         restored,
     })
+}
+
+fn rollback_complete_locked(
+    app_bundle: &Path,
+    state_dir: &Path,
+    reason: &str,
+) -> Result<(), Error> {
+    let _lock = staging_lock(app_bundle)?;
+    rollback_from(MODE, app_bundle, state_dir, reason, Backup::Complete)
 }
 
 fn spawn_bundle_app(
@@ -1113,6 +1187,102 @@ mod tests {
 
         fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn relaunch_and_verify_acquires_staging_lock_before_rollback() {
+        #[derive(Debug)]
+        struct Accept;
+        impl CodeVerifier for Accept {
+            fn verify(&self, _: &Path) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("mk-relaunch-rollback-lock-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let app = dir.join("Krill.app");
+        let staging = staging_path(&app);
+        let state = dir.join("state");
+        let started = dir.join("started");
+        let release = dir.join("release");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(staging.join("Contents/MacOS")).unwrap();
+        fs::write(
+            staging.join(super::super::BUNDLE_INFO),
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.2.0</string></dict></plist>"#,
+        )
+        .unwrap();
+
+        let old_exe = app.join(APP_EXE);
+        fs::write(&old_exe, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&old_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let new_exe = staging.join(APP_EXE);
+        fs::write(
+            &new_exe,
+            format!(
+                "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 200 ]; do sleep 0.02; i=$((i+1)); done\nexit 1\n",
+                started.display(),
+                release.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&new_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app_bg = app.clone();
+        let state_bg = state.clone();
+        let worker = thread::spawn(move || {
+            relaunch_and_verify(
+                &app_bg,
+                &state_bg,
+                "0.1.0",
+                "0.2.0",
+                None,
+                Duration::from_secs(5),
+                &Accept,
+            )
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.exists(), "new app must have started after swap");
+
+        // Hold staging_lock while the new app exits non-zero; rollback must wait for it.
+        let lock = staging_lock(&app).unwrap();
+        fs::write(&release, b"go").unwrap();
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            prev_path(&app).exists(),
+            "rollback must not proceed while staging_lock is held"
+        );
+        assert_eq!(
+            Journal::load(&state).unwrap().unwrap().stage,
+            Stage::VerifyingLaunch
+        );
+        drop(lock);
+
+        let outcome = worker.join().unwrap().unwrap();
+        match outcome {
+            RelaunchOutcome::RolledBack { mut restored, .. } => {
+                restored.kill().ok();
+                restored.wait().ok();
+            }
+            RelaunchOutcome::Updated { mut child } => {
+                child.kill().ok();
+                child.wait().ok();
+                panic!("expected rollback");
+            }
+        }
+        assert!(!prev_path(&app).exists());
+        assert!(matches!(
+            Journal::load(&state).unwrap().unwrap().stage,
+            Stage::RolledBack { .. }
+        ));
+        fs::remove_dir_all(dir).ok();
+    }
 }
 
 #[cfg(test)]
@@ -1226,6 +1396,50 @@ mod backup_cleanup_tests {
             ".prev backup must remain intact"
         );
         assert_eq!(fs::read(bundle.join("version")).unwrap(), b"0.2.0");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_journal_saves_use_unique_temp_files_without_racing() {
+        let root = std::env::temp_dir().join(format!("krill-journal-race-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let bundle = root.join("Krill.app");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for idx in 0..8_u64 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let state = state.clone();
+            let bundle = bundle.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iter in 0..30_u64 {
+                    let journal = Journal {
+                        bundle: bundle.clone(),
+                        from_version: "0.1.0".to_owned(),
+                        to_version: format!("0.2.{idx}"),
+                        health_timeout_ms: 1_000 + iter,
+                        stage: if iter.is_multiple_of(2) {
+                            Stage::VerifyingLaunch
+                        } else {
+                            Stage::Healthy
+                        },
+                    };
+                    journal.save(&state).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let loaded = Journal::load(&state).unwrap().unwrap();
+        assert_eq!(loaded.from_version, "0.1.0");
+        let leftovers: Vec<_> = fs::read_dir(state.join(UPDATE_DIR))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         fs::remove_dir_all(root).unwrap();
     }
 }

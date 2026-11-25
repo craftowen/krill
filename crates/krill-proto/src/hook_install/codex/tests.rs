@@ -55,3 +55,37 @@ fn account_home_trust_is_computed_by_codex_and_keeps_user_config() {
     assert_eq!(fs::read_to_string(&config).unwrap(), written);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn rpc_drop_terminates_and_reaps_child_process() {
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("kp-codex-drop-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let bin = root.join("bin");
+    let home = root.join("account");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let codex = bin.join("codex");
+    let pid_file = root.join("codex.pid");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nread -r _line\nprintf '{{\"id\":0,\"result\":{{}}}}\\n'\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let rpc = super::Rpc::start(&home, Some("fixture"), Some(bin.as_os_str())).unwrap();
+    let pid = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
+    drop(rpc);
+    let alive = std::process::Command::new("/bin/kill")
+        .args(["-0", &pid])
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "Rpc::drop left child {pid} running");
+    fs::remove_dir_all(root).ok();
+}

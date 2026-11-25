@@ -20,6 +20,8 @@ pub const ENV_ARCHIVE_OVERRIDE: &str = "KRILL_AGENT_DESKTOP_ARCHIVE";
 pub const ENV_SHA256_OVERRIDE: &str = "KRILL_AGENT_DESKTOP_SHA256";
 
 const VERSION_STAMP_FILE: &str = ".agent-desktop.version";
+#[cfg(any(not(unix), test))]
+const CLI_LINK_SHA256_FILE: &str = ".agent-desktop.link.sha256";
 const LOCK_FILE: &str = ".krill-agent-desktop.lock";
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -611,8 +613,26 @@ fn stage_pair_from_dir(
         }
         atomic_copy_executable(&helper_src, &bin_dir.join(helper))?;
     }
-    atomic_copy_executable(&main_src, &bin_dir.join(asset.main_binary))?;
+    let staged_main = bin_dir.join(asset.main_binary);
+    #[cfg(any(not(unix), test))]
+    backfill_pre_sidecar_link_sha256(bin_dir, &staged_main)?;
+    atomic_copy_executable(&main_src, &staged_main)?;
     write_version_stamp(bin_dir, version)
+}
+
+#[cfg(any(not(unix), test))]
+fn backfill_pre_sidecar_link_sha256(bin_dir: &Path, staged_main: &Path) -> io::Result<()> {
+    if read_link_sha256(bin_dir).is_some() {
+        return Ok(());
+    }
+    if let Ok(meta) = fs::symlink_metadata(staged_main)
+        && meta.is_file()
+        && !meta.file_type().is_symlink()
+        && let Ok(digest) = file_sha256(staged_main)
+    {
+        write_link_sha256(bin_dir, &digest)?;
+    }
+    Ok(())
 }
 
 fn atomic_copy_executable(src: &Path, dst: &Path) -> io::Result<()> {
@@ -787,10 +807,13 @@ pub fn ensure_agent_desktop_cli_link(
     let local_bin = home.join(".local/bin");
     let link_path = local_bin.join(bin_name);
     let staged_canon = fs::canonicalize(staged_main).ok();
+    let link_canon = fs::canonicalize(&link_path).ok();
 
     if let Some(found) = crate::agent::which("agent-desktop", path_env) {
         let found_canon = fs::canonicalize(&found).ok();
-        let is_ours = (staged_canon.is_some() && found_canon == staged_canon) || found == link_path;
+        let is_ours = (staged_canon.is_some() && found_canon == staged_canon)
+            || found == link_path
+            || (link_canon.is_some() && found_canon == link_canon);
         if !is_ours {
             return Ok(AgentDesktopLinkStatus::ForeignPreserved(found));
         }
@@ -833,20 +856,110 @@ pub fn ensure_agent_desktop_cli_link(
 
     #[cfg(not(unix))]
     {
-        if let Ok(link_meta) = fs::metadata(&link_path) {
-            let existing_matches = fs::metadata(staged_main)
-                .ok()
-                .filter(|staged_meta| staged_meta.len() == link_meta.len())
-                .and_then(|_| fs::read(&link_path).ok().zip(fs::read(staged_main).ok()))
-                .is_some_and(|(a, b)| a == b);
-            if !existing_matches {
-                return Ok(AgentDesktopLinkStatus::ForeignPreserved(link_path));
-            }
-            return Ok(AgentDesktopLinkStatus::Linked(link_path));
-        }
-        atomic_copy_executable(staged_main, &link_path)?;
-        Ok(AgentDesktopLinkStatus::Linked(link_path))
+        sync_copied_cli_link(home, staged_main, &link_path)
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn sync_copied_cli_link(
+    home: &Path,
+    staged_main: &Path,
+    link_path: &Path,
+) -> io::Result<AgentDesktopLinkStatus> {
+    let bin_dir = crate::user_dirs::share_dir(home).join("bin");
+    let staged_sha = file_sha256(staged_main)?;
+    let recorded_sha = read_link_sha256(&bin_dir);
+
+    match fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            let Ok(existing_sha) = file_sha256(link_path) else {
+                return Ok(AgentDesktopLinkStatus::ForeignPreserved(
+                    link_path.to_path_buf(),
+                ));
+            };
+            if existing_sha == staged_sha {
+                if recorded_sha != Some(staged_sha) {
+                    write_link_sha256(&bin_dir, &staged_sha)?;
+                }
+                return Ok(AgentDesktopLinkStatus::Linked(link_path.to_path_buf()));
+            }
+            if recorded_sha != Some(existing_sha) {
+                return Ok(AgentDesktopLinkStatus::ForeignPreserved(
+                    link_path.to_path_buf(),
+                ));
+            }
+        }
+        Ok(_) => {
+            return Ok(AgentDesktopLinkStatus::ForeignPreserved(
+                link_path.to_path_buf(),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    atomic_copy_executable(staged_main, link_path)?;
+    write_link_sha256(&bin_dir, &staged_sha)?;
+    Ok(AgentDesktopLinkStatus::Linked(link_path.to_path_buf()))
+}
+
+#[cfg(any(not(unix), test))]
+fn file_sha256(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(
+            buf.get(..n)
+                .ok_or_else(|| io::Error::other("invalid read size"))?,
+        );
+    }
+    let digest = ctx.finish();
+    <[u8; 32]>::try_from(digest.as_ref())
+        .map_err(|_| io::Error::other("unexpected SHA-256 digest length"))
+}
+
+#[cfg(any(not(unix), test))]
+fn read_link_sha256(bin_dir: &Path) -> Option<[u8; 32]> {
+    let stamp = bin_dir.join(CLI_LINK_SHA256_FILE);
+    if !super::skills::regular_or_missing(&stamp).ok()? {
+        return None;
+    }
+    let text = fs::read_to_string(&stamp).ok()?;
+    parse_sha256_hex(&text).ok()
+}
+
+#[cfg(any(not(unix), test))]
+fn write_link_sha256(bin_dir: &Path, digest: &[u8; 32]) -> io::Result<()> {
+    use std::fmt::Write as _;
+
+    super::skills::ensure_directory_safe(bin_dir)?;
+    fs::create_dir_all(bin_dir)?;
+    let stamp = bin_dir.join(CLI_LINK_SHA256_FILE);
+    if !super::skills::regular_or_missing(&stamp)? {
+        return Err(invalid("agent-desktop link digest must not be a symlink"));
+    }
+    let mut hex = String::with_capacity(65);
+    for byte in digest {
+        write!(hex, "{byte:02x}").map_err(io::Error::other)?;
+    }
+    hex.push('\n');
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = bin_dir.join(format!(".krill-ad-link-{}-{seq}.tmp", std::process::id()));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let write_res = file
+        .write_all(hex.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let rename_res = write_res.and_then(|()| fs::rename(&tmp, &stamp));
+    if rename_res.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    rename_res
 }
 
 #[cfg(test)]
@@ -1119,6 +1232,126 @@ mod tests {
             seq_before,
             "already-staged binary must not be copied or rewritten again"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copied_cli_link_upgrades_krill_managed_copy_and_preserves_foreign_binary() {
+        let root = temp_home("copied-cli-upgrade");
+        let home = root.join("home");
+        let bin_dir = crate::user_dirs::share_dir(&home).join("bin");
+        let local_bin = home.join(".local/bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&local_bin).unwrap();
+
+        let staged_main = bin_dir.join("agent-desktop.exe");
+        let link_path = local_bin.join("agent-desktop.exe");
+        fs::write(&staged_main, b"agent-desktop-v1").unwrap();
+
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"agent-desktop-v1");
+        assert!(bin_dir.join(CLI_LINK_SHA256_FILE).is_file());
+
+        // Re-syncing identical version must not rewrite link or sidecar.
+        let seq_before = TEMP_SEQ.load(Ordering::Relaxed);
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(TEMP_SEQ.load(Ordering::Relaxed), seq_before);
+
+        // Upgrading staged binary overwrites Krill's prior copy because the sidecar matches.
+        fs::write(&staged_main, b"agent-desktop-v2-upgraded").unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"agent-desktop-v2-upgraded");
+
+        // Pre-sidecar copy matching current staged binary backfills ownership for the next upgrade.
+        fs::remove_file(bin_dir.join(CLI_LINK_SHA256_FILE)).unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        fs::write(&staged_main, b"agent-desktop-v3-after-backfill").unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(
+            fs::read(&link_path).unwrap(),
+            b"agent-desktop-v3-after-backfill"
+        );
+
+        // User-replaced foreign binary at link_path must never be overwritten.
+        fs::write(&link_path, b"user-custom-agent-desktop").unwrap();
+        fs::write(&staged_main, b"agent-desktop-v4").unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::ForeignPreserved(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"user-custom-agent-desktop");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_pair_from_dir_backfills_pre_sidecar_digest_for_windows_upgrade() {
+        let root = temp_home("pre-sidecar-upgrade");
+        let home = root.join("home");
+        let bin_dir = crate::user_dirs::share_dir(&home).join("bin");
+        let local_bin = home.join(".local/bin");
+        let src_v2 = root.join("src-v2");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&local_bin).unwrap();
+        fs::create_dir_all(&src_v2).unwrap();
+
+        let win_asset = PINNED_ASSETS
+            .iter()
+            .find(|a| a.target == AgentDesktopTarget::WindowsX64)
+            .unwrap();
+        let staged_main = bin_dir.join(win_asset.main_binary);
+        let link_path = local_bin.join(win_asset.main_binary);
+
+        // Pre-PC-20 Windows install: v1 staged + copied to ~/.local/bin, no sidecar file yet.
+        fs::write(&staged_main, b"agent-desktop-v1-legacy").unwrap();
+        fs::write(&link_path, b"agent-desktop-v1-legacy").unwrap();
+        assert!(!bin_dir.join(CLI_LINK_SHA256_FILE).exists());
+
+        // Stage v2 over staged_main; backfill must record v1's SHA-256 before overwriting.
+        let src_main = src_v2.join(win_asset.main_binary);
+        fs::write(&src_main, b"agent-desktop-v2-new").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&src_main, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stage_pair_from_dir(&src_v2, &bin_dir, win_asset, "2.0.0").unwrap();
+        assert_eq!(fs::read(&staged_main).unwrap(), b"agent-desktop-v2-new");
+        assert!(bin_dir.join(CLI_LINK_SHA256_FILE).is_file());
+
+        // Now sync_copied_cli_link recognizes v1 in link_path via backfilled sidecar and upgrades it.
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"agent-desktop-v2-new");
+
+        // Pre-sidecar foreign binary at link_path must still be preserved when staged upgrades.
+        fs::remove_file(bin_dir.join(CLI_LINK_SHA256_FILE)).unwrap();
+        fs::write(&link_path, b"foreign-user-binary").unwrap();
+        fs::write(&src_main, b"agent-desktop-v3-new").unwrap();
+        stage_pair_from_dir(&src_v2, &bin_dir, win_asset, "3.0.0").unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::ForeignPreserved(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"foreign-user-binary");
+
         fs::remove_dir_all(root).unwrap();
     }
 }

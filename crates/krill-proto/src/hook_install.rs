@@ -222,7 +222,7 @@ impl Plan {
             }
             let legacy_agy = agent == TargetAgent::Other(Agent::Agy) && existing.is_legacy_agy();
             superseded_codex = existing.codex.filter(|record| {
-                record.path == path
+                codex::same_config_path(&record.path, path)
                     && record.command != command
                     && record.command.starts_with(hooks::POWERSHELL_CODEX_PREFIX)
             });

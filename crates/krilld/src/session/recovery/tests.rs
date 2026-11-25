@@ -412,3 +412,61 @@ fn poisoned_session_input_keeps_both_session_readers_and_other_input_running() {
         session.wait().unwrap();
     }
 }
+
+#[test]
+fn read_paths_recover_poisoned_engine() {
+    use krill_proto::control::Reply;
+    use krill_proto::screen::{HistoryViewRows, HistoryViewStatus};
+
+    for path in 0..4_u8 {
+        let (_slave, tap) = fixture();
+        assert!(
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut live = tap.0.live.lock().unwrap();
+                live.engine
+                    .feed(b"poisoned-tail\r\n", Feed::Live, &tap.0.look);
+                panic!("poison live for read path {path}");
+            }))
+            .is_err()
+        );
+        assert!(tap.0.live.is_poisoned());
+        match path {
+            0 => {
+                let lines = tap.preview_tail();
+                assert!(!lines.iter().any(|l| l.contains("poisoned-tail")));
+            }
+            1 => {
+                let Reply::CaptureSince { bytes, .. } = tap.capture_plain_since(None).unwrap()
+                else {
+                    panic!("expected CaptureSince");
+                };
+                assert!(
+                    !String::from_utf8_lossy(&bytes.unwrap_or_default()).contains("poisoned-tail")
+                );
+            }
+            2 => {
+                let snapshot = tap.history_snapshot(&|| false).unwrap();
+                assert!(snapshot.rows.is_empty());
+            }
+            _ => {
+                let mut reply = HistoryViewRows {
+                    req: 1,
+                    view: 1,
+                    session: tap.id(),
+                    epoch: [0; 3],
+                    status: HistoryViewStatus::Ready,
+                    identity: None,
+                    skip: 0,
+                    total: 0,
+                    complete: true,
+                    rows: Vec::new(),
+                    screen: None,
+                };
+                tap.publish_history(&mut reply, &|| false, |_| Ok(()))
+                    .unwrap();
+            }
+        }
+        assert!(!tap.0.live.is_poisoned());
+        assert!(tap.pulse().revision >= 1);
+    }
+}

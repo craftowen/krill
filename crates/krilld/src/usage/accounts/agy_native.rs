@@ -14,8 +14,16 @@ pub(crate) mod codec;
 pub(crate) mod service;
 pub(crate) mod store;
 
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::Path;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use krill_proto::usage::{AntigravityAccountOp, AntigravityAccountState, ProviderKind};
 use zeroize::Zeroizing;
@@ -31,6 +39,12 @@ use store::AntigravityAccountStore as _;
 pub(crate) use store::{StoredAntigravityAccount, vault_path};
 
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+/// Apple `/usr/bin/security -i` reads lines via a fixed 4096-byte `fgets` buffer (4095 bytes + NUL).
+/// Any command line longer than this is silently split and corrupts the keychain entry.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MAX_SECURITY_INTERACTIVE_LINE: usize = 4095;
+#[cfg(unix)]
+pub(crate) const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
 /// Dispatch one `UsageRequest::AntigravityAccounts(op)` against the host's native Antigravity service.
@@ -178,8 +192,30 @@ pub(crate) fn reconcile_host_to_profiles_then<T>(
     })
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || same_file::is_same_file(a, b).unwrap_or(false)
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(ca, cb)| ca == cb)
+}
+
 fn is_host_target(home: &Path, host_token_path: &Path, dir: &Path) -> bool {
-    dir == home || dir.join(".gemini/antigravity-cli/antigravity-oauth-token") == host_token_path
+    let host_default = super::host_default_dir(home, ProviderKind::Antigravity);
+    let host_gemini = home.join(".gemini");
+    same_path(dir, home)
+        || same_path(dir, &host_default)
+        || same_path(dir, &host_gemini)
+        || same_path(
+            &dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            host_token_path,
+        )
+        || same_path(
+            &dir.join("antigravity-cli/antigravity-oauth-token"),
+            host_token_path,
+        )
+        || same_path(&dir.join("antigravity-oauth-token"), host_token_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +328,7 @@ fn sync_account_gated(
                 continue;
             }
             let prof_dir = Path::new(&acc.profile_dir);
-            if !prof_dir.is_dir() {
+            if !prof_dir.is_dir() || is_host_target(home, host_token_path, prof_dir) {
                 continue;
             }
             let prof_token_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
@@ -336,8 +372,8 @@ fn sync_account_gated(
                     Some(host_token_path),
                     false,
                 )
+                && write_atomic_0600(host_token_path, &prof_raw).is_ok()
             {
-                write_atomic_0600(host_token_path, &prof_raw).ok();
                 current_file = Some(prof_raw);
                 evict_host_agy_caches(home);
             }
@@ -346,11 +382,15 @@ fn sync_account_gated(
     let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
         return;
     };
+    if is_host_target(home, host_token_path, target) {
+        return;
+    }
     let target_token_path = target.join(".gemini/antigravity-cli/antigravity-oauth-token");
     let mut host_changed = false;
     if let Some(target_raw) = read_token_file(&target_token_path) {
-        if current_file.as_ref() != Some(&target_raw) {
-            write_atomic_0600(host_token_path, &target_raw).ok();
+        if current_file.as_ref() != Some(&target_raw)
+            && write_atomic_0600(host_token_path, &target_raw).is_ok()
+        {
             host_changed = true;
         }
     } else if std::fs::symlink_metadata(host_token_path).is_ok()
@@ -513,6 +553,105 @@ fn valid_token(raw: &[u8]) -> bool {
     !raw.is_empty()
         && u64::try_from(raw.len()).is_ok_and(|len| len <= MAX_TOKEN_BYTES)
         && serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v.is_object())
+}
+
+#[cfg(unix)]
+pub(crate) fn run_command_with_timeout(
+    cmd: &mut Command,
+    stdin_bytes: Option<&[u8]>,
+    capture_stdout: bool,
+    max_stdout: u64,
+    timeout: Duration,
+) -> Option<(std::process::ExitStatus, Zeroizing<Vec<u8>>)> {
+    cmd.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(if capture_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    let reader = if capture_stdout {
+        let stdout = child.stdout.take()?;
+        let handle = std::thread::Builder::new()
+            .name("keychain-read".into())
+            .spawn(move || {
+                let mut buf = Zeroizing::new(Vec::new());
+                let limit = max_stdout.saturating_add(1);
+                stdout.take(limit).read_to_end(&mut buf).ok()?;
+                (u64::try_from(buf.len()).ok()? <= max_stdout).then_some(buf)
+            })
+            .ok();
+        let Some(handle) = handle else {
+            child.kill().ok();
+            child.wait().ok();
+            return None;
+        };
+        Some(handle)
+    } else {
+        None
+    };
+    let writer = if let Some(bytes) = stdin_bytes {
+        let Some(mut stdin) = child.stdin.take() else {
+            child.kill().ok();
+            child.wait().ok();
+            if let Some(handle) = reader {
+                drop(handle.join());
+            }
+            return None;
+        };
+        let payload = Zeroizing::new(bytes.to_vec());
+        let handle = std::thread::Builder::new()
+            .name("keychain-write".into())
+            .spawn(move || stdin.write_all(&payload).is_ok())
+            .ok();
+        let Some(handle) = handle else {
+            child.kill().ok();
+            child.wait().ok();
+            if let Some(handle) = reader {
+                drop(handle.join());
+            }
+            return None;
+        };
+        Some(handle)
+    } else {
+        None
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    };
+    let wrote = match writer {
+        Some(handle) => handle.join().ok().unwrap_or(false),
+        None => true,
+    };
+    let stdout = match reader {
+        Some(handle) => handle.join().ok().flatten(),
+        None => Some(Zeroizing::new(Vec::new())),
+    };
+    if !wrote {
+        return None;
+    }
+    let status = status?;
+    let stdout = stdout?;
+    Some((status, stdout))
 }
 
 #[cfg(test)]

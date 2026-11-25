@@ -442,10 +442,9 @@ fn init(cx: &mut App) {
     // menu_bar::init switches to explicit quit only after its tray icon succeeds.
     cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
+        let services = krill_app::hosts::link::begin_shutdown();
         cx.background_executor().spawn(async move {
-            for service in krill_app::hosts::link::begin_shutdown() {
-                service.shutdown();
-            }
+            krill_app::hosts::link::shutdown_services(&services);
         })
     })
     .detach();

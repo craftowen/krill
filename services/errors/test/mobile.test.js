@@ -309,3 +309,29 @@ test('mobile stats sample_detail picks modal reason and breaks ties away from un
   assert.equal(byCode.mobile_auth_failed, 'auth_required');
   assert.equal(byCode.mobile_rpc_failed, 'auth_rejected');
 });
+
+test('mobile allows screens/bots.js in source_file and stack_frames without poisoning batches', async t => {
+  const env = environment(t);
+  const botsEvent = event(1, {
+    error_code: 'mobile_runtime_error',
+    diagnostics: {
+      phase: 'runtime',
+      reason: 'runtime_error',
+      error_name: 'TypeError',
+      source_file: 'screens/bots.js',
+      line: 120,
+      column: 8,
+      stack_frames: [{source_file: 'screens/bots.js', line: 120, column: 8}],
+    },
+  });
+  const otherEvent = event(2);
+  const response = await send(env, [botsEvent, otherEvent]);
+  cors(response);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    schema_version: 1,
+    accepted_ids: [id(1), id(2)],
+    duplicate_ids: [],
+  });
+  assert.equal(rows(env).length, 2);
+});

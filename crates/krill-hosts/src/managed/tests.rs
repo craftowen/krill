@@ -217,6 +217,13 @@ fn parse_probe_covers_installed_unmanaged_missing_and_socket() {
         )
         .is_err()
     );
+    for padded in [
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home= /Users/alice\nkrill-version=missing\n",
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=\t/Users/alice\nkrill-version=missing\n",
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=/Users/alice \nkrill-version=missing\n",
+    ] {
+        assert!(parse_probe(padded).is_err(), "padded={padded:?}");
+    }
 }
 
 #[test]
@@ -267,6 +274,10 @@ fn install_spec_rejects_bad_home_and_version() {
     assert!(InstallSpec::new("/Users/r", "").is_err());
     assert!(InstallSpec::new("/Users/r", "0.1.5; rm -rf /").is_err());
     assert!(InstallSpec::new("/Users/r", "$(evil)").is_err());
+    assert!(InstallSpec::new(" /Users/r", "0.1.5").is_err());
+    assert!(InstallSpec::new("\t/Users/r", "0.1.5").is_err());
+    assert!(InstallSpec::new("/Users/r\n", "0.1.5").is_err());
+    assert!(InstallSpec::new("/Users/r ", "0.1.5").is_err());
 }
 
 #[test]

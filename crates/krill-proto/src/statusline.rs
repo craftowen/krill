@@ -208,11 +208,112 @@ pub enum OwnCommand {
 /// Executable word. Without Git Bash, Claude Code runs the Windows status line in PowerShell,
 /// so Windows uses a form both shells read ([`crate::agent::hooks::windows_shell_word`]).
 fn exe_word(exe: &str) -> String {
-    if cfg!(windows) {
+    exe_word_for(exe, cfg!(windows))
+}
+
+fn exe_word_for(exe: &str, windows: bool) -> String {
+    if windows {
         crate::agent::hooks::windows_shell_word(exe)
     } else {
         shell_quote(exe)
     }
+}
+
+/// Shell-agnostic flag carrying an unpadded URL-safe base64 user command (used on Windows so
+/// `PowerShell` and Git Bash both pass commands containing single quotes verbatim).
+pub const CHAIN_B64_FLAG: &str = "--chain-b64";
+
+fn b64url_char(val: u8) -> char {
+    match val {
+        0..=25 => char::from(b'A'.saturating_add(val)),
+        26..=51 => char::from(b'a'.saturating_add(val.saturating_sub(26))),
+        52..=61 => char::from(b'0'.saturating_add(val.saturating_sub(52))),
+        62 => '-',
+        _ => '_',
+    }
+}
+
+fn b64url_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte.saturating_sub(b'A')),
+        b'a'..=b'z' => Some(byte.saturating_sub(b'a').saturating_add(26)),
+        b'0'..=b'9' => Some(byte.saturating_sub(b'0').saturating_add(52)),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// Encodes a chained `statusLine` command into canonical unpadded URL-safe base64 (`[A-Za-z0-9_-]`).
+/// Contains no whitespace or shell metacharacters in POSIX `sh`, `bash`, `PowerShell`, or `cmd.exe`.
+#[must_use]
+pub fn encode_chain_b64(command: &str) -> String {
+    let bytes = command.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    for &[b0, b1, b2] in chunks {
+        out.push(b64url_char(b0 >> 2));
+        out.push(b64url_char(((b0 & 0x03) << 4) | (b1 >> 4)));
+        out.push(b64url_char(((b1 & 0x0f) << 2) | (b2 >> 6)));
+        out.push(b64url_char(b2 & 0x3f));
+    }
+    match rem {
+        [b0] => {
+            out.push(b64url_char(b0 >> 2));
+            out.push(b64url_char((b0 & 0x03) << 4));
+        }
+        [b0, b1] => {
+            out.push(b64url_char(b0 >> 2));
+            out.push(b64url_char(((b0 & 0x03) << 4) | (b1 >> 4)));
+            out.push(b64url_char((b1 & 0x0f) << 2));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Decodes a canonical unpadded URL-safe base64 token produced by [`encode_chain_b64`].
+/// Rejects padding, whitespace, invalid characters, non-zero trailing bits, and invalid UTF-8.
+#[must_use]
+pub fn decode_chain_b64(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity((bytes.len() / 4).saturating_mul(3).saturating_add(2));
+    let (chunks, rem) = bytes.as_chunks::<4>();
+    for &[c0, c1, c2, c3] in chunks {
+        let v0 = b64url_value(c0)?;
+        let v1 = b64url_value(c1)?;
+        let v2 = b64url_value(c2)?;
+        let v3 = b64url_value(c3)?;
+        out.push((v0 << 2) | (v1 >> 4));
+        out.push((v1 << 4) | (v2 >> 2));
+        out.push((v2 << 6) | v3);
+    }
+    match rem {
+        [] => {}
+        [c0, c1] => {
+            let v0 = b64url_value(*c0)?;
+            let v1 = b64url_value(*c1)?;
+            if v1 & 0x0f != 0 {
+                return None;
+            }
+            out.push((v0 << 2) | (v1 >> 4));
+        }
+        [c0, c1, c2] => {
+            let v0 = b64url_value(*c0)?;
+            let v1 = b64url_value(*c1)?;
+            let v2 = b64url_value(*c2)?;
+            if v2 & 0x03 != 0 {
+                return None;
+            }
+            out.push((v0 << 2) | (v1 >> 4));
+            out.push((v1 << 4) | (v2 >> 2));
+        }
+        _ => return None,
+    }
+    String::from_utf8(out).ok()
 }
 
 /// 설치 명령(체인 없음).
@@ -224,20 +325,36 @@ pub fn install_command(exe: &str) -> String {
 /// 설치 명령(사용자 원본을 체인으로 보존).
 #[must_use]
 pub fn chain_command(exe: &str, user_command: &str) -> String {
-    format!(
-        "{} {SUBCOMMAND} --chain {}",
-        exe_word(exe),
-        shell_quote(user_command)
-    )
+    chain_command_for(exe, user_command, cfg!(windows))
+}
+
+fn chain_command_for(exe: &str, user_command: &str, windows: bool) -> String {
+    if windows && !user_command.is_empty() {
+        format!(
+            "{} {SUBCOMMAND} {CHAIN_B64_FLAG} {}",
+            exe_word_for(exe, true),
+            encode_chain_b64(user_command)
+        )
+    } else {
+        format!(
+            "{} {SUBCOMMAND} --chain {}",
+            exe_word_for(exe, windows),
+            shell_quote(user_command)
+        )
+    }
 }
 
 /// Krill 설치 명령을 구조로 판별한다. 엄격한 형식 일치만 우리 것으로 본다.
 /// Windows에서 예전에 설치한 POSIX 인용 모양(`'C:\…\krill.exe' statusline`)과 8.3 짧은 경로 모양도 우리 것이다.
 #[must_use]
 pub fn classify_command(cmd: &str, exe: &str) -> OwnCommand {
+    classify_command_for(cmd, exe, cfg!(windows))
+}
+
+fn classify_command_for(cmd: &str, exe: &str, windows: bool) -> OwnCommand {
     let cmd = cmd.trim();
     let mut words = vec![shell_quote(exe)];
-    if cfg!(windows) {
+    if windows {
         words.extend(crate::agent::hooks::plain_word(exe));
         // 8.3 짧은 경로로 설치한 단어는 같은 파일인지로 확인한다(짧은 경로를 다시 구하지 않는다).
         if let Some((first, _)) = cmd.split_once(' ')
@@ -250,6 +367,12 @@ pub fn classify_command(cmd: &str, exe: &str) -> OwnCommand {
     for word in words {
         if cmd == format!("{word} {SUBCOMMAND}") {
             return OwnCommand::Bare;
+        }
+        let chained_b64_prefix = format!("{word} {SUBCOMMAND} {CHAIN_B64_FLAG} ");
+        if let Some(rest) = cmd.strip_prefix(chained_b64_prefix.as_str())
+            && let Some(original) = decode_chain_b64(rest)
+        {
+            return OwnCommand::Chained(original);
         }
         let chained_prefix = format!("{word} {SUBCOMMAND} --chain ");
         if let Some(rest) = cmd.strip_prefix(chained_prefix.as_str())

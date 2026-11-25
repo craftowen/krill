@@ -2,7 +2,7 @@
 
 use std::ffi::{c_int, c_void};
 use std::io;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::PathBuf;
@@ -206,7 +206,7 @@ pub fn verify_audit_token(token: &[u8]) -> CodeSign {
     }
 }
 
-/// 서명 정보 딕셔너리에서 `CFString` 값을 읽는다. 값의 소유자는 딕셔너리라 `drop`하지 않는다.
+/// 서명 정보 딕셔너리에서 `CFString` 값을 읽는다.
 ///
 /// # Safety
 ///
@@ -215,16 +215,13 @@ unsafe fn signing_string(
     dict: &CFDictionary<CFString, CFType>,
     key: CFStringRef,
 ) -> Option<String> {
-    // SAFETY: 호출자 계약대로 `key`는 살아 있는 `CFString`이다. get 규칙이라 `drop` 대신 소유권을 놓는다.
+    // SAFETY: 호출자 계약대로 `key`는 살아 있는 `CFString`이다.
+    // `wrap_under_get_rule`이 `CFRetain`을 부르므로 `Drop`의 `CFRelease`와 짝을 이룬다.
     let key: CFString = unsafe { CFString::wrap_under_get_rule(key) };
-    let key = ManuallyDrop::new(key);
-    dict.find(&*key).and_then(|value| {
-        let text: CFString = value.downcast()?;
-        let out = text.to_string();
-        // get 규칙: 소유자는 딕셔너리라 해제하지 않는다.
-        let _text = ManuallyDrop::new(text);
-        Some(out)
-    })
+    dict.find(&key)
+        .and_then(|value| value.downcast::<CFString>())
+        .as_ref()
+        .map(ToString::to_string)
 }
 
 /// 부모 PID(`proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`). 다른 UID 프로세스(예: root `login`)도 조회된다.
@@ -607,5 +604,25 @@ mod vnode_path_tests {
         drop(file);
         std::fs::remove_file(path).unwrap();
         assert!(open_vnode_paths(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn signing_string_balances_core_foundation_retain_counts() {
+        let key = CFString::new("krill.test.signing.dictionary.key.0123456789abcdef");
+        let value = CFString::new("com.krill.test.signing.value.0123456789abcdef0123456789");
+        let dict: CFDictionary<CFString, CFType> =
+            CFDictionary::from_CFType_pairs(&[(key.clone(), value.as_CFType())]);
+        let key_rc = key.retain_count();
+        let value_rc = value.retain_count();
+        for _ in 0..16 {
+            // SAFETY: `key`와 `dict`는 이 루프 동안 살아 있는 유효한 CoreFoundation 객체다.
+            let got = unsafe { signing_string(&dict, key.as_concrete_TypeRef()) };
+            assert_eq!(
+                got.as_deref(),
+                Some("com.krill.test.signing.value.0123456789abcdef0123456789")
+            );
+        }
+        assert_eq!(key.retain_count(), key_rc);
+        assert_eq!(value.retain_count(), value_rc);
     }
 }

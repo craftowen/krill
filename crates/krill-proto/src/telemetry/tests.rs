@@ -228,3 +228,88 @@ fn no_state_dir_is_off() {
         Consent::Disabled(Reason::NoConsentFile)
     );
 }
+
+#[test]
+fn queue_state_tolerates_unknown_fields_from_newer_version() {
+    let dir = state_dir();
+    let env = Env::default();
+    record_open(&dir, &env, 1_793_000_000).unwrap();
+    let original_id = status_with(&dir, &env).unwrap().install_id.unwrap();
+
+    let state_file = dir.join("telemetry/state.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    json["future_field"] = serde_json::json!({"schema": 2});
+    fs::write(&state_file, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let status = status_with(&dir, &env).unwrap();
+    assert_eq!(status.install_id.as_deref(), Some(original_id.as_str()));
+    assert_eq!(status.pending, 2);
+
+    record_activity(&dir, &env, 1_793_000_010).unwrap();
+    assert_eq!(status_with(&dir, &env).unwrap().pending, 3);
+
+    disable(&dir).unwrap();
+    assert!(!consent(Some(&dir), &env).enabled());
+    enable(&dir).unwrap();
+    assert!(consent(Some(&dir), &env).enabled());
+    assert_eq!(
+        status_with(&dir, &env).unwrap().install_id.as_deref(),
+        Some(original_id.as_str())
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn corrupt_or_oversized_queue_state_recovers_across_lifecycle() {
+    let env = Env::default();
+    let samples: [Vec<u8>; 3] = [
+        b"{not valid json".to_vec(),
+        br#"{"install_id":"not-a-uuid","generation":"bad","first_open":false,"active_day":null,"events":[],"failures":0,"next_attempt_unix":null,"last_success_unix":null,"last_outcome":"empty"}"#.to_vec(),
+        vec![b' '; 133_120],
+    ];
+
+    for payload in samples {
+        let dir = state_dir();
+        let state_file = dir.join("telemetry/state.json");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(&state_file, &payload).unwrap();
+
+        let status = status_with(&dir, &env).unwrap();
+        assert_eq!(status.pending, 0);
+        assert!(status.install_id.is_none());
+
+        // `disable` must succeed and wipe corrupt state.json.
+        disable(&dir).unwrap();
+        assert!(dir.join(DISABLED_FILE).exists());
+        assert!(!state_file.exists());
+
+        // Corrupt state.json while disabled must never wedge `enable`.
+        fs::write(&state_file, &payload).unwrap();
+        enable(&dir).unwrap();
+        assert!(!dir.join(DISABLED_FILE).exists());
+        assert!(consent(Some(&dir), &env).enabled());
+        let token = activity_generation(&dir, &env).unwrap().unwrap();
+
+        // Corrupt state.json rejects stale deferred input instead of fabricating a match.
+        fs::write(&state_file, &payload).unwrap();
+        assert!(!record_activity_for_generation(&dir, &env, 1_793_000_000, &token).unwrap());
+
+        // `flush_with` wipes corrupt state.json and returns Empty without calling transport.
+        let report = flush_with(&dir, &env, 1_793_000_000, |_| {
+            panic!("corrupt queue must not upload")
+        })
+        .unwrap();
+        assert_eq!(report.outcome, Outcome::Empty);
+        assert!(!state_file.exists());
+
+        // `record_open` self-heals a corrupt state.json into a fresh valid queue.
+        fs::write(&state_file, &payload).unwrap();
+        record_open(&dir, &env, 1_793_000_000).unwrap();
+        let healed = status_with(&dir, &env).unwrap();
+        assert_eq!(healed.pending, 2);
+        assert!(healed.install_id.is_some());
+
+        fs::remove_dir_all(dir).ok();
+    }
+}

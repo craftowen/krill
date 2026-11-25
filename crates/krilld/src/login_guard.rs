@@ -25,17 +25,25 @@ pub fn start(registry: &Arc<Registry>) {
     ) else {
         return;
     };
+    let registry = Arc::downgrade(registry);
     std::thread::Builder::new()
         .name("login-guard".to_owned())
         .stack_size(256 * 1024)
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(10));
+                let holder_alive = || {
+                    registry.upgrade().is_some_and(|reg| {
+                        reg.holder()
+                            .is_some_and(crate::holder::Holder::is_connected)
+                    }) && crate::rejoin::holder_pid() == Some(holder)
+                };
                 if replace_stale_holder_with(
                     &dir,
                     holder,
                     unix_seconds(),
                     Duration::from_secs(2),
+                    holder_alive,
                     krill_proto::os::bootstrap_dead,
                     kill,
                 ) {
@@ -54,6 +62,7 @@ pub fn start(_registry: &Arc<Registry>) {}
 const COOLDOWN: u64 = 5 * 60;
 
 /// 포트가 죽었음이 두 번 연속 확인되고 쿨다운이 지났으면 holder를 죽이고 `true`.
+/// holder가 이미 떠났거나 연결이 끊겼으면 죽이지 않고 감시를 끝낸다(`true`).
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(
     not(test),
@@ -63,10 +72,19 @@ fn replace_stale_holder(
     dir: &std::path::Path,
     holder: u32,
     now: u64,
+    holder_alive: impl FnMut() -> bool,
     dead: impl FnMut() -> bool,
     kill: impl FnOnce(u32),
 ) -> bool {
-    replace_stale_holder_with(dir, holder, now, std::time::Duration::ZERO, dead, kill)
+    replace_stale_holder_with(
+        dir,
+        holder,
+        now,
+        std::time::Duration::ZERO,
+        holder_alive,
+        dead,
+        kill,
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -75,9 +93,13 @@ fn replace_stale_holder_with(
     holder: u32,
     now: u64,
     recheck_delay: std::time::Duration,
+    mut holder_alive: impl FnMut() -> bool,
     mut dead: impl FnMut() -> bool,
     kill: impl FnOnce(u32),
 ) -> bool {
+    if !holder_alive() {
+        return true;
+    }
     if !dead() {
         return false;
     }
@@ -86,6 +108,9 @@ fn replace_stale_holder_with(
     }
     if !dead() {
         return false;
+    }
+    if !holder_alive() {
+        return true;
     }
     let path = dir.join("login-guard-restart");
     let last = std::fs::read_to_string(&path)
@@ -96,6 +121,9 @@ fn replace_stale_holder_with(
         || krill_proto::os::write_atomic_0600(&path, now.to_string().as_bytes()).is_err()
     {
         return false;
+    }
+    if !holder_alive() {
+        return true;
     }
     tracing::warn!(holder, "stale login session; replacing holder");
     kill(holder);
@@ -137,6 +165,7 @@ mod tests {
             &d,
             7,
             1,
+            || true,
             || false,
             |p| killed = Some(p)
         ));
@@ -146,6 +175,7 @@ mod tests {
             &d,
             7,
             1,
+            || true,
             || {
                 calls += 1;
                 calls == 1
@@ -166,6 +196,7 @@ mod tests {
             7,
             10_000,
             || true,
+            || true,
             |p| killed.push(p)
         ));
         // 새 holder의 krilld도 거절돼도 쿨다운 안에서는 다시 죽이지 않는다(재기동 루프 방지).
@@ -174,12 +205,14 @@ mod tests {
             8,
             10_001,
             || true,
+            || true,
             |p| killed.push(p)
         ));
         assert!(!replace_stale_holder(
             &d,
             8,
             9_000,
+            || true,
             || true,
             |p| killed.push(p)
         ));
@@ -188,9 +221,64 @@ mod tests {
             8,
             10_000 + COOLDOWN,
             || true,
+            || true,
             |p| killed.push(p)
         ));
         assert_eq!(killed, [7, 8]);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn gone_holder_exits_without_killing_stale_pid() {
+        let d = dir("gone");
+        let mut killed = Vec::new();
+        let mut dead_calls = 0;
+        // Holder already gone before bootstrap check: stop immediately without probing or killing.
+        assert!(replace_stale_holder(
+            &d,
+            9,
+            10_000,
+            || false,
+            || {
+                dead_calls += 1;
+                true
+            },
+            |p| killed.push(p)
+        ));
+        assert_eq!(dead_calls, 0);
+        assert!(killed.is_empty());
+        assert!(!d.join("login-guard-restart").exists());
+
+        // Holder disappears while bootstrap_dead is running: stop without cooldown write or kill.
+        let mut checks = 0;
+        assert!(replace_stale_holder(
+            &d,
+            9,
+            10_000,
+            || {
+                checks += 1;
+                checks == 1
+            },
+            || true,
+            |p| killed.push(p)
+        ));
+        assert!(killed.is_empty());
+        assert!(!d.join("login-guard-restart").exists());
+
+        // Holder disappears right before kill: stop without sending SIGKILL to a recycled PID.
+        let mut checks = 0;
+        assert!(replace_stale_holder(
+            &d,
+            9,
+            10_000,
+            || {
+                checks += 1;
+                checks <= 2
+            },
+            || true,
+            |p| killed.push(p)
+        ));
+        assert!(killed.is_empty());
         std::fs::remove_dir_all(d).unwrap();
     }
 }

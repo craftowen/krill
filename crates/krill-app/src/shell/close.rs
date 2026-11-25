@@ -184,11 +184,16 @@ impl Shell {
         let call = self.close_call.clone().or(call);
         let Some(call) = call else {
             self.notice = Some(text::DAEMON_FAILED.get().to_owned());
+            cx.notify();
             return;
         };
         let host = host.clone();
         cx.spawn(async move |this, cx| {
             if cx.update(|cx| super::session_shown(&host, session, cx)) {
+                this.update(cx, |this, _| {
+                    this.workspace_closing.remove(&(host, session));
+                })
+                .ok();
                 return;
             }
             let bg = cx.background_executor().clone();
@@ -218,6 +223,7 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 if let Err(error) = result {
+                    this.workspace_closing.remove(&(host, session));
                     this.notice = Some(error.to_string());
                 }
                 this.refresh_detached(cx);

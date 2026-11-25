@@ -16,7 +16,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -768,9 +769,20 @@ fn command_version(binary: &Path) -> Option<String> {
     })?
 }
 
-/// `--version` 앞부분(릴리스 버전). 개발 해시(`+dev.…`)가 달라도 같은 릴리스면 일치한다.
+/// `--version` 앞부분(릴리스 버전). `krill --version`은 `"krill <BUILD>"`, `krilld --version`은
+/// `"<BUILD>"`를 출력하므로 실행 파일 이름 접두사와 개발 해시(`+dev.…`)를 떼고 비교한다.
 fn version_prefix(build: &str) -> &str {
-    build.split_once('+').map_or(build, |(v, _)| v)
+    let trimmed = build.trim();
+    let without_bin = ["krilld", "krill"]
+        .into_iter()
+        .find_map(|bin| {
+            trimmed
+                .strip_prefix(bin)
+                .and_then(|rest| rest.strip_prefix(char::is_whitespace))
+                .map(str::trim_start)
+        })
+        .unwrap_or(trimmed);
+    without_bin.split_once('+').map_or(without_bin, |(v, _)| v)
 }
 
 fn quick_version(env: &Env) -> Check {
@@ -1006,6 +1018,7 @@ pub(super) fn agent_name(id: &str) -> &str {
         "cursor" => "Cursor",
         "claude" => "Claude Code",
         "agy" | "antigravity" => "Antigravity",
+        "pi" => "Pi",
         _ => id,
     }
 }
@@ -1253,6 +1266,7 @@ fn add_user_path(dir: &Path) -> io::Result<()> {
 fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    static STAGE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     if std::fs::canonicalize(src).ok() == std::fs::canonicalize(dst).ok() && dst.is_file() {
         return Ok(());
@@ -1260,8 +1274,12 @@ fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::copy(src, &tmp)?;
+    let seq = STAGE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dst.with_extension(format!("tmp-{}-{seq}", std::process::id()));
+    if let Err(err) = std::fs::copy(src, &tmp) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(err);
+    }
     #[cfg(unix)]
     if let Err(err) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
         std::fs::remove_file(&tmp).ok();
@@ -1547,6 +1565,60 @@ mod path_tests {
                 "{payload}"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_prefix_strips_binary_name_and_build_metadata() {
+        assert_eq!(version_prefix("krill 0.2.6+dev.abc"), "0.2.6");
+        assert_eq!(version_prefix("krilld 0.2.6+dev.xyz"), "0.2.6");
+        assert_eq!(version_prefix("0.2.6+dev.xyz"), "0.2.6");
+        assert_eq!(version_prefix("krill 0.2.6"), "0.2.6");
+        assert_eq!(
+            version_prefix("  krill   0.2.6-rc.1+build.4  "),
+            "0.2.6-rc.1"
+        );
+        assert_ne!(
+            version_prefix("usage: something"),
+            version_prefix("error: something")
+        );
+        assert_eq!(version_prefix("krill"), "krill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_executable_handles_concurrent_same_process_calls_without_temp_collision() {
+        let root =
+            std::env::temp_dir().join(format!("krill-stage-concurrent-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("src-bin");
+        let dst = root.join(format!("krill{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&src, b"krill-binary-payload").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let src = src.clone();
+            let dst = dst.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..16 {
+                    stage_executable(&src, &dst).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(std::fs::read(&dst).unwrap(), b"krill-binary-payload");
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftover_tmps.is_empty(), "{leftover_tmps:?}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

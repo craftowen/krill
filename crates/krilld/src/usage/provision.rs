@@ -102,6 +102,45 @@ pub const MEMORY_IMPORT: &str = "@~/.claude/CLAUDE.md\n";
 /// 임시 파일·링크가 엇갈리지 않는다. 처리량이 문제면 프로필별 잠금으로.
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 해당 프로필에 대한 백그라운드 기록 이행 작업이 실행 중인지 확인한다.
+pub(crate) fn is_busy(profile: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        history_jobs::is_running(profile)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = profile;
+        false
+    }
+}
+
+/// 진행 중인 프로비저닝과 충돌하지 않을 때만 비차단으로 잠금을 얻는다(`SAVE_LOCK` -> `LOCK` 순서).
+pub(crate) fn try_lock_provision() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match LOCK.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_provision_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    crate::session::lock(&LOCK)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct BusyGuard {
+    _inner: history_jobs::RunningGuard,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn mark_busy_for_tests(profile: &Path) -> BusyGuard {
+    BusyGuard {
+        _inner: history_jobs::mark_running_for_tests(profile),
+    }
+}
+
 /// 한 번의 프로비저닝 결과. 항목 이름만 담는다(경로는 로그에 남기지 않는다, CONVENTIONS A8).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -253,13 +292,13 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
         for &name in HISTORY.iter().chain(EXTENSIONS) {
             let src = host.join(name);
             if src.is_dir() {
-                link(&src, &profile.join(name), name, &mut report)?;
+                link(&src, &profile_real.join(name), name, &mut report)?;
             }
         }
         for &name in COPIED {
             let src = host.join(name);
             if src.is_file() {
-                let dst = profile.join(name);
+                let dst = profile_real.join(name);
                 publish(
                     &dst,
                     |tmp| std::fs::copy(&src, tmp).map(drop),
@@ -270,7 +309,7 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
         }
         if host.join("CLAUDE.md").is_file() {
             publish(
-                &profile.join("CLAUDE.md"),
+                &profile_real.join("CLAUDE.md"),
                 |tmp| std::fs::write(tmp, MEMORY_IMPORT),
                 "CLAUDE.md",
                 &mut report,
@@ -282,6 +321,14 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
 }
 
 fn provision_opencode(home: &Path, profile: &Path) -> io::Result<Report> {
+    provision_opencode_with(home, profile, crate::os::symlink)
+}
+
+fn provision_opencode_with(
+    home: &Path,
+    profile: &Path,
+    mut symlink_fn: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Report> {
     let mut report = Report::default();
     let host_data = home.join(".local/share/opencode");
     if !host_data.is_dir() {
@@ -309,23 +356,7 @@ fn provision_opencode(home: &Path, profile: &Path) -> io::Result<Report> {
             continue;
         }
         let dst = prof_data.join(name);
-        match dst.symlink_metadata() {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if std::fs::read_link(&dst)? != src {
-                    report.conflicts.push(name);
-                }
-                continue;
-            }
-            Ok(meta) if meta.is_dir() && std::fs::remove_dir(&dst).is_ok() => {}
-            Ok(_) => {
-                report.conflicts.push(name);
-                continue;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        crate::os::symlink(&src, &dst)?;
-        report.changed.push(name);
+        link_with(&src, &dst, name, &mut report, &mut symlink_fn)?;
     }
     Ok(report)
 }
@@ -497,8 +528,15 @@ fn publish_mcp(dst: &Path, bytes: &[u8], original: Option<&[u8]>) -> io::Result<
 }
 
 /// 없으면 링크, 빈 폴더면 링크로 바꾼다(기존 빈 프로필 이전). 같은 링크면 그대로, 그 밖은 충돌.
-#[cfg(not(unix))]
-fn link(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::Result<()> {
+/// 링크 미지원 환경(`Unsupported`, 예: Windows)은 무시해 뒤이은 파일 복사·MCP 병합을 계속한다.
+fn link_with(
+    src: &Path,
+    dst: &Path,
+    name: &'static str,
+    report: &mut Report,
+    symlink_fn: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut removed_empty_dir = false;
     match dst.symlink_metadata() {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -509,15 +547,34 @@ fn link(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::
             return Ok(());
         }
         // `remove_dir`는 빈 폴더만 지운다. 내용이 있으면 실패하고 그대로 둔다.
-        Ok(m) if m.is_dir() && std::fs::remove_dir(dst).is_ok() => {}
+        Ok(m) if m.is_dir() && std::fs::remove_dir(dst).is_ok() => {
+            removed_empty_dir = true;
+        }
         Ok(_) => {
             report.conflicts.push(name);
             return Ok(());
         }
     }
-    crate::os::symlink(src, dst)?;
-    report.changed.push(name);
+    match symlink_fn(src, dst) {
+        Ok(()) => report.changed.push(name),
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+            if removed_empty_dir {
+                std::fs::create_dir(dst).ok();
+            }
+        }
+        Err(e) => {
+            if removed_empty_dir {
+                std::fs::create_dir(dst).ok();
+            }
+            return Err(e);
+        }
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn link(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::Result<()> {
+    link_with(src, dst, name, report, crate::os::symlink)
 }
 
 /// `dst`가 없을 때만 임시 파일을 써서 하드 링크로 게시한다. 쓰다 죽어도 반쪽 파일이 `dst`에 남지 않고,

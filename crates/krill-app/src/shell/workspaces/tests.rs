@@ -1382,3 +1382,57 @@ fn hidden_restore_session_gone_prunes_zombie_tab_when_sidebar_connected(cx: &mut
         );
     });
 }
+
+#[gpui::test]
+fn reconcile_empty_primary_keeps_primary_active_over_secondary_startup_workspace(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("reconcile-primary-over-secondary"));
+    let w1 = PathBuf::from("/work/primary-w1");
+    let w2 = PathBuf::from("/work/secondary-w2");
+    view.update(cx, |s, cx| {
+        let p = s.layout.active_tab().focused;
+        s.layout.set_launch(
+            p,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: w2.as_os_str().as_encoded_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.layout.set_session(p, SessionId(201));
+        s.startup_reconcile_panes = vec![p];
+        s.layout.deactivate();
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(sidebar::Snapshot {
+                    sessions: vec![
+                        live_session(101, "/work/primary-w1"),
+                        live_session(201, "/work/secondary-w2"),
+                        live_session(202, "/work/secondary-w2"),
+                    ],
+                    trees: BTreeMap::from([
+                        (w1.clone(), vec![w1.clone()]),
+                        (w2.clone(), vec![w2.clone()]),
+                    ]),
+                })),
+                cx,
+            );
+            sidebar.select_worktree(Some(w1.clone()), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, super::super::Shell::reconcile_workspace_sessions);
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, _| {
+        let focused = s.layout.focused().expect("primary tab must be active");
+        assert_eq!(
+            s.layout.session(focused),
+            Some(SessionId(101)),
+            "active tab must belong to selected primary workspace W1, not secondary W2"
+        );
+    });
+}

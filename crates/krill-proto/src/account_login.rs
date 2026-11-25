@@ -320,14 +320,6 @@ pub fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 /// 비밀값을 출력하지 않는 CLI 상태 조회. stdout·stderr를 함께 읽되 결과에는 신원만 남긴다.
 /// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_command`]).
 pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
-    if provider == ProviderKind::Antigravity {
-        let dir = dir?;
-        let logged_in = agy_token_logged_in(dir);
-        return Some(AuthStatus {
-            logged_in,
-            identity: logged_in.then(|| agy_identity_from_dir(dir)).flatten(),
-        });
-    }
     probe_with_environment(exe, provider, dir, None, None)
 }
 
@@ -339,6 +331,14 @@ pub fn probe_with_environment(
     home: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
 ) -> Option<AuthStatus> {
+    if provider == ProviderKind::Antigravity {
+        let dir = dir?;
+        let logged_in = agy_token_logged_in(dir);
+        return Some(AuthStatus {
+            logged_in,
+            identity: logged_in.then(|| agy_identity_from_dir(dir)).flatten(),
+        });
+    }
     let args: &[&str] = match provider {
         ProviderKind::Claude => &["auth", "status", "--json"],
         ProviderKind::Codex => &["login", "status"],
@@ -678,12 +678,48 @@ mod tests {
                 .unwrap()
                 .logged_in
         );
+        assert_eq!(
+            probe_with_environment(
+                Path::new("/unused"),
+                ProviderKind::Antigravity,
+                Some(&root),
+                Some(&root),
+                Some(std::ffi::OsStr::new("/unused")),
+            ),
+            Some(AuthStatus {
+                logged_in: true,
+                identity: None,
+            })
+        );
+        assert_eq!(
+            probe_with_environment(
+                Path::new("/unused"),
+                ProviderKind::Antigravity,
+                None,
+                Some(&root),
+                Some(std::ffi::OsStr::new("/unused")),
+            ),
+            None
+        );
         // 토큰 파일이 없으면 모름이 아니라 로그인 필요다(OWE-901: 프로필 판정 통일).
         std::fs::remove_file(&token).unwrap();
         assert!(
             !probe(Path::new("/unused"), ProviderKind::Antigravity, Some(&root))
                 .unwrap()
                 .logged_in
+        );
+        assert_eq!(
+            probe_with_environment(
+                Path::new("/unused"),
+                ProviderKind::Antigravity,
+                Some(&root),
+                Some(&root),
+                Some(std::ffi::OsStr::new("/unused")),
+            ),
+            Some(AuthStatus {
+                logged_in: false,
+                identity: None,
+            })
         );
         assert!(!agy_token_logged_in(&root));
         std::fs::remove_dir_all(root).unwrap();

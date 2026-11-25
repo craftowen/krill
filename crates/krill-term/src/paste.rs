@@ -115,9 +115,9 @@ pub fn quote_path(path: &[u8], shell: ShellFamily) -> Option<Vec<u8>> {
     match shell {
         ShellFamily::Posix => Some(shell_quote(path)),
         ShellFamily::PowerShell => {
-            // PowerShell treats curly single quotes as string delimiters too.
+            // PowerShell treats curly/low/reversed single quotes as string delimiters too.
             // Refuse these filenames instead of changing their literal spelling.
-            if ["‘", "’"]
+            if ["‘", "’", "\u{201a}", "\u{201b}"]
                 .iter()
                 .any(|quote| path.windows(quote.len()).any(|w| w == quote.as_bytes()))
             {
@@ -141,7 +141,7 @@ pub fn quote_path(path: &[u8], shell: ShellFamily) -> Option<Vec<u8>> {
             };
             if path.iter().any(|b| forbidden.contains(b))
                 || shell == ShellFamily::WindowsUnknown
-                    && ["“", "”"]
+                    && ["“", "”", "\u{201e}"]
                         .iter()
                         .any(|quote| path.windows(quote.len()).any(|w| w == quote.as_bytes()))
             {
@@ -282,16 +282,17 @@ mod tests {
 
     #[test]
     fn powershell_unicode_delimiters_are_refused_without_altering_posix_paths() {
-        for quote in ["‘", "’", "“", "”"] {
+        for quote in ["‘", "’", "\u{201a}", "\u{201b}", "“", "”", "\u{201e}"] {
             let path = format!(r"C:\tmp\smart{quote} ; New-Item injected; #.png");
-            let family = if matches!(quote, "‘" | "’") {
+            let is_single = matches!(quote, "‘" | "’" | "\u{201a}" | "\u{201b}");
+            let family = if is_single {
                 ShellFamily::PowerShell
             } else {
                 ShellFamily::WindowsUnknown
             };
             assert!(quote_path(path.as_bytes(), family).is_none());
             assert!(quote_path(path.as_bytes(), ShellFamily::Posix).is_some());
-            if matches!(quote, "“" | "”") {
+            if !is_single {
                 for shell in [
                     ShellFamily::Posix,
                     ShellFamily::PowerShell,

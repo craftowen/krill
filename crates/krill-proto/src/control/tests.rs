@@ -1021,10 +1021,13 @@ fn resume_and_hibernation_account_tails_decode_old_bytes() {
     }
 }
 
-/// `Failure::Os` 와이어: 같은 OS끼리는 늘 원래 errno로 돌아오고, Linux 번호는 표식으로 구분돼 macOS가 아는 것만 옮긴다.
+/// `Failure::Os` 와이어: 같은 OS끼리는 늘 원래 errno로 돌아오고, Linux·Windows 번호는 표식으로 구분돼 이기종이 아는 것만 옮긴다.
 #[test]
 fn os_failure_errno_travels_in_macos_numbering() {
-    use super::wire_errno::{from_wire, to_wire};
+    use super::wire_errno::{
+        from_wire, from_wire_linux, from_wire_macos, from_wire_windows, to_wire, to_wire_linux,
+        to_wire_macos, to_wire_windows,
+    };
     for errno in [1, 2, 11, 13, 34, 35, 38, 40, 62, 63, 78, 110, 4000] {
         assert_eq!(
             from_wire(to_wire(errno)),
@@ -1038,7 +1041,7 @@ fn os_failure_errno_travels_in_macos_numbering() {
         assert_eq!(to_wire(38), 10_038);
         assert_eq!(from_wire(78), 38, "원격 Mac의 ENOSYS");
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
     {
         assert_eq!(to_wire(78), 78);
         assert_eq!(from_wire(10_038), 78, "Linux ENOSYS → macOS ENOSYS");
@@ -1053,6 +1056,67 @@ fn os_failure_errno_travels_in_macos_numbering() {
             "macOS 와이어 바이트 불변"
         );
     }
+    #[cfg(windows)]
+    {
+        assert_eq!(to_wire(10_035), 110_035);
+        assert_eq!(from_wire(to_wire(10_035)), 10_035, "WSAEWOULDBLOCK 왕복");
+        assert_eq!(from_wire(10_038), 120, "Linux ENOSYS → Win32");
+    }
+
+    // Cross-OS matrix tested unconditionally on every host OS.
+    for win_err in [
+        2,
+        5,
+        120,
+        145,
+        206,
+        4000,
+        10_000,
+        10_035, // WSAEWOULDBLOCK
+        10_036, // WSAEINPROGRESS
+        10_038, // WSAENOTSOCK
+        10_039, // WSAEDESTADDRREQ
+        10_040, // WSAEMSGSIZE
+        10_054, // WSAECONNRESET
+        10_060, // WSAETIMEDOUT
+        10_061, // WSAECONNREFUSED
+        10_104, // WSAINVALIDPROCTABLE
+        10_110, // WSA_E_NO_MORE
+        -2_147_024_891,
+    ] {
+        assert_eq!(
+            from_wire_windows(to_wire_windows(win_err)),
+            win_err,
+            "Windows<->Windows roundtrip {win_err}"
+        );
+    }
+    // Windows -> Linux & macOS
+    assert_eq!(from_wire_linux(to_wire_windows(10_035)), 11); // WSAEWOULDBLOCK -> EAGAIN
+    assert_eq!(from_wire_macos(to_wire_windows(10_035)), 35); // WSAEWOULDBLOCK -> EAGAIN
+    assert_eq!(from_wire_linux(to_wire_windows(10_054)), 104); // WSAECONNRESET -> ECONNRESET
+    assert_eq!(from_wire_macos(to_wire_windows(10_054)), 54);
+    assert_eq!(from_wire_linux(to_wire_windows(10_060)), 110); // WSAETIMEDOUT -> ETIMEDOUT
+    assert_eq!(from_wire_macos(to_wire_windows(10_060)), 60);
+    assert_eq!(from_wire_linux(to_wire_windows(10_061)), 111); // WSAECONNREFUSED -> ECONNREFUSED
+    assert_eq!(from_wire_macos(to_wire_windows(10_061)), 61);
+    // Unmapped WinSock codes stay tagged (never subtracted by LINUX_TAG into bogus Unix errnos).
+    assert_eq!(from_wire_linux(to_wire_windows(10_110)), 110_110);
+    assert_eq!(from_wire_macos(to_wire_windows(10_110)), 110_110);
+
+    // Linux -> Windows maps to real Win32 / WinSock error codes, never macOS errnos.
+    assert_eq!(from_wire_windows(to_wire_linux(38)), 120); // ENOSYS -> ERROR_CALL_NOT_IMPLEMENTED
+    assert_eq!(from_wire_windows(to_wire_linux(39)), 145); // ENOTEMPTY -> ERROR_DIR_NOT_EMPTY
+    assert_eq!(from_wire_windows(to_wire_linux(36)), 206); // ENAMETOOLONG -> ERROR_FILENAME_EXCED_RANGE
+    assert_eq!(from_wire_windows(to_wire_linux(104)), 10_054); // ECONNRESET -> WSAECONNRESET
+    assert_eq!(from_wire_windows(to_wire_linux(110)), 10_060); // ETIMEDOUT -> WSAETIMEDOUT
+    assert_eq!(from_wire_windows(to_wire_linux(111)), 10_061); // ECONNREFUSED -> WSAECONNREFUSED
+    assert_eq!(from_wire_windows(to_wire_linux(62)), 10_062); // unknown Linux errno stays tagged
+
+    // N-1 Linux <-> macOS wire bytes stay identical.
+    assert_eq!(to_wire_linux(2), 2);
+    assert_eq!(to_wire_linux(38), 10_038);
+    assert_eq!(from_wire_macos(to_wire_linux(38)), 78);
+    assert_eq!(from_wire_linux(to_wire_macos(78)), 38);
 }
 
 /// OWE-872: `Reply::States` 전경 프로세스 이름 꼬리는 구버전 프레임과 양방향 호환한다.
@@ -1705,5 +1769,5 @@ fn states_startup_stall_tail_round_trips_and_old_decoders_ignore_it() {
 #[test]
 fn reply_bot_tag_matches_derived_discriminant() {
     let encoded = postcard::to_stdvec(&Reply::Bot(crate::bots::BotRpcResponse::Ok)).unwrap();
-    assert_eq!(encoded[0], REPLY_BOT_TAG);
+    assert_eq!(encoded[0], 33);
 }

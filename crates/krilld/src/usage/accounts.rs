@@ -311,7 +311,27 @@ pub fn read_profile_usage(
     email: Option<&str>,
     host_default: bool,
 ) -> ProfileUsage {
-    let direct = super::direct::cached(home, provider, profile_dir);
+    read_profile_usage_in(
+        home,
+        None,
+        provider,
+        profile_dir,
+        label,
+        email,
+        host_default,
+    )
+}
+
+fn read_profile_usage_in(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    profile_dir: &Path,
+    label: &str,
+    email: Option<&str>,
+    host_default: bool,
+) -> ProfileUsage {
+    let direct = super::direct::cached_in(home, state_dir, provider, profile_dir);
     // 실행 중인 세션이 이 프로필에 기록한 값이 직접 조회보다 새롭거나 조회가 실패했으면 그것을 쓴다.
     let recorded = (provider == ProviderKind::Claude)
         .then(|| claude_recorded_usage(profile_dir))
@@ -353,9 +373,16 @@ pub fn read_profile_usage(
                         dir_uuid.is_some_and(|u| !r.id.is_empty() && r.id.eq_ignore_ascii_case(u))
                             || (!r.label.is_empty()
                                 && (r.label.eq_ignore_ascii_case(label)
-                                    || email.is_some_and(|e| r.label.eq_ignore_ascii_case(e))))
+                                    || email.is_some_and(|e| r.label.eq_ignore_ascii_case(e))
+                                    || (primary_email(&r.label).contains('@')
+                                        && primary_email(&r.label).eq_ignore_ascii_case(
+                                            primary_email(email.unwrap_or(label)),
+                                        ))))
                             || r.email.as_deref().is_some_and(|re| {
                                 re.eq_ignore_ascii_case(label)
+                                    || (primary_email(re).contains('@')
+                                        && primary_email(re)
+                                            .eq_ignore_ascii_case(primary_email(label)))
                                     || email.is_some_and(|e| {
                                         primary_email(re).eq_ignore_ascii_case(primary_email(e))
                                     })
@@ -495,7 +522,7 @@ fn orca_detected_id(idx: usize, row: &AccountUsage) -> String {
 /// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
 /// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
 pub(super) fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
-    let mut parts = dir.split('/');
+    let mut parts = dir.split(['/', '\\']).filter(|p| !p.is_empty());
     let leaf = parts.next_back()?;
     let uuid = parts.next_back()?;
     let parent = parts.next_back()?;
@@ -809,7 +836,7 @@ fn refresh_accounts_authenticated(
                 .and_then(|n| n.to_str())
                 .unwrap_or("default")
         );
-        let pu = read_profile_usage(home, provider, &dir, &label, None, true);
+        let pu = read_profile_usage_in(home, state_dir, provider, &dir, &label, None, true);
         meta.insert(id.clone(), (pu.error, pu.detail, pu.updated_at));
         all.push(AccountInfo {
             id,
@@ -912,8 +939,9 @@ fn refresh_accounts_authenticated(
             raw_dir
         };
         let resolved_profile_dir = dir.display().to_string();
-        let pu = read_profile_usage(
+        let pu = read_profile_usage_in(
             home,
+            state_dir,
             provider,
             &dir,
             &stored.label,
@@ -952,13 +980,26 @@ fn refresh_accounts_authenticated(
                         }))
         }) {
             if existing.id != stored.id {
-                if let Some(m) = meta.remove(&existing.id) {
-                    meta.entry(stored.id.clone()).or_insert(m);
+                if let Some((m_error, m_detail, m_updated)) = meta.remove(&existing.id) {
+                    let entry = meta.entry(stored.id.clone()).or_default();
+                    if pu.usage.is_empty() {
+                        if entry.0.is_none() {
+                            entry.0 = m_error;
+                        }
+                        if entry.1.is_none() {
+                            entry.1 = m_detail;
+                        }
+                    }
+                    if entry.2.is_none() {
+                        entry.2 = m_updated;
+                    }
                 }
                 existing.id.clone_from(&stored.id);
             }
             existing.label.clone_from(&stored.label);
-            existing.email.clone_from(&stored.email);
+            if stored.email.is_some() {
+                existing.email.clone_from(&stored.email);
+            }
             existing.profile_dir.clone_from(&resolved_profile_dir);
             if !pu.usage.is_empty() {
                 existing.usage = pu.usage.to_proto();
@@ -1494,7 +1535,7 @@ pub fn switch_account(
         return Ok(refresh_accounts(home, state_dir));
     }
     if provider == ProviderKind::Codex {
-        codex_home::migrate(home, state_dir)?;
+        codex_home::migrate_for_switch(home, state_dir, account_id)?;
     }
     let snap = refresh_accounts(home, state_dir);
     let Some(target) = snap
@@ -1520,12 +1561,20 @@ pub fn switch_account(
         file.active
             .insert(provider.as_str().to_owned(), account_id.to_owned());
         save_inner(home, state_dir, &file)?;
+        // 사용자가 한도 계정을 직접 고르면 이전 한도 기록을 `SAVE_LOCK` 안에서 함께 지운다.
+        clear_rate_limited(provider, account_id);
     }
     agy_native::sync_active_from_disk(home, state_dir);
-    // 사용자가 한도 계정을 직접 고르면 이전 한도 기록을 지운다. 다시 한도에 걸리면 훅이 새로 기록한다.
-    clear_rate_limited(provider, account_id);
 
     Ok(refresh_accounts(home, state_dir))
+}
+
+pub(crate) fn redacted_account_id(account_id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    crate::mobile::devices::hex(&Sha256::digest(account_id.as_bytes()))
+        .chars()
+        .take(12)
+        .collect()
 }
 
 /// 리셋 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다. Codex(banked reset)와
@@ -1702,7 +1751,11 @@ pub fn remove_account(
     {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
-        let Some(idx) = file.accounts.iter().position(|a| a.id == account_id) else {
+        let Some(idx) = file
+            .accounts
+            .iter()
+            .position(|a| a.id == account_id && a.provider == provider.as_str())
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("account not found: {account_id}"),
@@ -1788,37 +1841,45 @@ pub fn delete_account(
             "cannot remove host default account",
         ));
     }
-    if is_orca_detected(account_id) {
-        hide_orca_account(home, state_dir, provider, account_id)?;
-        return Ok(refresh_accounts(home, state_dir));
-    }
     let dir = {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
-        let Some(idx) = file
+        if let Some(idx) = file
             .accounts
             .iter()
             .position(|a| a.id == account_id && a.provider == provider.as_str())
-        else {
+        {
+            let removed = file.accounts.remove(idx);
+            let dir = PathBuf::from(&removed.profile_dir);
+            if profile_in_use(&dir, in_use) {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            hide_removed_orca_markers(home, &mut file, &removed);
+            if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
+                file.active.remove(provider.as_str());
+            }
+            save_inner(home, state_dir, &file)?;
+            Some(dir)
+        } else if provider == ProviderKind::Claude && is_orca_detected(account_id) {
+            // Orca 감지 계정 삭제 = Krill 목록에서 숨김. Orca 프로필·캐시는 Orca 소유라 지우지 않는다.
+            if !file.hidden_accounts.iter().any(|id| id == account_id) {
+                file.hidden_accounts.push(account_id.to_owned());
+            }
+            if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
+                file.active.remove(provider.as_str());
+            }
+            save_inner(home, state_dir, &file)?;
+            None
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("account not found: {account_id}"),
             ));
-        };
-        let removed = file.accounts.remove(idx);
-        let dir = PathBuf::from(&removed.profile_dir);
-        if profile_in_use(&dir, in_use) {
-            return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        hide_removed_orca_markers(home, &mut file, &removed);
-        if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
-            file.active.remove(provider.as_str());
-        }
-        save_inner(home, state_dir, &file)?;
-        dir
     };
     agy_native::sync_active_from_disk(home, state_dir);
-    if krill_proto::usage::profiles::is_managed(home, &dir)
+    if let Some(dir) = dir
+        && krill_proto::usage::profiles::is_managed(home, &dir)
         && let Err(e) = krill_proto::usage::profiles::move_to_trash(home, &dir)
     {
         tracing::warn!(kind = ?e.kind(), errno = e.raw_os_error(), "account profile left as orphan");
@@ -1828,28 +1889,6 @@ pub fn delete_account(
 
 fn is_orca_detected(account_id: &str) -> bool {
     account_id.starts_with("claude-orca-")
-}
-
-/// Orca 감지 계정 삭제 = Krill 목록에서 숨김. Orca 프로필·캐시는 Orca 소유라 지우지 않는다.
-fn hide_orca_account(
-    home: &Path,
-    state_dir: Option<&Path>,
-    provider: ProviderKind,
-    account_id: &str,
-) -> io::Result<()> {
-    {
-        let _guard = lock(&SAVE_LOCK);
-        let mut file = load_writable(home, state_dir)?;
-        if !file.hidden_accounts.iter().any(|id| id == account_id) {
-            file.hidden_accounts.push(account_id.to_owned());
-        }
-        if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
-            file.active.remove(provider.as_str());
-        }
-        save_inner(home, state_dir, &file)?;
-    }
-    agy_native::sync_active_from_disk(home, state_dir);
-    Ok(())
 }
 
 // 세션이 같은 폴더를 symlink·정규화된 경로로 기록했어도 보호한다.
@@ -2537,5 +2576,201 @@ mod orca_identity_regressions {
         assert_eq!(host_out.email, None);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_registered_account_named_orca_removes_entry_and_trashes_dir() {
+        let root = std::env::temp_dir().join(format!("dc42-orca-label-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let added = add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Claude,
+            "Orca Work",
+            None,
+            "",
+        )
+        .unwrap();
+        let acc = added
+            .accounts
+            .iter()
+            .find(|a| a.label == "Orca Work")
+            .unwrap()
+            .clone();
+        assert_eq!(acc.id, "claude-orca-work");
+        let dir = PathBuf::from(&acc.profile_dir);
+        assert!(dir.is_dir());
+
+        // Mismatched provider for unregistered claude-orca-* ID must return NotFound.
+        let err = delete_account(
+            &home,
+            Some(&state),
+            ProviderKind::Codex,
+            "claude-orca-unregistered",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let after =
+            delete_account(&home, Some(&state), ProviderKind::Claude, &acc.id, &[]).unwrap();
+        assert!(
+            after.accounts.iter().all(|a| a.id != acc.id),
+            "registered claude-orca-* account must actually be deleted"
+        );
+        assert!(!dir.exists(), "managed profile dir must be trashed");
+        let refreshed = refresh_accounts(&home, Some(&state));
+        assert!(refreshed.accounts.iter().all(|a| a.id != acc.id));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn remove_account_requires_matching_provider() {
+        let root =
+            std::env::temp_dir().join(format!("dc51-remove-provider-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        add_account(&home, Some(&state), ProviderKind::Claude, "Work", None, "").unwrap();
+        switch_account(&home, Some(&state), ProviderKind::Claude, "claude-work").unwrap();
+        let err =
+            remove_account(&home, Some(&state), ProviderKind::Codex, "claude-work").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let file = load_file(&home, Some(&state));
+        assert!(file.accounts.iter().any(|a| a.id == "claude-work"));
+        assert_eq!(
+            file.active.get("claude").map(String::as_str),
+            Some("claude-work")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn orca_uuid_from_profile_dir_handles_windows_separators_and_trailing_slashes() {
+        let uuid = "96f8c826-8b89-4470-a327-f4918efb8177";
+        assert_eq!(
+            orca_uuid_from_profile_dir(&format!(
+                r"C:\Users\me\AppData\Roaming\orca\claude-profiles\{uuid}\home"
+            )),
+            Some(uuid)
+        );
+        assert_eq!(
+            orca_uuid_from_profile_dir(&format!(r"C:\Users\me\orca\claude-accounts\{uuid}\auth\")),
+            Some(uuid)
+        );
+        assert_eq!(
+            orca_uuid_from_profile_dir(&format!("/tmp/orca/codex-accounts/{uuid}/home/")),
+            Some(uuid)
+        );
+    }
+
+    #[test]
+    fn merge_registered_claude_with_orca_preserves_status_metadata_and_email() {
+        let root = std::env::temp_dir().join(format!("dc50-orca-merge-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let profile = root.join("custom-profile");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+
+        std::fs::write(
+            home.join(".claude").join(ORCA_CACHE),
+            r#"{"updated_at":1700000123,"accounts":[{"id":"432d5922-d39e-4df0-9255-6de3443b3df0","label":"Personal","email":"user@example.com","error":"재로그인","detail":"token 400"}]}"#,
+        )
+        .unwrap();
+
+        let file = AccountsFile {
+            accounts: vec![StoredAccount {
+                id: "claude-org-user".into(),
+                provider: "claude".into(),
+                label: "user@example.com (Org)".into(),
+                email: None,
+                profile_dir: profile.display().to_string(),
+            }],
+            ..AccountsFile::default()
+        };
+        save_inner(&home, Some(&state), &file).unwrap();
+
+        let snap = refresh_accounts(&home, Some(&state));
+        let acc = snap
+            .accounts
+            .iter()
+            .find(|a| a.id == "claude-org-user")
+            .unwrap();
+        assert_eq!(acc.email.as_deref(), Some("user@example.com"));
+        let status = snap.status_for("claude-org-user").unwrap();
+        assert_eq!(status.status, AccountStatus::NeedsLogin);
+        assert_eq!(status.detail.as_deref(), Some("token 400"));
+        assert_eq!(status.updated_at, Some(1_700_000_123));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manual_switch_clears_rate_limit_and_keeps_selection_on_refresh() {
+        let root = std::env::temp_dir().join(format!("dc47-switch-rl-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let p1 = root.join("p1");
+        let p2 = root.join("p2");
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&p2).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(p1.join(CLAUDE_CACHE), r#"{"five_hour":{"utilization":90}}"#).unwrap();
+        std::fs::write(p2.join(CLAUDE_CACHE), r#"{"five_hour":{"utilization":10}}"#).unwrap();
+        let file = AccountsFile {
+            active: BTreeMap::from([("claude".into(), "claude-dc47-b".into())]),
+            accounts: vec![
+                StoredAccount {
+                    id: "claude-dc47-a".into(),
+                    provider: "claude".into(),
+                    label: "A".into(),
+                    email: None,
+                    profile_dir: p1.display().to_string(),
+                },
+                StoredAccount {
+                    id: "claude-dc47-b".into(),
+                    provider: "claude".into(),
+                    label: "B".into(),
+                    email: None,
+                    profile_dir: p2.display().to_string(),
+                },
+            ],
+            ..AccountsFile::default()
+        };
+        save_inner(&home, Some(&state), &file).unwrap();
+        record_rate_limited(ProviderKind::Claude, "claude-dc47-a");
+
+        let switched =
+            switch_account(&home, Some(&state), ProviderKind::Claude, "claude-dc47-a").unwrap();
+        assert!(
+            switched
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-dc47-a" && a.active)
+        );
+        assert!(
+            !lock(&RATE_LIMITED).contains_key(&("claude".to_owned(), "claude-dc47-a".to_owned()))
+        );
+        let refreshed = refresh_accounts(&home, Some(&state));
+        assert!(
+            refreshed
+                .accounts
+                .iter()
+                .any(|a| a.id == "claude-dc47-a" && a.active),
+            "manual selection must hold on subsequent refresh after clearing rate limit"
+        );
+        clear_rate_limited(ProviderKind::Claude, "claude-dc47-a");
+        std::fs::remove_dir_all(root).ok();
     }
 }

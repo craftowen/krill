@@ -890,33 +890,38 @@ pub fn handoff(
     copies.clear();
     drop(ack_write);
     drop(boot_read);
-    let info = listener
-        .map(|s| duplicate_socket(s, process.pid))
-        .transpose()?
-        .unwrap_or_default();
-    let mut boot = std::fs::File::from(boot_write);
-    boot.write_all(
-        &u32::try_from(info.len())
-            .map_err(|_| io::ErrorKind::InvalidData)?
-            .to_le_bytes(),
-    )?;
-    boot.write_all(&info)?;
-    drop(boot);
-    let mut reader = std::fs::File::from(ack_read);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while available(reader.as_handle()).unwrap_or_default() == 0 {
-        if process.status()?.is_some() || std::time::Instant::now() >= deadline {
-            terminate(&process).ok();
-            return Err(io::ErrorKind::TimedOut.into());
+    let result = (|| -> io::Result<()> {
+        let info = listener
+            .map(|s| duplicate_socket(s, process.pid))
+            .transpose()?
+            .unwrap_or_default();
+        let mut boot = std::fs::File::from(boot_write);
+        boot.write_all(
+            &u32::try_from(info.len())
+                .map_err(|_| io::ErrorKind::InvalidData)?
+                .to_le_bytes(),
+        )?;
+        boot.write_all(&info)?;
+        drop(boot);
+        let mut reader = std::fs::File::from(ack_read);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while available(reader.as_handle()).unwrap_or_default() == 0 {
+            if process.status()?.is_some() || std::time::Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut ack = [0];
+        reader.read_exact(&mut ack)?;
+        if ack != [1] {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        terminate(&process).ok();
     }
-    let mut ack = [0];
-    reader.read_exact(&mut ack)?;
-    if ack != [1] {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    Ok(())
+    result
 }
 type Handoff = (String, Vec<OwnedHandle>, std::fs::File, Option<OwnedSocket>);
 pub fn take_handoff() -> io::Result<Option<Handoff>> {

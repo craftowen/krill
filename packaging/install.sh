@@ -314,8 +314,12 @@ if [[ "${MODE}" == "release" ]]; then
 
     # [01/06] 릴리스 다운로드 경로 확인
     ui_step_start "01" "06" "$(msg "릴리스 확인 중" "Checking the release")"
-    if command -v curl >/dev/null && [[ "${VALUE}" == "latest" ]]; then
-        MANIFEST_URL="https://github.com/${REPO}/releases/latest/download/latest.json"
+    if command -v curl >/dev/null; then
+        if [[ "${VALUE}" == "latest" ]]; then
+            MANIFEST_URL="https://github.com/${REPO}/releases/latest/download/latest.json"
+        else
+            MANIFEST_URL="https://github.com/${REPO}/releases/download/${VALUE}/latest.json"
+        fi
         if curl -fsSL --connect-timeout 15 "${MANIFEST_URL}" -o "${WORK}/latest.json" 2>/dev/null; then
             ZIP_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "${WORK}/latest.json" 2>/dev/null || true)"
             if [[ -n "${ZIP_URL}" ]]; then
@@ -482,6 +486,7 @@ for root, dirs, files in os.walk(dst, topdown=False):
 
     # [06/06] CLI 연결·앱 열기 요청
     ui_step_start "06" "06" "$(msg "CLI 연결·앱 열기 요청 중" "Linking the CLI and opening the app")"
+    APP_DST="$(cd "${APP_DST}" && pwd)"
     BIN="${PREFIX}/bin"
     mkdir -p "${BIN}"
     ln -sfn "${APP_DST}/Contents/MacOS/krill" "${BIN}/krill"

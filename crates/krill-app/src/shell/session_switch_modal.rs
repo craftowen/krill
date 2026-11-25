@@ -303,7 +303,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn close_session_switch_modal(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_session_switch_modal(&mut self, cx: &mut Context<Self>) {
         if self.session_switch.take().is_some() {
             cx.notify();
         }

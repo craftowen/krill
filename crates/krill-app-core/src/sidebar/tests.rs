@@ -7936,3 +7936,218 @@ fn worktree_rename_ignores_enter_and_escape_during_ime_composition(cx: &mut Test
         );
     });
 }
+
+#[gpui::test]
+fn remote_session_focus_does_not_collide_with_same_local_id(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let local_repo = PathBuf::from("/local/repo");
+    let remote_repo = PathBuf::from("/remote/repo");
+    let remote = HostId::Remote("studio".into());
+    view.update(vcx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![session(7, AgentState::Exited, Some("/local/repo"))],
+            trees: BTreeMap::from([(local_repo.clone(), vec![local_repo.clone()])]),
+        };
+        s.set_remote_snapshot_for_test(
+            "studio",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![session(7, AgentState::Working, Some("/remote/repo"))],
+                trees: BTreeMap::from([(remote_repo.clone(), vec![remote_repo.clone()])]),
+            },
+            cx,
+        );
+        s.set_focused_on(remote.clone(), Some(SessionId(7)), cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        let local_idx = s
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| {
+                (matches!(r, Row::Session(sess, _) if sess.id == SessionId(7))
+                    && s.row_host(i).is_local())
+                .then_some(i)
+            })
+            .expect("local session row");
+        let remote_idx = s
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| {
+                (matches!(r, Row::Session(sess, _) if sess.id == SessionId(7))
+                    && s.row_host(i) == &remote)
+                    .then_some(i)
+            })
+            .expect("remote session row");
+        assert!(!s.is_session_focused(local_idx, SessionId(7)));
+        assert!(s.is_session_focused(remote_idx, SessionId(7)));
+    });
+
+    // With hide_sleeping enabled, remote focus on SessionId(7) must NOT wake local SessionId(7).
+    view.update(vcx, |s, cx| {
+        s.options.filters.hide_sleeping = true;
+        s.options.filters.always_show_default_branch = false;
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            !s.rows
+                .iter()
+                .enumerate()
+                .any(|(i, r)| matches!(r, Row::Worktree(p) if p == &local_repo)
+                    && s.row_host(i).is_local()),
+            "local sleeping worktree must not stay awake from remote SessionId(7) focus"
+        );
+        assert!(
+            s.rows
+                .iter()
+                .enumerate()
+                .any(|(i, r)| matches!(r, Row::Worktree(p) if p == &remote_repo)
+                    && s.row_host(i) == &remote),
+            "remote focused worktree must remain visible"
+        );
+    });
+}
+
+#[gpui::test]
+fn set_bot_sessions_rebuilds_hidden_bot_worktrees(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let repo = PathBuf::from("/repo");
+    let worker_wt = PathBuf::from("/repo/bot-worker-wt");
+    view.update(vcx, |s, cx| {
+        s.bot_worktrees = Some(BTreeSet::new());
+        s.snapshot = Snapshot {
+            sessions: vec![session(
+                10,
+                AgentState::Working,
+                Some("/repo/bot-worker-wt"),
+            )],
+            trees: BTreeMap::from([(repo.clone(), vec![repo.clone(), worker_wt.clone()])]),
+        };
+        s.disk
+            .orchestration
+            .runs
+            .push(krill_proto::orchestration::Run {
+                id: "run-1".into(),
+                title: "Run 1".into(),
+                coordinator_session_id: Some(99),
+                status: krill_proto::orchestration::RunStatus::Active,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            });
+        s.disk
+            .orchestration
+            .dispatches
+            .push(krill_proto::orchestration::Dispatch {
+                id: "disp-1".into(),
+                run_id: "run-1".into(),
+                task_id: None,
+                worker_name: "w1".into(),
+                agent: "claude".into(),
+                session_id: Some(10),
+                depth: 0,
+                cwd: worker_wt.to_string_lossy().into_owned(),
+                prompt: String::new(),
+                status: krill_proto::orchestration::DispatchStatus::Active,
+                summary: None,
+                archived_output: None,
+                started_at_ms: 1,
+                ended_at_ms: None,
+                release_state: krill_proto::orchestration::DispatchReleaseState::Active,
+                session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            });
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |s, _| s
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Worktree(p) if p == &worker_wt))),
+        "before bot session arrives, worktree is visible"
+    );
+
+    view.update(vcx, |s, cx| {
+        let meta = krill_ui::bot_types::BotSessionMeta {
+            bot_id: krill_proto::bots::BotId::new("bot-1").unwrap(),
+            bot_name: "Bot".into(),
+            emoji: None,
+            avatar_color: None,
+        };
+        s.set_bot_sessions(HostId::Local, BTreeMap::from([(SessionId(99), meta)]), cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(vcx, |s, _| s
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Worktree(p) if p == &worker_wt))),
+        "set_bot_sessions must rebuild and hide bot worker worktree"
+    );
+}
+
+#[gpui::test]
+fn remote_worktree_hides_and_ignores_local_pin_and_rename(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let shared_path = PathBuf::from("/shared/repo");
+    let remote = HostId::Remote("studio".into());
+    view.update(vcx, |s, cx| {
+        s.set_remote_snapshot_for_test(
+            "studio",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![session(1, AgentState::Working, Some("/shared/repo"))],
+                trees: BTreeMap::from([(shared_path.clone(), vec![shared_path.clone()])]),
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let remote_idx = view.read_with(vcx, |s, _| {
+        s.rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| {
+                (matches!(r, Row::Worktree(p) if p == &shared_path) && s.row_host(i) == &remote)
+                    .then_some(i)
+            })
+            .expect("remote worktree row")
+    });
+    assert_eq!(remote_idx, 1);
+    assert!(
+        vcx.debug_bounds("worktree-pin-1").is_none(),
+        "remote worktree must not render local pin button"
+    );
+    assert!(
+        vcx.debug_bounds("worktree-rename-1").is_none(),
+        "remote worktree must not render local rename button"
+    );
+    view.update(vcx, |s, cx| {
+        s.cursor = Some(remote_idx);
+        s.toggle_pin_cursor(cx);
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| s.rename_cursor(window, cx));
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(
+            !s.prefs.contains_key(&shared_path),
+            "pin shortcut on remote worktree must not mutate local prefs"
+        );
+        assert!(
+            s.editing.is_none(),
+            "rename shortcut on remote worktree must not open local rename editor"
+        );
+    });
+}

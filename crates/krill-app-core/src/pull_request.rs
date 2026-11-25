@@ -591,14 +591,70 @@ impl Runner for Gh {
     }
 }
 
-pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
-    let exe = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|p| p.join(name))
-                .find(|p| executable(p))
+const WINDOWS_EXE_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+fn has_windows_executable_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            WINDOWS_EXE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
         })
-        .or_else(|| fallbacks.iter().map(PathBuf::from).find(|p| executable(p)))
+}
+
+fn executable_candidates_for(dir: &Path, name: &str, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        if has_windows_executable_extension(Path::new(name)) {
+            return vec![dir.join(name)];
+        }
+        WINDOWS_EXE_EXTENSIONS
+            .iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .collect()
+    } else {
+        vec![dir.join(name)]
+    }
+}
+
+fn fallback_candidates_for(fallback: &str, windows: bool) -> Vec<PathBuf> {
+    let path = PathBuf::from(fallback);
+    if !windows || has_windows_executable_extension(&path) {
+        return vec![path];
+    }
+    WINDOWS_EXE_EXTENSIONS
+        .iter()
+        .map(|ext| PathBuf::from(format!("{fallback}.{ext}")))
+        .collect()
+}
+
+pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
+    find_executable_in_for(
+        name,
+        std::env::var_os("PATH").as_deref(),
+        fallbacks,
+        cfg!(windows),
+    )
+}
+
+fn find_executable_in_for(
+    name: &str,
+    path_env: Option<&std::ffi::OsStr>,
+    fallbacks: &[&str],
+    windows: bool,
+) -> PathBuf {
+    let exe = path_env
+        .and_then(|path| {
+            std::env::split_paths(path)
+                .flat_map(|dir| executable_candidates_for(&dir, name, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
+        .or_else(|| {
+            fallbacks
+                .iter()
+                .flat_map(|fallback| fallback_candidates_for(fallback, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
         .unwrap_or_else(|| name.into());
     std::fs::canonicalize(&exe).unwrap_or(exe)
 }
@@ -718,8 +774,16 @@ pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
 }
 
 fn executable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    executable_for(path, cfg!(windows))
+}
+
+fn executable_for(path: &Path, windows: bool) -> bool {
+    if windows {
+        has_windows_executable_extension(path) && path.metadata().is_ok_and(|m| m.is_file())
+    } else {
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    }
 }
 
 struct Reap {
@@ -1657,5 +1721,61 @@ mod local_agent_stdin_tests {
                 .expect("stdin pipe should round-trip multiline prompt");
             assert_eq!(out, b"line1\nline2\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod windows_executable_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn windows_executable_discovery_probes_extensions_and_rejects_extensionless_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pr-win-exe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon_dir = std::fs::canonicalize(&dir).unwrap();
+
+        // npm on Windows installs both an extensionless POSIX shim (`claude`) and `claude.cmd`.
+        let bare = dir.join("claude");
+        let cmd = dir.join("claude.cmd");
+        let bat = dir.join("gemini.bat");
+        let exe = dir.join("gh.exe");
+        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(&bat, b"@echo off\r\n").unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        assert!(!executable_for(&bare, true));
+        assert!(executable_for(&cmd, true));
+        assert!(executable_for(&bat, true));
+        assert!(executable_for(&exe, true));
+
+        let path_env = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(
+            find_executable_in_for("claude", Some(&path_env), &[], true),
+            canon_dir.join("claude.cmd")
+        );
+        assert_eq!(
+            find_executable_in_for("gemini", Some(&path_env), &[], true),
+            canon_dir.join("gemini.bat")
+        );
+        assert_eq!(
+            find_executable_in_for("gh", Some(&path_env), &[], true),
+            canon_dir.join("gh.exe")
+        );
+        // If only an extensionless file exists, Windows discovery must not return it as executable.
+        let bare_only = dir.join("codex");
+        std::fs::write(&bare_only, b"#!/bin/sh\n").unwrap();
+        let found = find_executable_in_for("codex", Some(&path_env), &[], true);
+        assert_eq!(found, PathBuf::from("codex"));
+        assert!(!executable_for(&found, true));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

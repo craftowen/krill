@@ -1515,3 +1515,23 @@ pub(crate) fn format_avatar_saved(
         ))
     }
 }
+
+pub(crate) fn format_avatar_updated(
+    bot_id: &BotId,
+    mime: &str,
+    bytes: usize,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        to_json(&serde_json::json!({
+            "ok": true,
+            "bot_id": bot_id,
+            "mime": mime,
+            "bytes": bytes,
+        }))
+    } else {
+        Ok(format!(
+            "updated avatar for {bot_id} ({mime}, {bytes} bytes)"
+        ))
+    }
+}

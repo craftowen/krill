@@ -167,14 +167,20 @@ impl SshOptions {
     /// 안정성용 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
     /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
     pub fn common_args(&self, connect_timeout_secs: u16) -> Vec<String> {
+        let effective = effective_config(&self.destination, self.port);
+        self.common_args_with_config(connect_timeout_secs, effective.as_deref())
+    }
+
+    fn common_args_with_config(
+        &self,
+        connect_timeout_secs: u16,
+        effective: Option<&str>,
+    ) -> Vec<String> {
         // 모든 호출이 비대화형이다: 비밀번호·ASKPASS 창을 띄우지 않고 바로 실패한다.
         let mut args = vec!["-o".to_owned(), "BatchMode=yes".to_owned()];
-        // 사용자가 StrictHostKeyChecking을 정하지 않았을 때만 처음 보는 호스트 키를 기록하고 믿는다.
-        // 바뀐 키는 ssh가 그대로 거부한다.
-        if !effective_config(&self.destination, self.port)
-            .as_deref()
-            .is_some_and(user_sets_host_key_checking)
-        {
+        // 사용자가 StrictHostKeyChecking을 정하지 않았음을 `ssh -G`로 확인했을 때만 accept-new를 붙인다.
+        // `ssh -G`가 실패하면 fail-closed로 두어 `~/.ssh/config`의 명시 설정을 CLI 플래그로 덮어쓰지 않는다.
+        if effective.is_some_and(|cfg| !user_sets_host_key_checking(cfg)) {
             args.extend([
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
@@ -260,11 +266,19 @@ impl SshOptions {
 /// `hosts.toml`에서 `destination`·`label`·`id`가 일치하는 항목을 찾아 포트·키·원격 소켓 옵션을 채운다.
 pub fn resolve_host_options(host: &str, state_dir: Option<&Path>) -> io::Result<SshOptions> {
     let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SSH destination: empty host",
+        ));
+    }
     if let Some(dir) = state_dir
         && let Ok(text) = std::fs::read_to_string(dir.join(HOSTS_FILE))
         && let Ok(parsed) = toml::from_str::<HostsFile>(&text)
         && let Some(entry) = parsed.hosts.into_iter().find(|h| {
-            h.destination == trimmed || h.label == trimmed || (!h.id.is_empty() && h.id == trimmed)
+            (!h.destination.is_empty() && h.destination == trimmed)
+                || (!h.label.is_empty() && h.label == trimmed)
+                || (!h.id.is_empty() && h.id == trimmed)
         })
     {
         let opts = SshOptions {
@@ -498,16 +512,18 @@ fn effective_config(destination: &str, port: Option<u16>) -> Option<String> {
     let key = (ssh_program(), destination.to_owned(), port);
     let mtime = ssh_config_mtime();
     if let Ok(cache) = SSH_CONFIGS.lock()
-        && let Some((at, seen, value)) = cache.get(&key)
+        && let Some((at, seen, Some(value))) = cache.get(&key)
         && at.elapsed() < MACHINE_KEY_TTL
         && *seen == mtime
     {
-        return value.clone();
+        return Some(value.clone());
     }
     let value = effective_config_with_program(destination, port, &ssh_program());
-    if let Ok(mut cache) = SSH_CONFIGS.lock() {
+    if let Some(ref resolved) = value
+        && let Ok(mut cache) = SSH_CONFIGS.lock()
+    {
         cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
-        cache.insert(key, (Instant::now(), mtime, value.clone()));
+        cache.insert(key, (Instant::now(), mtime, Some(resolved.clone())));
     }
     value
 }
@@ -528,8 +544,12 @@ fn effective_config_with_program(
     #[cfg(windows)]
     let out = windows::stdio::output(program, &args, None, Duration::from_secs(5));
     #[cfg(unix)]
-    let out =
-        crate::managed::run_piped_ssh_with_timeout(program, &args, None, Duration::from_secs(5));
+    let out = crate::managed::run_piped_command_with_timeout(
+        program,
+        &args,
+        None,
+        Duration::from_secs(5),
+    );
     match out {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         _ => None,
@@ -614,10 +634,12 @@ pub fn valid_identity_file(path: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && !s.chars().any(char::is_control)
 }
 
-/// 원격 소켓(또는 원격 HOME) 경로 검사. 절대 경로(`/`)여야 하며 `-L` 구분자(`:`)와 제어문자를 거부한다.
+/// 원격 소켓(또는 원격 HOME) 경로 검사. 앞뒤 공백 없는 절대 경로(`/`)여야 하며 `-L` 구분자(`:`)와 제어문자를 거부한다.
 pub fn valid_remote_socket(path: &str) -> bool {
-    let s = path.trim();
-    s.starts_with('/') && !s.contains(':') && !s.chars().any(char::is_control)
+    path.trim() == path
+        && path.starts_with('/')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control)
 }
 
 /// 로컬 포워딩 소켓 경로 검사. Unix `-L` 구분자(`:`)와 제어문자를 거부한다.
