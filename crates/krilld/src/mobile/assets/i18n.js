@@ -1005,6 +1005,22 @@
     "setup did not start: {0}": "설정 스크립트를 시작하지 못했습니다: {0}",
     "symlink: cannot resolve repository paths": "심볼릭 링크: 저장소 경로를 확인할 수 없습니다",
     "include: cannot resolve repository paths": "포함 파일: 저장소 경로를 확인할 수 없습니다",
+    "Switch bot": "봇 전환",
+    "Bot panel": "봇 패널",
+    "Bot settings": "봇 설정",
+    "More actions": "더보기",
+    "Items, {0} need you": "작업 목록, 확인 필요 {0}건",
+    "1 item needs you": "1개 항목 확인 필요",
+    "{0} items need you": "{0}개 항목 확인 필요",
+    View: "보기",
+    "1 chat": "채팅 1개",
+    "{0} chats": "채팅 {0}개",
+    "Chats ({0})": "채팅 ({0})",
+    "another chat is active": "다른 채팅이 실행 중",
+    "Switch chat": "채팅 전환",
+    "Stop active work": "실행 중인 작업 중지",
+    "No other bots": "다른 봇이 없습니다",
+    "No active chats": "활성 채팅이 없습니다",
   };
   function detectLanguage() {
     const nav = globalThis.navigator;

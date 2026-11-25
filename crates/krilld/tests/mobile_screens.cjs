@@ -992,9 +992,14 @@ async function botsScreens(){
  assert(uni.root.textContent.includes('All caught up'));
  uni.abort.abort();
 
- // 5. #/bots/:id Bot Workspace (A+C+D): 4 segment tabs, embedded chat, worker strip, collapsible items, automations run/toggle, settings (agy + pause + SOUL/MEMORY)
+ // 5. #/bots/:id Orca 1.4.274 Bot Session screen: compact header, 44px single-row tab bar, conditional needs strip, and botPanel bottom sheet
+ delete itemData[0].snoozed_until_ms;
  let mountedChatSessions=[];
  let unmountedChats=0;
+ const twoSessions=[
+  {session_id:99,bot_id:'b1',pid:4242,live:true,working:true,label:'Home',created_at_ms:1000},
+  {session_id:100,bot_id:'b1',pid:4243,live:true,working:false,label:'CI Triage',created_at_ms:2000},
+ ];
  const df=fixture('bots',{
   route:{botId:'b1'},
   state:{snapshot:{capabilities:{bots:true}}},
@@ -1005,7 +1010,7 @@ async function botsScreens(){
    if(req.action==='bots.connectors.status')return {statuses:[{bot_id:'b1',source:'telegram',state:'connected'}]};
    if(req.action==='bots.suggestions.list')return {suggestions:suggestionsData};
    if(req.action==='bots.access.list')return {requests:[]};
-   if(req.action==='bots.sessions.list')return {sessions:botSessionsData};
+   if(req.action==='bots.sessions.list')return {sessions:twoSessions};
    if(req.action==='bots.groups.list')return {groups:groupsData};
    if(req.action==='bots.upcoming')return {look_around_last_ms:Date.now()-60000,schedules:[{id:'nightly',running:false,next_ms:Date.now()+3600000}]};
    if(req.action==='bots.soul.get')return {bot_id:'b1',content:'# Soul'};
@@ -1021,47 +1026,111 @@ async function botsScreens(){
   }
  });
  df.M.chat={mount:(node,opts)=>{mountedChatSessions.push(opts.sessionId);node.append(df.ctx.el('div',`Embedded chat #${opts.sessionId}`,'chat-view'));return {setVisible(){},update(){},unmount(){unmountedChats++;}};}};
+ df.ctx.closeSheet=()=>{};
  df.view.update();
  await df.flush();
- // Default Chat tab mounts embedded chat + shows avatar rail + worker strip + Terminal switch
- const segTabs=df.all().filter(n=>n.dataset?.botTab);
- assert.deepEqual(segTabs.map(n=>n.dataset.botTab),['chat','work','automations','settings'],'4 segment tabs in Bot Workspace');
- assert(df.find('.bot-rail'),'avatar rail renders inside Bot Workspace for 1-tap switching');
- assert(mountedChatSessions.includes(99),'M.chat.mount embeds live bot session inside Chat tab');
- assert(df.find('.bot-worker-strip'),'worker strip shows active bot session');
- await df.find('.bot-worker-strip').descendants().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Stop').action();
+ // Old 5-layer chrome is completely removed from #/bots/:id
+ assert(!df.find('.bot-workspace-rail'),'avatar rail removed from #/bots/:id');
+ assert(!df.find('.bot-workspace-tabs'),'4-tab segment bar removed from #/bots/:id top');
+ assert(!df.find('.bot-thread-bar'),'thread chip bar removed from #/bots/:id');
+ assert(!df.find('.bot-worker-strip'),'worker banner removed from #/bots/:id');
+ assert(!df.find('.bot-decision-deck'),'decision deck removed from #/bots/:id chat top');
+ // Orca 1.4.274 header: centered bot title button + checklist button with badge + more button
+ assert(df.find('.bot-session-header'),'Orca session header renders');
+ assert(df.find('.bot-header-title-btn').textContent.includes('Triage Bot'),'header title shows bot name');
+ assert.equal(df.find('.bot-header-badge').textContent,'1','header checklist badge shows needsCount');
+ assert(!df.find('.bot-header-badge').hidden,'header checklist badge visible when needsCount > 0');
+ // Header title tap opens Switch bot sheet
+ await df.find('.bot-header-title-btn').action();
+ assert.equal(df.sheets.at(-1)[0],'Switch bot');
+ const switchSheetBody=df.ctx.el('div');
+ df.sheets.at(-1)[3](switchSheetBody);
+ assert(switchSheetBody.textContent.includes('Agy Bot'),'bot switcher sheet lists other bots');
+ // Conditional slim 1-line needs strip renders when needsCount > 0
+ const needsStrip=df.find('.bot-needs-strip');
+ assert(needsStrip&&needsStrip.textContent.includes('1 item needs you'),'conditional needs strip shows count');
+ // Single 44px Orca tab bar renders active session, count box [2], and + button
+ const tabBar=df.find('.bot-session-tabbar');
+ assert(tabBar,'Orca 44px session tab bar renders when live sessions >= 1');
+ assert(tabBar.querySelector('.bot-tab-title').textContent==='Home Chat','active tab shows Home Chat');
+ assert.equal(tabBar.querySelector('.tab-count-box').textContent,'2','count box shows live session count');
+ assert(mountedChatSessions.includes(99),'M.chat.mount embeds live bot session');
+ // Tapping active tab cell opens session actions sheet with Open in terminal + Stop
+ await tabBar.querySelector('.bot-tab-press').action();
+ const sessActionSheet=df.sheets.at(-1);
+ assert.equal(sessActionSheet[0],'Home Chat');
+ const stopFromTab=sessActionSheet[1].find(a=>a.label==='Stop');
+ assert(stopFromTab,'session action sheet exposes Stop');
+ await stopFromTab.action();
  assert(df.calls.some(c=>c.action==='bots.sessions.stop'&&c.bot_id==='b1'&&c.session_id===99));
+ // Tapping count box opens Chats (2) list sheet and switching session mounts session #100
+ await tabBar.querySelector('.bot-tab-count-cell').action();
+ assert.equal(df.sheets.at(-1)[0],'Chats (2)');
+ const chatsListBody=df.ctx.el('div');
+ df.sheets.at(-1)[3](chatsListBody);
+ const tab100Btn=chatsListBody.descendants().find(n=>n.dataset?.sessionTabId==='100');
+ assert(tab100Btn,'Chats sheet lists second session');
+ await tab100Btn.action();
+ assert(mountedChatSessions.includes(100),'switching session via Chats sheet mounts session #100');
+ assert.equal(tabBar.querySelector('.bot-tab-title').textContent,'CI Triage','tab bar updates to switched session label');
+ assert(!tabBar.querySelector('.bot-tab-count-alert').hidden,'count box shows corner alert dot when another session is working');
+ // Swipe right on active tab cell returns to Home Chat (#99)
+ const tabCellNode=tabBar.querySelector('.bot-tab-cell');
+ const tsEv=new Event('touchstart');tsEv.touches=[{clientX:40,clientY:20}];tabCellNode.dispatchEvent(tsEv);
+ const tmEv=new Event('touchmove');tmEv.touches=[{clientX:160,clientY:22}];tabCellNode.dispatchEvent(tmEv);
+ tabCellNode.dispatchEvent(new Event('touchend'));
+ assert.equal(tabBar.querySelector('.bot-tab-title').textContent,'Home Chat','swiping right switches back to previous session');
+ // More menu (⋯) exposes Open in terminal, Stop active work, Switch bot, Refresh, Pause, Bot settings
+ await df.find('.bot-more-btn').action();
+ const moreItems=df.sheets.at(-1)[1].map(a=>a.label);
+ for(const reqLabel of ['Open in terminal','Stop active work','Switch bot','Refresh','Pause','Bot settings']){
+  assert(moreItems.includes(reqLabel),`More menu missing ${reqLabel}`);
+ }
 
- // Work tab: collapsible item cards + Look Around + External reply
- await segTabs.find(n=>n.dataset.botTab==='work').action();
- const itemDetails=df.find('.bot-item-details');
- assert(itemDetails&&itemDetails.hidden,'item details start collapsed in Work tab to avoid mis-taps');
- await df.byText('Details').action();
- assert(!df.find('.bot-item-details').hidden,'tapping Details expands item details');
- await df.byText('Look Around').action();
+ // Bot Panel Bottom Sheet (Work / Automations / Settings) via View button on needs strip
+ await df.find('.bot-needs-view').action();
+ const panelSheet=df.sheets.at(-1);
+ assert.equal(panelSheet[0],'Triage Bot');
+ const panelHost=df.ctx.el('div');
+ df.doc.body.append(panelHost);
+ const panelAbort=new AbortController();
+ panelSheet[3](panelHost,panelAbort.signal);
+ const panelTabs=panelHost.descendants().filter(n=>n.dataset?.botTab);
+ assert.deepEqual(panelTabs.map(n=>n.dataset.botTab),['work','automations','settings'],'Bot Panel sheet has 3 segment tabs');
+ const findInPanel=(lbl)=>panelHost.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')===lbl);
+ // Work tab inside Bot Panel: collapsible item cards + Look Around + External reply + background refresh preserves focus/draft
+ const itemDetails=panelHost.querySelector('.bot-item-details');
+ assert(itemDetails&&itemDetails.hidden,'item details start collapsed in Work tab');
+ await findInPanel('Details').action();
+ assert(!panelHost.querySelector('.bot-item-details').hidden,'tapping Details expands item details inside open panel');
+ await findInPanel('Look Around').action();
  assert(df.calls.some(c=>c.action==='bots.look_around'&&c.bot_id==='b1'));
- const replyBox=df.find('.bot-reply-card').querySelector('textarea');
+ const replyBox=panelHost.querySelector('.bot-reply-card').querySelector('textarea');
+ replyBox.focus();
  replyBox.value='Ack';
- await df.byText('Send reply').action();
+ df.view.update();
+ assert.equal(df.doc.activeElement,replyBox,'background update preserves textarea focus inside open Bot Panel');
+ assert.equal(replyBox.value,'Ack','background update preserves draft inside open Bot Panel');
+ await findInPanel('Send reply').action();
  assert(df.calls.some(c=>c.action==='bots.reply'&&c.bot_id==='b1'&&c.text==='Ack'));
 
- // Automations tab: lists all schedules (active + paused) and supports Run now + Pause/Enable toggle
- await segTabs.find(n=>n.dataset.botTab==='automations').action();
- assert(df.root.textContent.includes('Nightly triage')&&df.root.textContent.includes('Weekly digest'),'Automations tab shows all schedules, not just failures');
- const autoRunBtns=df.all().filter(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Run now');
+ // Automations tab inside Bot Panel: lists all schedules (active + paused) and supports Run now + Pause/Enable toggle
+ await panelTabs.find(n=>n.dataset.botTab==='automations').action();
+ assert(panelHost.textContent.includes('Nightly triage')&&panelHost.textContent.includes('Weekly digest'),'Automations tab shows all schedules');
+ const autoRunBtns=panelHost.descendants().filter(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Run now');
  assert(autoRunBtns.length>=2,'Look Around + schedules have Run now buttons');
  await autoRunBtns[1].action();
  assert(df.calls.some(c=>c.action==='bots.schedule.run'&&c.bot_id==='b1'&&c.schedule_id==='nightly'));
- await df.byText('Pause').action();
+ await findInPanel('Pause').action();
  assert(df.calls.some(c=>c.action==='bots.schedule.toggle'&&c.bot_id==='b1'&&c.schedule_id==='nightly'&&c.enabled===false));
 
- // Settings tab: Pause/Resume, agy provider switch, SOUL & MEMORY auto-loaded
- await segTabs.find(n=>n.dataset.botTab==='settings').action();
+ // Settings tab inside Bot Panel: Pause/Resume, agy provider switch, SOUL & MEMORY auto-loaded
+ await panelTabs.find(n=>n.dataset.botTab==='settings').action();
  await df.flush();
- assert(df.root.textContent.includes('SOUL.md'),'Settings tab loads SOUL.md');
- await df.byText('Save Soul').action();
+ assert(panelHost.textContent.includes('SOUL.md'),'Settings tab loads SOUL.md');
+ await findInPanel('Save Soul').action();
  assert(df.calls.some(c=>c.action==='bots.soul.set'&&c.content==='# Soul'));
- await df.byText('Agent').action();
+ await findInPanel('Agent').action();
  assert.equal(df.sheets.at(-1)[0],'Agent');
  const agentBody=df.ctx.el('div');
  df.sheets.at(-1)[3](agentBody);
@@ -1077,12 +1146,44 @@ async function botsScreens(){
  await saveBtn.action();
  await df.flush();
  assert(df.calls.some(c=>c.action==='bots.update'&&c.bot_id==='b1'&&c.agent_id==='agy'&&c.model==='gemini-3.8-flash-low'));
- assert(df.root.textContent.includes('Antigravity'),'Settings tab displays Antigravity for agy bot');
+ assert(df.find('.bot-session-header').textContent.includes('Antigravity'),'header displays Antigravity for agy bot');
+ panelAbort.abort();
+ panelHost.remove();
  df.view.cleanup?.();
  assert(unmountedChats>0,'leaving Bot Workspace unmounts embedded chat cleanly');
  df.abort.abort();
 
- // 6. Refused bot chats on mobile: Start chat refusal, agent switch Home Chat (#46862), and failed automation decision card (#46892).
+ // 5b. botPendingTab deep-link opens Bot Panel Sheet directly on requested tab, and 0 live sessions hides tab bar & 0 needs hides needs strip
+ {
+  const dl=fixture('bots',{
+   route:{botId:'b1'},
+   state:{snapshot:{capabilities:{bots:true}},ui:{search:'',filter:'all',botPendingTab:'settings'}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:botsData};
+    if(req.action==='bots.items')return {items:[]};
+    if(req.action==='bots.connectors.status')return {statuses:[]};
+    if(req.action==='bots.suggestions.list')return {suggestions:[]};
+    if(req.action==='bots.access.list')return {requests:[]};
+    if(req.action==='bots.sessions.list')return {sessions:[]};
+    if(req.action==='bots.groups.list')return {groups:[]};
+    if(req.action==='bots.soul.get')return {bot_id:'b1',content:'# Deep Soul'};
+    if(req.action==='bots.memory.get')return {bot_id:'b1',content:''};
+    return {};
+   }
+  });
+  await dl.flush();
+  assert(!dl.find('.bot-session-tabbar'),'tab bar is hidden when 0 live sessions exist');
+  assert(!dl.find('.bot-needs-strip'),'needs strip is omitted from DOM when needsCount === 0');
+  assert(dl.find('.bot-header-badge').hidden,'header badge hidden when needsCount === 0');
+  assert(dl.sheets.length>0,'botPendingTab=settings automatically opens Bot Panel sheet');
+  const dlBody=dl.ctx.el('div');
+  dl.sheets.at(-1)[3](dlBody);
+  const settingsBtn=dlBody.descendants().find(n=>n.dataset?.botTab==='settings');
+  assert.equal(settingsBtn.getAttribute('aria-selected'),'true','deep-link opens Bot Panel on Settings tab');
+  dl.abort.abort();
+ }
+
+ // 6. Refused bot chats on mobile: Start chat refusal, agent switch Home Chat (#46862), and failed automation in Bot Panel Automations (#46892).
  const tooOldRefusal={code:'cli_too_old',agent:'hermes',installed_version:'0.20.5',minimum_version:'0.23.0'};
  const rf=fixture('bots',{
   route:{botId:'b1'},
@@ -1104,20 +1205,25 @@ async function botsScreens(){
  });
  const toasts=[];
  rf.ctx.toast=(m)=>toasts.push(m);
+ rf.ctx.closeSheet=()=>{};
  await rf.flush();
- // Failed automation card surfaces immediately on Chat tab decision deck with phone-side refusal text (no "this computer").
- const runRow=rf.find('.bot-automation-run-row');
- assert(runRow,'failed automation run card must render on mobile');
- assert(runRow.textContent.includes('Hermes')&&runRow.textContent.includes('0.20.5')&&runRow.textContent.includes('0.23.0'),runRow.textContent);
- assert(!runRow.textContent.includes('this computer'),runRow.textContent);
  // Explicit Start chat tap rejects with worded refusal without "this computer".
  let openErr=null;
  try{await rf.byText('Start chat').action();}catch(e){openErr=e;}
  assert(openErr&&openErr.message.includes('Hermes')&&openErr.message.includes('0.20.5')&&openErr.message.includes('0.23.0'),String(openErr));
  assert(!openErr.message.includes('this computer'),openErr.message);
- // Switching agent in Settings -> Agent sheet ensures Home Chat and toasts why it was refused (#46862).
- await rf.all().find(n=>n.dataset?.botTab==='settings').action();
- await rf.byText('Agent').action();
+ // Failed automation surfaces inside Bot Panel -> Automations tab with phone-side refusal text (no "this computer").
+ await rf.find('.bot-panel-btn').action();
+ const rfPanel=rf.ctx.el('div');
+ rf.sheets.at(-1)[3](rfPanel);
+ await rfPanel.descendants().find(n=>n.dataset?.botTab==='automations').action();
+ const runRow=rfPanel.querySelector('.bot-automation-run-row');
+ assert(runRow,'failed automation run card must render in Bot Panel Automations tab');
+ assert(runRow.textContent.includes('Hermes')&&runRow.textContent.includes('0.20.5')&&runRow.textContent.includes('0.23.0'),runRow.textContent);
+ assert(!runRow.textContent.includes('this computer'),runRow.textContent);
+ // Switching agent in Bot Panel Settings -> Agent sheet ensures Home Chat and toasts why it was refused (#46862).
+ await rfPanel.descendants().find(n=>n.dataset?.botTab==='settings').action();
+ await rfPanel.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Agent').action();
  const switchBody=rf.ctx.el('div');
  rf.sheets.at(-1)[3](switchBody);
  await rf.flush();
@@ -1133,15 +1239,17 @@ async function botsScreens(){
  assert(!lastToast.includes('this computer'),lastToast);
  rf.abort.abort();
 
- // 7. Korean i18n coverage for all new Bot UX A+C+D copy
+ // 7. Korean i18n coverage for all Bot UX & Orca 1.4.274 copy
  const koBox=vm.createContext({navigator:{language:'ko'}});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
  const K=koBox.KrillMobile.i18n;
- for(const key of ['Quick switch','Back to bots','New Chat','Home Chat','Work','Start chat','Active workers','Run now','Pause','Resume','Enable','No scheduled automations configured.','Bot status','Provider & model','Failed automation','Access request','Needs attention','Open in terminal']){
+ for(const key of ['Quick switch','Back to bots','New Chat','Home Chat','Work','Start chat','Active workers','Run now','Pause','Resume','Enable','No scheduled automations configured.','Bot status','Provider & model','Failed automation','Access request','Needs attention','Open in terminal','Switch bot','Bot panel','Bot settings','More actions','1 item needs you','View','1 chat','Switch chat','Stop active work']){
   assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
  }
  assert.equal(K.t('{0} active',2),'2개 실행 중');
- console.log('PASS mobile bots screens (A+C+D): rail, decision deck, 4-tab workspace, embedded chat, worker strip, collapsible items, automations, agy, promoted groups, refusals, ko i18n, no innerHTML');
+ assert.equal(K.t('{0} items need you',3),'3개 항목 확인 필요');
+ assert.equal(K.t('Chats ({0})',2),'채팅 (2)');
+ console.log('PASS mobile bots screens (Orca 1.4.274): compact header, 44px tab bar, swipe, conditional needs strip, botPanel sheet, deep-link, refusals, ko i18n, no innerHTML');
 }
 async function mobileAuditWave2Regressions(){
  const assetRoot=path.join(__dirname,'../src/mobile/assets');
@@ -1501,8 +1609,11 @@ async function mobileAuditWave2Regressions(){
   });
   sf.ctx.refreshHost=()=>{throw Error('Screen target changed');};
   await sf.flush();
-  await sf.all().find(n=>n.dataset?.botTab==='settings').action();
-  await sf.byText('Agent').action();
+  await sf.find('.bot-panel-btn').action();
+  const panelHost=sf.ctx.el('div');
+  sf.sheets.at(-1)[3](panelHost);
+  await panelHost.descendants().find(n=>n.dataset?.botTab==='settings').action();
+  await panelHost.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Agent').action();
   const body=sf.ctx.el('div');
   assert.doesNotThrow(()=>sf.sheets.at(-1)[3](body),'M-09: bots.models sync throw caught in Agent sheet');
   const saveBtn=body.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Save');
@@ -1612,30 +1723,37 @@ async function mobileAuditWave2Regressions(){
    },
   });
   await df.flush();
-  await df.all().find(n=>n.dataset?.botTab==='work').action();
-  const replyArea=df.find('.bot-reply-card').querySelector('textarea');
+  await df.find('.bot-panel-btn').action();
+  const panelHost=df.ctx.el('div');
+  df.doc.body.append(panelHost);
+  const panelAbort=new AbortController();
+  df.sheets.at(-1)[3](panelHost,panelAbort.signal);
+  await panelHost.descendants().find(n=>n.dataset?.botTab==='work').action();
+  const replyArea=panelHost.querySelector('.bot-reply-card').querySelector('textarea');
   replyArea.focus();replyArea.value='draft reply';emit(replyArea,'input');
   df.view.update();
-  assert.equal(df.find('.bot-reply-card').querySelector('textarea'),replyArea,'M-12: external reply textarea reused');
+  assert.equal(panelHost.querySelector('.bot-reply-card').querySelector('textarea'),replyArea,'M-12: external reply textarea reused');
   assert.equal(df.doc.activeElement,replyArea,'M-12: external reply textarea keeps focus on draw()');
-  await df.all().find(n=>n.dataset?.botTab==='settings').action();
+  await panelHost.descendants().find(n=>n.dataset?.botTab==='settings').action();
   await df.flush();
   for(const label of ['Signed out','Usage limit reached','Not set up','Folder missing','Agent error']){
-   assert(df.root.textContent.includes(label),`M-15: connector status renders human label "${label}"`);
+   assert(panelHost.textContent.includes(label),`M-15: connector status renders human label "${label}"`);
   }
   for(const raw of ['signed_out','usage_limit','not_set_up','folder_missing','agent_error']){
-   assert(!df.root.textContent.includes(raw),`M-15: raw enum "${raw}" must not appear in UI`);
+   assert(!panelHost.textContent.includes(raw),`M-15: raw enum "${raw}" must not appear in UI`);
   }
-  const [soulArea,memArea]=df.find('.bot-docs-card').querySelectorAll('textarea');
+  const [soulArea,memArea]=panelHost.querySelector('.bot-docs-card').querySelectorAll('textarea');
   soulArea.focus();soulArea.value='# Edited Soul';emit(soulArea,'input');
   df.view.update();
-  assert.equal(df.find('.bot-docs-card').querySelectorAll('textarea')[0],soulArea,'M-12: SOUL.md textarea reused');
+  assert.equal(panelHost.querySelector('.bot-docs-card').querySelectorAll('textarea')[0],soulArea,'M-12: SOUL.md textarea reused');
   assert.equal(df.doc.activeElement,soulArea,'M-12: SOUL.md textarea keeps focus on draw()');
   assert.equal(soulArea.value,'# Edited Soul');
   memArea.focus();memArea.value='- Edited Fact';emit(memArea,'input');
   df.view.update();
-  assert.equal(df.find('.bot-docs-card').querySelectorAll('textarea')[1],memArea,'M-12: MEMORY.md textarea reused');
+  assert.equal(panelHost.querySelector('.bot-docs-card').querySelectorAll('textarea')[1],memArea,'M-12: MEMORY.md textarea reused');
   assert.equal(df.doc.activeElement,memArea,'M-12: MEMORY.md textarea keeps focus on draw()');
+  panelAbort.abort();
+  panelHost.remove();
   df.abort.abort();
  }
 
@@ -2178,10 +2296,14 @@ async function sweepW2MobileRegressions(){
   df.state.sessions=new Map();
   df.view.update();
   assert(df.state.sessions.has(77),'MB-27: synthetic bot session re-ensured on update() after snapshot wipe');
-  // MB-52: Work badge counts only unsnoozed needs_you (1, not 2) and deck excludes Snoozed Ask.
-  const workTab=df.all().find(n=>n.dataset?.botTab==='work');
+  // MB-52: Header badge, needs strip, and Bot Panel Work badge count only unsnoozed needs_you (1, not 2).
+  assert.equal(df.find('.bot-header-badge').textContent,'1','MB-52: header badge excludes actively snoozed needs_you items');
+  assert(df.find('.bot-needs-strip').textContent.includes('1 item needs you'),'MB-52: needs strip excludes actively snoozed needs_you items');
+  await df.find('.bot-panel-btn').action();
+  const pBody=df.ctx.el('div');
+  df.sheets.at(-1)[3](pBody);
+  const workTab=pBody.descendants().find(n=>n.dataset?.botTab==='work');
   assert(workTab.textContent.includes('1')&&!workTab.textContent.includes('2'),'MB-52: Work tab badge excludes actively snoozed needs_you items');
-  assert(!df.find('.bot-decision-deck').textContent.includes('Snoozed Ask'),'MB-52: Bot decision deck excludes actively snoozed needs_you items');
   df.abort.abort();
  }
 
@@ -2581,12 +2703,22 @@ async function sweepR2MobileRegressions(){
    },
   });
   await df.flush();
-  assert.equal(df.all().filter(n=>String(n.className||'').includes('bot-rail-badge')).length,0,'R2M-27: Bot Rail omits badge when global needs_you is empty even if bot items contain snoozed needs_you');
-  // Even when global needs_you RPC fails and falls back to per-bot items, renderBotRail/sortBotsForDisplay exclude actively snoozed items.
+  assert(df.find('.bot-header-badge').hidden,'R2M-27: header badge stays hidden when only snoozed needs_you exists');
+  assert(!df.find('.bot-needs-strip'),'R2M-27: needs strip stays omitted when only snoozed needs_you exists');
+  await df.find('.bot-header-title-btn').action();
+  const sw1=df.ctx.el('div');
+  df.sheets.at(-1)[3](sw1);
+  assert.equal(sw1.descendants().filter(n=>String(n.className||'').includes('bot-seg-badge')).length,0,'R2M-27: Bot Switcher omits badge when global needs_you is empty even if bot items contain snoozed needs_you');
+  // Even when global needs_you RPC fails and falls back to per-bot items, switcher excludes actively snoozed items.
   failGlobal=true;
-  await df.byText('Refresh').action();
+  await df.find('.bot-more-btn').action();
+  await df.sheets.at(-1)[1].find(a=>a.label==='Refresh').action();
   await df.flush();
-  assert.equal(df.all().filter(n=>String(n.className||'').includes('bot-rail-badge')).length,0,'R2M-27: Bot Rail excludes actively snoozed needs_you even on global fallback');
+  assert(df.find('.bot-header-badge').hidden,'R2M-27: header badge excludes snoozed items after fallback refresh');
+  await df.find('.bot-header-title-btn').action();
+  const sw2=df.ctx.el('div');
+  df.sheets.at(-1)[3](sw2);
+  assert.equal(sw2.descendants().filter(n=>String(n.className||'').includes('bot-seg-badge')).length,0,'R2M-27: Bot Switcher excludes actively snoozed needs_you even on global fallback');
   df.abort.abort();
  }
  console.log('PASS sweep R2 mobile screen regressions: R2M-01, R2M-25, R2M-26, R2M-27');
@@ -2867,14 +2999,17 @@ async function mobileI18nAuditRegressions(){
    return {sessions:[],statuses:[],requests:[],suggestions:[],groups:[]};
   }});
   await bf.flush();
-  // Switch to Settings tab and verify effort is localized (매우 높음, not raw xhigh)
-  const settingsTab=bf.all().find(n=>n.tagName==='BUTTON'&&n.textContent===I.t('Settings'));
+  // Open Bot Panel sheet -> Settings tab and verify effort is localized (매우 높음, not raw xhigh)
+  await bf.find('.bot-panel-btn').action();
+  const koPanel=bf.ctx.el('div');
+  bf.sheets.at(-1)[3](koPanel);
+  const settingsTab=koPanel.descendants().find(n=>n.dataset?.botTab==='settings');
   await settingsTab.action();
-  assert(bf.root.textContent.includes('매우 높음')&&!bf.root.textContent.includes('xhigh'),'bot.effort localized in Settings');
+  assert(koPanel.textContent.includes('매우 높음')&&!koPanel.textContent.includes('xhigh'),'bot.effort localized in Settings');
   // Switch to Automations tab and verify last_error passes through safeMsg/t
-  const autoTab=bf.all().find(n=>n.tagName==='BUTTON'&&n.textContent.includes(I.t('Automations')));
+  const autoTab=koPanel.descendants().find(n=>n.dataset?.botTab==='automations');
   await autoTab.action();
-  assert(bf.root.textContent.includes('커넥터 워커에서 오류가 발생했습니다'),'run.last_error localized via safeMsg');
+  assert(koPanel.textContent.includes('커넥터 워커에서 오류가 발생했습니다'),'run.last_error localized via safeMsg');
   bf.abort.abort();
 
   // Up-next detail sheet verifies structured Activity timeline events are localized in ko
