@@ -153,8 +153,11 @@ impl Drop for ReadyDropGuard {
     }
 }
 
-/// Bot-specific launch inputs prepared when resuming a live bot session under a new account.
+/// Bot-specific launch inputs prepared when resuming a bot session (cold reboot resume or
+/// account switch).
 pub(crate) struct BotAccountSwitchLaunch {
+    pub bot_id: BotId,
+    pub created_at_ms: u64,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub extra_env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -163,10 +166,12 @@ pub(crate) struct BotAccountSwitchLaunch {
     pub instructions: String,
 }
 
-/// Outcome of rebinding a live bot session from `old` to `new`, holding `old`'s prior relay
-/// launch token so the caller can revoke it after retirement or roll back on error.
+/// Outcome of rebinding a bot session from `old` to `new`, holding `old`'s prior relay
+/// launch token and optional external `link_id` so callers can revoke the old token and update
+/// persisted external conversation links.
 pub(crate) struct ReboundBotSession {
     pub previous_token: Option<Zeroizing<String>>,
+    pub link_id: Option<String>,
 }
 
 /// Active mapping between a live Krill PTY session and the bot running inside it.
@@ -414,8 +419,10 @@ impl BotRuntime {
             .map(|b| b.bot_id.clone())
     }
 
-    /// Rehydrates live bindings from `<bots_root>/runtime-bindings.json` and prunes dead,
-    /// orphaned (deleted bot), or stale pre-creation bindings.
+    /// Rehydrates live and dormant-resumable bindings from `<bots_root>/runtime-bindings.json`,
+    /// adopts any live orphaned bot sessions identified by their stored launch metadata, and
+    /// prunes only bindings for deleted bots, explicitly closed sessions, or unrecoverable dead
+    /// sessions.
     pub fn rehydrate_from_disk(&self, store: &BotStore, registry: &Registry) -> usize {
         self.rehydrate_from_disk_with_cuts(store, registry).0
     }
@@ -431,34 +438,39 @@ impl BotRuntime {
         let Some(ref root) = self.inner.bots_root else {
             return (0, Vec::new());
         };
-        let records = {
+        let (records, had_file) = {
             let _io = lock(&self.inner.bindings_io_lock);
             let path = root.join(RUNTIME_BINDINGS_FILE);
             if ensure_no_symlink_path(root).is_err() || ensure_no_symlink_path(&path).is_err() {
                 return (0, Vec::new());
             }
-            let Ok(bytes) = fs::read(&path) else {
-                return (0, self.pending_unnotified_restart_cuts());
-            };
-            if bytes.len() > MAX_BINDINGS_BYTES {
-                return (0, Vec::new());
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    if bytes.len() > MAX_BINDINGS_BYTES {
+                        return (0, Vec::new());
+                    }
+                    let Ok(records) = serde_json::from_slice::<Vec<PersistedBotBinding>>(&bytes)
+                    else {
+                        return (0, Vec::new());
+                    };
+                    (records, true)
+                }
+                Err(_) => (Vec::new(), false),
             }
-            let Ok(records) = serde_json::from_slice::<Vec<PersistedBotBinding>>(&bytes) else {
-                return (0, Vec::new());
-            };
-            records
         };
 
         // Pre-read active bots, MEMORY.md, and query registry outside all runtime mutexes (MB-01).
-        let active_bots: Option<HashMap<BotId, BotConfig>> = store
-            .list_bots()
-            .ok()
-            .map(|list| list.into_iter().map(|b| (b.id.clone(), b)).collect());
-        let mut live_records = Vec::new();
+        let active_bots_list: Option<Vec<BotConfig>> = store.list_bots().ok();
+        let active_bots: Option<HashMap<BotId, BotConfig>> = active_bots_list
+            .as_ref()
+            .map(|list| list.iter().map(|b| (b.id.clone(), b.clone())).collect());
+        let mut kept_records = Vec::new();
+        let mut kept_sids = HashSet::new();
         let mut newly_cut: Vec<RestartCutTurn> = Vec::new();
         let mut pruned_any = false;
+        let mut needs_persist = false;
         let ts = now_ms();
-        for rec in records {
+        for mut rec in records {
             let bot_cfg = active_bots
                 .as_ref()
                 .and_then(|map| map.get(&rec.bot_id))
@@ -467,38 +479,98 @@ impl BotRuntime {
                 map.get(&rec.bot_id)
                     .is_some_and(|bot| session_belongs_to_bot(bot.created_at_ms, rec.created_at_ms))
             });
-            if registry.is_session_live(rec.session_id) && bot_valid {
-                let pid = registry.session_pid(rec.session_id).unwrap_or(rec.pid);
-                let memory = store.get_memory(&rec.bot_id).unwrap_or_default();
-                live_records.push((rec, pid, memory));
-            } else {
-                // Never report a live session, a finished turn (`!owner_turn_pending`), an
-                // already-answered turn (`explicit_reply_posted`), a paused/deleted bot, or
-                // an unlinked desktop turn as cut by restart (Orca #47898).
+            let is_live = registry.is_session_live(rec.session_id);
+            let is_resumable = !is_live
+                && !registry.is_session_closed(rec.session_id)
+                && registry.is_session_resumable(rec.session_id);
+            // Any non-live external-linked turn that was in flight at shutdown/reboot was cut off
+            // by the restart even when the session itself remains resumable (Orca #47898).
+            if !is_live {
                 let bot_paused = bot_cfg.as_ref().is_some_and(|b| b.paused);
                 if bot_valid
                     && !bot_paused
                     && rec.owner_turn_pending
                     && !rec.explicit_reply_posted
-                    && let Some(link_id) = rec.link_id.filter(|s| !s.trim().is_empty())
+                    && let Some(link_id) = rec
+                        .link_id
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
                 {
                     let fenced_seq = rec
                         .active_turn_seq
                         .or((rec.turn_seq > 0).then_some(rec.turn_seq))
                         .unwrap_or_else(|| ts.max(1));
                     newly_cut.push(RestartCutTurn {
-                        bot_id: rec.bot_id,
+                        bot_id: rec.bot_id.clone(),
                         link_id,
                         old_session_id: rec.session_id,
                         turn_seq: fenced_seq,
-                        last_prompt: rec.last_prompt,
-                        pending_turns: rec.pending_turns,
-                        status_message_id: rec.status_message_id,
+                        last_prompt: rec.last_prompt.clone(),
+                        pending_turns: rec.pending_turns.clone(),
+                        status_message_id: rec.status_message_id.clone(),
                         cut_at_ms: ts,
                         notified: false,
                     });
                 }
+            }
+            if bot_valid && (is_live || is_resumable) {
+                let pid = if is_live {
+                    registry.session_pid(rec.session_id).unwrap_or(rec.pid)
+                } else {
+                    if rec.owner_turn_pending
+                        || rec.active_turn_seq.is_some()
+                        || !rec.pending_turns.is_empty()
+                        || rec.pid != 0
+                    {
+                        needs_persist = true;
+                    }
+                    rec.owner_turn_pending = false;
+                    rec.active_turn_seq = None;
+                    rec.pending_turns.clear();
+                    0
+                };
+                let memory = store.get_memory(&rec.bot_id).unwrap_or_default();
+                kept_sids.insert(rec.session_id);
+                kept_records.push((rec, pid, memory));
+            } else {
                 pruned_any = true;
+            }
+        }
+
+        // Self-healing adoption: recover any live bot sessions whose runtime binding was lost
+        // (for example, resumed under an older daemon before bindings survived reboot).
+        let live_candidates = registry.live_bot_launch_candidates();
+        let mut adopted_records = Vec::new();
+        if let Some(ref bots) = active_bots_list
+            && !bots.is_empty()
+        {
+            let taken_over = lock(&self.inner.taken_over_sessions).clone();
+            for (sid, pid, cwd, instructions, launched_at_ms) in live_candidates {
+                if kept_sids.contains(&sid) || taken_over.contains(&sid) {
+                    continue;
+                }
+                let Some(bot) = match_bot_for_launch(store, bots, &cwd, &instructions) else {
+                    continue;
+                };
+                let created_at_ms = if launched_at_ms > 0 {
+                    launched_at_ms
+                } else {
+                    bot.created_at_ms
+                };
+                if !session_belongs_to_bot(bot.created_at_ms, created_at_ms) {
+                    continue;
+                }
+                let memory = store.get_memory(&bot.id).unwrap_or_default();
+                kept_sids.insert(sid);
+                adopted_records.push((
+                    sid,
+                    pid,
+                    bot.id.clone(),
+                    bot.name.clone(),
+                    created_at_ms,
+                    memory,
+                ));
             }
         }
 
@@ -508,7 +580,7 @@ impl BotRuntime {
             let mut sessions = lock(&self.inner.sessions);
             let mut controls = lock(&self.inner.turn_controls);
             let mut meta_map = lock(&self.inner.turn_meta);
-            for (rec, pid, memory) in live_records {
+            for (rec, pid, memory) in kept_records {
                 let mut turn_seq = rec.turn_seq;
                 let mut pending_turns = VecDeque::new();
                 for prompt in rec.pending_turns {
@@ -548,11 +620,40 @@ impl BotRuntime {
                     });
                 kept += 1;
             }
+            for (sid, pid, bot_id, label, created_at_ms, memory) in adopted_records {
+                if sessions.contains_key(&sid) {
+                    continue;
+                }
+                sessions.insert(
+                    sid,
+                    BotSessionBinding {
+                        bot_id,
+                        link_id: None,
+                        memory_snapshot: MemorySnapshot::capture(&memory),
+                        chat_offset: 0,
+                        explicit_reply_posted: false,
+                        launch_token: None,
+                        pid,
+                        label,
+                        created_at_ms,
+                        owner_turn_pending: false,
+                        last_prompt: None,
+                        status_message_id: None,
+                        rate_limit_pause: None,
+                    },
+                );
+                controls
+                    .entry(sid)
+                    .or_insert_with(|| SessionTurnControl::new(true));
+                meta_map.entry(sid).or_default();
+                needs_persist = true;
+                kept += 1;
+            }
         }
         if !newly_cut.is_empty() {
             self.merge_restart_cuts(&newly_cut);
         }
-        if pruned_any {
+        if (had_file && pruned_any) || needs_persist {
             self.inner.persist_bindings();
         }
         (kept, self.pending_unnotified_restart_cuts())
@@ -2265,18 +2366,106 @@ impl BotRuntime {
         new: SessionId,
         launch_cwd: &std::path::Path,
     ) -> Result<Option<BotAccountSwitchLaunch>, String> {
-        let Some((bot_id, link_id)) = lock(&self.inner.sessions)
+        let Some((bot_id, link_id, created_at_ms)) = lock(&self.inner.sessions)
             .get(&old)
-            .map(|b| (b.bot_id.clone(), b.link_id.clone()))
+            .map(|b| (b.bot_id.clone(), b.link_id.clone(), b.created_at_ms))
         else {
             return Ok(None);
         };
         let Some(bot) = store.get_bot(&bot_id).map_err(|err| err.to_string())? else {
             return Ok(None);
         };
+        Self::prepare_launch_for_existing_bot(
+            store,
+            secrets,
+            relay,
+            composio_base_url,
+            bot,
+            link_id.as_deref(),
+            created_at_ms,
+            new,
+            launch_cwd,
+        )
+        .map(Some)
+    }
+
+    /// Prepares bot launch inputs when `Registry::resume` resurrects a cold/exited bot session
+    /// `old` into `new`. Matches either an existing runtime binding or (as a self-healing
+    /// fallback) stored `bot_instructions` + launch `cwd` against active bots.
+    #[expect(clippy::too_many_arguments, reason = "bot resume launch preparation")]
+    pub(crate) fn prepare_resume_launch(
+        &self,
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        old: SessionId,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+        stored_instructions: Option<&str>,
+        stored_launched_at_ms: u64,
+    ) -> Result<Option<BotAccountSwitchLaunch>, String> {
+        if self.is_taken_over(old) {
+            return Ok(None);
+        }
+        let bound = lock(&self.inner.sessions)
+            .get(&old)
+            .map(|b| (b.bot_id.clone(), b.link_id.clone(), b.created_at_ms));
+        let (bot, link_id, created_at_ms) = if let Some((bot_id, link_id, created_at_ms)) = bound {
+            let Some(bot) = store.get_bot(&bot_id).map_err(|err| err.to_string())? else {
+                return Ok(None);
+            };
+            if !session_belongs_to_bot(bot.created_at_ms, created_at_ms) {
+                return Ok(None);
+            }
+            (bot, link_id, created_at_ms)
+        } else if let Some(instructions) = stored_instructions {
+            let bots = store.list_bots().map_err(|err| err.to_string())?;
+            let Some(bot) = match_bot_for_launch(store, &bots, launch_cwd, instructions) else {
+                return Ok(None);
+            };
+            let created_at_ms = if stored_launched_at_ms > 0 {
+                stored_launched_at_ms
+            } else {
+                bot.created_at_ms
+            };
+            if !session_belongs_to_bot(bot.created_at_ms, created_at_ms) {
+                return Ok(None);
+            }
+            (bot.clone(), None, created_at_ms)
+        } else {
+            return Ok(None);
+        };
+
+        Self::prepare_launch_for_existing_bot(
+            store,
+            secrets,
+            relay,
+            composio_base_url,
+            bot,
+            link_id.as_deref(),
+            created_at_ms,
+            new,
+            launch_cwd,
+        )
+        .map(Some)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "shared bot relaunch preparation")]
+    fn prepare_launch_for_existing_bot(
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        bot: BotConfig,
+        link_id: Option<&str>,
+        created_at_ms: u64,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+    ) -> Result<BotAccountSwitchLaunch, String> {
         let home = init_bot_home(store.root(), &bot, None).map_err(|err| err.to_string())?;
-        let soul = store.get_soul(&bot_id).unwrap_or_default();
-        let memory = store.get_memory(&bot_id).unwrap_or_default();
+        let soul = store.get_soul(&bot.id).unwrap_or_default();
+        let memory = store.get_memory(&bot.id).unwrap_or_default();
         let preamble = build_launch_preamble_in(
             &bot,
             Some(&soul),
@@ -2307,7 +2496,7 @@ impl BotRuntime {
             Err(err) => return Err(format!("failed to prepare bot tool relay: {err}")),
         };
         if let Some(ref g) = grant {
-            relay.bind_grant_session(&g.token, new, link_id.as_deref());
+            relay.bind_grant_session(&g.token, new, link_id);
         }
 
         let mut extra_env: Vec<(Vec<u8>, Vec<u8>)> = vec![
@@ -2334,18 +2523,21 @@ impl BotRuntime {
         let mut mcp_cfg = build_bot_mcp_launch_config(&bot, &home, grant.as_ref(), secrets);
         mcp_cfg.instructions = Some(preamble.clone());
 
-        Ok(Some(BotAccountSwitchLaunch {
+        Ok(BotAccountSwitchLaunch {
+            bot_id: bot.id,
+            created_at_ms,
             model: bot.model,
             effort: bot.effort,
             extra_env,
             mcp_cfg,
             grant_token: grant.map(|g| g.token),
             instructions: preamble,
-        }))
+        })
     }
 
-    /// Rebinds an active bot session from `old` to `new`, returning the previous launch token
-    /// so the caller can revoke it once `old` has retired (or roll back if retirement fails).
+    /// Rebinds a bot session from `old` to `new`, returning the previous launch token and
+    /// optional external `link_id` so the caller can revoke the old token and update external
+    /// conversation links.
     pub(crate) fn rebind_session(
         &self,
         old: SessionId,
@@ -2353,13 +2545,14 @@ impl BotRuntime {
         new_pid: u32,
         new_token: Option<Zeroizing<String>>,
     ) -> Option<ReboundBotSession> {
-        let previous_token = {
+        let (previous_token, link_id) = {
             let mut sessions = lock(&self.inner.sessions);
             let mut binding = sessions.remove(&old)?;
             let prev_token = std::mem::replace(&mut binding.launch_token, new_token);
+            let link_id = binding.link_id.clone();
             binding.pid = new_pid;
             sessions.insert(new, binding);
-            prev_token
+            (prev_token, link_id)
         };
         {
             let mut controls = lock(&self.inner.turn_controls);
@@ -2376,7 +2569,56 @@ impl BotRuntime {
             }
         }
         self.inner.persist_bindings();
-        Some(ReboundBotSession { previous_token })
+        Some(ReboundBotSession {
+            previous_token,
+            link_id,
+        })
+    }
+
+    /// Registers a resumed bot session whose prior binding was absent from `runtime-bindings.json`.
+    pub(crate) fn adopt_resumed_session(
+        &self,
+        store: &BotStore,
+        bot_id: BotId,
+        session_id: SessionId,
+        pid: u32,
+        launch_token: Option<Zeroizing<String>>,
+        created_at_ms: u64,
+    ) {
+        let label = store
+            .get_bot(&bot_id)
+            .ok()
+            .flatten()
+            .map_or_else(|| bot_id.as_str().to_owned(), |b| b.name);
+        let memory = store.get_memory(&bot_id).unwrap_or_default();
+        {
+            let mut sessions = lock(&self.inner.sessions);
+            let mut controls = lock(&self.inner.turn_controls);
+            let mut meta = lock(&self.inner.turn_meta);
+            sessions.insert(
+                session_id,
+                BotSessionBinding {
+                    bot_id,
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(&memory),
+                    chat_offset: 0,
+                    explicit_reply_posted: false,
+                    launch_token,
+                    pid,
+                    label,
+                    created_at_ms,
+                    owner_turn_pending: false,
+                    last_prompt: None,
+                    status_message_id: None,
+                    rate_limit_pause: None,
+                },
+            );
+            controls
+                .entry(session_id)
+                .or_insert_with(|| SessionTurnControl::new(true));
+            meta.entry(session_id).or_default();
+        }
+        self.inner.persist_bindings();
     }
 
     /// Retries a failed or restart-interrupted bot turn on `link_id` (fenced by `turn_seq`) and
@@ -3278,6 +3520,33 @@ fn resolve_launch_cwd(
         }
     }
     home.to_path_buf()
+}
+
+fn instructions_match_bot(instructions: &str, bot: &BotConfig) -> bool {
+    let prefix = format!("You are {}, a bot that runs in Krill.", bot.name);
+    instructions.starts_with(&prefix)
+}
+
+fn match_bot_for_launch<'a>(
+    store: &BotStore,
+    bots: &'a [BotConfig],
+    cwd: &std::path::Path,
+    instructions: &str,
+) -> Option<&'a BotConfig> {
+    if let Some(bot) = bots
+        .iter()
+        .find(|bot| krill_proto::path::equivalent(&store.bot_home(bot), cwd))
+    {
+        return Some(bot);
+    }
+    bots.iter().find(|bot| {
+        bot.workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .is_some_and(|w| krill_proto::path::equivalent(std::path::Path::new(w), cwd))
+            && instructions_match_bot(instructions, bot)
+    })
 }
 
 fn format_external_prompt(msg: &InboundExternalMessage) -> String {
@@ -5258,6 +5527,146 @@ mod tests {
             assert_eq!(m.turn_seq, 2);
             assert_eq!(m.active_turn_seq, Some(2));
         }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rehydrate_preserves_resumable_dormant_sessions_across_reboot_and_prunes_closed() {
+        let dir =
+            std::env::temp_dir().join(format!("krilld-rt-reboot-preserve-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("bots")).unwrap();
+        fs::create_dir_all(dir.join("agent-launches")).unwrap();
+
+        let bots_root = dir.join("bots");
+        let store = BotStore::new(bots_root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Reboot Survivor".to_owned(),
+                    agent_id: "agy".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_700_000_000_000,
+            )
+            .unwrap();
+
+        // Session 701: has durable agent-launches/701.json (typical bot session after reboot).
+        let bot_home = store.bot_home(&bot);
+        fs::create_dir_all(&bot_home).unwrap();
+        fs::write(
+            dir.join("agent-launches/701.json"),
+            serde_json::json!({
+                "profile": "agy",
+                "permission": "yolo",
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "cwd": bot_home.to_string_lossy().as_bytes(),
+                "hibernation_blocked": false,
+                "bot_instructions": "You are Reboot Survivor, a bot that runs in Krill.",
+                "launched_at": 1_700_000_001_u64
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Session 702: has cold session directory only.
+        fs::create_dir_all(dir.join("sessions/702.noindex")).unwrap();
+
+        // Session 703: explicitly closed before reboot (must be pruned).
+        fs::create_dir_all(dir.join("sessions/703.noindex")).unwrap();
+        fs::write(dir.join("sessions/703.noindex/closed"), b"1").unwrap();
+
+        // Session 704: no launch file and no cold dir (truly dead; must be pruned).
+
+        let rt1 = BotRuntime::with_root(bots_root.clone());
+        {
+            let mut sessions = lock(&rt1.inner.sessions);
+            for (sid, pending) in [
+                (SessionId(701), true),
+                (SessionId(702), false),
+                (SessionId(703), false),
+                (SessionId(704), false),
+            ] {
+                sessions.insert(
+                    sid,
+                    BotSessionBinding {
+                        bot_id: bot.id.clone(),
+                        link_id: None,
+                        memory_snapshot: MemorySnapshot::capture(""),
+                        chat_offset: 0,
+                        explicit_reply_posted: false,
+                        launch_token: None,
+                        pid: 99_999,
+                        label: bot.name.clone(),
+                        created_at_ms: 1_700_000_001_000,
+                        owner_turn_pending: pending,
+                        last_prompt: None,
+                        status_message_id: None,
+                        rate_limit_pause: None,
+                    },
+                );
+            }
+        }
+        rt1.inner.persist_bindings();
+
+        // Simulate post-reboot cold Registry (0 live PTYs).
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let rt2 = BotRuntime::with_root(bots_root.clone());
+        let kept = rt2.rehydrate_from_disk(&store, &reg);
+        assert_eq!(
+            kept, 2,
+            "resumable sessions 701 and 702 must survive reboot"
+        );
+        assert!(rt2.is_bot_session(SessionId(701)));
+        assert!(rt2.is_bot_session(SessionId(702)));
+        assert!(
+            !rt2.is_bot_session(SessionId(703)),
+            "closed session must be pruned"
+        );
+        assert!(
+            !rt2.is_bot_session(SessionId(704)),
+            "unrecoverable session must be pruned"
+        );
+
+        // Dormant bindings must have pid cleared and owner_turn_pending reset.
+        {
+            let sessions = lock(&rt2.inner.sessions);
+            let b701 = sessions.get(&SessionId(701)).unwrap();
+            assert_eq!(b701.pid, 0);
+            assert!(!b701.owner_turn_pending);
+        }
+
+        // Deleting a dormant chat permanently closes it so a second reboot never resurrects it.
+        let relay = BotToolRelay::new(Arc::new(SecretVault::with_static_key(
+            bots_root.clone(),
+            [0x22; 32],
+        )));
+        rt2.reset_chat(
+            &reg,
+            &store,
+            &relay,
+            &bot.id,
+            Some(SessionId(701)),
+            1_700_000_002_000,
+        )
+        .unwrap();
+        assert!(!rt2.is_bot_session(SessionId(701)));
+        assert!(reg.is_session_closed(SessionId(701)));
+
+        let rt3 = BotRuntime::with_root(bots_root);
+        let kept_after_reset = rt3.rehydrate_from_disk(&store, &reg);
+        assert_eq!(kept_after_reset, 1);
+        assert!(!rt3.is_bot_session(SessionId(701)));
+        assert!(rt3.is_bot_session(SessionId(702)));
 
         fs::remove_dir_all(&dir).ok();
     }
