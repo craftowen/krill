@@ -1,0 +1,2486 @@
+use std::fs;
+
+use gpui::{Entity, TestAppContext, VisualTestContext};
+
+use super::*;
+use crate::shell::tests::{layout_of, open, state_path};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("mk-files-{}-{tag}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        Self(dir.canonicalize().unwrap())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn open_file(view: &Entity<Shell>, path: &Path, cx: &mut VisualTestContext) -> PaneId {
+    let path = path.to_owned();
+    view.update(cx, |s, cx| s.open_file(path, cx));
+    cx.run_until_parked();
+    layout_of(view, cx).active_tab().focused
+}
+
+fn editor_text(view: &Entity<Shell>, pane: PaneId, cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        let state = shell.files.tabs[&pane].editor().unwrap().clone();
+        state.read(cx).text().to_string()
+    })
+}
+
+/// 디스크 감시 한 주기를 돌린다.
+fn tick(cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(WATCH_EVERY * 2);
+    cx.run_until_parked();
+}
+
+#[test]
+fn file_request_lock_contention_defers_without_consuming_the_queue() {
+    let dir = TempDir::new("queue-lock-contention");
+    let queue = dir.0.join(FILE_REQUESTS_FILE);
+    fs::write(
+        &queue,
+        br#"{"requests":[{"id":1,"kind":"open","worktree":"/repo","path":"/repo/a.rs","relative_path":"a.rs"}]}"#,
+    )
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.0.join(FILE_REQUESTS_LOCK))
+        .unwrap();
+    lock.lock().unwrap();
+    let path = dir.0.clone();
+    let (send, recv) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        send.send(take_pending_file_requests(&path)).unwrap();
+    });
+    // 구 blocking lock에서도 단언 전에 잠금을 풀어 테스트가 영구 정지하지 않게 한다.
+    let deferred = recv.recv_timeout(Duration::from_secs(1));
+    let preserved = queue.exists();
+    lock.unlock().unwrap();
+    worker.join().unwrap();
+    assert!(deferred.unwrap().is_empty(), "busy queue must defer");
+    assert!(preserved, "busy queue must remain for the next poll");
+    let requests = take_pending_file_requests(&dir.0);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].id, 1);
+    assert!(!queue.exists());
+    assert!(take_pending_file_requests(&dir.0).is_empty());
+}
+
+/// 열기 → 키 입력은 에디터로 가지만(터미널 아님) 읽기 전용이라 내용도 디스크도 바뀌지 않는다.
+/// ⌘S는 없고, 닫기와 종료는 묻지 않는다.
+#[gpui::test]
+fn file_tab_is_read_only_and_closes_without_asking(cx: &mut TestAppContext) {
+    let dir = TempDir::new("read-only");
+    let file = dir.0.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-read-only"));
+    let pane = open_file(&view, &file, cx);
+
+    let l = layout_of(&view, cx);
+    assert_eq!(l.tabs().len(), 2);
+    assert_eq!(l.file(pane), Some(file.as_path()));
+    assert_eq!(l.session(pane), None);
+    assert!(cx.debug_bounds("file-pane").is_some());
+    let label = cx.update(|_, cx| view.read(cx).pane_label(pane, cx));
+    assert_eq!(label, "main.rs");
+    let focused = cx.update(|window, cx| {
+        let shell = view.read(cx);
+        let editor = shell.files.tabs[&pane].editor().unwrap().read(cx);
+        (
+            editor.focus_handle(cx).is_focused(window),
+            shell.focus.is_focused(window),
+        )
+    });
+    assert_eq!(
+        focused,
+        (true, false),
+        "keys go to the editor, not the terminal"
+    );
+
+    cx.simulate_input("x");
+    cx.simulate_keystrokes("enter backspace cmd-s");
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "fn main() {}\n");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+    assert!(cx.update(|_, cx| cx.build_action("shell::SaveFile", None).is_err()));
+
+    // 같은 파일을 다시 열면 새 탭이 아니라 그 탭으로 간다.
+    cx.simulate_keystrokes("ctrl-1");
+    assert_eq!(open_file(&view, &file, cx), pane);
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(layout_of(&view, cx).file(pane), None);
+    assert!(cx.update(|_, cx| view.read(cx).files.tabs.is_empty()));
+}
+
+/// 외부 변경은 늘 다시 읽는다(키 입력이 있었어도). 삭제는 표시하고, 다시 생기면 다시 읽는다.
+#[gpui::test]
+fn external_change_reloads_and_delete_is_marked(cx: &mut TestAppContext) {
+    let dir = TempDir::new("external");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "one\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-external"));
+    let pane = open_file(&view, &file, cx);
+
+    fs::write(&file, "two lines\nhere\n").unwrap();
+    tick(cx);
+    assert_eq!(editor_text(&view, pane, cx), "two lines\nhere\n");
+
+    cx.simulate_input("!");
+    fs::write(&file, "outside edit, longer\n").unwrap();
+    tick(cx);
+    assert_eq!(editor_text(&view, pane, cx), "outside edit, longer\n");
+
+    fs::remove_file(&file).unwrap();
+    tick(cx);
+    assert!(cx.debug_bounds("file-deleted").is_some());
+
+    fs::write(&file, "back again\n").unwrap();
+    tick(cx);
+    assert_eq!(editor_text(&view, pane, cx), "back again\n");
+    assert!(cx.debug_bounds("file-deleted").is_none());
+}
+
+/// 감사 2026-10-17: 메뉴바 아이콘 '종료'·창 밖 ⌘Q(전역 핸들러)는 `cx.quit()`로 종료 준비를 건너뛰었다.
+/// 모든 종료 경로가 `quit_app`으로 모인다. 메뉴바가 이름으로 만드는 액션도 실제로 있다. 파일 탭이 열려 있어도 묻지 않는다.
+#[gpui::test]
+fn every_quit_path_quits_without_asking(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quit");
+    let file = dir.0.join("a.txt");
+    fs::write(&file, "a\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-quit"));
+    open_file(&view, &file, cx);
+    cx.simulate_input("z");
+
+    assert!(cx.update(|_, cx| cx.build_action("shell::Quit", None).is_ok()));
+    for quit in [false, true] {
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        cx.update(|_, cx| cx.set_global(QuitObserved(observed.clone())));
+        if quit {
+            // 셸 창 안 ⌘Q(액션 처리 중 창이 빌려진 상태)도 같은 경로로 간다.
+            cx.simulate_keystrokes("cmd-q");
+        } else {
+            cx.update(|_, cx| quit_app(cx));
+        }
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(observed.get(), "quit completes");
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), "a\n");
+}
+
+/// 터미널 탭으로 돌아오면 키보드 포커스도 셸(터미널)로 돌아온다. 재시작하면 파일 탭 경로가 복원된다.
+#[gpui::test]
+fn focus_returns_to_terminal_and_tabs_restore(cx: &mut TestAppContext) {
+    let dir = TempDir::new("restore");
+    let file = dir.0.join("b.json");
+    fs::write(&file, "{}\n").unwrap();
+    let path = state_path("files-restore");
+    let (view, vcx) = open(cx, path.clone());
+    let pane = open_file(&view, &file, vcx);
+    vcx.simulate_keystrokes("ctrl-1");
+    vcx.run_until_parked();
+    let on_shell = vcx.update(|window, cx| view.read(cx).focus.is_focused(window));
+    assert!(on_shell);
+
+    vcx.update(|_, cx| view.read(cx).flush_layout());
+    let restored = Layout::load(&path).unwrap();
+    assert_eq!(restored.file(pane), Some(file.as_path()));
+}
+
+#[gpui::test]
+fn unopenable_file_shows_placeholder(cx: &mut TestAppContext) {
+    let dir = TempDir::new("binary");
+    let file = dir.0.join("blob.bin");
+    fs::write(&file, b"\0\x01\x02").unwrap();
+    let (view, cx) = open(cx, state_path("files-binary"));
+    let pane = open_file(&view, &file, cx);
+    let kind = cx.update(|_, cx| match view.read(cx).files.tabs[&pane].body {
+        Body::Placeholder(kind, len) => Some((kind, len)),
+        _ => None,
+    });
+    assert_eq!(kind, Some((Kind::Binary, 3)));
+}
+
+/// 변경 패널 파일 행의 '에디터로 열기'는 가운데 영역에 파일 탭을 연다.
+#[gpui::test]
+fn diff_panel_open_file_event_opens_tab(cx: &mut TestAppContext) {
+    let dir = TempDir::new("diff");
+    let file = dir.0.join("changed.rs");
+    fs::write(&file, "x\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-diff"));
+    let target = file.clone();
+    cx.update(|_, cx| {
+        let panel = view.read(cx).diff.clone();
+        panel.update(cx, |_, cx| cx.emit(krill_app_core::diff::OpenFile(target)));
+    });
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    assert_eq!(l.file(l.active_tab().focused), Some(file.as_path()));
+}
+
+/// ⌘P: 작업 폴더(.gitignore 존중) 퍼지 검색 → Enter로 연다.
+#[gpui::test]
+fn quick_open_finds_and_opens(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick");
+    fs::create_dir(dir.0.join("src")).unwrap();
+    fs::write(dir.0.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    fs::write(dir.0.join("README.md"), "r\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-quick"));
+    let root = dir.0.clone();
+    view.update(cx, |s, cx| {
+        s.new_folder_tab_on(
+            s.launch_host.clone(),
+            &root,
+            krill_proto::control::Program::Login,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).files.quick_open.is_some()));
+    cx.simulate_input("librs");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    assert_eq!(
+        l.file(l.active_tab().focused),
+        Some(dir.0.join("src/lib.rs").as_path())
+    );
+    assert!(cx.update(|_, cx| view.read(cx).files.quick_open.is_none()));
+}
+
+fn previewing(view: &Entity<Shell>, pane: PaneId, cx: &mut VisualTestContext) -> Option<String> {
+    cx.update(|_, cx| match &view.read(cx).files.tabs[&pane].body {
+        Body::Text {
+            shown: Some(Shown::Markdown(src, _)),
+            ..
+        } => Some(src.to_string()),
+        Body::Text { shown: Some(_), .. } => Some(String::new()),
+        _ => None,
+    })
+}
+
+/// MK-121: 마크다운은 미리보기로 열리고(입력은 숨은 에디터로 가지 않는다), 원본으로 바꿔도 입력으로
+/// 내용이 바뀌지 않는다. CSV는 표로 열린다. 이미지는 이미지 뷰, 외부 변경 시 다시 읽는다.
+#[gpui::test]
+fn markdown_preview_toggle_csv_table_and_image_reload(cx: &mut TestAppContext) {
+    let dir = TempDir::new("viewers");
+    let md = dir.0.join("README.md");
+    fs::write(&md, "# hi\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-viewers"));
+    let pane = open_file(&view, &md, cx);
+    assert_eq!(previewing(&view, pane, cx).as_deref(), Some("# hi\n"));
+    cx.simulate_keystrokes("x");
+    assert_eq!(editor_text(&view, pane, cx), "# hi\n");
+
+    cx.update(|window, cx| view.update(cx, |s, cx| s.set_preview(pane, false, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(previewing(&view, pane, cx), None);
+    assert!(cx.debug_bounds("file-preview-toggle").is_some());
+    cx.simulate_keystrokes("x");
+    assert_eq!(editor_text(&view, pane, cx), "# hi\n");
+    cx.update(|window, cx| view.update(cx, |s, cx| s.set_preview(pane, true, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(previewing(&view, pane, cx).as_deref(), Some("# hi\n"));
+
+    let csv = dir.0.join("a.csv");
+    fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let pane = open_file(&view, &csv, cx);
+    let table = cx.update(|_, cx| {
+        matches!(
+            view.read(cx).files.tabs[&pane].body,
+            Body::Text {
+                shown: Some(Shown::Table(_)),
+                ..
+            }
+        )
+    });
+    assert!(table);
+
+    let png = dir.0.join("p.png");
+    let header = |w: u8| {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        b.extend_from_slice(&[0, 0, 0, w, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        b
+    };
+    fs::write(&png, header(1)).unwrap();
+    let pane = open_file(&view, &png, cx);
+    let image = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| match &view.read(cx).files.tabs[&pane].body {
+            Body::Image(v) => Some(v.entity_id()),
+            _ => None,
+        })
+    };
+    let before = image(cx).expect("image view");
+    fs::write(&png, [header(2), vec![0]].concat()).unwrap();
+    tick(cx);
+    let after = image(cx).expect("image view after reload");
+    assert_ne!(before, after, "외부 변경 뒤 이미지 뷰를 다시 만든다");
+}
+
+/// OWE-663 4번: 출력 속 `src/main.rs:3:4`(세션 cwd 기준 상대 경로)를 ⌘호버하면 밑줄, ⌘을 떼면 사라지고,
+/// ⌘클릭하면 가운데 에디터 탭으로 열려 3번째 줄 4번째 글자에 커서가 간다.
+#[gpui::test]
+fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, point};
+    use krill_proto::screen::{Cell, Op, Revision, Seq, encode_update};
+
+    let dir = TempDir::new("path-link");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/main.rs");
+    fs::write(&file, "a\nb\nfn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-path-link"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    view.update(cx, |s, cx| {
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: dir.0.as_os_str().as_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.attach_test(pane, krill_proto::SessionId(12), ours, cx);
+        let row = |t: &str| {
+            t.chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect()
+        };
+        let ops = vec![
+            Op::Reset { cols: 40, lines: 2 },
+            Op::Line {
+                line: 1,
+                cells: row("  --> src/main.rs:3:4 nope.rs:1"),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = |col: f32| {
+        point(
+            bounds.origin.x + cell.width * (col + 0.5),
+            bounds.origin.y + cell.height * 1.5,
+        )
+    };
+    let cmd = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    let hover = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).path_hover(pane));
+
+    cx.simulate_mouse_move(at(9.), None, Modifiers::default());
+    cx.run_until_parked();
+    let underline = Some(Highlight {
+        line: 1,
+        column: 6,
+        cols: 15,
+    });
+    assert_eq!(
+        hover(cx),
+        underline,
+        "마우스 보고가 꺼져 있으면 ⌘ 없이 마우스만 올려도 밑줄과 포인터 커서가 표시된다"
+    );
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes {
+            flags: Modes::MOUSE_CLICK,
+            ..Modes::default()
+        }
+        .encode()
+        .unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.simulate_mouse_move(at(9.), None, Modifiers::default());
+    assert_eq!(
+        hover(cx),
+        None,
+        "마우스 보고가 켜진 TUI에서는 ⌘ 없이는 밑줄이 없다"
+    );
+    cx.simulate_mouse_move(at(9.), None, cmd);
+    assert_eq!(hover(cx), underline);
+    cx.simulate_modifiers_change(Modifiers::default());
+    assert_eq!(hover(cx), None, "마우스 보고 중 ⌘을 떼면 사라진다");
+    cx.simulate_modifiers_change(cmd);
+    assert_eq!(hover(cx), underline, "움직이지 않고 ⌘만 눌러도 나타난다");
+    cx.simulate_mouse_move(at(25.), None, cmd);
+    assert_eq!(hover(cx), None, "없는 파일은 링크가 아니다");
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::Msg as _;
+        use krill_proto::term_modes::Modes;
+        let frame = Modes::default().encode().unwrap();
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+
+    cx.simulate_mouse_down(at(9.), MouseButton::Left, cmd);
+    cx.simulate_mouse_up(at(9.), MouseButton::Left, cmd);
+    cx.run_until_parked();
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&opened].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(2, 3));
+
+    // OWE-867: 터미널 탭으로 돌아가 일반 평문 URL을 ⌘+호버하면 밑줄이 생기고 ⌘+클릭하면 브라우저로 연다.
+    // 에디터를 여는 동안 숨은 터미널 칸의 연결은 끊기므로(EOF) 다시 붙인다.
+    cx.simulate_keystrokes("ctrl-1");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        s.attach_test(pane, krill_proto::SessionId(12), ours, cx);
+        let row = |t: &str| {
+            t.chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect()
+        };
+        let ops = vec![
+            Op::Reset { cols: 40, lines: 2 },
+            Op::Line {
+                line: 1,
+                cells: row("see (https://example.com/docs?x=1)."),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.run_until_parked();
+    let url = Highlight {
+        line: 1,
+        column: 5,
+        cols: 28,
+    };
+    cx.simulate_mouse_move(at(10.), None, Modifiers::default());
+    assert_eq!(hover(cx), Some(url), "평문 URL은 ⌘ 없이도 밑줄이 생긴다");
+    // 끌어서 선택하면 열지 않고, 끌지 않은 맨 클릭은 팝오버를 띄워 브라우저 열기를 고르게 한다.
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(at(20.), Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(at(20.), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url(), None, "끌어 선택한 것은 링크 열기가 아니다");
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(at(10.), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url(),
+        None,
+        "맨 클릭은 바로 열지 않고 팝오버를 띄운다"
+    );
+    let open = cx.debug_bounds("terminal-link-open").unwrap().center();
+    cx.simulate_click(open, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/docs?x=1")
+    );
+    cx.simulate_mouse_move(at(10.), None, cmd);
+    assert_eq!(
+        hover(cx),
+        Some(Highlight {
+            line: 1,
+            column: 5,
+            cols: 28,
+        }),
+        "평문 URL에 ⌘+호버하면 구두점을 뺀 범위에 밑줄이 생긴다"
+    );
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, cmd);
+    cx.simulate_mouse_up(at(10.), MouseButton::Left, cmd);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/docs?x=1")
+    );
+}
+
+/// OWE-732(MK-178): `⌘⇧E` 파일 탐색기 토글 단축키와 `krill file open|diff` 요청 큐 통합 검증.
+#[gpui::test]
+fn toggle_explorer_shortcut_and_cli_file_open_diff_requests_work(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cli-explorer");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/lib.rs");
+    fs::write(&file, "line1\n    line2_col5\nline3\n").unwrap();
+    let diff_target = dir.0.join("src/staged.rs");
+    fs::write(&diff_target, "pub fn staged() {}\n").unwrap();
+
+    let layout_file = state_path("files-cli-explorer");
+    let state_dir = layout_file.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&state_dir).unwrap();
+    let (view, cx) = open(cx, layout_file);
+
+    // 1. `cmd-shift-e` switches right panel to `Files` tab, second press collapses, third reopens on `Files`.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Changes
+    );
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Files
+    );
+
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).panel_collapsed));
+
+    cx.simulate_keystrokes("cmd-shift-e");
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Files
+    );
+
+    // 2. Write `file-requests.json` queue (as `krill file open` and `krill file diff --staged` do)
+    // and verify the running shell consumes it, opens `src/lib.rs` at line 2 col 5, and opens
+    // `src/staged.rs` in the right Diff panel (`Comparison::Index`).
+    let queue_json = serde_json::json!({
+        "next_id": 3,
+        "requests": [
+            {
+                "id": 1,
+                "kind": "open",
+                "worktree": dir.0,
+                "path": file,
+                "relative_path": "src/lib.rs",
+                "line": 2,
+                "column": 5,
+                "staged": false,
+                "focus": false,
+                "created_at_ms": 1
+            },
+            {
+                "id": 2,
+                "kind": "diff",
+                "worktree": dir.0,
+                "path": diff_target,
+                "relative_path": "src/staged.rs",
+                "staged": true,
+                "focus": false,
+                "created_at_ms": 2
+            }
+        ]
+    });
+    let req_file = state_dir.join("file-requests.json");
+    fs::write(&req_file, serde_json::to_vec(&queue_json).unwrap()).unwrap();
+
+    tick(cx);
+
+    assert!(!req_file.exists(), "file-requests.json must be consumed");
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&opened].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(1, 4));
+
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Changes
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).comparison()),
+        krill_app_core::diff::Comparison::Index
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).selected_path()),
+        Some("src/staged.rs".to_owned())
+    );
+}
+
+#[gpui::test]
+fn cmd_shift_f_toggles_search_and_match_click_moves_editor_cursor(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+
+    let dir = TempDir::new("search-cmd-shift-f");
+    let src_dir = dir.0.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    let file = src_dir.join("target.rs");
+    fs::write(
+        &file,
+        "fn first() {}\nfn second() {\n    let jump_here_token = 42;\n}\n",
+    )
+    .unwrap();
+
+    let (view, cx) = open(cx, state_path("files-search-cmd-shift-f"));
+    let root = dir.0.clone();
+    cx.update(|_, cx| {
+        let diff = view.read(cx).diff.clone();
+        diff.update(cx, |d, cx| d.set_repo(root, cx));
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Changes
+    );
+
+    // 1. Pressing `cmd-shift-f` switches the right panel to `PanelTab::Search`.
+    cx.simulate_keystrokes("cmd-shift-f");
+    tick(cx);
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Search
+    );
+
+    // 2. Pressing `cmd-shift-f` again while `PanelTab::Search` is active (even with search input focused) collapses the right panel.
+    cx.simulate_keystrokes("cmd-shift-f");
+    tick(cx);
+    assert!(cx.update(|_, cx| view.read(cx).panel_collapsed));
+
+    // 3. Pressing `cmd-shift-f` while collapsed uncollapses the right panel and opens `PanelTab::Search`.
+    cx.simulate_keystrokes("cmd-shift-f");
+    tick(cx);
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app_core::diff::PanelTab::Search
+    );
+
+    // 4. Search for `"jump_here_token"` and click the match row -> opens `src/target.rs` in the center editor at 1-based (line 3, col 9) = 0-based (2, 8).
+    cx.update(|_, cx| {
+        let diff = view.read(cx).diff.clone();
+        diff.update(cx, |d, cx| {
+            d.set_search_query("jump_here_token", cx);
+        });
+    });
+    tick(cx);
+
+    let match_bounds = cx
+        .debug_bounds("search-match-src/target.rs-3-9")
+        .expect("match row for src/target.rs:3:9 must be rendered");
+    cx.simulate_mouse_down(
+        match_bounds.center(),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        match_bounds.center(),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    tick(cx);
+    tick(cx);
+
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&opened].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(2, 8));
+}
+
+/// OWE-874-1: 줄:열 지정 열기(`open_file_at`)는 미리보기 종류(마크다운)도 원본 보기로 열고 커서를 옮긴다.
+#[gpui::test]
+fn goto_opens_preview_kind_as_source_with_cursor(cx: &mut TestAppContext) {
+    let dir = TempDir::new("goto-preview");
+    let md = dir.0.join("doc.md");
+    fs::write(&md, "# t\nline2 here\nline3\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-goto-preview"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file_at(md.clone(), 2, 3, cx));
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(pane), Some(md.as_path()));
+    let source = cx.update(|_, cx| {
+        matches!(
+            view.read(cx).files.tabs[&pane].body,
+            Body::Text { shown: None, .. }
+        )
+    });
+    assert!(source, "goto는 미리보기 종류도 원본 보기로 연다");
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(1, 2));
+}
+
+/// OWE-874-3: 에디터 파일 탭이 포커스된 상태에서 ⌘F는 터미널 검색 바가 아니라 에디터 내장 검색을 연다.
+#[gpui::test]
+fn cmd_f_in_editor_opens_editor_search(cx: &mut TestAppContext) {
+    let dir = TempDir::new("editor-search");
+    let file = dir.0.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-editor-search"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| view.read(cx).search.is_some()),
+        "에디터 탭에서는 터미널 검색 바를 띄우지 않는다"
+    );
+    assert!(
+        cx.update(|_, cx| {
+            let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+            state.read(cx).search_session().open
+        }),
+        "에디터 내장 검색이 열린다"
+    );
+}
+
+/// OWE-874-4: 창보다 긴 줄도 잘리지 않고(자동 줄 바꿈) 끝까지 볼 수 있다.
+#[gpui::test]
+fn long_line_wraps_and_cursor_reaches_end(cx: &mut TestAppContext) {
+    let dir = TempDir::new("long-line");
+    let file = dir.0.join("long.txt");
+    let long: String = "x".repeat(600);
+    fs::write(&file, format!("{long}\n")).unwrap();
+    let (view, cx) = open(cx, state_path("files-long-line"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), format!("{long}\n"));
+    // 600번째 글자(0-based 599)로 커서를 옮긴다 — 잘려서 못 가는 일이 없다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let state = s.files.tabs[&pane].editor().unwrap().clone();
+            state.update(cx, |e, cx| {
+                e.set_cursor_position(gpui_component::input::Position::new(0, 599), window, cx);
+            });
+        });
+    });
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(0, 599));
+}
+
+/// 파일 탭이 섞인 일괄 닫기도 묻지 않고 바로 세션을 끝낸다.
+#[gpui::test]
+fn explicit_close_bulk_with_file_tab_terminates_without_asking(cx: &mut TestAppContext) {
+    let dir = TempDir::new("close-sessions-with-file");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "text\n").unwrap();
+    let (view, cx) = open(cx, state_path("close-sessions-with-file"));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    view.update(cx, |s, _| {
+        s.close_call = Some(Arc::new(move |request| {
+            if matches!(request, krill_proto::control::Request::List) {
+                return Ok(krill_proto::control::Reply::Sessions(Vec::new()));
+            }
+            recorded.lock().unwrap().push(request.clone());
+            Ok(krill_proto::control::Reply::Closed)
+        }));
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, krill_proto::SessionId(107));
+    });
+    open_file(&view, &file, cx);
+    cx.simulate_input("draft");
+    cx.simulate_keystrokes("cmd-t");
+    view.update(cx, |s, cx| s.close_other_tabs(s.layout.active(), cx));
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt());
+    assert!(cx.update(|_, cx| view.read(cx).files.tabs.is_empty()));
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: krill_proto::SessionId(107)
+        }]
+    );
+}
+
+/// The file worker is deliberately held while UI actions and drawing continue.
+#[gpui::test]
+fn slow_open_keeps_ui_responsive_and_rejects_replaced_preview(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-stale-open");
+    let old = dir.0.join("old.txt");
+    let new = dir.0.join("new.txt");
+    fs::write(&old, "old").unwrap();
+    fs::write(&new, "new").unwrap();
+    let (view, cx) = open(cx, state_path("async-stale-open"));
+    let (release, gate) = tokio::sync::oneshot::channel();
+    view.update(cx, |shell, cx| {
+        shell.files.next_io = Some(gate);
+        shell.open_file_preview(old.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.update(|_, cx| view.read(cx).files.loading.contains_key(&pane)));
+    assert!(
+        cx.debug_bounds("file-pane").is_some(),
+        "draws while disk work is pending"
+    );
+    view.update(cx, |shell, cx| shell.open_file_preview(new.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active_tab().focused, pane);
+    assert_eq!(editor_text(&view, pane, cx), "new");
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        editor_text(&view, pane, cx),
+        "new",
+        "late IO must not replace the new preview"
+    );
+}
+
+/// 읽는 동안 들어온 키 입력은 무시되고, 늦게 끝난 재로드가 디스크 내용을 보인다.
+#[gpui::test]
+fn late_reload_applies_disk_content_despite_key_input(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-reload-edit");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("async-reload-edit"));
+    let pane = open_file(&view, &file, cx);
+    fs::write(&file, "external change").unwrap();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.files.next_io = Some(gate);
+            shell.reload_file(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "external change");
+}
+
+/// 아티팩트 공유: .md·.html 파일 머리에만 공유 버튼이 있다.
+#[gpui::test]
+fn share_button_only_on_shareable_files(cx: &mut TestAppContext) {
+    let dir = TempDir::new("share-artifact");
+    let md = dir.0.join("doc.md");
+    fs::write(&md, "# doc\n").unwrap();
+    let rs = dir.0.join("main.rs");
+    fs::write(&rs, "fn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-share-artifact"));
+
+    open_file(&view, &rs, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+
+    open_file(&view, &md, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_some());
+}
+
+#[gpui::test]
+fn crlf_survives_open_and_reload(cx: &mut TestAppContext) {
+    let dir = TempDir::new("crlf-baseline");
+    let file = dir.0.join("source.txt");
+    fs::write(&file, "first\r\nsecond\r\n").unwrap();
+    let (view, cx) = open(cx, state_path("crlf-baseline"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), "first\r\nsecond\r\n");
+    fs::write(&file, "third\r\nfourth\r\n").unwrap();
+    cx.update(|window, cx| view.update(cx, |shell, cx| shell.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "third\r\nfourth\r\n");
+}
+
+#[gpui::test]
+fn hidden_clean_cache_evicts_but_selected_documents_survive(cx: &mut TestAppContext) {
+    let dir = TempDir::new("clean-cache-pins");
+    let (view, cx) = open(cx, state_path("clean-cache-pins"));
+    let selected_path = dir.0.join("selected.txt");
+    fs::write(&selected_path, "selected text").unwrap();
+    let selected = open_file(&view, &selected_path, cx);
+    cx.update(|window, cx| {
+        let editor = view.read(cx).files.tabs[&selected]
+            .editor()
+            .unwrap()
+            .clone();
+        editor.update(cx, |editor, cx| editor.select_all(window, cx));
+    });
+    let oldest_path = dir.0.join("oldest.txt");
+    fs::write(&oldest_path, "old content").unwrap();
+    let oldest = open_file(&view, &oldest_path, cx);
+    for index in 0..CLEAN_CACHE_TABS + 3 {
+        let path = dir.0.join(format!("{index}.txt"));
+        fs::write(&path, "small document").unwrap();
+        open_file(&view, &path, cx);
+    }
+    view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs.contains_key(&selected));
+        assert!(!shell.files.tabs.contains_key(&oldest));
+        assert!(shell.files.tabs.len() <= CLEAN_CACHE_TABS);
+    });
+    fs::write(&oldest_path, "fresh content after eviction").unwrap();
+    let reopened = open_file(&view, &oldest_path, cx);
+    assert_eq!(
+        editor_text(&view, reopened, cx),
+        "fresh content after eviction"
+    );
+}
+
+#[gpui::test]
+fn clearing_hidden_selection_releases_cache_pin_without_switching_tabs(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache-selection-unpin");
+    let (view, cx) = open(cx, state_path("cache-selection-unpin"));
+    let mut editors = Vec::new();
+    for index in 0..CLEAN_CACHE_TABS + 3 {
+        let path = dir.0.join(format!("{index}.txt"));
+        fs::write(&path, "selected text").unwrap();
+        let pane = open_file(&view, &path, cx);
+        cx.update(|window, cx| {
+            let editor = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+            editor.update(cx, |editor, cx| editor.select_all(window, cx));
+            editors.push(editor);
+        });
+        cx.run_until_parked();
+    }
+    let focused = view.read_with(cx, |shell, _| {
+        assert!(shell.files.tabs.len() > CLEAN_CACHE_TABS);
+        shell.layout.focused()
+    });
+    for editor in editors {
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.set_selected_range(0..0, cx)));
+    }
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout.focused(), focused);
+        assert!(shell.files.tabs.len() <= CLEAN_CACHE_TABS);
+    });
+}
+
+#[gpui::test]
+fn closing_window_materializes_latest_pending_layout_without_waiting_for_debounce(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("close-ui-layout-debounce");
+    let (view, visual) = open(cx, path.clone());
+    let (before, expected) = view.update(visual, |shell, _| {
+        shell.flush_layout();
+        let before = shell.layout_save_requests.snapshots();
+        for width in 240_u16..320 {
+            shell.layout.sidebar_width = f32::from(width);
+            shell.save();
+        }
+        (before, shell.layout.clone())
+    });
+    visual.update(|window, cx| view.update(cx, |shell, cx| shell.request_close(window, cx)));
+    visual.run_until_parked();
+    assert!(cx.update(|cx| cx.windows().is_empty()));
+    assert_eq!(Layout::load(&path).unwrap(), expected);
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+    });
+    cx.executor()
+        .advance_clock(super::super::persist::DELAY * 2);
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+    });
+}
+
+#[gpui::test]
+fn quit_preflush_materializes_latest_layout_before_shutdown_waits(cx: &mut TestAppContext) {
+    let path = state_path("quit-ui-layout-debounce");
+    let (view, visual) = open(cx, path.clone());
+    let (before, expected) = view.update(visual, |shell, _| {
+        shell.flush_layout();
+        let before = shell.layout_save_requests.snapshots();
+        for width in 260_u16..340 {
+            shell.layout.panel_width = f32::from(width);
+            shell.save();
+        }
+        (before, shell.layout.clone())
+    });
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    // No UI timer advance: quit must materialize the last pending request now.
+    visual.update(|_, cx| {
+        cx.set_global(QuitObserved(quitting.clone()));
+        quit_app(cx);
+    });
+    visual.run_until_parked();
+    view.read_with(visual, |shell, _| {
+        assert_eq!(shell.layout_save_requests.snapshots(), before + 1);
+        assert!(!shell.layout_save_requests.is_pending());
+        shell.saver.flush();
+        let persisted = Layout::load(&path).unwrap();
+        assert_eq!(persisted, shell.layout);
+        assert_eq!(
+            persisted.panel_width.to_bits(),
+            expected.panel_width.to_bits()
+        );
+        assert!(shell.quit_layout_ready.get());
+    });
+    visual.run_until_parked();
+    assert!(
+        quitting.get(),
+        "platform quit is requested only after durable preflush"
+    );
+    view.read_with(visual, |shell, _| {
+        assert_eq!(Layout::load(&path).unwrap(), shell.layout);
+    });
+}
+
+#[gpui::test]
+fn quit_preflush_shuts_down_link_hosts_before_platform_quit(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-quit-link-preflush-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let link_hosts = krill_app_core::hosts::link::LinkHosts::shared(dir.clone(), PathBuf::new());
+    let path = state_path("quit-link-preflush");
+    let (_view, visual) = open(cx, path);
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    visual.update(|_, cx| {
+        cx.set_global(QuitObserved(quitting.clone()));
+        quit_app(cx);
+    });
+    visual.run_until_parked();
+    assert!(quitting.get(), "quit must complete after link preflush");
+    assert!(
+        link_hosts.is_closed(),
+        "quit_now must close and shut down LinkHosts before cx.quit()"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn show_wrapped_path(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    dir: &Path,
+) -> (PaneId, Point<Pixels>) {
+    use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+    let pane = layout_of(view, cx).active_tab().focused;
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    view.update(cx, |s, cx| {
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: dir.as_os_str().as_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.attach_test(pane, krill_proto::SessionId(121), ours, cx);
+        let mut head: Vec<_> = "src/long-name.rs"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        assert_eq!(head.len(), 16, "실제 마지막 칸에 WRAPLINE을 둔다");
+        head.last_mut().unwrap().flags |= Flags::WRAPLINE;
+        let ops = vec![
+            Op::Reset { cols: 16, lines: 4 },
+            Op::Line {
+                line: 0,
+                cells: head,
+            },
+            Op::Line {
+                line: 1,
+                cells: ":2:3"
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect(),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    (
+        pane,
+        point(
+            bounds.origin.x + cell.width * 2.5,
+            bounds.origin.y + cell.height * 1.5,
+        ),
+    )
+}
+
+#[gpui::test]
+fn wrapped_file_cmd_click_uses_full_location_and_rejects_changed_prefix(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-cmd");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/long-name.rs");
+    fs::write(&file, "first\nsecond\n").unwrap();
+    let (view, cx) = open(cx, state_path("wrapped-cmd"));
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, cx| {
+        use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+        s.files.link_next_io = Some(rx);
+        s.path_link_at(pane, at, Some(terminal_menu::FileAction::Open), cx);
+        // 포인터 행은 두고 앞 행만 바꾼다.
+        let mut cells: Vec<_> = "src/wrong-na.rs"
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        cells.resize(16, Cell::default());
+        cells.last_mut().unwrap().flags |= Flags::WRAPLINE;
+        let frame =
+            &encode_update(Revision(2), Seq(0), vec![Op::Line { line: 0, cells }]).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    tx.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(
+        layout_of(&view, cx).file(pane).is_none(),
+        "늦은 결과로 옛 파일을 열지 않는다"
+    );
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    cx.simulate_mouse_move(
+        at,
+        None,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        Some(Highlight {
+            line: 1,
+            column: 0,
+            cols: 4
+        })
+    );
+    cx.simulate_click(
+        at,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    let cursor = cx.update(|_, cx| {
+        view.read(cx).files.tabs[&opened]
+            .editor()
+            .unwrap()
+            .read(cx)
+            .cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(1, 2));
+}
+
+#[gpui::test]
+fn wrapped_file_remote_guard_and_expired_negative_cache(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-cache");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let (view, cx) = open(cx, state_path("wrapped-cache"));
+    let (pane, at) = show_wrapped_path(&view, cx, &dir.0);
+    view.update(cx, |s, cx| {
+        s.path_link_at(pane, at, None, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| {
+        view.read(cx)
+            .files
+            .link_lookup
+            .as_ref()
+            .unwrap()
+            .found
+            .is_none()
+    }));
+    fs::write(dir.0.join("src/long-name.rs"), "first\nsecond\n").unwrap();
+    view.update(cx, |s, cx| {
+        s.files.link_lookup.as_mut().unwrap().checked_at =
+            std::time::Instant::now().checked_sub(Duration::from_secs(1));
+        // 내부 캐시도 같은 유효기간으로 만료시킨다.
+        s.files.link_cache.lock().unwrap().0 = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        s.path_link_at(pane, at, None, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| {
+        view.read(cx)
+            .files
+            .link_lookup
+            .as_ref()
+            .unwrap()
+            .found
+            .is_some()
+    }));
+    view.update(cx, |s, cx| {
+        s.layout
+            .set_host(pane, krill_app_core::hosts::HostId::Remote("other".into()));
+        assert!(
+            s.path_link_at(pane, at, Some(terminal_menu::FileAction::Open), cx)
+                .is_none()
+        );
+        s.update_path_hover(pane, at, true, cx);
+        assert!(s.path_hover(pane).is_none());
+        s.open_terminal_file(
+            dir.0.join("src/long-name.rs"),
+            at,
+            terminal_menu::FileAction::Open,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).file(pane).is_none());
+}
+
+#[gpui::test]
+fn restart_quit_stops_after_helper_failure_or_payload_replacement(cx: &mut TestAppContext) {
+    use krill_app_core::updater::{RestartStatus, StagedUpdate, UpdateState};
+    let staged = StagedUpdate {
+        state_dir: "/test/restart-quit".into(),
+        app_bundle: "/test/Krill.app".into(),
+        from_version: "0.1.0".into(),
+        to_version: "0.2.0".into(),
+        manifest_url: "https://example.test/latest.json".into(),
+        relaunched: false,
+    };
+    cx.update(|cx| {
+        cx.set_global(UpdateState {
+            staged: Some(staged.clone()),
+            restart: RestartStatus::Starting,
+            ..Default::default()
+        });
+        assert!(super::restart_quit_is_current(Some(&staged), cx));
+        let mut failed = cx.global::<UpdateState>().clone();
+        failed.restart = RestartStatus::Failed("helper exited".into());
+        cx.set_global(failed);
+        assert!(!super::restart_quit_is_current(Some(&staged), cx));
+        assert!(
+            super::restart_quit_is_current(None, cx),
+            "ordinary quit remains available"
+        );
+        let mut next = staged.clone();
+        next.to_version = "0.3.0".into();
+        cx.set_global(UpdateState {
+            staged: Some(next),
+            restart: RestartStatus::Starting,
+            ..Default::default()
+        });
+        assert!(!super::restart_quit_is_current(Some(&staged), cx));
+    });
+}
+
+#[gpui::test]
+fn session_tab_keeps_focus_after_viewing_file_and_closing_or_reloading(cx: &mut TestAppContext) {
+    let dir = TempDir::new("session-focus-after-file");
+    let md = dir.0.join("REPORT.md");
+    fs::write(&md, "# Report\n\ninitial\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("session-focus-after-file"));
+    let session_pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "초기 세션 탭은 Shell 포커스를 가져야 한다"
+    );
+
+    // 1. 마크다운 파일(`REPORT.md`)을 조회한 뒤 원본 보기로 전환해 에디터가 포커스를 가져가게 한다.
+    let file_pane = open_file(&view, &md, cx);
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
+        Some(true)
+    );
+    let toggle = cx.debug_bounds("file-edit").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane)),
+        Some(false)
+    );
+    assert!(
+        cx.update(|window, cx| view.read(cx).is_editor_focused(window, cx)),
+        "원본 보기 전환 후에는 에디터가 포커스를 가져야 한다"
+    );
+
+    // 2. 마우스로 세션 탭(0번)을 클릭해 돌아온 뒤 비활성 파일 탭(1번)의 닫기 버튼(`close-tab-1`)을 눌러 닫아도
+    // 세션 탭의 키보드 포커스(`shell.focus`)가 끊기지 않아야 한다.
+    let tab0 = cx.debug_bounds("session-tab-0").unwrap().center();
+    cx.simulate_click(tab0, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell.layout.focused()),
+        Some(session_pane)
+    );
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "세션 탭을 클릭해 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    let tab1 = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_move(tab1, None, Modifiers::default());
+    cx.run_until_parked();
+    let close_file_tab = cx.debug_bounds("close-tab-1").unwrap().center();
+    cx.simulate_click(close_file_tab, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "비활성 파일 탭의 닫기 버튼을 눌러 닫은 뒤에도 세션 포커스가 유지되어야 한다"
+    );
+
+    // 3. 다시 파일을 열어 둔 상태에서 세션 탭으로 돌아오고(검색 바가 열려 있더라도),
+    // 백그라운드 감시가 디스크 변경을 자동 리로드할 때 숨겨진 에디터가 세션 포커스를 뺏지 않아야 한다.
+    let file_pane2 = open_file(&view, &md, cx);
+    let toggle = cx.debug_bounds("file-edit").unwrap().center();
+    cx.simulate_click(toggle, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(file_pane2)),
+        Some(false)
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            // 검색 바를 열어 둔 채 세션 탭으로 복귀
+            let bar = cx.new(|cx| krill_app_core::search::Bar::new(window, cx));
+            let sub = cx.subscribe_in(
+                &bar,
+                window,
+                |_, _, _: &krill_app_core::search::Event, _, _| {},
+            );
+            shell.search = Some((bar, sub));
+            shell.change(true, cx, |l| l.activate(0));
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "검색 바가 열려 있어도 파일 탭에서 세션 탭으로 돌아오면 Shell 포커스가 복원되어야 한다"
+    );
+
+    fs::write(&md, "# Report\n\nupdated by agent in background\n").unwrap();
+    tick(cx);
+    assert!(
+        cx.update(|window, cx| view.read(cx).focus.is_focused(window)),
+        "백그라운드 파일 자동 리로드가 실행 중인 세션 탭의 포커스를 뺏으면 안 된다"
+    );
+}
+
+#[gpui::test]
+fn remote_terminal_image_click_and_hover_open_staged_image_tab(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, point};
+    use krill_app_core::hosts::{HostId, HostTarget};
+    use krill_proto::control::{FEAT_CONTROL, FEAT_REMOTE_FS, Reply, Request};
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+    use krill_proto::remote_fs::{
+        RemoteFsReply, RemoteFsRequest, WireReadChunk, WireStamp, WireStat,
+    };
+    use krill_proto::screen::{Cell, Msg as _, Op, Revision, Seq, encode_update};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = TempDir::new("remote-image-open");
+    let sock_path = dir.0.join("remote-d.sock");
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let remote_img = PathBuf::from("/Users/remote/visual/threads/krill-threads-card.png");
+    let remote_img_wire = remote_img.as_os_str().as_bytes().to_vec();
+    let mut png_bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png_bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let probe_calls_bg = probe_calls.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = stop.clone();
+
+    let daemon = std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            if stop_bg.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut writer = stream.try_clone().unwrap();
+            let server = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: FEAT_CONTROL | FEAT_REMOTE_FS,
+                build: "test".to_owned(),
+                instance_id: 1,
+            };
+            if writer.write_all(&server.encode().unwrap()).is_err() {
+                continue;
+            }
+            let Some((kind, body)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                continue;
+            };
+            let _ = ClientHello::decode(kind, &body).unwrap();
+            let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                continue;
+            };
+            let Ok(req) = Request::decode(kind, &payload) else {
+                continue;
+            };
+            let reply = match req {
+                Request::RemoteFs(RemoteFsRequest::ProbePaths { paths, .. }) => {
+                    probe_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    let resolved = paths
+                        .into_iter()
+                        .map(|p| (p == remote_img_wire).then(|| remote_img_wire.clone()))
+                        .collect();
+                    Reply::RemoteFs(RemoteFsReply::ProbedPaths(resolved))
+                }
+                Request::RemoteFs(RemoteFsRequest::ReadFile { .. }) => {
+                    Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                        stat: WireStat {
+                            exists: true,
+                            is_file: true,
+                            is_dir: false,
+                            is_symlink: false,
+                            stamp: Some(WireStamp {
+                                modified_unix_ns: Some(1_700_000_000_000_000_000),
+                                len: u64::try_from(png_bytes.len()).unwrap(),
+                            }),
+                        },
+                        bytes: png_bytes.clone(),
+                        eof: true,
+                    })))
+                }
+                Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                    Reply::RemoteFs(RemoteFsReply::Stat(Ok(WireStat {
+                        exists: true,
+                        is_file: true,
+                        is_dir: false,
+                        is_symlink: false,
+                        stamp: Some(WireStamp {
+                            modified_unix_ns: Some(1_700_000_000_000_000_000),
+                            len: u64::try_from(png_bytes.len()).unwrap(),
+                        }),
+                    })))
+                }
+                _ => continue,
+            };
+            stream.write_all(&reply.encode().unwrap()).ok();
+        }
+    });
+
+    let (view, cx) = open(cx, state_path("remote-image-open"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let host = HostId::Remote("macmini".into());
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let line_text = format!("  {}", remote_img.display());
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(
+            host.clone(),
+            HostTarget::remote("macmini", sock_path.clone()),
+        );
+        s.layout.set_host(pane, host.clone());
+        s.attach_test(pane, krill_proto::SessionId(860), ours, cx);
+        let cells: Vec<_> = line_text
+            .chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect();
+        let ops = vec![
+            Op::Reset { cols: 80, lines: 4 },
+            Op::Line { line: 1, cells },
+        ];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.run_until_parked();
+
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = |col: f32| {
+        point(
+            bounds.origin.x + cell.width * (col + 0.5),
+            bounds.origin.y + cell.height * 1.5,
+        )
+    };
+    let cmd = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+
+    // 1. ⌘ 없이 마우스만 올려도 원격 ProbePaths를 거쳐 밑줄(및 포인터 커서)이 뜨고,
+    // 같은 경로의 옆 열로 움직여도 재조회 없이 밑줄이 유지된다.
+    cx.simulate_mouse_move(at(5.), None, Modifiers::default());
+    cx.run_until_parked();
+    let expected_hl = Some(Highlight {
+        line: 1,
+        column: 2,
+        cols: u16::try_from(remote_img.to_str().unwrap().len()).unwrap(),
+    });
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+    let calls_after_hover = probe_calls.load(Ordering::SeqCst);
+    assert_eq!(calls_after_hover, 1);
+
+    cx.simulate_mouse_move(at(12.), None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+    assert_eq!(
+        probe_calls.load(Ordering::SeqCst),
+        calls_after_hover,
+        "같은 링크 범위 안 열 이동은 원격 ProbePaths를 다시 호출하지 않는다"
+    );
+    cx.simulate_mouse_move(at(12.), None, cmd);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path_hover(pane)),
+        expected_hl
+    );
+
+    // 2. 원격 터미널에서 이미지를 일반 클릭(⌘ 없이)해도 원격 호스트의 이미지 탭으로 열린다.
+    cx.simulate_click(at(12.), Modifiers::default());
+    cx.run_until_parked();
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx).file(opened),
+        Some(remote_img.as_path())
+    );
+    assert_eq!(layout_of(&view, cx).host(opened), &host);
+    assert!(cx.update(|_, cx| matches!(view.read(cx).files.tabs[&opened].body, Body::Image(_))));
+
+    stop.store(true, Ordering::SeqCst);
+    drop(UnixStream::connect(&sock_path));
+    daemon.join().ok();
+}
+
+/// APP-RUNTIME-004: `layout_loading` 중에 연 파일 탭은 `restore_layout`이 끝나도 같은 `EditorState`로
+/// 남고, 복원된 파일 탭과 `PaneId`가 충돌하지 않는다.
+#[gpui::test]
+fn early_file_editor_survives_startup_restore(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-early-editor");
+    let saved_file = dir.0.join("saved.rs");
+    let early_file = dir.0.join("early.rs");
+    fs::write(&saved_file, "const SAVED: usize = 1;\n").unwrap();
+    fs::write(&early_file, "fn main() {}\n").unwrap();
+
+    let path = state_path("startup-early-editor-layout");
+    let mut saved = krill_app_core::layout::Layout::default();
+    let saved_term = saved.focused().unwrap();
+    saved.set_session(saved_term, krill_proto::SessionId(7));
+    let saved_editor_pane = saved.open_file(saved_file.clone());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::shell::bind_keys(cx);
+        krill_app_core::settings::init_at(state_dir, cx);
+    });
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = crate::shell::Shell::new_with_restore_gate(Some(path.clone()), gate, cx);
+        assert!(shell.layout_loading);
+        shell.open_file(early_file.clone(), cx);
+        shell
+    });
+    cx.run_until_parked();
+
+    let (early_pane, editor_entity_before) = view.read_with(cx, |shell, _| {
+        assert!(shell.layout_loading);
+        let pane = shell.layout.active_tab().focused;
+        let entity_id = shell.files.tabs[&pane].editor().unwrap().entity_id();
+        (pane, entity_id)
+    });
+    assert_eq!(
+        early_pane, saved_editor_pane,
+        "early file tab originally collides with saved editor PaneId before saved-layout rekey"
+    );
+    assert_eq!(editor_text(&view, early_pane, cx), "fn main() {}\n");
+
+    // 이제 백그라운드 레이아웃 복원이 끝난다.
+    release.send(()).unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.layout_loading);
+        assert_eq!(shell.layout.tabs().len(), 3);
+        assert_eq!(shell.layout.active(), 2);
+        assert_eq!(shell.layout.tab_panes(2), vec![early_pane]);
+        assert_ne!(shell.layout.tab_panes(1)[0], early_pane);
+        assert_eq!(
+            shell.layout.file(shell.layout.tab_panes(1)[0]),
+            Some(saved_file.as_path())
+        );
+        assert_eq!(
+            shell.files.tabs[&early_pane].editor().unwrap().entity_id(),
+            editor_entity_before,
+            "same EditorState entity must survive startup restore without reload"
+        );
+    });
+    assert_eq!(editor_text(&view, early_pane, cx), "fn main() {}\n");
+    assert_eq!(
+        fs::read_to_string(&saved_file).unwrap(),
+        "const SAVED: usize = 1;\n"
+    );
+}
+
+/// APP-F01 후속 회귀용 가짜 원격 파일 데몬: 실제 `krilld`처럼 한 제어 연결에서 연속 `Stat`·`ReadFile`·`WriteAtomic`
+/// 요청을 처리하고 `offset`/`max_bytes` 슬라이싱과 연결·읽기 횟수, 오류 주입을 지원한다.
+struct FakeRemoteFs {
+    sock_path: PathBuf,
+    text: Arc<std::sync::Mutex<Vec<u8>>>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    fail_reads: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeRemoteFs {
+    fn serve(initial: &[u8]) -> Self {
+        use krill_proto::control::{FEAT_CONTROL, FEAT_REMOTE_FS, Reply, Request};
+        use krill_proto::ipc::{ClientHello, ServerHello};
+        use krill_proto::os::net::UnixListener;
+        use krill_proto::remote_fs::{
+            RemoteFsReply, RemoteFsRequest, WireReadChunk, WireStamp, WireStat, WireWriteOutcome,
+        };
+        use krill_proto::screen::Msg as _;
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // macOS 유닉스 소켓 경로 상한(SUN_LEN)이 짧아 임시 폴더 바로 아래의 짧은 이름을 쓴다.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let sock_path = std::env::temp_dir().join(format!(
+            "mk-rfs-{}-{}.sock",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::remove_file(&sock_path).ok();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let text = Arc::new(std::sync::Mutex::new(initial.to_vec()));
+        let generation = Arc::new(AtomicUsize::new(1));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (text_bg, conns_bg, reads_bg, writes_bg, fail_bg, stop_bg) = (
+            text.clone(),
+            connections.clone(),
+            reads.clone(),
+            writes.clone(),
+            fail_reads.clone(),
+            stop.clone(),
+        );
+        let stat = move |text: &[u8], generation: usize| WireStat {
+            exists: true,
+            is_file: true,
+            is_dir: false,
+            is_symlink: false,
+            stamp: Some(WireStamp {
+                modified_unix_ns: Some(
+                    1_700_000_000_000_000_000 + u64::try_from(generation).unwrap(),
+                ),
+                len: u64::try_from(text.len()).unwrap(),
+            }),
+        };
+        let thread = std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                if stop_bg.load(Ordering::SeqCst) {
+                    break;
+                }
+                conns_bg.fetch_add(1, Ordering::SeqCst);
+                let mut writer = stream.try_clone().unwrap();
+                let server = ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: FEAT_CONTROL | FEAT_REMOTE_FS,
+                    build: "test".to_owned(),
+                    instance_id: 1,
+                };
+                if writer.write_all(&server.encode().unwrap()).is_err() {
+                    continue;
+                }
+                let Some((kind, body)) = ipc::read_frame(&mut stream).ok().flatten() else {
+                    continue;
+                };
+                let _ = ClientHello::decode(kind, &body).unwrap();
+                while let Some((kind, payload)) = ipc::read_frame(&mut stream).ok().flatten() {
+                    let Ok(req) = Request::decode(kind, &payload) else {
+                        break;
+                    };
+                    let reply = match req {
+                        Request::RemoteFs(RemoteFsRequest::Stat { .. }) => {
+                            let text = text_bg.lock().unwrap();
+                            Reply::RemoteFs(RemoteFsReply::Stat(Ok(stat(
+                                &text,
+                                generation.load(Ordering::SeqCst),
+                            ))))
+                        }
+                        Request::RemoteFs(RemoteFsRequest::ReadFile {
+                            offset, max_bytes, ..
+                        }) => {
+                            reads_bg.fetch_add(1, Ordering::SeqCst);
+                            if fail_bg.load(Ordering::SeqCst) {
+                                Reply::RemoteFs(RemoteFsReply::FileChunk(Err(
+                                    "simulated remote disk read error".to_owned(),
+                                )))
+                            } else {
+                                let text = text_bg.lock().unwrap();
+                                let start = usize::try_from(offset)
+                                    .unwrap_or(text.len())
+                                    .min(text.len());
+                                let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+                                let end = start.saturating_add(cap).min(text.len());
+                                Reply::RemoteFs(RemoteFsReply::FileChunk(Ok(WireReadChunk {
+                                    stat: stat(&text, generation.load(Ordering::SeqCst)),
+                                    bytes: text[start..end].to_vec(),
+                                    eof: end >= text.len(),
+                                })))
+                            }
+                        }
+                        Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+                            bytes, commit, ..
+                        }) => {
+                            assert!(commit, "test files fit one chunk");
+                            *text_bg.lock().unwrap() = bytes.clone();
+                            let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                            writes_bg.lock().unwrap().push(bytes.clone());
+                            Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(
+                                stat(&bytes, generation).stamp.unwrap(),
+                            )))
+                        }
+                        _ => break,
+                    };
+                    if stream.write_all(&reply.encode().unwrap()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            sock_path,
+            text,
+            connections,
+            reads,
+            writes,
+            fail_reads,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn target(&self) -> krill_app_core::hosts::HostTarget {
+        krill_app_core::hosts::HostTarget::remote("studio", self.sock_path.clone())
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    fn set_fail_reads(&self, fail: bool) {
+        self.fail_reads
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for FakeRemoteFs {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(UnixStream::connect(&self.sock_path));
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+        fs::remove_file(&self.sock_path).ok();
+    }
+}
+
+/// APP-F01 후속: 원격 텍스트 칸은 어떤 경로에서도 같은 경로의 로컬 파일을 읽거나 쓰지 않는다.
+/// 전송이 없으면 읽지 않고(오프라인 안내), 보는 중 전송이 끊기면 다시 읽기가 보이던 내용을 지킨 채
+/// 거부되며, 전송이 돌아오면 원격 변경을 원격 데몬에서만 다시 읽는다.
+#[gpui::test]
+fn remote_text_pane_never_reads_or_writes_colliding_local_file(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-local-guard");
+    // 원격 경로와 같은 로컬 경로에 다른 내용의 파일을 둔다(충돌 경로).
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local secret\n").unwrap();
+    let daemon = FakeRemoteFs::serve(b"remote content\n");
+    let host = HostId::Remote("studio".into());
+    let (view, cx) = open(cx, state_path("remote-editor-local-guard"));
+
+    // 1. 전송이 없는 원격 칸: 같은 경로의 로컬 파일을 읽지 않는다.
+    view.update(cx, |s, cx| {
+        assert!(s.target_for_host(&host).is_none());
+        s.open_file_on(host.clone(), file.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_some());
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert!(matches!(tab.body, Body::Offline));
+        assert!(
+            tab.doc.is_none() && tab.editor().is_none(),
+            "a remote pane without a transport must not load the colliding local file"
+        );
+        assert!(!s.files.loading.contains_key(&pane));
+    });
+    assert_eq!(daemon.reads(), 0);
+
+    // 2. 전송이 생기면 원격 데몬에서 읽는다(로컬 내용은 보이지 않는다).
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "remote content\n");
+    assert_eq!(daemon.reads(), 1);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_none());
+
+    // 3. 입력은 원격 파일도 로컬 파일도 바꾸지 않는다. 전송이 끊기면 다시 읽기는 로컬 파일을 읽지 않고
+    // 보이던 내용을 지킨 채 오류 띠만 띄운다.
+    cx.simulate_input("x");
+    assert_eq!(editor_text(&view, pane, cx), "remote content\n");
+    view.update(cx, |s, _| {
+        s.host_targets.remove(&host);
+    });
+    cx.update(|window, cx| view.update(cx, |s, cx| s.reload_file(pane, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "remote content\n");
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert_eq!(tab.error.as_deref(), Some(etext::REMOTE_DISCONNECTED.get()));
+        assert!(!s.files.loading.contains_key(&pane));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-error").is_some());
+    assert_eq!(
+        daemon.reads(),
+        1,
+        "no disk read happened while disconnected"
+    );
+
+    // 4. 전송이 돌아오면 원격 변경을 원격 데몬에서 다시 읽는다. 로컬 파일은 그대로고 아무것도 쓰지 않는다.
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    *daemon.text.lock().unwrap() = b"remote content, changed\n".to_vec();
+    tick(cx);
+    assert_eq!(editor_text(&view, pane, cx), "remote content, changed\n");
+    assert_eq!(daemon.reads(), 2);
+    view.read_with(cx, |s, _| assert!(s.files.tabs[&pane].error.is_none()));
+    assert!(daemon.writes().is_empty());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "local secret\n");
+}
+
+/// APP-F01 후속: 원격 HTML 칸은 로컬 전용 공유(아티팩트)를 버튼·호출 모두에서 거부하고, 전송이 없으면
+/// 브라우저 열기·Finder 보기처럼 로컬 경로로 떨어지는 동작을 숨긴다. 로컬 칸의 공유 버튼은 그대로다.
+#[gpui::test]
+fn remote_html_pane_hides_local_only_share_and_browser_actions(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-share-guard");
+    let file = dir.0.join("page.html");
+    fs::write(&file, "<title>local</title>\n").unwrap();
+    let daemon = FakeRemoteFs::serve(b"<title>remote</title>\n");
+    let host = HostId::Remote("studio".into());
+    let (view, cx) = open(cx, state_path("remote-editor-share-guard"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), file.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // 연결된 원격: HTML 미리보기·브라우저 열기는 원격 전송으로 가므로 보이고, 로컬 전용 공유 버튼은 없다.
+    assert_eq!(
+        view.read_with(cx, |s, _| s.is_file_preview(pane)),
+        Some(true)
+    );
+    assert!(cx.debug_bounds("file-html-preview").is_some());
+    assert!(cx.debug_bounds("file-open-browser").is_some());
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+    assert_eq!(daemon.reads(), 1);
+
+    // 버튼 없이 직접 불러도 원격 칸의 공유는 거부된다(같은 경로의 로컬 파일이 올라가지 않는다).
+    cx.update(|window, cx| view.update(cx, |s, cx| s.share_file_artifact(pane, window, cx)));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(!s.files.sharing.contains(&pane));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(atext::SHARE_REMOTE_UNSUPPORTED.get())
+        );
+    });
+
+    // 전송이 끊기면 로컬 경로로 떨어지는 동작을 모두 숨기고 연결 안내만 보인다.
+    view.update(cx, |s, _| {
+        s.host_targets.remove(&host);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-offline").is_some());
+    assert!(cx.debug_bounds("file-html-preview").is_none());
+    assert!(cx.debug_bounds("file-open-browser").is_none());
+    assert!(cx.debug_bounds("file-html-open-browser").is_none());
+    assert!(cx.debug_bounds("file-reveal").is_none());
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+
+    // 전송이 돌아오면 다시 읽지 않고도 원격 미리보기로 돌아간다.
+    view.update(cx, |s, _| {
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-html-preview").is_some());
+    assert!(cx.debug_bounds("file-open-browser").is_some());
+    assert_eq!(daemon.reads(), 1);
+
+    // 로컬 칸에는 공유 버튼이 그대로 있다.
+    let local = dir.0.join("doc.md");
+    fs::write(&local, "# doc\n").unwrap();
+    view.update(cx, |s, cx| s.open_file_on(HostId::Local, local.clone(), cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_some());
+}
+
+/// APP-F01 후속: 탭이 없는 원격 작업공간에서 단일 클릭 미리보기는 `open_file`처럼 작업공간 호스트에 열린다.
+/// 전송이 없으므로 같은 경로의 로컬 파일이 있어도 읽지 않는다.
+#[gpui::test]
+fn preview_in_empty_remote_workspace_keeps_workspace_host(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use std::collections::BTreeMap;
+
+    let (view, cx) = open(cx, state_path("remote-editor-empty-ws-preview"));
+    let host = HostId::Remote("studio".into());
+    let wt = PathBuf::from("/remote/repo/wt-1");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_manager.sync_specs(&[RemoteHostSpec {
+                id: "studio".into(),
+                label: "Studio".into(),
+                address: "owen@studio.local".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            }]);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "studio",
+                    HostStatus::Connected,
+                    krill_app_core::sidebar::Snapshot {
+                        sessions: Vec::new(),
+                        trees: BTreeMap::from([(PathBuf::from("/remote/repo"), vec![wt.clone()])]),
+                    },
+                    cx,
+                );
+                sb.select_worktree(Some(wt.clone()), cx);
+            });
+            while !s.layout.tabs().is_empty() {
+                s.layout.close_tab(0);
+            }
+        });
+    });
+    cx.run_until_parked();
+    let readme = wt.join("README.md");
+    view.update(cx, |s, cx| {
+        assert!(s.layout.focused().is_none());
+        assert_eq!(s.active_workspace(cx).host, host);
+        assert!(s.target_for_host(&host).is_none());
+        s.open_file_preview(readme.clone(), cx);
+    });
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    let pane = l.active_tab().focused;
+    assert_eq!(l.file(pane), Some(readme.as_path()));
+    assert_eq!(
+        l.host(pane),
+        &host,
+        "preview in an empty remote workspace must open on the workspace host, not Local"
+    );
+    assert_eq!(
+        l.launch(pane).map(|c| c.cwd.clone()),
+        Some(wt.as_os_str().as_bytes().to_vec())
+    );
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Offline)
+        ));
+    });
+}
+
+/// APP-F01 후속: 전송이 없는 원격 터미널 칸의 경로 링크 동작(기본 앱으로 열기·Finder에서 보기)은 같은 경로의
+/// 로컬 파일로 떨어지지 않고 연결 안내만 띄운다. 경로 복사와 에디터로 열기(오프라인 칸)는 그대로 된다.
+#[gpui::test]
+fn terminal_link_actions_on_disconnected_remote_pane_never_touch_local_path(
+    cx: &mut TestAppContext,
+) {
+    use krill_app_core::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-link-guard");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local secret\n").unwrap();
+    let (view, cx) = open(cx, state_path("remote-editor-link-guard"));
+    let host = HostId::Remote("studio".into());
+    let link = || PathLink {
+        column: 0,
+        cols: 1,
+        path: file.clone(),
+        line: None,
+        col: None,
+    };
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(pane, host.clone());
+        assert!(s.target_for_host(&host).is_none());
+        for action in [
+            terminal_menu::FileAction::OpenDefault,
+            terminal_menu::FileAction::Reveal,
+        ] {
+            s.notice = None;
+            s.activate_terminal_file(link(), action, cx);
+            assert_eq!(
+                s.notice.as_deref(),
+                Some(etext::REMOTE_DISCONNECTED.get()),
+                "{action:?} must fail closed without a transport"
+            );
+        }
+        s.notice = None;
+        s.activate_terminal_file(link(), terminal_menu::FileAction::CopyPath, cx);
+        assert!(s.notice.is_none());
+        s.activate_terminal_file(link(), terminal_menu::FileAction::Open, cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(pane), Some(file.as_path()));
+    assert_eq!(layout_of(&view, cx).host(pane), &host);
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Offline)
+        ));
+    });
+}
+
+/// APP-F01 후속: 읽어 온 본문은 읽어 온 호스트에만 속한다. 칸의 호스트가 바뀌면 로컬에서 읽은 에디터를
+/// 원격 칸으로 재사용하지 않고 버린 뒤 새 호스트 기준으로 다시 읽는다(전송이 없으면 오프라인 칸).
+#[gpui::test]
+fn loaded_file_body_is_dropped_when_pane_host_changes(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+
+    let dir = TempDir::new("remote-editor-host-identity");
+    let file = dir.0.join("notes.txt");
+    fs::write(&file, "local\n").unwrap();
+    let (view, cx) = open(cx, state_path("remote-editor-host-identity"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), "local\n");
+    let host = HostId::Remote("studio".into());
+    view.update(cx, |s, _| s.layout.set_host(pane, host.clone()));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        let tab = &s.files.tabs[&pane];
+        assert_eq!(tab.host, host);
+        assert!(
+            matches!(tab.body, Body::Offline),
+            "a body loaded from Local must not be reused under a remote host"
+        );
+    });
+    view.update(cx, |s, _| s.layout.set_host(pane, HostId::Local));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "local\n");
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.files.tabs[&pane].host, HostId::Local);
+    });
+}
+
+/// 원격 목록 조회가 실패하면 100ms마다 무한 재시도하지 않고 멈춘 뒤 알린다.
+#[gpui::test]
+fn quick_open_stops_and_reports_remote_failure(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("files-quick-remote"));
+    view.update(cx, |s, _| {
+        let pane = s.layout.focused().unwrap();
+        s.layout.set_host(
+            pane,
+            krill_app_core::hosts::HostId::Remote("quick-offline".into()),
+        );
+    });
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.files.quick_open.is_some(), "the palette stays open");
+        assert!(!s.files.quick_loading, "remote failure must end loading");
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(krill_app_core::i18n::catalog::editor::QUICK_OPEN_FAILED.get())
+        );
+    });
+}
+
+#[gpui::test]
+fn remote_media_placeholder_stages_multi_chunk_file_to_this_pc_and_reuses_stamp_cache(
+    cx: &mut TestAppContext,
+) {
+    use krill_app_core::hosts::HostId;
+    use krill_proto::remote_fs::MAX_REMOTE_CHUNK;
+
+    let remote_bytes: Vec<u8> = (0..(MAX_REMOTE_CHUNK * 2 + 123_456))
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let daemon = FakeRemoteFs::serve(&remote_bytes);
+    let host = HostId::Remote(format!("studio-stage-{}", std::process::id()));
+    let remote_path = PathBuf::from(format!(
+        "/remote/output/video-{}/joseon_hangae_deo_v11_clean.mp4",
+        std::process::id()
+    ));
+
+    let (view, cx) = open(cx, state_path("remote-media-stage-open"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+
+    let pane = layout_of(&view, cx).active_tab().focused;
+    view.read_with(cx, |s, _| {
+        assert!(matches!(
+            s.files.tabs.get(&pane).map(|t| &t.body),
+            Some(Body::Placeholder(Kind::Media, len)) if *len == u64::try_from(remote_bytes.len()).unwrap()
+        ));
+    });
+    let reads_after_preview_open = daemon.reads();
+    let conns_after_preview_open = daemon.connections();
+    assert_eq!(reads_after_preview_open, 1);
+
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        let done = view.read_with(cx, |s, _| s.files.opened_external.len() == 1);
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let staged_path = view.read_with(cx, |s, _| {
+        assert_eq!(s.files.opened_external.len(), 1);
+        let (path, reveal) = &s.files.opened_external[0];
+        assert!(!reveal);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("joseon_hangae_deo_v11_clean.mp4")
+        );
+        path.clone()
+    });
+    assert_eq!(fs::read(&staged_path).unwrap(), remote_bytes);
+    assert_eq!(
+        daemon.connections() - conns_after_preview_open,
+        1,
+        "Stat + 3 ReadFile chunks must stream over one control connection"
+    );
+    let reads_after_first_stage = daemon.reads();
+    assert_eq!(reads_after_first_stage - reads_after_preview_open, 3);
+
+    // 두 번째 클릭(이 PC에서 열기)과 내려받아 Finder에서 보기는 .stamp 캐시를 재사용해 추가 ReadFile이 없다.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(daemon.reads(), reads_after_first_stage);
+
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let reveal_btn = cx.debug_bounds("file-reveal").unwrap().center();
+    cx.simulate_click(reveal_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 3) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(daemon.reads(), reads_after_first_stage);
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.files.opened_external[2], (staged_path.clone(), true));
+    });
+    if let Some(parent) = staged_path.parent() {
+        fs::remove_dir_all(parent).ok();
+    }
+}
+
+#[gpui::test]
+fn remote_media_placeholder_cancel_and_error_banner_behave_cleanly(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+    use krill_proto::remote_fs::MAX_REMOTE_CHUNK;
+
+    let remote_bytes = vec![0x5au8; MAX_REMOTE_CHUNK * 3];
+    let daemon = FakeRemoteFs::serve(&remote_bytes);
+    let host = HostId::Remote(format!("studio-cancel-{}", std::process::id()));
+    let remote_path = PathBuf::from(format!(
+        "/remote/output/cancel-{}/clip.mp4",
+        std::process::id()
+    ));
+
+    let (view, cx) = open(cx, state_path("remote-media-stage-cancel"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, _| {
+        s.files.next_io = Some(gate_rx);
+    });
+    let reads_before_cancel = daemon.reads();
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-progress").is_some());
+    let cancel_btn = cx.debug_bounds("file-stage-cancel").unwrap().center();
+    cx.simulate_click(cancel_btn, gpui::Modifiers::default());
+    gate_tx.send(()).ok();
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-cancel").is_none());
+    assert!(
+        cx.debug_bounds("file-error").is_none(),
+        "user cancellation must not raise an error banner"
+    );
+    assert_eq!(daemon.reads(), reads_before_cancel);
+    view.read_with(cx, |s, _| {
+        assert!(s.files.opened_external.is_empty());
+        assert!(s.files.tabs[&pane].error.is_none());
+    });
+
+    // 원격 디스크 읽기 오류가 나면 무음 무시 대신 파일 칸 오류 배너를 띄운다.
+    daemon.set_fail_reads(true);
+    let open_btn = cx.debug_bounds("file-open-default").unwrap().center();
+    cx.simulate_click(open_btn, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.tabs[&pane].error.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-error").is_some());
+    view.read_with(cx, |s, _| {
+        assert!(s.files.opened_external.is_empty());
+    });
+}
+
+#[gpui::test]
+fn remote_tab_context_menu_reveal_guards_disconnected_host_and_stages_connected_host(
+    cx: &mut TestAppContext,
+) {
+    use krill_app_core::hosts::HostId;
+
+    let dir = TempDir::new("remote-tab-menu-reveal");
+    let colliding_path = dir.0.join("secret.mp4");
+    fs::write(&colliding_path, b"local secret bytes").unwrap();
+
+    let remote_bytes = b"\0\0\0\x18ftypmp42remote video bytes";
+    let daemon = FakeRemoteFs::serve(remote_bytes);
+    let host = HostId::Remote(format!("studio-tabmenu-{}", std::process::id()));
+
+    let (view, cx) = open(cx, state_path("remote-tab-menu-reveal"));
+    view.update(cx, |s, cx| {
+        s.open_file_on(host.clone(), colliding_path.clone(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 1. 연결 끊긴 원격 파일 탭 우클릭 -> 내려받아 Finder에서 보기 클릭 시 로컬 파일을 건드리지 않고 안내를 띄운다.
+    let tab = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.notice.as_deref(), Some(etext::REMOTE_DISCONNECTED.get()));
+        assert!(s.files.opened_external.is_empty());
+    });
+
+    // 2. 연결이 복구되면 원격 바이트를 스테이징한 로컬 캐시 경로로만 표시한다.
+    view.update(cx, |s, _| {
+        s.notice = None;
+        s.host_targets.insert(host.clone(), daemon.target());
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+
+    let tab = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.files.opened_external.len() == 1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let staged = view.read_with(cx, |s, _| {
+        let (path, reveal) = &s.files.opened_external[0];
+        assert!(*reveal);
+        assert_ne!(path, &colliding_path);
+        path.clone()
+    });
+    assert_eq!(fs::read(&staged).unwrap(), remote_bytes);
+    if let Some(parent) = staged.parent() {
+        fs::remove_dir_all(parent).ok();
+    }
+}
+
+#[gpui::test]
+fn remote_html_source_bar_and_background_tab_reveal_surface_progress_and_errors(
+    cx: &mut TestAppContext,
+) {
+    use krill_app_core::hosts::HostId;
+
+    let html_bytes = b"<!doctype html><title>Demo</title><h1>Hello</h1>";
+    let daemon = FakeRemoteFs::serve(html_bytes);
+    let host = HostId::Remote(format!("studio-html-{}", std::process::id()));
+    let remote_path = PathBuf::from("/Users/macmini/site/index.html");
+
+    let (view, cx) = open(cx, state_path("remote-html-stage-bar"));
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host.clone(), daemon.target());
+        s.open_file_on(host.clone(), remote_path.clone(), cx);
+    });
+    for _ in 0..50 {
+        cx.run_until_parked();
+        let ready = view.read_with(cx, |s, _| {
+            s.layout
+                .focused()
+                .and_then(|p| s.files.tabs.get(&p))
+                .is_some()
+        });
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 1. HTML 원본 보기(Source)로 전환한 뒤 머리줄 [브라우저에서 열기]를 누르면 상단 진행률·취소 줄이 뜬다.
+    let edit_btn = cx.debug_bounds("file-html-edit").unwrap().center();
+    cx.simulate_click(edit_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    view.update(cx, |s, _| s.files.next_io = Some(gate_rx));
+    let browser_btn = cx.debug_bounds("file-open-browser").unwrap().center();
+    cx.simulate_click(browser_btn, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-stage-progress").is_some());
+    let cancel_btn = cx.debug_bounds("file-stage-cancel").unwrap().center();
+    cx.simulate_click(cancel_btn, gpui::Modifiers::default());
+    drop(gate_tx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // 2. 같은 원격 호스트에서 다른 탭을 열어 index.html(session-tab-1)을 배경에 둔 채 우클릭 실패 시 s.notice에 노출된다.
+    view.update(cx, |s, cx| {
+        s.open_file_on(
+            host.clone(),
+            PathBuf::from("/Users/macmini/site/second.html"),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    daemon.set_fail_reads(true);
+    let tab1 = cx.debug_bounds("session-tab-1").unwrap().center();
+    cx.simulate_mouse_down(tab1, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let reveal_item = cx.debug_bounds("tab-menu-reveal-finder").unwrap().center();
+    cx.simulate_click(reveal_item, gpui::Modifiers::default());
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if view.read_with(cx, |s, _| s.notice.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.notice.is_some(),
+            "background tab reveal failure must surface to Shell.notice"
+        );
+        assert!(s.files.opened_external.is_empty());
+    });
+}

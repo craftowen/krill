@@ -3816,30 +3816,22 @@ dependencies = [
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
- "image",
  "krill-app-core",
+ "krill-app-shell",
  "krill-bots-ui",
  "krill-hosts",
  "krill-link",
- "krill-log",
  "krill-proto",
  "krill-term",
- "krill-ui",
  "krill-version",
  "krilld",
- "postcard",
  "proptest",
- "regex",
  "ring",
  "rustix",
  "rustix-openpty",
  "serde",
  "serde_json",
- "sha2 0.11.1",
- "sysinfo",
- "tokio",
  "toml 1.1.8+spec-1.1.0",
- "tracing",
 ]
 
 [[package]]
@@ -3874,6 +3866,36 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "krill-app-shell"
+version = "0.0.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "krill-app-core",
+ "krill-bots-ui",
+ "krill-hosts",
+ "krill-link-core",
+ "krill-log",
+ "krill-proto",
+ "krill-term",
+ "krill-ui",
+ "krilld",
+ "postcard",
+ "proptest",
+ "rustix",
+ "rustix-openpty",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

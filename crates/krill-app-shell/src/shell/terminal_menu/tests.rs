@@ -1,0 +1,407 @@
+use std::fs;
+
+use gpui::{Entity, TestAppContext, VisualTestContext};
+use krill_proto::screen::{Cell, Flags, Link, Op, Revision, Seq, encode_update};
+
+use super::*;
+use crate::shell::tests::{layout_of, open, state_path};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("krill-terminal-menu-{}-{tag}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        Self(path.canonicalize().unwrap())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn show_output(
+    view: &Entity<Shell>,
+    cwd: &std::path::Path,
+    text: &str,
+    uri: Option<&str>,
+    cx: &mut VisualTestContext,
+) -> (PaneId, Point<Pixels>) {
+    let pane = layout_of(view, cx).active_tab().focused;
+    let mut cells = Vec::new();
+    for ch in text.chars() {
+        let wide = !ch.is_ascii();
+        cells.push(Cell {
+            ch,
+            flags: if wide { Flags::WIDE } else { Flags::default() },
+            ..Cell::default()
+        });
+        if wide {
+            cells.push(Cell {
+                flags: Flags::SPACER,
+                ..Cell::default()
+            });
+        }
+    }
+    let cols = u16::try_from(cells.len()).unwrap();
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    view.update(cx, |s, cx| {
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: cwd.as_os_str().as_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        s.attach_test(pane, krill_proto::SessionId(22), ours, cx);
+        let mut ops = vec![
+            Op::Reset {
+                cols: 100,
+                lines: 4,
+            },
+            Op::Line { line: 1, cells },
+        ];
+        if let Some(uri) = uri {
+            ops.push(Op::Links {
+                line: 1,
+                links: vec![Link {
+                    column: 0,
+                    cols,
+                    uri: uri.into(),
+                }],
+            });
+        }
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    (
+        pane,
+        point(
+            bounds.origin.x + cell.width * 4.5,
+            bounds.origin.y + cell.height * 1.5,
+        ),
+    )
+}
+
+fn right_click(at: Point<Pixels>, cx: &mut VisualTestContext) {
+    cx.simulate_mouse_move(at, None, Modifiers::default());
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+}
+
+fn click(selector: &'static str, cx: &mut VisualTestContext) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("missing {selector}"));
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn terminal_file_menu_copies_full_path_and_opens_at_line(cx: &mut TestAppContext) {
+    let dir = TempDir::new("plain");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/my file.rs");
+    fs::write(&file, "first\nsecond\n").unwrap();
+    let (view, cx) = open(cx, state_path("terminal-menu-plain"));
+    let (_, at) = show_output(&view, &dir.0, "src/my file.rs:2:3", None, cx);
+    right_click(at, cx);
+    for selector in [
+        "terminal-file-open",
+        "terminal-file-open-default",
+        "terminal-file-reveal",
+        "terminal-file-copy-path",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    click("terminal-file-copy-path", cx);
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some(file.to_str().unwrap())
+    );
+    right_click(at, cx);
+    click("terminal-file-open", cx);
+    let layout = layout_of(&view, cx);
+    let pane = layout.active_tab().focused;
+    assert_eq!(layout.file(pane), Some(file.as_path()));
+    cx.simulate_keystrokes("shift-right cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some("c"),
+        "2번째 줄 3번째 글자에서 열어야 한다"
+    );
+}
+
+#[gpui::test]
+fn terminal_osc8_file_menu_uses_uri_with_korean_and_spaces(cx: &mut TestAppContext) {
+    let dir = TempDir::new("osc8");
+    let file = dir.0.join("보정 완료.jpeg");
+    fs::write(&file, "image").unwrap();
+    let uri = gpui::http_client::Url::from_file_path(&file)
+        .unwrap()
+        .to_string();
+    let (view, cx) = open(cx, state_path("terminal-menu-osc8"));
+    let (_, at) = show_output(&view, &dir.0, "다운로드 링크", Some(&uri), cx);
+    right_click(at, cx);
+    click("terminal-file-copy-path", cx);
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some(file.to_str().unwrap())
+    );
+}
+
+#[gpui::test]
+fn terminal_file_menu_ignores_missing_web_and_remote_targets(cx: &mut TestAppContext) {
+    let dir = TempDir::new("not-local");
+    let file = dir.0.join("exists.rs");
+    fs::write(&file, "code").unwrap();
+    let (view, cx) = open(cx, state_path("terminal-menu-not-local"));
+    for uri in [
+        None,
+        Some("https://example.com/exists.rs"),
+        Some("file://other-host/etc/hosts"),
+    ] {
+        let (_, at) = show_output(&view, &dir.0, "missing.rs", uri, cx);
+        right_click(at, cx);
+        assert!(cx.debug_bounds("terminal-file-open").is_none());
+        cx.simulate_keystrokes("escape");
+    }
+    let (pane, at) = show_output(&view, &dir.0, "exists.rs", None, cx);
+    view.update(cx, |s, _| {
+        s.layout.set_host(
+            pane,
+            krill_app_core::hosts::HostId::Remote("other-host".into()),
+        );
+    });
+    right_click(at, cx);
+    assert!(
+        cx.debug_bounds("terminal-file-open").is_none(),
+        "원격 경로를 로컬 파일로 열지 않는다"
+    );
+}
+
+#[gpui::test]
+fn wrapped_url_click_and_context_menu_copy_complete_address(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-url");
+    let (view, cx) = open(cx, state_path("terminal-menu-wrapped-url"));
+    let (pane, _) = show_output(&view, &dir.0, "placeholder", None, cx);
+    let rows = [
+        "  http://127.0.0.1:48900/#pair=abc",
+        "  def0123456789&key=testtesttestte",
+        "  st00",
+    ];
+    let expected = "http://127.0.0.1:48900/#pair=abcdef0123456789&key=testtesttesttest00";
+    view.update(cx, |s, cx| {
+        let mut ops = vec![Op::Reset { cols: 35, lines: 4 }];
+        for (line, text) in (0u16..).zip(rows) {
+            ops.push(Op::Line {
+                line,
+                cells: text
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect(),
+            });
+        }
+        let frame = &encode_update(Revision(2), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    });
+    cx.run_until_parked();
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    for line in 0u16..3 {
+        let at = point(
+            bounds.origin.x + cell.width * 3.5,
+            bounds.origin.y + cell.height * (f32::from(line) + 0.5),
+        );
+        cx.simulate_click(at, Modifiers::default());
+        cx.run_until_parked();
+        click("terminal-link-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(expected)
+        );
+        right_click(at, cx);
+        click("terminal-url-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().as_deref(),
+            Some(expected)
+        );
+    }
+    // 연결이 없는 원격 세션의 루프백 URL은 복사만 되고 로컬 브라우저로 열리지 않아야 한다.
+    view.update(cx, |s, _| {
+        s.layout.set_host(
+            pane,
+            krill_app_core::hosts::HostId::Remote("other-host".into()),
+        );
+    });
+    let at = point(
+        bounds.origin.x + cell.width * 3.5,
+        bounds.origin.y + cell.height * 1.5,
+    );
+    right_click(at, cx);
+    click("terminal-url-open", cx);
+    assert_eq!(cx.opened_url(), None);
+    cx.simulate_click(
+        at,
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    );
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url(), None);
+}
+
+#[gpui::test]
+fn osc8_url_context_menu_copies_target_instead_of_label(cx: &mut TestAppContext) {
+    let dir = TempDir::new("osc8-url");
+    let (view, cx) = open(cx, state_path("terminal-menu-osc8-url"));
+    let expected = "https://example.com/long?key=abc#fragment";
+    let (_, at) = show_output(&view, &dir.0, "friendly label", Some(expected), cx);
+    right_click(at, cx);
+    click("terminal-url-copy", cx);
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some(expected)
+    );
+}
+
+#[gpui::test]
+fn wrapped_file_menu_copies_full_path_from_each_row(cx: &mut TestAppContext) {
+    let dir = TempDir::new("wrapped-file");
+    fs::create_dir_all(dir.0.join("src")).unwrap();
+    let file = dir.0.join("src/long-name.rs");
+    fs::write(&file, "first\nsecond\n").unwrap();
+    let (view, cx) = open(cx, state_path("terminal-menu-wrapped-file"));
+    let (pane, _) = show_output(&view, &dir.0, "placeholder", None, cx);
+    for (revision, cols, rows, soft) in [
+        (2, 16, ["src/long-name.rs", ":2:3"], true),
+        (3, 14, ["  src/long-na", "  me.rs:2:3"], false),
+    ] {
+        view.update(cx, |s, cx| {
+            let mut ops = vec![Op::Reset { cols, lines: 4 }];
+            for (line, text) in (0u16..).zip(rows) {
+                let mut cells: Vec<_> = text
+                    .chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect();
+                if soft && line == 0 {
+                    assert_eq!(cells.len(), usize::from(cols));
+                    cells.last_mut().unwrap().flags |= Flags::WRAPLINE;
+                }
+                ops.push(Op::Line { line, cells });
+            }
+            let frame = &encode_update(Revision(revision), Seq(0), ops).unwrap()[0];
+            let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, kind, &body, cx));
+        });
+        cx.run_until_parked();
+        let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+        for line in 0u16..2 {
+            let at = point(
+                bounds.origin.x + cell.width * 3.5,
+                bounds.origin.y + cell.height * (f32::from(line) + 0.5),
+            );
+            right_click(at, cx);
+            click("terminal-file-copy-path", cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(file.to_str().unwrap())
+            );
+        }
+    }
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    right_click(
+        point(
+            bounds.origin.x + cell.width * 3.5,
+            bounds.origin.y + cell.height * 1.5,
+        ),
+        cx,
+    );
+    click("terminal-file-open", cx);
+    let opened = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(opened), Some(file.as_path()));
+    cx.simulate_keystrokes("shift-right cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().unwrap().text().as_deref(),
+        Some("c")
+    );
+}
+
+#[gpui::test]
+fn pane_context_menu_puts_rename_first_and_displays_custom_pane_title(cx: &mut TestAppContext) {
+    let dir = TempDir::new("pane-rename-menu");
+    let (view, cx) = open(cx, state_path("terminal-menu-pane-rename"));
+    let (pane, at) = show_output(&view, &dir.0, "https://example.com/docs", None, cx);
+    right_click(at, cx);
+    let rename_bounds = cx
+        .debug_bounds("terminal-pane-rename")
+        .expect("Rename item must appear in pane context menu");
+    let url_copy_bounds = cx
+        .debug_bounds("terminal-url-copy")
+        .expect("URL copy item present");
+    assert!(
+        rename_bounds.origin.y < url_copy_bounds.origin.y,
+        "Rename must be the first item at the top of the pane context menu: rename={rename_bounds:?} url={url_copy_bounds:?}"
+    );
+    click("terminal-pane-rename", cx);
+    assert!(
+        cx.debug_bounds("pane-rename-input").is_some(),
+        "clicking Rename opens inline pane rename input"
+    );
+    cx.simulate_keystrokes("A P I enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pane-rename-input").is_none());
+    assert_eq!(layout_of(&view, cx).pane_title(pane), Some("API"));
+    assert_eq!(
+        layout_of(&view, cx).tab_title(0),
+        None,
+        "per-pane rename must remain distinct from tab rename"
+    );
+    let title_sel: &'static str = Box::leak(format!("pane-title-{}", pane.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(title_sel).is_some(),
+        "custom pane name must stay visible in the pane header"
+    );
+}
+
+#[gpui::test]
+fn cursor_and_vscode_remote_links_dispatch_on_cmd_click(cx: &mut TestAppContext) {
+    let dir = TempDir::new("ide-remote-links");
+    let (view, cx) = open(cx, state_path("terminal-menu-ide-links"));
+    for uri in [
+        "cursor://vscode-remote/ssh-remote+dev-box/home/user/krill",
+        "vscode://vscode-remote/wsl+Ubuntu/workspace/src/main.rs:10",
+    ] {
+        let (_, at) = show_output(&view, &dir.0, uri, None, cx);
+        cx.simulate_click(
+            at,
+            Modifiers {
+                platform: true,
+                ..Modifiers::default()
+            },
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(uri),
+            "Cmd-click must open {uri} via system URI handler"
+        );
+    }
+}

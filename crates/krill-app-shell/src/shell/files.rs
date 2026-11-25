@@ -1,0 +1,3320 @@
+//! MK-119: 가운데 영역 파일 탭(읽기 전용)의 셸 통합 — 파일 칸 그리기·⌘P·디스크 감시·닫기/종료 때 레이아웃 저장.
+//! 상태기계와 디스크 IO는 [`krill_app_core::editor`](Orca 참조 출처도 그쪽 문서). 파일 칸은 세션에 붙지 않는다.
+//! MK-121: 분류([`editor::open`])에 따라 코드 보기·원본/미리보기 토글(마크다운·CSV·ipynb·SVG)·이미지·표·자리표시자를 고른다.
+
+use std::path::Path;
+
+use gpui::Focusable as _;
+use gpui_component::Icon;
+use gpui_component::input::{Editor, EditorState};
+use krill_app_core::editor::{self, Disk, Doc, Opened, Poll, Preview, Unopenable};
+use krill_app_core::file_format::view::{self as fview, CsvView, ImageView};
+use krill_app_core::file_format::{Kind, csv, ipynb};
+use krill_app_core::i18n::catalog::artifacts as atext;
+use krill_app_core::i18n::catalog::editor as etext;
+use krill_app_core::i18n::catalog::file_format as ftext;
+use krill_app_core::terminal::Highlight;
+use krill_app_core::terminal::path_link::{self, PathLink};
+
+use super::*;
+
+/// 열린 파일의 디스크 지문을 보는 간격.
+// ponytail: stat 폴링(파일 수 × 1Hz). 탭이 수백 개가 되면 FSEvents 감시로.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
+// Conservative retention accounting, not a phys_footprint measurement. Selected,
+// visible and deleted-on-disk documents may exceed this budget.
+const CLEAN_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const CLEAN_CACHE_TABS: usize = 16;
+const FILE_REQUESTS_FILE: &str = "file-requests.json";
+const FILE_REQUESTS_LOCK: &str = "file-requests.lock";
+const MAX_REQUEST_FILE_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CliFileActionKind {
+    Open,
+    Diff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(super) struct CliFileRequest {
+    #[serde(default)]
+    pub id: u64,
+    pub kind: CliFileActionKind,
+    pub worktree: PathBuf,
+    pub path: PathBuf,
+    pub relative_path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CliFileRequestQueue {
+    #[serde(default)]
+    requests: Vec<CliFileRequest>,
+}
+
+fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
+    use std::io::Read as _;
+    let file_path = state_dir.join(FILE_REQUESTS_FILE);
+    if !matches!(file_path.try_exists(), Ok(true)) {
+        return Vec::new();
+    }
+    let lock_path = state_dir.join(FILE_REQUESTS_LOCK);
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    else {
+        return Vec::new();
+    };
+    // CLI가 쓰는 중이면 큐를 그대로 두고 다음 감시 주기에 다시 시도한다.
+    // 잠금을 기다리면 파일 요청 하나가 다른 창의 요청 소비까지 막을 수 있다.
+    if lock.try_lock().is_err() {
+        return Vec::new();
+    }
+    let Ok(file) = std::fs::File::open(&file_path) else {
+        lock.unlock().ok();
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let read_ok = file
+        .take(MAX_REQUEST_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_ok();
+    std::fs::remove_file(&file_path).ok();
+    lock.unlock().ok();
+    if !read_ok || u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_REQUEST_FILE_BYTES {
+        return Vec::new();
+    }
+    serde_json::from_slice::<CliFileRequestQueue>(&buf)
+        .map(|q| q.requests)
+        .unwrap_or_default()
+}
+
+actions!(shell, [QuickOpen]);
+
+pub(super) fn bind_keys(cx: &mut App) {
+    let ctx = Some(KEY_CONTEXT);
+    cx.bind_keys([krill_app_core::keys::bind("cmd-p", QuickOpen, ctx)]);
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent watcher, focus, palette and window-close lifecycle flags"
+)]
+pub(super) struct Files {
+    /// 불러온 파일 칸. 보인 적 있는 칸만 들어 있다(숨은 복원 탭은 처음 보일 때 읽는다).
+    tabs: HashMap<PaneId, FileTab>,
+    watch: Option<Task<()>>,
+    watching: bool,
+    quick_open: Option<(gpui::Entity<jump::Palette>, Subscription)>,
+    /// 탭·칸 포커스가 바뀌었다. 다음 그리기에서 키보드 포커스를 에디터나 터미널로 옮긴다.
+    pub(super) refocus: bool,
+    close_guard: bool,
+    closing: bool,
+    next_request: u64,
+    next_stage_id: u64,
+    loading: HashMap<PaneId, (u64, PathBuf)>,
+    cache_clock: u64,
+    cache_visible: Vec<PaneId>,
+    cache_count: usize,
+    last_visible: HashMap<PaneId, u64>,
+    evicted_scroll: HashMap<PaneId, (PathBuf, gpui::Point<Pixels>)>,
+    quick_generation: u64,
+    quick_loading: bool,
+    recent: Vec<PathBuf>,
+    #[cfg(test)]
+    next_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    link_next_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    opened_external: Vec<(PathBuf, bool)>,
+    /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
+    released: Vec<PathBuf>,
+    /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
+    link_lookup: Option<LinkLookup>,
+    link_busy: bool,
+    link_cache: Arc<std::sync::Mutex<(std::time::Instant, path_link::Cache)>>,
+    link_generation: u64,
+    link_open_generation: u64,
+    pub(super) hover: Option<(PaneId, Highlight)>,
+    goto: Option<(PathBuf, u32, u32)>,
+    /// 아티팩트 공유(`krill artifacts share`)가 진행 중인 칸.
+    sharing: std::collections::HashSet<PaneId>,
+    scratch_panes: Vec<PaneId>,
+    scratch_candidates: Vec<(u64, PaneId, usize)>,
+}
+
+#[derive(Clone, PartialEq)]
+struct LinkKey {
+    pane: PaneId,
+    host: krill_app_core::hosts::HostId,
+    input: path_link::Input,
+    session: Option<krill_proto::SessionId>,
+    line: u16,
+    column: u16,
+    cwd: Option<PathBuf>,
+}
+
+impl LinkKey {
+    fn same_context(&self, other: &Self) -> bool {
+        self.pane == other.pane
+            && self.host == other.host
+            && self.session == other.session
+            && self.line == other.line
+            && self.cwd == other.cwd
+            && self.input.same_context(&other.input)
+    }
+}
+
+struct LinkLookup {
+    key: LinkKey,
+    ready: bool,
+    checked_at: Option<std::time::Instant>,
+    found: Option<PathLink>,
+}
+
+impl LinkLookup {
+    fn covers(&self, key: &LinkKey) -> bool {
+        self.key == *key
+            || (self.ready
+                && self.key.same_context(key)
+                && self.found.as_ref().is_some_and(|link| {
+                    (link.column..link.column.saturating_add(link.cols)).contains(&key.column)
+                }))
+    }
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Self {
+            tabs: HashMap::new(),
+            watch: None,
+            watching: false,
+            quick_open: None,
+            refocus: true,
+            close_guard: false,
+            closing: false,
+            next_request: 0,
+            next_stage_id: 0,
+            loading: HashMap::new(),
+            cache_clock: 0,
+            cache_visible: Vec::new(),
+            cache_count: 0,
+            last_visible: HashMap::new(),
+            evicted_scroll: HashMap::new(),
+            quick_generation: 0,
+            quick_loading: false,
+            recent: Vec::new(),
+            #[cfg(test)]
+            next_io: None,
+            #[cfg(test)]
+            link_next_io: None,
+            #[cfg(test)]
+            opened_external: Vec::new(),
+            released: Vec::new(),
+            link_lookup: None,
+            link_busy: false,
+            link_cache: Arc::new(std::sync::Mutex::new((
+                std::time::Instant::now(),
+                path_link::Cache::default(),
+            ))),
+            link_generation: 0,
+            link_open_generation: 0,
+            hover: None,
+            goto: None,
+            sharing: std::collections::HashSet::new(),
+            scratch_panes: Vec::new(),
+            scratch_candidates: Vec::new(),
+        }
+    }
+}
+
+impl Files {
+    pub(super) fn retained_startup_panes(&self) -> std::collections::BTreeSet<PaneId> {
+        self.tabs
+            .keys()
+            .chain(self.loading.keys())
+            .copied()
+            .collect()
+    }
+
+    pub(super) fn close_quick_open(&mut self) {
+        self.quick_open = None;
+        self.quick_generation = self.quick_generation.wrapping_add(1);
+        self.quick_loading = false;
+    }
+
+    #[must_use]
+    pub(super) const fn has_quick_open(&self) -> bool {
+        self.quick_open.is_some()
+    }
+
+    /// 닫히거나 바뀌는 탭의 이미지 캐시를 놓도록 예약한다.
+    fn forget(&mut self, tab: &FileTab) {
+        if tab.shows_image() {
+            if let Some(staged) = &tab.staged_image {
+                self.released.push(staged.clone());
+            } else if let Some(doc) = &tab.doc {
+                self.released.push(doc.path().to_owned());
+            }
+        }
+    }
+}
+
+struct ActiveStage {
+    id: u64,
+    percent: u8,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ActiveStage {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct FileTab {
+    path: PathBuf,
+    /// 본문을 읽어 온 호스트. 칸의 호스트가 달라지면 본문을 재사용하지 않는다(APP-F01 후속).
+    host: krill_app_core::hosts::HostId,
+    staged_image: Option<PathBuf>,
+    staging: Option<ActiveStage>,
+    revision: u64,
+    preview_generation: u64,
+    selection_pin: bool,
+    doc: Option<Doc>,
+    body: Body,
+    error: Option<String>,
+}
+
+enum Body {
+    Text {
+        state: gpui::Entity<EditorState>,
+        _cursor: Subscription,
+        _focus: Subscription,
+        /// 원본/미리보기 토글이 있는 종류.
+        preview: Option<Preview>,
+        /// 미리보기를 보는 중. 들어갈 때 에디터 내용으로 만든 사본이다.
+        shown: Option<Shown>,
+    },
+    Image(gpui::Entity<ImageView>),
+    /// 에디터 한도를 넘는 CSV의 앞부분 표(읽기 전용).
+    Table(gpui::Entity<CsvView>),
+    Placeholder(Kind, u64),
+    Unopenable(Unopenable),
+    Failed(String),
+    /// 전송이 없는 원격 호스트의 파일: 읽지 않았다(같은 경로의 로컬 파일을 보이면 안 된다). 전송이 생기면 다시 읽는다.
+    Offline,
+}
+
+/// 지금 보이는 미리보기.
+enum Shown {
+    /// 원문과 그릴 때 쓰는 요소 id(새로 만들 때마다 바꿔 `TextView`가 이전 파싱 결과를 쓰지 않게 한다).
+    Markdown(SharedString, ElementId),
+    Table(gpui::Entity<CsvView>),
+    Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
+    Image(gpui::Entity<ImageView>),
+    Html {
+        title: Option<String>,
+        len: u64,
+    },
+}
+
+/// Parse bounded preview data on the executor; entity creation remains on the UI.
+enum PreparedPreview {
+    Markdown(String),
+    Table(csv::Table),
+    Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
+    Svg(Arc<gpui::Image>),
+    Html { title: Option<String>, len: u64 },
+}
+
+fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
+    match preview {
+        Preview::Markdown => PreparedPreview::Markdown(text.to_owned()),
+        Preview::Table(delimiter) => {
+            let head = text.as_bytes();
+            let head = head.get(..csv::PREVIEW_BYTES).unwrap_or(head);
+            PreparedPreview::Table(csv::preview(
+                head,
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+                delimiter,
+            ))
+        }
+        Preview::Notebook => PreparedPreview::Notebook(
+            ipynb::parse(text).map(|notebook| Arc::new(fview::NotebookPreview::new(notebook))),
+        ),
+        Preview::Svg => PreparedPreview::Svg(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            text.as_bytes().to_vec(),
+        ))),
+        Preview::Html => PreparedPreview::Html {
+            title: editor::syntax::html_title(text),
+            len: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        },
+    }
+}
+
+fn build_preview(prepared: PreparedPreview, cx: &mut App) -> Shown {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match prepared {
+        PreparedPreview::Markdown(text) => {
+            let n = GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Shown::Markdown(text.into(), ElementId::Name(format!("file-md-{n}").into()))
+        }
+        PreparedPreview::Table(table) => Shown::Table(cx.new(|_| CsvView::new(table))),
+        PreparedPreview::Notebook(result) => Shown::Notebook(result),
+        PreparedPreview::Svg(image) => Shown::Image(cx.new(|_| ImageView::new_svg_image(image))),
+        PreparedPreview::Html { title, len } => Shown::Html { title, len },
+    }
+}
+
+struct PreparedFile {
+    opened: std::io::Result<(Opened, editor::Stamp)>,
+    preview: Option<PreparedPreview>,
+    staged_image: Option<PathBuf>,
+}
+
+fn read_file_on(
+    path: &Path,
+    preview: bool,
+    remote: Option<&(
+        krill_app_core::hosts::HostId,
+        krill_app_core::hosts::HostTarget,
+    )>,
+) -> PreparedFile {
+    let (opened, staged_image) = match remote {
+        Some((host, target)) => match krill_app_core::remote_fs::open(target, host, path) {
+            Ok((opened, stamp, staged)) => (Ok((opened, stamp)), staged),
+            Err(e) => (Err(e), None),
+        },
+        None => (editor::open(path), None),
+    };
+    let prepared = match &opened {
+        Ok((Opened::Text(kind, text), _)) if preview => {
+            editor::preview(*kind).map(|p| prepare_preview(p, text))
+        }
+        _ => None,
+    };
+    PreparedFile {
+        opened,
+        preview: prepared,
+        staged_image,
+    }
+}
+
+/// 미리보기 버튼 이름. 다른 쪽 버튼은 늘 원본 보기다.
+fn preview_label(preview: Preview) -> &'static str {
+    match preview {
+        Preview::Markdown | Preview::Html => etext::PREVIEW.get(),
+        Preview::Table(_) => etext::TABLE.get(),
+        Preview::Notebook => etext::CELLS.get(),
+        Preview::Svg => etext::IMAGE.get(),
+    }
+}
+
+impl FileTab {
+    /// 전송이 없는 원격 파일 칸. 디스크를 읽지 않았으므로 문서 상태가 없다.
+    fn offline(host: krill_app_core::hosts::HostId, path: PathBuf) -> Self {
+        Self {
+            path,
+            host,
+            staged_image: None,
+            staging: None,
+            revision: 0,
+            preview_generation: 0,
+            selection_pin: false,
+            doc: None,
+            body: Body::Offline,
+            error: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
+    fn editor(&self) -> Option<&gpui::Entity<EditorState>> {
+        match &self.body {
+            Body::Text { state, .. } => Some(state),
+            _ => None,
+        }
+    }
+
+    /// 키보드 포커스를 받을 에디터. 미리보기 중이면 숨은 에디터에 입력이 가지 않게 `None`.
+    fn focus_editor(&self) -> Option<&gpui::Entity<EditorState>> {
+        match &self.body {
+            Body::Text {
+                state, shown: None, ..
+            } => Some(state),
+            _ => None,
+        }
+    }
+
+    fn shows_image(&self) -> bool {
+        matches!(
+            self.body,
+            Body::Image(_)
+                | Body::Text {
+                    shown: Some(Shown::Image(_)),
+                    ..
+                }
+        )
+    }
+}
+
+fn unopenable_text(reason: Unopenable) -> String {
+    match reason {
+        Unopenable::NotUtf8 => etext::NOT_UTF8.get().to_owned(),
+        Unopenable::Directory => etext::DIRECTORY.get().to_owned(),
+        Unopenable::NotFile => etext::NOT_FILE.get().to_owned(),
+    }
+}
+
+/// 텍스트 탭을 다시 읽었더니 텍스트가 아니게 됐다(보이던 내용은 그대로 둔다).
+fn not_text(opened: &Opened) -> String {
+    const MIB: u64 = 1024 * 1024;
+    match opened {
+        Opened::Unopenable(reason) => unopenable_text(*reason),
+        Opened::Placeholder(Kind::TooLarge, n) => etext::TOO_LARGE.format(&[
+            ("size", &n.div_ceil(MIB).to_string()),
+            ("limit", &(editor::MAX_BYTES / MIB).to_string()),
+        ]),
+        Opened::Table(_) => etext::TOO_LARGE.format(&[
+            ("size", &format!(">{}", editor::MAX_BYTES / MIB)),
+            ("limit", &(editor::MAX_BYTES / MIB).to_string()),
+        ]),
+        _ => etext::BINARY.get().to_owned(),
+    }
+}
+
+/// 파일 칸의 호스트를 세 갈래로 가른다(APP-F01 후속). `remote_target_for_pane`의 `None`은 로컬과
+/// 전송이 없는 원격을 구분하지 못해, 호출자가 같은 경로의 로컬 파일을 읽고 쓰는 쪽으로 흘렀다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FileHost {
+    Local,
+    /// 전송이 있는 원격 호스트: 원격 파일 시스템 RPC로만 읽고 쓴다(타깃은 커서 Box).
+    Remote(
+        krill_app_core::hosts::HostId,
+        Box<krill_app_core::hosts::HostTarget>,
+    ),
+    /// 전송이 없는(시작 중·끊김·제거된) 원격 호스트: 어떤 로컬 디스크 IO도 하지 않는다.
+    Unavailable(krill_app_core::hosts::HostId),
+}
+
+impl FileHost {
+    /// 원격 파일 시스템 호출에 넘길 (호스트, 전송). 로컬은 `Ok(None)`, 전송이 없는 원격은 `Err`라서
+    /// 호출자가 `None`을 로컬로 오해할 수 없다.
+    pub(super) fn transport(
+        &self,
+    ) -> Result<
+        Option<(
+            krill_app_core::hosts::HostId,
+            krill_app_core::hosts::HostTarget,
+        )>,
+        &krill_app_core::hosts::HostId,
+    > {
+        match self {
+            Self::Local => Ok(None),
+            Self::Remote(host, target) => Ok(Some((host.clone(), target.as_ref().clone()))),
+            Self::Unavailable(host) => Err(host),
+        }
+    }
+}
+
+fn visit_tree_leaves_while(
+    tree: &krill_app_core::layout::PaneTree,
+    f: &mut impl FnMut(PaneId) -> bool,
+) -> bool {
+    match tree {
+        krill_app_core::layout::PaneTree::Leaf(id) => f(*id),
+        krill_app_core::layout::PaneTree::Split { first, second, .. } => {
+            visit_tree_leaves_while(first, f) && visit_tree_leaves_while(second, f)
+        }
+    }
+}
+
+fn visit_tree_leaves(tree: &krill_app_core::layout::PaneTree, f: &mut impl FnMut(PaneId)) {
+    visit_tree_leaves_while(tree, &mut |pane| {
+        f(pane);
+        true
+    });
+}
+
+fn visible_panes_match(layout: &krill_app_core::layout::Layout, cached: &[PaneId]) -> bool {
+    let Some(tab) = layout.tabs().get(layout.active()) else {
+        return cached.is_empty();
+    };
+    let mut index = 0usize;
+    let matches = visit_tree_leaves_while(&tab.root, &mut |pane| {
+        if cached.get(index) == Some(&pane) {
+            index += 1;
+            true
+        } else {
+            false
+        }
+    });
+    matches && index == cached.len()
+}
+
+impl Shell {
+    fn pane_host_is_available(&self, pane: PaneId) -> bool {
+        let host = self.layout.host(pane);
+        !host.is_remote() || self.host_targets.contains_key(host)
+    }
+
+    pub(super) fn file_host_for_pane(&self, pane: PaneId) -> FileHost {
+        let host = self.layout.host(pane);
+        if !host.is_remote() {
+            return FileHost::Local;
+        }
+        match self.target_for_host(host) {
+            Some(target) => FileHost::Remote(host.clone(), Box::new(target)),
+            None => FileHost::Unavailable(host.clone()),
+        }
+    }
+
+    /// 전송이 없는 원격 칸의 디스크 작업을 거부했다: 보이던 내용은 그대로 두고 오류 띠만 띄운다.
+    fn mark_remote_unavailable(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if let Some(tab) = self.files.tabs.get_mut(&pane) {
+            tab.error = Some(etext::REMOTE_DISCONNECTED.get().to_owned());
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn file_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        root.on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
+            this.toggle_quick_open(window, cx);
+        }))
+        .on_action(
+            cx.listener(|this, _: &krill_app_core::settings::ZoomIn, window, cx| {
+                this.on_zoom_step(1, window, cx);
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &krill_app_core::settings::ZoomOut, window, cx| {
+                this.on_zoom_step(-1, window, cx);
+            }),
+        )
+        .on_action(cx.listener(
+            |this, _: &krill_app_core::settings::ZoomReset, window, cx| {
+                this.on_zoom_reset(window, cx);
+            },
+        ))
+        .on_action(cx.listener(|_, _: &Quit, _, cx| quit_app(cx)))
+    }
+
+    pub(super) fn is_editor_focused(&self, window: &Window, cx: &App) -> bool {
+        self.files.tabs.values().any(|tab| {
+            tab.focus_editor()
+                .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window))
+        })
+    }
+
+    pub(super) fn file_pane_uses_editor_focus(&self, id: PaneId) -> bool {
+        self.files
+            .tabs
+            .get(&id)
+            .and_then(FileTab::focus_editor)
+            .is_some()
+    }
+
+    pub(super) fn file_editor_has_focus(&self, id: PaneId, window: &Window, cx: &App) -> bool {
+        self.files
+            .tabs
+            .get(&id)
+            .and_then(FileTab::focus_editor)
+            .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    fn focused_file_pane_active(&self, window: &Window, cx: &App) -> bool {
+        self.is_editor_focused(window, cx)
+            || (self.focus.is_focused(window)
+                && self
+                    .layout
+                    .focused()
+                    .is_some_and(|pane| self.layout.file(pane).is_some()))
+    }
+
+    pub(super) fn on_zoom_step(&mut self, dir: i8, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_open() {
+            return;
+        }
+        if self.focused_file_pane_active(window, cx) {
+            if let Some(pane) = self.layout.focused()
+                && let Some(tab) = self.files.tabs.get(&pane)
+            {
+                match &tab.body {
+                    Body::Image(img)
+                    | Body::Text {
+                        shown: Some(Shown::Image(img)),
+                        ..
+                    } => {
+                        img.update(cx, |v, cx| {
+                            if dir >= 0 {
+                                v.zoom_in(cx);
+                            } else {
+                                v.zoom_out(cx);
+                            }
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            krill_app_core::settings::step_editor_font_size(dir, cx);
+        } else if self.layout.focused().is_some() {
+            krill_app_core::settings::step_terminal_font_size(dir, cx);
+        }
+    }
+
+    pub(super) fn on_zoom_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_open() {
+            return;
+        }
+        if self.focused_file_pane_active(window, cx) {
+            if let Some(pane) = self.layout.focused()
+                && let Some(tab) = self.files.tabs.get(&pane)
+            {
+                match &tab.body {
+                    Body::Image(img)
+                    | Body::Text {
+                        shown: Some(Shown::Image(img)),
+                        ..
+                    } => {
+                        img.update(cx, ImageView::zoom_reset);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            krill_app_core::settings::reset_editor_font_size(cx);
+        } else if self.layout.focused().is_some() {
+            krill_app_core::settings::reset_terminal_font_size(cx);
+        }
+    }
+
+    /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
+    pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let host = self
+            .layout
+            .focused()
+            .filter(|_| !self.page_open() && self.dashboard.is_none())
+            .map_or_else(
+                || self.active_workspace(cx).host,
+                |p| self.layout.host(p).clone(),
+            );
+        self.open_file_on(host, path, cx);
+    }
+
+    pub(super) fn open_file_on(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        self.files.recent.retain(|old| old != &path);
+        self.files.recent.insert(0, path.clone());
+        self.files.recent.truncate(100);
+        let ws = self.active_workspace(cx);
+        let ws_folder = (ws.host == host)
+            .then_some(ws.folder)
+            .filter(|f| !f.as_os_str().is_empty());
+        self.close_settings(None, cx);
+        self.diff
+            .update(cx, krill_app_core::diff::Panel::clear_selection);
+        self.change(true, cx, move |l| {
+            let pane = l.open_file_on(host, path);
+            if l.launch(pane).is_none_or(|c| c.cwd.is_empty())
+                && let Some(folder) = ws_folder
+            {
+                l.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
+            }
+        });
+        self.files.refocus = true;
+    }
+
+    /// 파일을 미리보기 탭으로 연다(OWE-849): 같은 칸을 재사용하며 다음 단일 클릭이 교체한다.
+    pub(super) fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let ws = self.active_workspace(cx);
+        // `open_file`과 같은 호스트 판정: 포커스된 칸의 호스트, 없으면 활성 작업공간의 호스트.
+        // 탭이 없는 원격 작업공간에서도 로컬로 떨어지지 않는다(APP-F01 후속).
+        let host = self
+            .layout
+            .focused()
+            .filter(|_| !self.page_open() && self.dashboard.is_none())
+            .map_or_else(|| ws.host.clone(), |p| self.layout.host(p).clone());
+        let ws_folder = (ws.host == host)
+            .then_some(ws.folder)
+            .filter(|f| !f.as_os_str().is_empty());
+        self.close_settings(None, cx);
+        self.diff
+            .update(cx, krill_app_core::diff::Panel::clear_selection);
+        let tabs = self.workspace_tabs(cx);
+        self.change(true, cx, move |l| {
+            let pane = l.open_file_preview_on(host, path, &tabs);
+            if l.launch(pane).is_none_or(|c| c.cwd.is_empty())
+                && let Some(folder) = ws_folder
+            {
+                l.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
+            }
+        });
+        self.files.refocus = true;
+    }
+
+    /// 파일을 가운데 영역 에디터 탭으로 열고 지정한 1-based `(line, column)`으로 커서를 이동한다(OWE-733).
+    pub(super) fn open_file_at(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.files.goto = Some((path.clone(), line.max(1), column.max(1)));
+        self.open_file(path, cx);
+    }
+
+    pub(super) fn open_file_on_at(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.files.goto = Some((path.clone(), line.max(1), column.max(1)));
+        self.open_file_on(host, path, cx);
+    }
+
+    /// 세션의 현재 폴더(krilld가 알린 값), 모르면 칸을 연 폴더. 터미널 상대 경로 링크의 기준이다.
+    pub(super) fn pane_cwd(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
+        use krill_proto::os::ffi::OsStringExt as _;
+        let host = self.layout.host(pane);
+        let live = self
+            .layout
+            .session(pane)
+            .or_else(|| self.live.get(&pane).and_then(|l| l.pane.session()))
+            .and_then(|id| self.sidebar.read(cx).session_on(host, id))
+            .and_then(|s| s.cwd.clone());
+        live.or_else(|| {
+            let cwd = self.launch_for(pane).cwd;
+            (!cwd.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(cwd)))
+        })
+    }
+
+    /// 포인터 아래 출력 속 파일 경로 링크(OWE-663 4번). OSC 8 링크 칸은 그쪽이 먼저다.
+    pub(super) fn path_link_at(
+        &mut self,
+        pane: PaneId,
+        position: gpui::Point<Pixels>,
+        action: Option<terminal_menu::FileAction>,
+        cx: &mut Context<Self>,
+    ) -> Option<(u16, PathLink)> {
+        let host = self.layout.host(pane).clone();
+        let remote_target = if host.is_remote() {
+            Some(self.remote_target_for_pane(pane)?.1)
+        } else {
+            None
+        };
+        let cwd = self.pane_cwd(pane, cx);
+        let l = self.live.get(&pane)?;
+        let screen = l.pane.shown();
+        let (column, line) = cell_at(&l.painted, &screen, position)?;
+        if screen.link_at(line, column).is_some() {
+            return None;
+        }
+        let input = path_link::Input::at(&screen, line, column)?;
+        let key = LinkKey {
+            pane,
+            host,
+            input,
+            session: l.pane.session(),
+            line,
+            column,
+            cwd,
+        };
+        if let Some(action) = action {
+            if let Some(lookup) = &self.files.link_lookup
+                && lookup.covers(&key)
+                && lookup.ready
+                && lookup
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+            {
+                return lookup.found.clone().map(|link| (line, link));
+            }
+            self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
+            let generation = self.files.link_open_generation;
+            let session = l.pane.session();
+            let remote = remote_target.clone();
+            let cache = self.files.link_cache.clone();
+            let checked = key.clone();
+            #[cfg(test)]
+            let next_io = self.files.link_next_io.take();
+            cx.spawn(async move |this, cx| {
+                #[cfg(test)]
+                if let Some(next_io) = next_io {
+                    next_io.await.ok();
+                }
+                let found = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(mut cache) = cache.lock() else {
+                            return None;
+                        };
+                        if cache.0.elapsed() >= Duration::from_millis(500) {
+                            *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
+                        match remote {
+                            Some(target) => checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            ),
+                            None => checked.input.resolve(&mut cache.1, checked.cwd.as_deref()),
+                        }
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.files.link_open_generation == generation
+                        && this.layout.focused() == Some(pane)
+                        && this.path_link_key_matches(&key, cx)
+                        && this
+                            .live
+                            .get(&pane)
+                            .is_some_and(|live| live.pane.session() == session)
+                        && let Some(link) = found
+                    {
+                        this.activate_terminal_file(link, action, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return None;
+        }
+        if let Some(lookup) = &mut self.files.link_lookup
+            && lookup.covers(&key)
+            && (!lookup.ready
+                || lookup
+                    .checked_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500)))
+        {
+            return lookup.found.clone().map(|link| (line, link));
+        }
+        self.files.link_generation = self.files.link_generation.wrapping_add(1);
+        self.files.link_lookup = Some(LinkLookup {
+            key,
+            ready: false,
+            checked_at: None,
+            found: None,
+        });
+        if self.files.link_busy {
+            return None;
+        }
+        self.files.link_busy = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(Some((generation, key, cache, remote))) = this.read_with(cx, |this, _| {
+                    let key = this.files.link_lookup.as_ref()?.key.clone();
+                    let remote = if key.host.is_remote() {
+                        Some(this.target_for_host(&key.host)?)
+                    } else {
+                        None
+                    };
+                    Some((
+                        this.files.link_generation,
+                        key,
+                        this.files.link_cache.clone(),
+                        remote,
+                    ))
+                }) else {
+                    this.update(cx, |this, _| this.files.link_busy = false).ok();
+                    return;
+                };
+                let checked = key.clone();
+                let found = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(mut cache) = cache.lock() else {
+                            return None;
+                        };
+                        if cache.0.elapsed() >= Duration::from_millis(500) {
+                            *cache = (std::time::Instant::now(), path_link::Cache::default());
+                        }
+                        if let Some(target) = remote {
+                            return checked.input.resolve_remote_cached(
+                                &mut cache.1,
+                                &target,
+                                checked.cwd.as_deref(),
+                            );
+                        }
+                        checked.input.resolve(&mut cache.1, checked.cwd.as_deref())
+                    })
+                    .await;
+                let pointer = this
+                    .read_with(cx, |this, _| this.window)
+                    .ok()
+                    .flatten()
+                    .and_then(|handle| {
+                        handle
+                            .update(cx, |_, window, _| {
+                                (
+                                    window.mouse_position(),
+                                    krill_app_core::keys::link_modifier(window.modifiers()),
+                                )
+                            })
+                            .ok()
+                    });
+                let again = this
+                    .update(cx, |this, cx| {
+                        if this.files.link_generation != generation
+                            && this.files.link_lookup.is_some()
+                        {
+                            return true;
+                        }
+                        this.files.link_busy = false;
+                        if !this.path_link_key_matches(&key, cx) {
+                            this.files.link_lookup = None;
+                            if this.files.hover.is_some_and(|hover| hover.0 == key.pane) {
+                                this.files.hover = None;
+                                cx.notify();
+                            }
+                            return false;
+                        }
+                        let Some(lookup) = &mut this.files.link_lookup else {
+                            return false;
+                        };
+                        let same_found_span = lookup.key.same_context(&key)
+                            && found.as_ref().is_some_and(|link| {
+                                (link.column..link.column.saturating_add(link.cols))
+                                    .contains(&lookup.key.column)
+                            });
+                        if lookup.key != key && !same_found_span {
+                            return false;
+                        }
+                        lookup.ready = true;
+                        lookup.checked_at = Some(std::time::Instant::now());
+                        lookup.found.clone_from(&found);
+                        if let Some(link) = found {
+                            let under_pointer = pointer.is_some_and(|(position, command)| {
+                                this.live.get(&key.pane).is_some_and(|live| {
+                                    (command || !live.pane.modes().mouse())
+                                        && cell_at(&live.painted, &live.pane.shown(), position)
+                                            .is_some_and(|(col, line)| {
+                                                line == key.line
+                                                    && (col == key.column
+                                                        || (link.column
+                                                            ..link
+                                                                .column
+                                                                .saturating_add(link.cols))
+                                                            .contains(&col))
+                                            })
+                                })
+                            });
+                            if under_pointer {
+                                this.files.hover = Some((
+                                    key.pane,
+                                    Highlight {
+                                        line: key.line,
+                                        column: link.column,
+                                        cols: link.cols,
+                                    },
+                                ));
+                                cx.notify();
+                            }
+                        }
+                        false
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    return;
+                }
+            }
+        })
+        .detach();
+        None
+    }
+
+    fn path_link_key_matches(&self, key: &LinkKey, cx: &App) -> bool {
+        *self.layout.host(key.pane) == key.host
+            && self.pane_cwd(key.pane, cx) == key.cwd
+            && self.live.get(&key.pane).is_some_and(|live| {
+                live.pane.session() == key.session && key.input.matches(&live.pane.shown())
+            })
+    }
+
+    pub(super) fn open_terminal_file(
+        &mut self,
+        path: PathBuf,
+        position: Point<Pixels>,
+        action: terminal_menu::FileAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused_pane) = self.layout.focused() else {
+            return;
+        };
+        let host = self.layout.host(focused_pane).clone();
+        let remote = if host.is_remote() {
+            let Some((_, target)) = self.remote_target_for_pane(focused_pane) else {
+                return;
+            };
+            Some(target)
+        } else {
+            None
+        };
+        let focused = Some(focused_pane);
+        let session = self.live.get(&focused_pane).and_then(|l| l.pane.session());
+        let target = path.clone();
+        self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
+        let generation = self.files.link_open_generation;
+        cx.spawn(async move |this, cx| {
+            let check = path.clone();
+            let is_file = cx
+                .background_executor()
+                .spawn(async move {
+                    match remote {
+                        Some(target) => krill_app_core::remote_fs::stat(&target, &check)
+                            .ok()
+                            .flatten()
+                            .is_some(),
+                        None => check.is_file(),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.files.link_open_generation != generation
+                    || this.layout.focused() != focused
+                    || *this.layout.host(focused_pane) != host
+                    || this.live.get(&focused_pane).and_then(|l| l.pane.session()) != session
+                    || !this.live.get(&focused_pane).is_some_and(|live| {
+                        krill_app_core::terminal::file_link_target(
+                            &live.pane.shown(),
+                            &live.painted,
+                            position,
+                        )
+                        .as_ref()
+                            == Some(&target)
+                    })
+                {
+                    return;
+                }
+                if is_file {
+                    this.activate_terminal_file(
+                        PathLink {
+                            column: 0,
+                            cols: 0,
+                            path,
+                            line: None,
+                            col: None,
+                        },
+                        action,
+                        cx,
+                    );
+                } else if host.is_local() {
+                    cx.reveal_path(&path);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// ⌘ 없이 클릭하면 팝오버로 보여 줄 링크(OSC 8 `http(s)`·`mailto:`, 평문 `http(s)://` URL)와 밑줄 범위.
+    /// 프로그램이 마우스 보고를 켰으면 클릭은 프로그램 것이다. OSC 8은 보이는 글과 대상이 다를 수 있어
+    /// 바로 열지 않고 팝오버에 실제 대상을 보여 준다.
+    pub(super) fn click_link_at(
+        &self,
+        pane: PaneId,
+        position: gpui::Point<Pixels>,
+    ) -> Option<(Highlight, String)> {
+        let l = self.live.get(&pane).filter(|l| !l.pane.modes().mouse())?;
+        let screen = l.pane.shown();
+        if let Some(uri) = krill_app_core::terminal::link_target(&screen, &l.painted, position) {
+            let h = krill_app_core::terminal::osc_link_highlight(&screen, &l.painted, position)?;
+            return Some((h, uri.to_owned()));
+        }
+        krill_app_core::terminal::url_link_target(&screen, &l.painted, position)
+    }
+
+    /// 마우스를 움직이면 클릭 가능한 링크(OSC 8·평문 URL·파일 및 이미지 경로)에 밑줄과 포인터 커서를 표시한다(OWE-867).
+    /// 마우스 보고가 켜진 TUI에서는 ⌘를 누른 동안에만 링크로 동작한다.
+    pub(super) fn update_path_hover(
+        &mut self,
+        pane: PaneId,
+        position: gpui::Point<Pixels>,
+        cmd: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let clickable = cmd
+            || self
+                .live
+                .get(&pane)
+                .is_some_and(|l| !l.pane.modes().mouse());
+        if !clickable {
+            self.files.link_generation = self.files.link_generation.wrapping_add(1);
+            self.files.link_lookup = None;
+        }
+        let next = if clickable {
+            let osc_or_url = self.live.get(&pane).and_then(|l| {
+                let screen = l.pane.shown();
+                krill_app_core::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
+                    || {
+                        krill_app_core::terminal::url_link_target(&screen, &l.painted, position)
+                            .map(|(h, _)| h)
+                    },
+                )
+            });
+            if osc_or_url.is_some() {
+                self.files.link_generation = self.files.link_generation.wrapping_add(1);
+                self.files.link_lookup = None;
+            }
+            osc_or_url
+                .or_else(|| {
+                    self.path_link_at(pane, position, None, cx)
+                        .map(|(line, link)| Highlight {
+                            line,
+                            column: link.column,
+                            cols: link.cols,
+                        })
+                })
+                .map(|h| (pane, h))
+        } else {
+            None
+        };
+        if self.files.hover != next {
+            self.files.hover = next;
+            cx.notify();
+        }
+    }
+
+    /// 움직이지 않고 ⌘만 누르거나 떼도 밑줄이 따라오게 한다. Ctrl을 떼면 MRU 탭 전환을 확정한다.
+    pub(super) fn on_link_modifiers(
+        &mut self,
+        e: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !e.modifiers.control && self.layout.mru_switching() {
+            self.commit_mru_switcher(cx);
+        }
+        // 마우스 모드 패인의 우클릭 메뉴는 ⇧·⌥ 상태로 붙인다(render_pane). 바뀌면 다시 그린다.
+        if self
+            .layout
+            .visible()
+            .into_iter()
+            .any(|p| !self.selects(p, gpui::Modifiers::default()))
+        {
+            cx.notify();
+        }
+        let position = window.mouse_position();
+        let pane = self.layout.visible().into_iter().find(|p| {
+            self.live
+                .get(p)
+                .is_some_and(|l| l.painted.get().0.contains(&position))
+        });
+        match pane {
+            Some(pane) => self.update_path_hover(
+                pane,
+                position,
+                krill_app_core::keys::link_modifier(e.modifiers),
+                cx,
+            ),
+            None if self.files.hover.is_some() => {
+                self.files.hover = None;
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// 칸에 그릴 링크 밑줄.
+    pub(super) fn path_hover(&self, pane: PaneId) -> Option<Highlight> {
+        self.files.hover.filter(|h| h.0 == pane).map(|h| h.1)
+    }
+
+    /// 경로 링크를 가운데 에디터로 연다. 줄이 있으면 탭이 한 번 그려진 뒤(스크롤에 레이아웃이 필요) 그 줄로 옮긴다.
+    pub(super) fn open_path_link(&mut self, link: PathLink, cx: &mut Context<Self>) {
+        self.files.goto = link
+            .line
+            .map(|line| (link.path.clone(), line, link.col.unwrap_or(1)));
+        self.files.hover = None;
+        self.open_file(link.path, cx);
+    }
+
+    /// 파일 칸 하나를 그린다: 경로 줄, 디스크 변경 띠, 에디터(또는 열 수 없음 안내).
+    pub(super) fn render_file_pane(
+        &self,
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = krill_app_core::ui::palette(cx);
+        let in_card = self.workspace_stage() == super::pane_frame::WorkspaceStage::CardStage;
+        let focus_state = self.pane_focus_state(id, window, cx);
+        let is_split = self.layout.visible().len() > 1;
+        let path = self.layout.file(id).map(Path::to_owned).unwrap_or_default();
+        let tab = self.files.tabs.get(&id);
+        let file_host = self.file_host_for_pane(id);
+        let header = div()
+            .min_h(krill_app_core::ui::PANE_HEADER_HEIGHT)
+            .px_2()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .when(in_card, |d| {
+                d.rounded_t(krill_app_core::ui::PANE_CARD_INNER_RADIUS)
+            })
+            .bg(p.sidebar)
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                Icon::new(IconName::FileText)
+                    .with_size(krill_app_core::ui::ICON_XS)
+                    .text_color(p.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(krill_app_core::ui::FONT_MONO)
+                    .text_size(krill_app_core::ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    // OWE-849: 절대 경로 대신 워크트리 상대 경로(또는 `~` 축약)를 보인다.
+                    .child(self.diff.read(cx).display_path(&path)),
+            )
+            .children(self.preview_toggle(id, cx))
+            .children(self.open_browser_button(id, &path, &file_host, cx))
+            .children(self.share_button(id, &path, &file_host, cx))
+            .child(krill_app_core::ui::button_with_tooltip(
+                Button::new(("file-pane-split-right", id.get()))
+                    .debug_selector(move || format!("file-pane-split-right-{}", id.get()))
+                    .icon(Icon::default().data(krill_app_core::ui::icons::SPLIT_HORIZONTAL_SVG))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.split_pane(id, krill_app_core::layout::Axis::Horizontal, cx);
+                    })),
+                format!("file-pane-split-right-{}", id.get()),
+                text::SPLIT_RIGHT.get(),
+            ))
+            .when(is_split, |d| {
+                d.child(
+                    Button::new(("file-pane-close", id.get()))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .tooltip(text::CLOSE_PANE.get())
+                        .accessibility_label(text::CLOSE_PANE.get())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.change(true, cx, |l| {
+                                l.focus(id);
+                                l.close_pane();
+                            });
+                        })),
+                )
+            });
+        let banner = |msg: &str| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(p.warning.opacity(0.3))
+                .bg(p.warning.opacity(0.12))
+                .text_color(p.warning)
+                .text_size(krill_app_core::ui::TEXT_XS)
+                .child(div().flex_1().min_w_0().truncate().child(msg.to_owned()))
+        };
+        let disk = tab
+            .and_then(|t| t.doc.as_ref())
+            .map_or(Disk::Same, Doc::disk);
+        let disk_banner = (disk == Disk::Deleted)
+            .then(|| banner(etext::DELETED.get()).debug_selector(|| "file-deleted".into()));
+        let error = tab.and_then(|t| t.error.clone()).map(|e| {
+            div()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .child(krill_app_core::ui::error_banner(p, e))
+                .debug_selector(|| "file-error".into())
+        });
+        let inline_stage_in_body = matches!(
+            tab.map(|t| &t.body),
+            Some(
+                Body::Placeholder(..)
+                    | Body::Text {
+                        shown: Some(Shown::Html { .. }),
+                        ..
+                    }
+            )
+        );
+        let stage_bar = (!inline_stage_in_body)
+            .then(|| self.pane_stage_view(id, cx))
+            .flatten()
+            .map(|stage| fview::stage_status_bar(stage, p));
+        let notice = |msg: String| {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(krill_app_core::ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(msg)
+                .into_any_element()
+        };
+        // 전송이 없는 원격 파일: 같은 경로의 로컬 파일을 읽거나 열지 않고 연결 안내만 보인다.
+        let offline = || {
+            div()
+                .size_full()
+                .debug_selector(|| "file-offline".into())
+                .child(notice(etext::REMOTE_DISCONNECTED.get().to_owned()))
+                .into_any_element()
+        };
+        let body = match tab.map(|t| &t.body) {
+            Some(Body::Text {
+                shown: Some(shown), ..
+            }) => match shown {
+                Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
+                Shown::Table(view) => view.clone().into_any_element(),
+                Shown::Notebook(Ok(nb)) => {
+                    fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
+                }
+                Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
+                Shown::Image(view) => view.clone().into_any_element(),
+                Shown::Html { title, len } => match file_host.transport() {
+                    // 브라우저 열기·Finder 보기가 같은 경로의 로컬 파일로 가므로 띄우지 않는다.
+                    Err(_) => offline(),
+                    Ok(remote) => {
+                        let open_weak = cx.weak_entity();
+                        let source_weak = cx.weak_entity();
+                        let reveal_weak = cx.weak_entity();
+                        fview::html_preview_interactive(
+                            &path,
+                            remote.is_some(),
+                            title.as_deref(),
+                            *len,
+                            self.pane_stage_view(id, cx),
+                            move |_, cx| {
+                                open_weak
+                                    .update(cx, |this, cx| {
+                                        this.start_file_pane_open(id, false, cx);
+                                    })
+                                    .ok();
+                            },
+                            move |window, cx| {
+                                source_weak
+                                    .update(cx, |this, cx| {
+                                        this.set_preview(id, false, window, cx);
+                                    })
+                                    .ok();
+                            },
+                            move |_, cx| {
+                                reveal_weak
+                                    .update(cx, |this, cx| {
+                                        this.start_file_pane_open(id, true, cx);
+                                    })
+                                    .ok();
+                            },
+                            cx,
+                        )
+                    }
+                },
+            },
+            Some(Body::Text { state, .. }) => div()
+                .size_full()
+                .when(in_card, |d| {
+                    d.rounded_b(krill_app_core::ui::PANE_CARD_INNER_RADIUS)
+                })
+                .bg(p.editor_surface)
+                .child(
+                    Editor::new(state)
+                        .readonly(true)
+                        .bordered(false)
+                        .h(gpui::relative(1.)),
+                )
+                .into_any_element(),
+            Some(Body::Image(view)) => view.clone().into_any_element(),
+            Some(Body::Table(view)) => view.clone().into_any_element(),
+            Some(Body::Placeholder(kind, len)) => match file_host.transport() {
+                Err(_) => offline(),
+                Ok(remote) => {
+                    let open_weak = cx.weak_entity();
+                    let reveal_weak = cx.weak_entity();
+                    fview::placeholder_interactive(
+                        &path,
+                        remote.is_some(),
+                        *kind,
+                        *len,
+                        self.pane_stage_view(id, cx),
+                        move |_, cx| {
+                            open_weak
+                                .update(cx, |this, cx| {
+                                    this.start_file_pane_open(id, false, cx);
+                                })
+                                .ok();
+                        },
+                        move |_, cx| {
+                            reveal_weak
+                                .update(cx, |this, cx| {
+                                    this.start_file_pane_open(id, true, cx);
+                                })
+                                .ok();
+                        },
+                        cx,
+                    )
+                }
+            },
+            Some(Body::Offline) => offline(),
+            Some(Body::Unopenable(reason)) => notice(unopenable_text(*reason)),
+            Some(Body::Failed(err)) => notice(etext::OPEN_FAILED.format(&[("error", err)])),
+            None => notice(String::new()),
+        };
+        let file_el = div()
+            .id(ElementId::Name(format!("file-pane-{}", id.get()).into()))
+            .debug_selector(|| "file-pane".into())
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .when(!in_card, |d| d.bg(p.background))
+            .text_color(p.foreground)
+            .child(header)
+            .children(stage_bar)
+            .children(disk_banner)
+            .children(error)
+            .child(div().flex_1().min_h_0().child(body))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    if this.layout.focused() != Some(id) {
+                        this.change(true, cx, |l| l.focus(id));
+                    }
+                    if let Some(editor) = this.files.tabs.get(&id).and_then(FileTab::focus_editor) {
+                        this.files.refocus = false;
+                        let focused = editor.read(cx).focus_handle(cx).is_focused(window);
+                        if !focused {
+                            let editor = editor.clone();
+                            editor.update(cx, |s, cx| s.focus(window, cx));
+                        }
+                    } else {
+                        this.files.refocus = false;
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
+                        }
+                    }
+                }),
+            )
+            .into_any_element();
+        if in_card {
+            super::pane_frame::render_pane_card(id, focus_state, p, p.background, file_el)
+        } else {
+            file_el
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(super) fn is_file_preview(&self, id: PaneId) -> Option<bool> {
+        let Body::Text { preview, shown, .. } = &self.files.tabs.get(&id)?.body else {
+            return None;
+        };
+        Some(preview.is_some() && shown.is_some())
+    }
+
+    fn pane_stage_view(&self, id: PaneId, cx: &Context<Self>) -> Option<fview::PlaceholderStage> {
+        let stage = self.files.tabs.get(&id)?.staging.as_ref()?;
+        let weak = cx.weak_entity();
+        Some(fview::PlaceholderStage {
+            percent: stage.percent,
+            on_cancel: Box::new(move |_, cx| {
+                weak.update(cx, |this, cx| {
+                    this.cancel_file_pane_open(id, cx);
+                })
+                .ok();
+            }),
+        })
+    }
+
+    pub(super) fn cancel_file_pane_open(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if let Some(tab) = self.files.tabs.get_mut(&pane)
+            && let Some(stage) = tab.staging.take()
+        {
+            stage
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "test build records opened external paths on self.files"
+        )
+    )]
+    fn finish_external_open_for_pane(
+        &mut self,
+        target_path: PathBuf,
+        reveal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let command = if reveal {
+            krill_app_core::file_format::reveal_command
+        } else {
+            krill_app_core::file_format::open_default_command
+        };
+        #[cfg(test)]
+        {
+            let _ = command(&target_path);
+            self.files.opened_external.push((target_path, reveal));
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            cx.background_executor()
+                .spawn(async move {
+                    fview::run_open_command(&target_path, command);
+                })
+                .detach();
+        }
+    }
+
+    /// 파일 칸에서 외부 열기(`이 PC에서 열기`·`브라우저에서 열기`) 또는 파일 관리자 표시를 시작한다.
+    pub(super) fn start_file_pane_open(
+        &mut self,
+        pane: PaneId,
+        reveal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.layout.file(pane).map(Path::to_owned) else {
+            return;
+        };
+        if self
+            .files
+            .tabs
+            .get(&pane)
+            .is_some_and(|t| t.staging.is_some())
+        {
+            return;
+        }
+        match self.file_host_for_pane(pane) {
+            FileHost::Unavailable(_) => {
+                self.mark_remote_unavailable(pane, cx);
+            }
+            FileHost::Local => {
+                if let Some(tab) = self.files.tabs.get_mut(&pane) {
+                    tab.error = None;
+                }
+                self.finish_external_open_for_pane(path, reveal, cx);
+            }
+            FileHost::Remote(host, target) => {
+                let target = *target;
+                if !self.files.tabs.contains_key(&pane) {
+                    let command = if reveal {
+                        krill_app_core::file_format::reveal_command
+                    } else {
+                        krill_app_core::file_format::open_default_command
+                    };
+                    let weak = cx.weak_entity();
+                    fview::spawn_open_on_reported(
+                        path,
+                        Some((host, target)),
+                        command,
+                        move |msg, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.notice = Some(msg);
+                                cx.notify();
+                            })
+                            .ok();
+                        },
+                        cx,
+                    );
+                    return;
+                }
+                self.files.next_stage_id = self.files.next_stage_id.wrapping_add(1);
+                let stage_id = self.files.next_stage_id;
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Some(tab) = self.files.tabs.get_mut(&pane) {
+                    tab.error = None;
+                    tab.staging = Some(ActiveStage {
+                        id: stage_id,
+                        percent: 0,
+                        cancel: cancel.clone(),
+                    });
+                    self.files.cache_count = usize::MAX;
+                }
+                cx.notify();
+
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+                let cancel_bg = cancel;
+                let host_bg = host.clone();
+                let path_bg = path.clone();
+                #[cfg(test)]
+                let gate = self.files.next_io.take();
+                let work = cx.background_executor().spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    let mut last_pct: Option<u8> = None;
+                    krill_app_core::remote_fs::stage_to_local_cache_with_progress(
+                        &target,
+                        &host_bg,
+                        &path_bg,
+                        krill_app_core::remote_fs::MAX_STAGE_BYTES,
+                        Some(&cancel_bg),
+                        |done, total| {
+                            let pct = done
+                                .saturating_mul(100)
+                                .checked_div(total)
+                                .map_or(100, |v| u8::try_from(v).unwrap_or(100).min(100));
+                            if last_pct != Some(pct) {
+                                last_pct = Some(pct);
+                                progress_tx.send(pct).ok();
+                            }
+                        },
+                    )
+                });
+
+                let progress_weak = cx.weak_entity();
+                cx.spawn(async move |_, cx| {
+                    while let Some(pct) = progress_rx.recv().await {
+                        let alive = progress_weak
+                            .update(cx, |this, cx| {
+                                if let Some(tab) = this.files.tabs.get_mut(&pane)
+                                    && let Some(stage) = tab.staging.as_mut()
+                                    && stage.id == stage_id
+                                    && stage.percent != pct
+                                {
+                                    stage.percent = pct;
+                                    cx.notify();
+                                }
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+
+                cx.spawn(async move |this, cx| {
+                    let outcome = work.await;
+                    this.update(cx, |this, cx| {
+                        let still_current = this
+                            .files
+                            .tabs
+                            .get(&pane)
+                            .and_then(|t| t.staging.as_ref())
+                            .is_some_and(|s| s.id == stage_id);
+                        if !still_current {
+                            return;
+                        }
+                        if let Some(tab) = this.files.tabs.get_mut(&pane) {
+                            tab.staging = None;
+                            this.files.cache_count = usize::MAX;
+                        }
+                        if this.layout.file(pane) != Some(path.as_path())
+                            || *this.layout.host(pane) != host
+                        {
+                            cx.notify();
+                            return;
+                        }
+                        match outcome {
+                            Ok((local, _)) => {
+                                this.finish_external_open_for_pane(local, reveal, cx);
+                            }
+                            Err(err) => {
+                                if let Some(msg) =
+                                    krill_app_core::remote_fs::stage_error_message(&err)
+                                {
+                                    if !this.layout.visible().contains(&pane) {
+                                        this.notice = Some(msg.clone());
+                                    }
+                                    if let Some(tab) = this.files.tabs.get_mut(&pane) {
+                                        tab.error = Some(msg);
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// 열린 HTML 파일을 기본 웹 브라우저에서 여는 머리 버튼.
+    fn open_browser_button(
+        &self,
+        id: PaneId,
+        path: &Path,
+        host: &FileHost,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        if !krill_app_core::file_format::is_html_path(path) {
+            return None;
+        }
+        // 전송이 없는 원격 파일은 같은 경로의 로컬 파일을 열게 되므로 버튼을 두지 않는다.
+        host.transport().ok()?;
+        let busy = self
+            .files
+            .tabs
+            .get(&id)
+            .is_some_and(|t| t.staging.is_some());
+        Some(
+            Button::new(("file-open-browser", id.get()))
+                .debug_selector(|| "file-open-browser".into())
+                .icon(IconName::ExternalLink)
+                .label(etext::OPEN_BROWSER.get())
+                .ghost()
+                .xsmall()
+                .disabled(busy)
+                .max_w(gpui::relative(1.))
+                .overflow_hidden()
+                .accessibility_label(etext::OPEN_BROWSER_TOOLTIP.get())
+                .tooltip(etext::OPEN_BROWSER_TOOLTIP.get())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.start_file_pane_open(id, false, cx);
+                })),
+        )
+    }
+
+    /// 열린 HTML·Markdown 파일을 아티팩트(공개 링크)로 공유하는 머리 버튼.
+    fn share_button(
+        &self,
+        id: PaneId,
+        path: &Path,
+        host: &FileHost,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        // 공유 CLI는 이 기기의 파일만 읽는다: 원격 칸에 두면 같은 경로의 로컬 파일이 올라간다.
+        if *host != FileHost::Local || !krill_proto::artifacts::is_shareable_path(path) {
+            return None;
+        }
+        let busy = self.files.sharing.contains(&id);
+        Some(
+            krill_app_core::ui::button_with_reserved_label(
+                ("file-share-artifact", id.get()),
+                atext::SHARE_BUTTON.get(),
+                atext::SHARING.get(),
+                busy,
+            )
+            .debug_selector(|| "file-share-artifact".into())
+            .icon(IconName::Globe)
+            .ghost()
+            .xsmall()
+            .disabled(busy)
+            .max_w(gpui::relative(1.))
+            .overflow_hidden()
+            .accessibility_label(atext::SHARE_TOOLTIP.get())
+            .tooltip(atext::SHARE_TOOLTIP.get())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.share_file_artifact(id, window, cx);
+            })),
+        )
+    }
+
+    /// 칸의 파일을 공유한다(이미 공유했으면 같은 링크의 내용을 갱신한다). 링크는 클립보드에 복사한다.
+    /// 공개 공유가 꺼져 있으면 설정 > 아티팩트로 보낸다.
+    pub(super) fn share_file_artifact(
+        &mut self,
+        id: PaneId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.layout.file(id).map(Path::to_owned) else {
+            return;
+        };
+        if self.files.sharing.contains(&id) {
+            return;
+        }
+        if self.file_host_for_pane(id) != FileHost::Local {
+            // 버튼이 없어도(지연된 클릭 등) 원격 칸의 공유는 로컬 파일을 올리므로 거부한다.
+            self.notice = Some(atext::SHARE_REMOTE_UNSUPPORTED.get().to_owned());
+            cx.notify();
+            return;
+        }
+        // 설정을 아직 안 열었으면 게이트·CLI가 krilld와 같은 상태 디렉터리를 보게 먼저 맞춘다.
+        if !cx.has_global::<krill_app_core::settings::Config>() {
+            let dir = self.state_dir(cx);
+            krill_app_core::settings::init_at(dir, cx);
+        }
+        let Some(run) = krill_app_core::artifacts::runner(cx) else {
+            self.notice = Some(atext::ERROR.format(&[(
+                "error",
+                krill_app_core::i18n::catalog::general::ERR_CLI_MISSING.get(),
+            )]));
+            cx.notify();
+            return;
+        };
+        self.files.sharing.insert(id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { krill_app_core::artifacts::share_path(&run, &path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.files.sharing.remove(&id);
+                this.notice = Some(match res {
+                    Ok(out) => {
+                        if let Some(cached) = this.artifacts_cache.clone() {
+                            cached
+                                .update(cx, krill_app_core::artifacts::View::sync_from_disk_cache);
+                        }
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            out.share_url.clone(),
+                        ));
+                        let msg = if out.change == "updated" {
+                            atext::UPDATED
+                        } else {
+                            atext::SHARED
+                        };
+                        msg.format(&[("url", &out.share_url)])
+                    }
+                    Err(e) => e.message(),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 파일 칸 머리의 원본/미리보기 토글(마크다운·CSV·ipynb·SVG·HTML만).
+    fn preview_toggle(&self, id: PaneId, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let Some(Body::Text {
+            preview: Some(preview),
+            shown,
+            ..
+        }) = self.files.tabs.get(&id).map(|t| &t.body)
+        else {
+            return None;
+        };
+        let preview_label = preview_label(*preview);
+        let previewing = shown.is_some();
+        let p = krill_app_core::ui::palette(cx);
+        let segment_button = |name: &'static str, label: &'static str, on: bool| {
+            krill_app_core::ui::segment(p, (name, id.get()), label, previewing == on)
+                .debug_selector(move || name.to_owned())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.set_preview(id, on, window, cx);
+                }))
+        };
+        Some(
+            krill_app_core::ui::segmented_control(
+                p,
+                [
+                    segment_button("file-preview", preview_label, true),
+                    segment_button("file-edit", etext::SOURCE.get(), false),
+                ],
+            )
+            .debug_selector(|| "file-preview-toggle".into())
+            .max_w(gpui::relative(1.))
+            .flex_wrap(),
+        )
+    }
+
+    /// 원본/미리보기를 바꾼다. 미리보기는 들어갈 때마다 지금 에디터 내용으로 다시 만든다.
+    pub(super) fn set_preview(
+        &mut self,
+        pane: PaneId,
+        on: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.files.tabs.get_mut(&pane) else {
+            return;
+        };
+        let Body::Text {
+            state,
+            preview: Some(preview),
+            shown,
+            ..
+        } = &mut tab.body
+        else {
+            return;
+        };
+        tab.preview_generation = tab.preview_generation.wrapping_add(1);
+        let generation = tab.preview_generation;
+        if on {
+            let text = state.read(cx).text().clone();
+            let state_id = state.entity_id();
+            let preview = *preview;
+            let revision = tab.revision;
+            cx.spawn(async move |this, cx| {
+                let prepared = cx
+                    .background_executor()
+                    .spawn(async move { prepare_preview(preview, &text.to_string()) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                        return;
+                    };
+                    if tab.preview_generation != generation || tab.revision != revision {
+                        return;
+                    }
+                    let Body::Text { state, shown, .. } = &mut tab.body else {
+                        return;
+                    };
+                    if state.entity_id() != state_id {
+                        return;
+                    }
+                    *shown = Some(build_preview(prepared, cx));
+                    this.files.refocus = true;
+                    this.sync_file_states(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        } else {
+            *shown = None;
+        }
+        self.files.refocus = true;
+        self.sync_file_states(cx);
+        cx.notify();
+    }
+
+    fn sync_file_state(&mut self, pane: PaneId, cx: &App) {
+        let Some(tab) = self.files.tabs.get(&pane) else {
+            return;
+        };
+        let Body::Text {
+            state,
+            preview,
+            shown,
+            ..
+        } = &tab.body
+        else {
+            return;
+        };
+        let position = state.read(cx).cursor_position();
+        let saved = layout::SavedFileState {
+            line: position.line,
+            column: position.character,
+            preview: preview.is_some() && shown.is_some(),
+        };
+        if self.layout.file_state(pane) != Some(saved) {
+            self.layout.set_file_state(pane, saved);
+            self.save();
+        }
+    }
+
+    /// 열린 텍스트 탭들의 커서 위치·미리보기 여부를 `layout.file_states`에 동기화하고 바뀌었으면 저장한다(OWE-842).
+    pub(super) fn sync_file_states(&mut self, cx: &App) {
+        let mut changed = false;
+        let entries: Vec<_> = self
+            .files
+            .tabs
+            .iter()
+            .filter_map(|(&pane, tab)| {
+                let Body::Text {
+                    state,
+                    preview,
+                    shown,
+                    ..
+                } = &tab.body
+                else {
+                    return None;
+                };
+                let pos = state.read(cx).cursor_position();
+                let is_preview = preview.is_some() && shown.is_some();
+                Some((
+                    pane,
+                    layout::SavedFileState {
+                        line: pos.line,
+                        column: pos.character,
+                        preview: is_preview,
+                    },
+                ))
+            })
+            .collect();
+        for (pane, st) in entries {
+            if self.layout.file_state(pane) != Some(st) {
+                self.layout.set_file_state(pane, st);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn editor_search_active(&self, pane: PaneId, cx: &gpui::App) -> bool {
+        self.files
+            .tabs
+            .get(&pane)
+            .and_then(FileTab::focus_editor)
+            .is_some_and(|state| state.read(cx).search_session().is_active())
+    }
+
+    /// OWE-874: 파일 탭이 포커스된 상태에서 ⌘F — 미리보기면 원본 보기로 돌린 뒤 에디터 내장 검색을
+    /// 연다. 에디터 본문이 없으면(이미지·표·자리표시자) false를 돌려 호출자가 터미널 검색으로 이어가게 한다.
+    pub(super) fn open_editor_search(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .files
+            .tabs
+            .get(&pane)
+            .is_some_and(|t| matches!(t.body, Body::Text { .. }))
+        {
+            return false;
+        }
+        self.set_preview(pane, false, window, cx);
+        let Some(state) = self
+            .files
+            .tabs
+            .get(&pane)
+            .and_then(FileTab::focus_editor)
+            .cloned()
+        else {
+            return false;
+        };
+        state.update(cx, |s, cx| {
+            s.open_search(false, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    /// 탭 바의 파일 탭 앞 아이콘. 세션 칸이면 `None`.
+    pub(super) fn file_tab_prefix(&self, pane: PaneId) -> Option<gpui::Div> {
+        self.layout.file(pane)?;
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .child(Icon::new(IconName::FileText).small()),
+        )
+    }
+
+    pub(super) fn file_requests_dir(&self, cx: &App) -> Option<PathBuf> {
+        let explicit = self
+            .path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(PathBuf::from)
+            .or_else(|| {
+                let parent = self.paths.as_ref()?.socket.parent()?;
+                if parent.file_name().is_some_and(|n| n == "run") {
+                    parent.parent().map(PathBuf::from)
+                } else {
+                    Some(parent.to_path_buf())
+                }
+            });
+        #[cfg(test)]
+        {
+            let _ = cx;
+            explicit
+        }
+        #[cfg(not(test))]
+        {
+            explicit.or_else(|| krill_app_core::settings::state_dir(cx))
+        }
+    }
+
+    /// `krill file open|diff` CLI가 상태 디렉터리(`file-requests.json`)에 넣은 요청을 소비한다.
+    pub(super) fn apply_file_requests(
+        &mut self,
+        requests: Vec<CliFileRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if requests.is_empty() {
+            return;
+        }
+        for req in requests {
+            if req.focus {
+                window.activate_window();
+            }
+            match req.kind {
+                CliFileActionKind::Open => {
+                    self.files.goto = req
+                        .line
+                        .map(|line| (req.path.clone(), line, req.column.unwrap_or(1)));
+                    self.open_file_on(krill_app_core::hosts::HostId::Local, req.path, cx);
+                }
+                CliFileActionKind::Diff => {
+                    self.close_settings(Some(window), cx);
+                    if self.panel_collapsed {
+                        self.panel_collapsed = false;
+                        self.layout.panel_collapsed = false;
+                        self.save();
+                    }
+                    let worktree = req.worktree;
+                    let rel = req.relative_path;
+                    let staged = req.staged;
+                    let local_target = self.local_target();
+                    self.diff.update(cx, |d, cx| {
+                        if let Some(target) = local_target {
+                            d.connect(target, cx);
+                        }
+                        d.set_visible(true, cx);
+                        d.open_diff_file(worktree, &rel, staged, cx);
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 그리기 전에: 보이는 파일 칸을 읽고, 감시를 켜고, 바뀐 포커스를 옮기고, 창 닫기 확인을 건다.
+    pub(super) fn sync_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.files.released.is_empty() {
+            for path in std::mem::take(&mut self.files.released) {
+                fview::release_image(&path, window, cx);
+            }
+        }
+        if self.files.goto.is_some() {
+            self.apply_goto(window, cx);
+        }
+        if !self.files.loading.is_empty() {
+            self.files
+                .loading
+                .retain(|pane, (_, path)| self.layout.file(*pane) == Some(path.as_path()));
+        }
+        // 전송이 없어 읽지 못한 칸은 전송이 생기면, 다른 호스트에서 읽은 칸은 칸의 호스트가 바뀌면 버리고
+        // 다시 읽는다(디스크 IO 없이 맵 조회만). 읽어 온 본문은 읽어 온 호스트에만 속한다(APP-F01 후속).
+        if !self.files.tabs.is_empty() {
+            let mut stale = std::mem::take(&mut self.files.scratch_panes);
+            stale.clear();
+            for (&pane, tab) in &self.files.tabs {
+                let host_changed =
+                    self.layout.file(pane).is_some() && *self.layout.host(pane) != tab.host;
+                let came_online =
+                    matches!(tab.body, Body::Offline) && self.pane_host_is_available(pane);
+                if host_changed || came_online {
+                    stale.push(pane);
+                }
+            }
+            if !stale.is_empty() {
+                for &pane in &stale {
+                    if let Some(tab) = self.files.tabs.remove(&pane) {
+                        self.files.forget(&tab);
+                    }
+                }
+                self.files.cache_count = usize::MAX;
+            }
+            stale.clear();
+            self.files.scratch_panes = stale;
+        }
+        let mut to_load = std::mem::take(&mut self.files.scratch_panes);
+        to_load.clear();
+        if let Some(tab) = self.layout.tabs().get(self.layout.active()) {
+            visit_tree_leaves(&tab.root, &mut |pane| {
+                if self.layout.file(pane).is_some()
+                    && !self.files.tabs.contains_key(&pane)
+                    && !self.files.loading.contains_key(&pane)
+                {
+                    to_load.push(pane);
+                }
+            });
+        }
+        if !to_load.is_empty() {
+            for &pane in &to_load {
+                if let Some(path) = self.layout.file(pane).map(Path::to_owned) {
+                    self.start_file_load(pane, path, window, cx);
+                }
+            }
+        }
+        to_load.clear();
+        self.files.scratch_panes = to_load;
+        self.trim_clean_file_cache(window, cx);
+        if !self.files.watching
+            && (self.layout.files().next().is_some() || self.file_requests_dir(cx).is_some())
+        {
+            self.files.watching = true;
+            self.files.watch = Some(Self::watch_files(window, cx));
+        }
+        // 팔레트·모달이 떠 있거나 터미널 칸에서 검색 바 입력창에 포커스가 있으면 그쪽 포커스를 뺏지 않는다.
+        if self.files.refocus {
+            let search_focused = self.search.as_ref().is_some_and(|(bar, _)| {
+                self.layout
+                    .focused()
+                    .is_none_or(|p| self.layout.file(p).is_none())
+                    && bar.read(cx).is_focused(window, cx)
+            });
+            if !self.has_workspace_focus_blocker(cx) && !search_focused {
+                self.files.refocus = false;
+                let focused = self.layout.focused();
+                let editor = focused
+                    .and_then(|p| self.files.tabs.get(&p))
+                    .and_then(FileTab::focus_editor)
+                    .cloned();
+                if let Some(state) = editor {
+                    state.update(cx, |s, cx| s.focus(window, cx));
+                } else if let Some(pane) = focused.filter(|p| self.is_split_launcher(*p)) {
+                    self.focus_split_launcher(pane, window, cx);
+                } else if let Some(chat_key) = focused
+                    .filter(|p| self.is_pane_chat_view(*p, cx))
+                    .and_then(|p| self.chat_key(p))
+                {
+                    let input = self.ensure_chat_input(chat_key, window, cx);
+                    input.update(cx, |s, cx| s.focus(window, cx));
+                } else {
+                    window.focus(&self.focus, cx);
+                }
+            }
+        }
+        if !self.files.close_guard {
+            self.files.close_guard = true;
+            let weak = cx.weak_entity();
+            window.on_window_should_close(cx, move |window, cx| {
+                weak.update(cx, |this, cx| this.request_close(window, cx))
+                    .ok();
+                false
+            });
+        }
+    }
+
+    fn trim_clean_file_cache(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.cache_count == self.files.tabs.len()
+            && visible_panes_match(&self.layout, &self.files.cache_visible)
+        {
+            return;
+        }
+        self.files.cache_visible.clear();
+        if let Some(tab) = self.layout.tabs().get(self.layout.active()) {
+            visit_tree_leaves(&tab.root, &mut |pane| self.files.cache_visible.push(pane));
+        }
+        self.files.cache_count = self.files.tabs.len();
+        self.files.cache_clock = self.files.cache_clock.wrapping_add(1);
+        let clock = self.files.cache_clock;
+        for &pane in &self.files.cache_visible {
+            self.files.last_visible.insert(pane, clock);
+        }
+        if !self.files.last_visible.is_empty() {
+            self.files
+                .last_visible
+                .retain(|pane, _| self.layout.file(*pane).is_some());
+        }
+        if !self.files.evicted_scroll.is_empty() {
+            self.files
+                .evicted_scroll
+                .retain(|pane, (path, _)| self.layout.file(*pane) == Some(path.as_path()));
+        }
+        let mut candidates = std::mem::take(&mut self.files.scratch_candidates);
+        candidates.clear();
+        let mut retained = 0usize;
+        for (&pane, tab) in &self.files.tabs {
+            let bytes = if tab.shows_image() {
+                usize::try_from(krill_app_core::file_format::raster::MAX_PIXELS * 4)
+                    .unwrap_or(usize::MAX)
+            } else {
+                match &tab.body {
+                    Body::Text { state, .. } => state.read(cx).text().len().saturating_mul(3),
+                    Body::Image(_) => {
+                        usize::try_from(krill_app_core::file_format::raster::MAX_PIXELS * 4)
+                            .unwrap_or(usize::MAX)
+                    }
+                    Body::Table(_) => usize::try_from(editor::MAX_BYTES).unwrap_or(usize::MAX),
+                    _ => 0,
+                }
+            };
+            retained = retained.saturating_add(bytes);
+            let selected = match &tab.body {
+                Body::Text { state, .. } => state.read(cx).is_copyable(),
+                _ => false,
+            };
+            if self.files.cache_visible.contains(&pane)
+                || self.layout.focused() == Some(pane)
+                || selected
+                || tab.error.is_some()
+                || tab.staging.is_some()
+                || self.files.loading.contains_key(&pane)
+                || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
+            {
+                continue;
+            }
+            candidates.push((
+                self.files.last_visible.get(&pane).copied().unwrap_or(0),
+                pane,
+                bytes,
+            ));
+        }
+        candidates.sort_by_key(|(age, pane, _)| (*age, *pane));
+        let mut count = self.files.tabs.len();
+        for &(_, pane, bytes) in &candidates {
+            if retained <= CLEAN_CACHE_BYTES && count <= CLEAN_CACHE_TABS {
+                break;
+            }
+            if let Some(tab) = self.files.tabs.remove(&pane) {
+                if let Body::Text { state, .. } = &tab.body {
+                    self.files
+                        .evicted_scroll
+                        .insert(pane, (tab.path.clone(), state.read(cx).scroll_offset()));
+                }
+                self.files.forget(&tab);
+                retained = retained.saturating_sub(bytes);
+                count -= 1;
+            }
+        }
+        candidates.clear();
+        self.files.scratch_candidates = candidates;
+        self.files.cache_count = self.files.tabs.len();
+        if !self.files.released.is_empty() {
+            for path in std::mem::take(&mut self.files.released) {
+                fview::release_image(&path, window, cx);
+            }
+        }
+    }
+
+    /// Close only after a durable layout barrier.
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.closing {
+            return;
+        }
+        self.files.closing = true;
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let Ok((barrier, layout)) = this.update(cx, |this, cx| {
+                (this.layout_barrier(cx), this.layout.clone())
+            }) else {
+                return;
+            };
+            if barrier.await {
+                let unchanged = this
+                    .read_with(cx, |this, _| this.layout == layout)
+                    .unwrap_or(false);
+                if unchanged {
+                    handle
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                    return;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.files.closing = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 경로 링크의 줄로 커서를 옮긴다. 아직 안 읽은 탭이면 이번에 읽고 다음 프레임에 옮긴다.
+    fn apply_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, line, col)) = self.files.goto.take() else {
+            return;
+        };
+        let Some(pane) = self
+            .layout
+            .focused()
+            .filter(|p| self.layout.file(*p) == Some(path.as_path()))
+        else {
+            return;
+        };
+        let Some(tab) = self.files.tabs.get_mut(&pane) else {
+            self.files.goto = Some((path, line, col));
+            return;
+        };
+        if let Body::Text { shown, .. } = &mut tab.body
+            && shown.is_some()
+        {
+            *shown = None;
+        }
+        if let Some(state) = tab.focus_editor().cloned() {
+            let at =
+                gpui_component::input::Position::new(line.saturating_sub(1), col.saturating_sub(1));
+            state.update(cx, |s, cx| s.set_cursor_position(at, window, cx));
+        }
+        self.sync_file_states(cx);
+    }
+
+    fn start_file_load(
+        &mut self,
+        pane: PaneId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.layout.host(pane).clone();
+        let Ok(remote) = self.file_host_for_pane(pane).transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽지 않는다. 전송이 생기면 `sync_files`가 다시 읽는다.
+            self.files.tabs.insert(pane, FileTab::offline(host, path));
+            self.files.cache_count = usize::MAX;
+            cx.notify();
+            return;
+        };
+        self.files.next_request = self.files.next_request.wrapping_add(1);
+        let generation = self.files.next_request;
+        self.files.loading.insert(pane, (generation, path.clone()));
+        let saved = self.layout.file_state(pane);
+        #[cfg(test)]
+        let gate = self.files.next_io.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    read_file_on(&read_path, saved.is_none_or(|s| s.preview), remote.as_ref())
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.files.loading.get(&pane) != Some(&(generation, path.clone())) {
+                    return;
+                }
+                this.files.loading.remove(&pane);
+                // 읽는 동안 칸의 파일·호스트가 바뀌었으면 다른 호스트에서 읽은 내용을 보이지 않는다.
+                if this.layout.file(pane) != Some(path.as_path()) || *this.layout.host(pane) != host
+                {
+                    return;
+                }
+                let mut tab =
+                    Self::load_file_tab(pane, path.clone(), saved, host, window, cx, loaded);
+                if this.files.goto.as_ref().is_some_and(|(p, _, _)| *p == path)
+                    && let Body::Text { shown, .. } = &mut tab.body
+                {
+                    *shown = None;
+                }
+                if let Some((previous_path, offset)) = this.files.evicted_scroll.remove(&pane)
+                    && previous_path == path
+                    && let Body::Text { state, .. } = &tab.body
+                {
+                    state.update(cx, |state, cx| state.set_scroll_offset(offset, cx));
+                }
+                this.files.tabs.insert(pane, tab);
+                this.files.cache_count = usize::MAX;
+                this.files.refocus = true;
+                this.apply_goto(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_file_tab(
+        pane: PaneId,
+        path: PathBuf,
+        saved: Option<layout::SavedFileState>,
+        host: krill_app_core::hosts::HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        loaded: PreparedFile,
+    ) -> FileTab {
+        let local = host.is_local();
+        let PreparedFile {
+            opened,
+            preview: prepared,
+            staged_image,
+        } = loaded;
+        let (body, stamp) = match opened {
+            Ok((Opened::Text(kind, text), stamp)) => {
+                let language = editor::language(kind, &path);
+                let preview = editor::preview(kind);
+                let shown = prepared.map(|prepared| build_preview(prepared, cx));
+                let state = cx.new(|cx| {
+                    let mut ed = EditorState::new(window, cx)
+                        .language(language)
+                        .line_number(true)
+                        // OWE-874: 긴 줄은 자동 줄 바꿈(기본값 true를 고정 — 잘려서 못 보는 일이 없게).
+                        .soft_wrap(true)
+                        .default_value(text);
+                    editor::syntax::install(&mut ed, language, cx);
+                    ed
+                });
+                if let Some(s) = saved
+                    && (s.line != 0 || s.column != 0)
+                {
+                    let at = gpui_component::input::Position::new(s.line, s.column);
+                    let prev_focus = window.focused(cx);
+                    state.update(cx, |ed, cx| ed.set_cursor_position(at, window, cx));
+                    if shown.is_some()
+                        && let Some(prev) = prev_focus
+                    {
+                        window.focus(&prev, cx);
+                    }
+                }
+                let cursor = cx.observe(&state, move |this, state, cx| {
+                    let selected = state.read(cx).is_copyable();
+                    if let Some(tab) = this.files.tabs.get_mut(&pane)
+                        && tab.selection_pin != selected
+                    {
+                        tab.selection_pin = selected;
+                        this.files.cache_count = usize::MAX;
+                        cx.notify();
+                    }
+                    this.sync_file_state(pane, cx);
+                });
+                let focus = cx.subscribe_in(
+                    &state,
+                    window,
+                    move |this, _, ev: &gpui_component::input::InputEvent, _, cx| match ev {
+                        gpui_component::input::InputEvent::Focus => {
+                            if this.layout.focused() != Some(pane)
+                                && this.layout.visible().contains(&pane)
+                            {
+                                this.change(false, cx, |l| l.focus(pane));
+                                this.files.refocus = false;
+                            } else {
+                                cx.notify();
+                            }
+                        }
+                        gpui_component::input::InputEvent::Blur => {
+                            cx.notify();
+                        }
+                        gpui_component::input::InputEvent::Change
+                        | gpui_component::input::InputEvent::PressEnter { .. } => {}
+                    },
+                );
+                return FileTab {
+                    path: path.clone(),
+                    host,
+                    staged_image: None,
+                    staging: None,
+                    revision: 0,
+                    preview_generation: 0,
+                    selection_pin: false,
+                    doc: Some(Doc::new(path, stamp)),
+                    body: Body::Text {
+                        state,
+                        _cursor: cursor,
+                        _focus: focus,
+                        preview,
+                        shown,
+                    },
+                    error: None,
+                };
+            }
+            Ok((Opened::Image(Ok(dims)), stamp)) => {
+                let img_path = staged_image.clone().unwrap_or_else(|| path.clone());
+                (
+                    Body::Image(cx.new(|_| ImageView::new(img_path, Some(dims)))),
+                    stamp,
+                )
+            }
+            Ok((Opened::Image(Err(e)), stamp)) => (Body::Failed(fview::image_error(e)), stamp),
+            Ok((Opened::Table(table), stamp)) => {
+                (Body::Table(cx.new(|_| CsvView::new(table))), stamp)
+            }
+            Ok((Opened::Placeholder(kind, len), stamp)) => (Body::Placeholder(kind, len), stamp),
+            Ok((Opened::Unopenable(reason), stamp)) => (Body::Unopenable(reason), stamp),
+            Err(e) => {
+                // 원격 읽기 실패를 이 기기의 디스크 접근 권한 문제로 안내하지 않는다.
+                if local {
+                    krill_app_core::onboarding::actions::note_access_denied(&path, &e, cx);
+                }
+                return FileTab {
+                    path: path.clone(),
+                    host,
+                    staged_image: None,
+                    staging: None,
+                    revision: 0,
+                    preview_generation: 0,
+                    selection_pin: false,
+                    doc: None,
+                    body: Body::Failed(e.to_string()),
+                    error: None,
+                };
+            }
+        };
+        // 텍스트가 아닌 탭도 디스크 지문을 들고 있어 바뀌면 다시 읽는다.
+        FileTab {
+            path: path.clone(),
+            host,
+            staged_image,
+            staging: None,
+            revision: 0,
+            preview_generation: 0,
+            selection_pin: false,
+            doc: Some(Doc::new(path, stamp)),
+            body,
+            error: None,
+        }
+    }
+
+    /// Read and parse off-thread; refuse stale results after another reload or close.
+    fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.files.tabs.get(&pane) else {
+            return;
+        };
+        if self.files.loading.contains_key(&pane) {
+            return;
+        }
+        let Some(doc) = &tab.doc else { return };
+        let Ok(remote) = self.file_host_for_pane(pane).transport() else {
+            // 전송이 없는 원격: 같은 경로의 로컬 파일을 읽어 보이던 내용을 덮지 않는다.
+            self.mark_remote_unavailable(pane, cx);
+            return;
+        };
+        let host = self.layout.host(pane).clone();
+        let local = remote.is_none();
+        let path = doc.path().to_owned();
+        let before = doc.clone();
+        let revision = tab.revision;
+        let state_id = match &tab.body {
+            Body::Text { state, .. } => Some(state.entity_id()),
+            _ => None,
+        };
+        self.files.next_request = self.files.next_request.wrapping_add(1);
+        let generation = self.files.next_request;
+        self.files.loading.insert(pane, (generation, path.clone()));
+        let saved = self.layout.file_state(pane);
+        let previewing = matches!(&tab.body, Body::Text { shown: Some(_), .. });
+        #[cfg(test)]
+        let gate = self.files.next_io.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    read_file_on(&read_path, previewing, remote.as_ref())
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.files.loading.get(&pane) != Some(&(generation, path.clone())) {
+                    return;
+                }
+                this.files.loading.remove(&pane);
+                let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                    return;
+                };
+                let current_state_id = match &tab.body {
+                    Body::Text { state, .. } => Some(state.entity_id()),
+                    _ => None,
+                };
+                if current_state_id != state_id
+                    || tab.revision != revision
+                    || tab.doc.as_ref() != Some(&before)
+                    || this.layout.file(pane) != Some(path.as_path())
+                    || *this.layout.host(pane) != host
+                {
+                    return;
+                }
+                if !matches!(tab.body, Body::Text { .. }) {
+                    if tab.shows_image() {
+                        this.files
+                            .released
+                            .push(tab.staged_image.clone().unwrap_or_else(|| path.clone()));
+                    }
+                    let fresh =
+                        Self::load_file_tab(pane, path, saved, host.clone(), window, cx, loaded);
+                    this.files.tabs.insert(pane, fresh);
+                    this.files.cache_count = usize::MAX;
+                    cx.notify();
+                    return;
+                }
+                let (Some(doc), Body::Text { state, shown, .. }) =
+                    (tab.doc.as_mut(), &mut tab.body)
+                else {
+                    return;
+                };
+                let PreparedFile {
+                    opened,
+                    preview: prepared,
+                    staged_image: _,
+                } = loaded;
+                match opened {
+                    Ok((Opened::Text(_, text), stamp)) => {
+                        let prev_focus = window.focused(cx);
+                        let next_shown = prepared.map(|p| build_preview(p, cx));
+                        let editor_focused =
+                            this.layout.focused() == Some(pane) && next_shown.is_none();
+                        state.update(cx, |s, cx| {
+                            let cursor = s.cursor_position();
+                            s.set_value(text, window, cx);
+                            s.set_cursor_position(cursor, window, cx);
+                        });
+                        if !editor_focused && let Some(prev) = prev_focus {
+                            window.focus(&prev, cx);
+                        }
+                        *shown = next_shown;
+                        *doc = Doc::new(path.clone(), stamp);
+                        this.files.refocus = true;
+                        this.files.cache_count = usize::MAX;
+                        tab.revision = tab.revision.wrapping_add(1);
+                        tab.error = None;
+                    }
+                    Ok((other, _)) => {
+                        tab.error = Some(not_text(&other));
+                    }
+                    Err(e) => {
+                        if local {
+                            krill_app_core::onboarding::actions::note_access_denied(&path, &e, cx);
+                        }
+                        tab.error = Some(etext::OPEN_FAILED.format(&[("error", &e.to_string())]));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn watch_files(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            let mut cycle = 0u8;
+            loop {
+                cx.background_executor().timer(WATCH_EVERY).await;
+                cycle = (cycle + 1) % 10;
+                let Ok(Some((paths, req_dir))) = this.update(cx, |this, cx| {
+                    let req_dir = this.file_requests_dir(cx);
+                    if this.layout.files().next().is_none() && req_dir.is_none() {
+                        this.files.watching = false;
+                        return None;
+                    }
+                    let visible: std::collections::HashSet<_> =
+                        this.layout.visible().into_iter().collect();
+                    let paths = this
+                        .files
+                        .tabs
+                        .iter()
+                        .filter(|(pane, tab)| {
+                            cycle == 0
+                                || visible.contains(pane)
+                                || tab.doc.as_ref().is_some_and(|doc| doc.disk() != Disk::Same)
+                        })
+                        .filter_map(|(p, t)| {
+                            // 전송이 없는 원격 칸은 같은 경로의 로컬 파일을 stat하지 않는다.
+                            let remote = this.file_host_for_pane(*p).transport().ok()?;
+                            let remote = remote.map(|(_, target)| target);
+                            Some((*p, t.revision, t.doc.clone()?, remote))
+                        })
+                        .collect::<Vec<_>>();
+                    Some((paths, req_dir))
+                }) else {
+                    return;
+                };
+                let (stamps, requests) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        // 큐의 잠금·읽기·삭제를 모두 IO 작업에서 마친다.
+                        // 화면 그리기에서는 CLI나 디스크를 기다리지 않는다.
+                        let requests = req_dir
+                            .as_deref()
+                            .map(take_pending_file_requests)
+                            .unwrap_or_default();
+                        let stamps = paths
+                            .into_iter()
+                            .map(|(p, revision, doc, remote)| {
+                                let now = match remote {
+                                    Some(target) => {
+                                        krill_app_core::remote_fs::stat(&target, doc.path())
+                                    }
+                                    None => editor::stamp(doc.path()),
+                                };
+                                (p, revision, doc, now)
+                            })
+                            .collect::<Vec<_>>();
+                        (stamps, requests)
+                    })
+                    .await;
+                if stamps.is_empty() && requests.is_empty() {
+                    continue;
+                }
+                let polled = this.update_in(cx, |this, window, cx| {
+                    this.apply_file_requests(requests, window, cx);
+                    for (pane, revision, before, now) in stamps {
+                        // stat 자체가 실패하면(권한 등) 판단하지 않고 다음 주기에 다시 본다.
+                        let Ok(now) = now else { continue };
+                        let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                            continue;
+                        };
+                        if tab.revision != revision || tab.doc.as_ref() != Some(&before) {
+                            continue;
+                        }
+                        let Some(doc) = tab.doc.as_mut() else {
+                            continue;
+                        };
+                        match doc.poll(now) {
+                            Poll::Nothing => {}
+                            Poll::Marked => {
+                                this.files.cache_count = usize::MAX;
+                                cx.notify();
+                            }
+                            Poll::Reload => this.reload_file(pane, window, cx),
+                        }
+                    }
+                });
+                if polled.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// ⌘P는 즉시 열고 백그라운드 스캔이 끝나면 입력을 유지한 채 목록을 갱신한다.
+    pub(super) fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files.quick_generation = self.files.quick_generation.wrapping_add(1);
+        let generation = self.files.quick_generation;
+        if self.files.quick_open.take().is_some() {
+            self.files.quick_loading = false;
+            self.files.refocus = true;
+            cx.notify();
+            return;
+        }
+        self.close_settings(Some(window), cx);
+        self.jump = None;
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
+        }
+        let ws = self.active_workspace(cx);
+        let ws_host = ws.host.clone();
+        let root = self.quick_open_root(cx);
+        let remote_target = ws_host
+            .is_remote()
+            .then(|| self.target_for_host(&ws_host))
+            .flatten();
+        let mut recent: Vec<_> = self
+            .files
+            .recent
+            .iter()
+            .filter_map(|path| path.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .collect();
+        for (_, path) in self.layout.files() {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                let relative = relative.to_path_buf();
+                if !recent.contains(&relative) {
+                    recent.push(relative);
+                }
+            }
+        }
+        let shared = Rc::new(std::cell::RefCell::new(recent.clone()));
+        let palette =
+            cx.new(|cx| jump::Palette::new(editor::quick_open::items(&recent), window, cx));
+        palette.update(cx, |p, cx| {
+            p.set_mode(jump::Mode::Files, cx);
+            p.focus(window, cx);
+        });
+        let selected_files = shared.clone();
+        let selected_root = root.clone();
+        let confirm_host = ws_host.clone();
+        let events = cx.subscribe_in(
+            &palette,
+            window,
+            move |this, _, event: &jump::Event, _, cx| {
+                this.files.quick_open = None;
+                this.files.quick_loading = false;
+                this.files.refocus = true;
+                if let jump::Event::Confirm(id) = *event {
+                    let file = editor::quick_open::chosen(&selected_files.borrow(), id).cloned();
+                    if let Some(file) = file {
+                        this.open_file_on(confirm_host.clone(), selected_root.join(file), cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.files.quick_open = Some((palette.clone(), events));
+        self.files.quick_loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (ordered, items) = loop {
+                if !this
+                    .read_with(cx, |this, cx| {
+                        let current_root = this.quick_open_root(cx);
+                        this.files.quick_generation == generation
+                            && this.files.quick_loading
+                            && this.files.quick_open.is_some()
+                            && current_root == root
+                    })
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                let scan = root.clone();
+                let recent = recent.clone();
+                let remote = remote_target.clone();
+                let is_remote = ws_host.is_remote();
+                // Ok(None): a local scan already owns admission, so retry. Err: the remote list failed.
+                let listed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let files = if is_remote {
+                            remote
+                                .and_then(|target| {
+                                    krill_app_core::remote_fs::quick_open_list(&target, &scan)
+                                })
+                                .ok_or(())?
+                        } else {
+                            let Some(files) = editor::quick_open::try_list(&scan) else {
+                                return Ok(None);
+                            };
+                            files
+                        };
+                        let membership: std::collections::HashSet<_> = files.iter().collect();
+                        let mut ordered: Vec<_> = recent
+                            .into_iter()
+                            .filter(|path| membership.contains(path))
+                            .collect();
+                        let mut seen: std::collections::HashSet<_> =
+                            ordered.iter().cloned().collect();
+                        ordered.extend(files.into_iter().filter(|file| seen.insert(file.clone())));
+                        let items = editor::quick_open::items(&ordered);
+                        Ok(Some((ordered, items)))
+                    })
+                    .await;
+                match listed {
+                    Ok(Some(result)) => break result,
+                    Ok(None) => {}
+                    Err(()) => {
+                        this.update(cx, |this, cx| {
+                            if this.files.quick_generation == generation && this.files.quick_loading
+                            {
+                                this.files.quick_loading = false;
+                                this.notice = Some(etext::QUICK_OPEN_FAILED.get().to_owned());
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            };
+            this.update(cx, |this, cx| {
+                let current_root = this.quick_open_root(cx);
+                if this.files.quick_generation != generation
+                    || !this.files.quick_loading
+                    || this.files.quick_open.is_none()
+                    || current_root != root
+                {
+                    return;
+                }
+                *shared.borrow_mut() = ordered;
+                palette.update(cx, |p, cx| p.set_items(items, cx));
+                this.files.quick_loading = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn quick_open_root(&self, cx: &App) -> PathBuf {
+        if self.layout.focused().is_some() {
+            let focused_folder = self.folder();
+            if !focused_folder.as_os_str().is_empty() {
+                return focused_folder;
+            }
+        }
+        self.active_workspace(cx).folder
+    }
+
+    pub(super) fn quick_open_palette(&self) -> Option<gpui::Entity<jump::Palette>> {
+        self.files.quick_open.as_ref().map(|(p, _)| p.clone())
+    }
+
+    /// 레이아웃에서 사라진 파일 칸의 탭 상태를 버린다.
+    pub(super) fn forget_closed_file_tabs(&mut self) {
+        let gone: Vec<PaneId> = self
+            .files
+            .tabs
+            .iter()
+            .filter(|(p, t)| self.layout.file(**p) != Some(t.path.as_path()))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in gone {
+            if let Some(tab) = self.files.tabs.remove(&p) {
+                self.files.forget(&tab);
+            }
+        }
+    }
+}
+
+/// 앱 종료의 유일한 경로(⌘Q·메뉴·메뉴바 아이콘). 셸 창마다 레이아웃을 디스크에 내려쓴 뒤 끝낸다.
+/// 액션 처리 중에는 그 창이 빌려져 있어 갱신되지 않으므로(레이아웃을 못 내려씀) 다음 틱에 본다.
+pub(super) fn quit_app(cx: &mut App) {
+    cx.defer(quit_now);
+}
+
+#[cfg(test)]
+struct QuitObserved(std::rc::Rc<std::cell::Cell<bool>>);
+#[cfg(test)]
+impl gpui::Global for QuitObserved {}
+
+fn quit_now(cx: &mut App) {
+    // A restart helper can time out while a durable flush waits.
+    // Do not finish that update-triggered quit after its helper has failed.
+    let restart = cx
+        .try_global::<krill_app_core::updater::UpdateState>()
+        .filter(|state| state.restart.is_starting())
+        .and_then(|state| state.staged.clone());
+    // GPUI quit observers only have a 200ms budget. Finish filesystem work
+    // while the event loop is still running, before requesting app shutdown.
+    let pending = cx
+        .windows()
+        .into_iter()
+        .filter_map(|w| w.downcast::<Shell>())
+        .filter_map(|window| {
+            window
+                .update(cx, |shell, _, cx| {
+                    // Include the final last-seen value in the unbounded-time
+                    // preflush, rather than creating another write at shutdown.
+                    shell.touch_last_seen();
+                    (window, shell.layout.clone(), shell.layout_barrier(cx))
+                })
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    let settings_saved = krill_app_core::settings::flush_file_io(cx);
+    let sidebar_saved = krill_app_core::sidebar::flush_file_io(cx);
+    let star_saved = krill_app_core::star_nag::flush(cx);
+    cx.spawn(async move |cx| {
+        settings_saved.await;
+        sidebar_saved.await;
+        star_saved.await;
+        let mut snapshots = Vec::new();
+        for (window, layout, barrier) in pending {
+            if !barrier.await {
+                return;
+            }
+            snapshots.push((window, layout));
+        }
+        let link_services = cx.update(|cx| {
+            if !restart_quit_is_current(restart.as_ref(), cx) {
+                return None;
+            }
+            if snapshots
+                .iter()
+                .all(|(window, layout)| window.read(cx).is_ok_and(|shell| shell.layout == *layout))
+            {
+                for (window, _) in &snapshots {
+                    if let Ok(shell) = window.read(cx) {
+                        shell.quit_layout_ready.set(true);
+                    }
+                }
+                Some(krill_app_core::hosts::link::begin_shutdown())
+            } else {
+                quit_app(cx);
+                None
+            }
+        });
+        let Some(link_services) = link_services else {
+            return;
+        };
+        if !link_services.is_empty() {
+            cx.background_executor()
+                .spawn(async move {
+                    krill_app_core::hosts::link::shutdown_services(&link_services);
+                })
+                .await;
+        }
+        cx.update(|cx| {
+            #[cfg(test)]
+            if let Some(observed) = cx.try_global::<QuitObserved>() {
+                observed.0.set(true);
+            }
+            cx.quit();
+        });
+    })
+    .detach();
+}
+
+fn restart_quit_is_current(
+    staged: Option<&krill_app_core::updater::StagedUpdate>,
+    cx: &App,
+) -> bool {
+    staged.is_none_or(|staged| {
+        cx.try_global::<krill_app_core::updater::UpdateState>()
+            .is_some_and(|state| {
+                state.restart.is_starting() && state.staged.as_ref() == Some(staged)
+            })
+    })
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests;
+
+#[cfg(test)]
+mod sync_perf_tests {
+    use super::*;
+
+    #[test]
+    fn visible_panes_match_agrees_with_layout_visible() {
+        let mut layout = krill_app_core::layout::Layout::default();
+        let p0 = layout.focused().unwrap();
+        assert_eq!(layout.visible(), vec![p0]);
+        assert!(visible_panes_match(&layout, &[p0]));
+        assert!(!visible_panes_match(&layout, &[]));
+        assert!(!visible_panes_match(&layout, &[p0, p0]));
+
+        layout.split(krill_app_core::layout::Axis::Horizontal);
+        layout.split(krill_app_core::layout::Axis::Vertical);
+        let expected = layout.visible();
+        assert_eq!(expected.len(), 3);
+        assert!(visible_panes_match(&layout, &expected));
+        assert!(!visible_panes_match(&layout, &expected[..2]));
+        let reversed = [expected[2], expected[1], expected[0]];
+        assert!(!visible_panes_match(&layout, &reversed));
+
+        layout.deactivate();
+        assert!(layout.visible().is_empty());
+        assert!(visible_panes_match(&layout, &[]));
+        assert!(!visible_panes_match(&layout, &expected));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn sync_files_steady_state_is_idempotent_and_preserves_cache_clock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::shell::tests::{open, state_path};
+
+        let dir = std::env::temp_dir().join(format!("mk-files-sync-idle-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("steady.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let (view, visual) = open(cx, state_path("files-sync-steady"));
+        view.update(visual, |s, cx| s.open_file(file.clone(), cx));
+        visual.run_until_parked();
+
+        // Settle once after open_file completes.
+        visual.update(|window, cx| {
+            view.update(cx, |s, cx| {
+                s.sync_files(window, cx);
+            });
+        });
+
+        let (clock_before, count_before, visible_before) = view.read_with(visual, |s, _| {
+            (
+                s.files.cache_clock,
+                s.files.cache_count,
+                s.files.cache_visible.clone(),
+            )
+        });
+        assert!(!visible_before.is_empty());
+
+        // Repeated steady-state sync_files passes must not advance cache_clock or disturb state.
+        for _ in 0..8 {
+            visual.update(|window, cx| {
+                view.update(cx, |s, cx| {
+                    s.sync_files(window, cx);
+                    assert!(s.files.close_guard);
+                    assert!(s.files.watching);
+                    assert!(!s.files.refocus);
+                });
+            });
+        }
+
+        view.read_with(visual, |s, _| {
+            assert_eq!(s.files.cache_clock, clock_before);
+            assert_eq!(s.files.cache_count, count_before);
+            assert_eq!(s.files.cache_visible, visible_before);
+            assert!(s.files.scratch_panes.is_empty());
+        });
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn sync_files_preserves_refocus_while_blocked_and_applies_goto(cx: &mut gpui::TestAppContext) {
+        use crate::shell::tests::{layout_of, open, state_path};
+
+        let dir = std::env::temp_dir().join(format!("mk-files-sync-goto-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("goto.rs");
+        std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+        let (view, visual) = open(cx, state_path("files-sync-goto"));
+        // Hold refocus while settings modal blocks workspace focus.
+        view.update(visual, |s, cx| {
+            s.open_settings(krill_app_core::settings::AdminTab::Appearance, None, cx);
+            s.files.refocus = true;
+        });
+        visual.update(|window, cx| view.update(cx, |s, cx| s.sync_files(window, cx)));
+        view.read_with(visual, |s, _| {
+            assert!(
+                s.files.refocus,
+                "refocus must wait while a modal blocks workspace focus"
+            );
+        });
+        view.update(visual, |s, cx| s.close_settings(None, cx));
+        visual.update(|window, cx| view.update(cx, |s, cx| s.sync_files(window, cx)));
+        view.read_with(visual, |s, _| {
+            assert!(
+                !s.files.refocus,
+                "refocus clears once workspace blocker is gone"
+            );
+        });
+
+        // Open file at line 3, col 2 via goto and ensure sync_files/load applies it cleanly.
+        view.update(visual, |s, cx| s.open_file_at(file.clone(), 3, 2, cx));
+        visual.run_until_parked();
+        let pane = layout_of(&view, visual).active_tab().focused;
+        view.read_with(visual, |shell, cx| {
+            assert!(shell.files.goto.is_none());
+            let ed = shell.files.tabs[&pane].editor().unwrap().read(cx);
+            let pos = ed.cursor_position();
+            assert_eq!((pos.line, pos.character), (2, 1));
+        });
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

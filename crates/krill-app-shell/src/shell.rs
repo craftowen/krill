@@ -1,0 +1,11278 @@
+//! 앱 셸 뷰(MK-030): 3열(사이드바 · 탭 바 + 분할 트리 · 오른쪽 패널), 비율 드래그, 변경마다 레이아웃 저장.
+//!
+//! gpui 셸 의존은 이 파일·`sidebar`·`jump`·`main.rs`에 있다(MK-002 잠정 결정). 모델·저장은 `layout`이 맡는다.
+//!
+//! # 칸 ↔ 세션 (OWE-490)
+//!
+//! 데몬에 붙으면 보이는 칸(활성 탭의 잎)마다 [`Live`] 하나를 두고 IO 태스크가 세션을 정해(`pane::ensure_session`)
+//! 화면 스트림에 붙는다(`pane::attach`). 프레임 읽기는 백그라운드에서 막고 읽고, 적용·입력·그리기는 UI 스레드에서 한다.
+//! 끊기면 칸 상태는 그대로 두고 다시 붙는다(같은 krilld 세대면 스냅샷 생략). 탭을 바꿔 칸이 안 보이면 [`Live`]를
+//! 지워 소켓을 닫는다(MK-035). 칸의 세션이 사라졌으면(재부팅 등) 디스크 기록의 마지막 화면을 읽기 전용으로 띄우고
+//! "다시 시작" 버튼으로 새 세션을 붙인다(MK-032 콜드 복원). 키는 `keys`(특수 키)와 IME 확정 텍스트(`krill_term::ime`)로 `Pane::input`에 간다.
+//!
+//! # 기본 상호작용 (MK-033)
+//!
+//! 프로그램이 마우스 보고를 켜지 않았거나 Shift를 누르면 왼쪽 끌기가 선택(`krill_term::select`)이 되고 ⌘C가 복사한다.
+//! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
+//! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
+
+// Automations design reference: Orca (MIT, Copyright (c) 2026 Lovecast Inc.).
+mod account_input;
+mod chat;
+mod close;
+mod commands;
+mod diff;
+mod external_switch;
+pub(crate) mod files;
+mod fit;
+mod folder;
+mod handoff;
+mod liveness;
+mod new_session;
+mod notifications;
+mod overlays;
+mod pane_frame;
+mod persist;
+pub(crate) mod popout;
+mod release;
+pub(crate) mod security;
+mod session_accounts;
+mod session_switch_modal;
+mod split_launcher;
+mod stale_account_banner;
+mod tabs;
+mod terminal_menu;
+mod voice;
+mod workspaces;
+
+// 앱의 마지막 생존 시각 저장.
+mod artifacts;
+mod away;
+mod bot_group_chat;
+mod bot_group_panel;
+mod bot_panel;
+mod bot_section;
+
+use krill_proto::os::ffi::OsStringExt as _;
+use krill_proto::os::net::UnixStream;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::Shutdown;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context, DragMoveEvent, ElementId,
+    ElementInputHandler, Empty, EntityInputHandler, ExternalPaths, FocusHandle, KeyBinding,
+    KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, Pixels, Point, PromptLevel, ScrollWheelEvent,
+    SharedString, Subscription, Task, UTF16Selection, Window, actions, canvas, div, point,
+    prelude::*, px, relative,
+};
+#[cfg(windows)]
+use gpui_component::ActiveTheme as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::ContextMenuExt as _;
+
+use gpui_component::{Disableable as _, IconName, Sizable as _};
+use krill_app_core::detached;
+use krill_app_core::echo::EchoDraw;
+use krill_app_core::link::{Link, notice_text};
+use krill_app_core::pane::{self, Pane};
+use krill_app_core::terminal::{
+    Painted, Preedit, TerminalElement, cell_at, cell_size, file_link_target, link_target,
+};
+use krill_app_core::{keys, platform};
+use krill_proto::agent::Permission;
+use krill_proto::control::{AgentLaunch, AgentSettings};
+use krill_proto::daemon::{self, Paths};
+use krill_proto::input::{Notice, Now};
+use krill_proto::ipc::{self, ClientRole};
+use krill_proto::theme::{CellSize, Push, Theme};
+use krill_term::ime::{CellPoint, Ime, Output};
+use krill_term::select::{self, Anchored, Selection};
+
+use krill_app_core::layout::{self, Axis, Branch, Layout, PaneId, PaneTree};
+
+use krill_app_core::{jump, sidebar};
+use krill_proto::control::{Create, Program};
+use krill_proto::os::ffi::OsStrExt as _;
+
+const KEY_CONTEXT: &str = "Shell";
+/// 커서 깜박임 반주기(OWE-658, macOS 기본 텍스트 커서와 비슷한 값 — 추정).
+const CURSOR_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
+/// 분할선의 잡는 폭(pt). 보이는 선은 1pt.
+const DIVIDER_GRAB: Pixels = krill_app_core::ui::DIVIDER_HIT_PX;
+
+/// 사용자에게 보이는 ko/en 문자열 키(MK-094).
+use krill_app_core::i18n::catalog::shell as text;
+
+/// 칸 연결 재시도 간격: 50ms에서 두 배씩, 상한 500ms(`krill_proto::daemon` 재연결과 같은 설계값).
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(50)
+        .saturating_mul(1u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX))
+        .min(Duration::from_millis(500))
+}
+
+/// 칸 IO 태스크가 붙기를 마친 뒤 할 일.
+enum Next {
+    /// 붙었다. 이 소켓을 읽는다.
+    Read(UnixStream),
+    /// 못 붙었다. 잠시 뒤 다시.
+    Retry,
+    /// 칸이 안 보이게 됐거나 콜드 화면을 띄웠다(태스크 끝).
+    Gone,
+}
+
+/// 칸 IO 태스크가 백그라운드에서 정한 것.
+enum Got {
+    Live {
+        session: krill_proto::SessionId,
+        linked: std::io::Result<pane::Linked>,
+        prior_cold: Option<(krill_proto::SessionId, krill_proto::control::Cold)>,
+    },
+    Cold(krill_proto::SessionId, krill_proto::control::Cold),
+    /// 콜드 화면을 띄우되, 그 세션을 다시 시작한 요청의 결과는 모른다(같은 요청을 자동으로 보내지 않는다).
+    ColdUnknown(
+        krill_proto::SessionId,
+        krill_proto::control::Cold,
+        std::io::Error,
+    ),
+    /// 세션 생성 결과를 모르는 칸이 찾을 세션이 없다. 새로 만들지 않고 멈춘다.
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettledAttempt {
+    layout_session: Option<krill_proto::SessionId>,
+    target: krill_app_core::hosts::HostTarget,
+    had_registered_target: bool,
+}
+
+pub(crate) fn saved_window_bounds_from_gpui(wb: gpui::WindowBounds) -> layout::SavedWindowBounds {
+    let (mode, bounds) = match wb {
+        gpui::WindowBounds::Windowed(b) => (layout::SavedWindowMode::Windowed, b),
+        gpui::WindowBounds::Maximized(b) => (layout::SavedWindowMode::Maximized, b),
+        gpui::WindowBounds::Fullscreen(b) => (layout::SavedWindowMode::Fullscreen, b),
+    };
+    layout::SavedWindowBounds {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+        mode,
+    }
+}
+
+#[must_use]
+pub fn gpui_window_bounds_from_saved(saved: layout::SavedWindowBounds) -> gpui::WindowBounds {
+    let b = gpui::Bounds::new(
+        gpui::point(gpui::px(saved.x), gpui::px(saved.y)),
+        gpui::size(gpui::px(saved.width), gpui::px(saved.height)),
+    );
+    match saved.mode {
+        layout::SavedWindowMode::Windowed => gpui::WindowBounds::Windowed(b),
+        layout::SavedWindowMode::Maximized => gpui::WindowBounds::Maximized(b),
+        layout::SavedWindowMode::Fullscreen => gpui::WindowBounds::Fullscreen(b),
+    }
+}
+
+/// 마우스 선택 단위(OWE-866): 더블클릭=단어, 트리플클릭=줄. 드래그 중에도 단위를 유지한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SelectKind {
+    #[default]
+    Char,
+    Word,
+    Line,
+}
+
+/// 보이는 칸 하나의 세션 연결과 입력 상태. 지우면 소켓을 닫아 IO 태스크도 끝난다.
+struct Live {
+    pane: Pane<pane::Writer>,
+    target: Option<krill_app_core::hosts::HostTarget>,
+    suspended: bool,
+    /// 연결을 끊을 때 쓰는 소켓 사본(IO 태스크가 읽는 소켓과 같다).
+    sock: Option<UnixStream>,
+    ime: Ime,
+    /// 출력이 멈춰도 확정 에코 대기 표시를 만료시킨다.
+    ime_expiry: Option<(Instant, Task<()>)>,
+    echo: EchoDraw,
+    /// 마지막으로 그린 자리와 칸 크기(IME 후보창).
+    painted: Painted,
+    /// 마지막으로 그린 스크롤바 트랙 경계(클릭·드래그 스크롤용).
+    scrollbar_track: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// Live와 함께 해제하는 행 계획(계정 입력 보존 중인 숨은 Live는 예외).
+    row_cache: krill_app_core::terminal::RowPlanCache,
+    /// 한 행이 안 되는 스크롤 양(px).
+    scroll_rem: f32,
+    /// 붙지 못한 이유(연결 전까지 칸에 보인다).
+    error: Option<String>,
+    launch: Option<AgentLaunch>,
+    /// 마우스 선택(MK-033, 버퍼 기준 줄). 휠로 스크롤해도 같은 글자를 가리키고, 입력하면 지운다.
+    selection: Option<Anchored>,
+    /// 선택을 마쳤을 때 그 자리 글자(AS-17: 출력 스크롤·리사이즈·재접속으로 내용이
+    /// 바뀌면 선택 좌표가 다른 글자를 가리키므로 선택을 지운다). 바닥으로 돌아와 버린
+    /// 스크롤백 행을 다시 읽을 수 없을 때 복사할 글자이기도 하다.
+    selection_text: Option<String>,
+    /// 왼쪽 버튼으로 선택을 끄는 중.
+    selecting: bool,
+    /// 끄는 중인 선택 단위(OWE-866).
+    selecting_kind: SelectKind,
+    /// 더블·트리플 클릭 시작 시점의 정규화된 원점 범위(역방향·줄바꿈 드래그용).
+    selecting_origin: Option<((i64, u16), (i64, u16))>,
+    /// 프로그램 마우스 보고로 누른 버튼 비트마스크(bit b = button b).
+    mouse_down: u8,
+    task: Task<()>,
+    creation: Arc<std::sync::Mutex<close::Creation>>,
+    /// 만든 때. 붙기 전 [`CONNECTING_GRACE`] 동안은 문구 없이 빈 터미널로 보인다.
+    born: Instant,
+}
+
+/// 새 칸이 세션에 붙기 전 "연결 중" 문구를 숨기는 시간. 즉시 반응 규칙(STYLEGUIDE): 보통의 붙기(수십 ms)는
+/// 빈 터미널이 곧바로 프롬프트로 바뀌는 것으로 보이고, 정말 늦을 때만 문구가 뜬다.
+const CONNECTING_GRACE: Duration = Duration::from_secs(1);
+
+impl Live {
+    fn new(task: Task<()>) -> Self {
+        Self {
+            pane: Pane::default(),
+            target: None,
+            suspended: false,
+            sock: None,
+            ime: Ime::default(),
+            ime_expiry: None,
+            echo: EchoDraw::default(),
+            painted: Rc::default(),
+            scrollbar_track: Rc::default(),
+            row_cache: krill_app_core::terminal::RowPlanCache::default(),
+            scroll_rem: 0.,
+            error: None,
+            launch: None,
+            selection: None,
+            selection_text: None,
+            selecting: false,
+            selecting_kind: SelectKind::Char,
+            selecting_origin: None,
+            mouse_down: 0,
+            task,
+            creation: Arc::default(),
+            born: Instant::now(),
+        }
+    }
+
+    fn cut(&mut self) {
+        self.mouse_down = 0;
+        if let Some(s) = self.sock.take() {
+            s.shutdown(Shutdown::Both).ok();
+        }
+    }
+
+    /// 선택을 지운다(입력·출력으로 내용이 바뀔 때).
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_text = None;
+        self.selecting_kind = SelectKind::Char;
+        self.selecting_origin = None;
+    }
+
+    /// 보이는 화면 칸을 버퍼 기준 끝점으로.
+    fn anchor_point(&self, at: select::Point) -> (i64, u16) {
+        Anchored::point(at, self.pane.scroll_offset())
+    }
+
+    /// 지금 화면에 보이는 선택 부분(그리기·클릭 판정용).
+    fn shown_selection(&self) -> Option<Selection> {
+        let shown = self.pane.shown();
+        self.selection?
+            .view(self.pane.scroll_offset(), shown.lines, shown.cols)
+    }
+
+    /// 선택한 칸을 지금 버퍼에서 읽는다. 버린 스크롤백 행이 끼면 `None`.
+    fn read_selection(&self) -> Option<String> {
+        self.selection?
+            .text(self.pane.shown().cols, |line| self.pane.row(line))
+    }
+
+    /// 복사할 글자: 지금 읽을 수 있으면 그 글자, 아니면 선택을 마칠 때 기록한 글자.
+    fn selected_text(&self) -> Option<String> {
+        self.read_selection()
+            .or_else(|| self.selection_text.clone())
+    }
+
+    /// 확정된 선택의 그 자리 글자를 기록한다(AS-17: 출력으로 내용이 바뀌면 지우기 위해).
+    fn snapshot_selection(&mut self) {
+        self.selection_text = self.read_selection();
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.cut();
+    }
+}
+
+actions!(
+    shell,
+    [
+        NewTab,
+        CloseTab,
+        NextTab,
+        PrevTab,
+        NextSameTypeTab,
+        PrevSameTypeTab,
+        NextTerminalTab,
+        PrevTerminalTab,
+        NextRecentTab,
+        PrevRecentTab,
+        SplitRight,
+        SplitDown,
+        ClosePane,
+        FocusNextPane,
+        FocusPrevPane,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
+        ResizePaneLeft,
+        ResizePaneRight,
+        ResizePaneUp,
+        ResizePaneDown,
+        RenamePane,
+        ToggleZoomPane,
+        ClearPane,
+        SelectAll,
+        NewAgentTab,
+        ReopenClosedTab,
+        PrevSession,
+        NextSession,
+        NavigateBack,
+        NavigateForward,
+        NewWorktree,
+        ScrollTop,
+        ScrollBottom,
+        ScrollPageUp,
+        ScrollPageDown,
+        RenameTab,
+        CloseEditors,
+        ActivateWorkspace1,
+        ActivateWorkspace2,
+        ActivateWorkspace3,
+        ActivateWorkspace4,
+        ActivateWorkspace5,
+        ActivateWorkspace6,
+        ActivateWorkspace7,
+        ActivateWorkspace8,
+        ActivateWorkspace9,
+        ActivateTab1,
+        ActivateTab2,
+        ActivateTab3,
+        ActivateTab4,
+        ActivateTab5,
+        ActivateTab6,
+        ActivateTab7,
+        ActivateTab8,
+        ActivateTab9,
+        ToggleSidebar,
+        FocusSidebar,
+        TogglePanel,
+        ToggleChatView,
+        ToggleChanges,
+        ToggleExplorer,
+        ToggleSearch,
+        Quit,
+        Jump,
+        CommandPalette,
+        Find,
+        FindNext,
+        FindPrev,
+        Copy,
+        CopyClean,
+        QuoteChat,
+        Paste,
+        ForkSession,
+        ContinueInNewSession,
+        OpenBots
+    ]
+);
+
+const MAX_NAV_HISTORY: usize = 50;
+
+/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상. 탭은 그 탭 안의 칸으로 기억한다(`Layout::tab_of_pane`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingRunningClose {
+    Tab(PaneId),
+    Pane(PaneId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum NavEntry {
+    Workspace {
+        pane: PaneId,
+        session: Option<krill_proto::SessionId>,
+        worktree: Option<PathBuf>,
+    },
+    Settings(krill_app_core::settings::AdminTab),
+    Mobile,
+    Artifacts,
+    Automations,
+    Bots,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct NavHistory {
+    entries: Vec<NavEntry>,
+    index: usize,
+    navigating: bool,
+}
+
+impl NavHistory {
+    fn push(&mut self, entry: NavEntry) {
+        if self.navigating {
+            return;
+        }
+        if let (
+            Some(NavEntry::Workspace {
+                pane: cur_pane,
+                session: cur_session,
+                worktree: cur_wt,
+            }),
+            NavEntry::Workspace {
+                pane,
+                session,
+                worktree,
+            },
+        ) = (self.entries.get_mut(self.index), &entry)
+            && cur_pane == pane
+            && (cur_wt == worktree || cur_wt.is_none() || worktree.is_none())
+        {
+            if cur_session.is_none() && session.is_some() {
+                *cur_session = *session;
+            }
+            if cur_wt.is_none() && worktree.is_some() {
+                cur_wt.clone_from(worktree);
+            }
+            return;
+        }
+        if self.entries.get(self.index) == Some(&entry) {
+            return;
+        }
+        if self.index + 1 < self.entries.len() {
+            self.entries.truncate(self.index + 1);
+        }
+        if self.entries.last() == Some(&entry) {
+            self.index = self.entries.len().saturating_sub(1);
+            return;
+        }
+        self.entries.push(entry);
+        if self.entries.len() > MAX_NAV_HISTORY {
+            let overflow = self.entries.len() - MAX_NAV_HISTORY;
+            self.entries.drain(0..overflow);
+        }
+        self.index = self.entries.len().saturating_sub(1);
+    }
+
+    fn prune_missing_panes(&mut self, layout: &Layout) {
+        let mut new_entries = Vec::with_capacity(self.entries.len());
+        let mut new_index = 0usize;
+        for (idx, entry) in self.entries.drain(..).enumerate() {
+            let keep = match &entry {
+                NavEntry::Workspace {
+                    pane,
+                    session: None,
+                    ..
+                } => layout.pane_exists(*pane),
+                _ => true,
+            };
+            if keep {
+                if idx <= self.index {
+                    new_index = new_entries.len();
+                }
+                new_entries.push(entry);
+            } else if idx < self.index {
+                new_index = new_entries.len().saturating_sub(1);
+            }
+        }
+        self.entries = new_entries;
+        self.index = new_index.min(self.entries.len().saturating_sub(1));
+    }
+}
+
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some(KEY_CONTEXT);
+    cx.bind_keys(vec![
+        krill_app_core::keys::bind("cmd-t", NewTab, ctx),
+        krill_app_core::keys::bind("cmd-alt-t", NewAgentTab, ctx),
+        krill_app_core::keys::bind("cmd-shift-w", CloseTab, ctx),
+        krill_app_core::keys::bind("cmd-shift-t", ReopenClosedTab, ctx),
+        krill_app_core::keys::bind("cmd-shift-]", NextTab, ctx),
+        krill_app_core::keys::bind("cmd-shift-[", PrevTab, ctx),
+        krill_app_core::keys::bind("cmd-alt-]", NextSameTypeTab, ctx),
+        krill_app_core::keys::bind("cmd-alt-[", PrevSameTypeTab, ctx),
+        KeyBinding::new("ctrl-tab", NextRecentTab, ctx),
+        KeyBinding::new("ctrl-shift-tab", PrevRecentTab, ctx),
+        KeyBinding::new("ctrl-pagedown", NextTerminalTab, ctx),
+        KeyBinding::new("ctrl-pageup", PrevTerminalTab, ctx),
+        krill_app_core::keys::bind("cmd-d", SplitRight, ctx),
+        krill_app_core::keys::bind("cmd-shift-d", SplitDown, ctx),
+        krill_app_core::keys::bind("cmd-w", ClosePane, ctx),
+        krill_app_core::keys::bind("cmd-]", FocusNextPane, ctx),
+        krill_app_core::keys::bind("cmd-[", FocusPrevPane, ctx),
+        krill_app_core::keys::bind("cmd-alt-down", FocusNextPane, ctx),
+        krill_app_core::keys::bind("cmd-alt-up", FocusPrevPane, ctx),
+        krill_app_core::keys::bind("cmd-alt-left", NavigateBack, None),
+        krill_app_core::keys::bind("cmd-alt-right", NavigateForward, None),
+        // OWE-871: ⌘⌥화살표는 히스토리·순환에 그대로 두고, 기하 방향 이동은 ⌘⌥⇧+화살표다.
+        krill_app_core::keys::bind("cmd-alt-shift-left", FocusPaneLeft, ctx),
+        krill_app_core::keys::bind("cmd-alt-shift-right", FocusPaneRight, ctx),
+        krill_app_core::keys::bind("cmd-alt-shift-up", FocusPaneUp, ctx),
+        krill_app_core::keys::bind("cmd-alt-shift-down", FocusPaneDown, ctx),
+        krill_app_core::keys::bind("cmd-shift-r", RenamePane, ctx),
+        krill_app_core::keys::bind("cmd-shift-enter", ToggleZoomPane, ctx),
+        krill_app_core::keys::bind("cmd-k", ClearPane, ctx),
+        krill_app_core::keys::bind("cmd-up", ScrollTop, ctx),
+        krill_app_core::keys::bind("cmd-down", ScrollBottom, ctx),
+        KeyBinding::new("shift-pageup", ScrollPageUp, ctx),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, ctx),
+        krill_app_core::keys::bind("cmd-r", RenameTab, ctx),
+        krill_app_core::keys::bind("cmd-alt-w", CloseEditors, ctx),
+        krill_app_core::keys::bind("cmd-a", SelectAll, ctx),
+        krill_app_core::keys::bind("cmd-shift-up", PrevSession, ctx),
+        krill_app_core::keys::bind("cmd-shift-down", NextSession, ctx),
+        krill_app_core::keys::bind("cmd-n", NewWorktree, ctx),
+        krill_app_core::keys::bind("cmd-shift-n", NewWorktree, ctx),
+        krill_app_core::keys::bind("cmd-1", ActivateWorkspace1, ctx),
+        krill_app_core::keys::bind("cmd-2", ActivateWorkspace2, ctx),
+        krill_app_core::keys::bind("cmd-3", ActivateWorkspace3, ctx),
+        krill_app_core::keys::bind("cmd-4", ActivateWorkspace4, ctx),
+        krill_app_core::keys::bind("cmd-5", ActivateWorkspace5, ctx),
+        krill_app_core::keys::bind("cmd-6", ActivateWorkspace6, ctx),
+        krill_app_core::keys::bind("cmd-7", ActivateWorkspace7, ctx),
+        krill_app_core::keys::bind("cmd-8", ActivateWorkspace8, ctx),
+        krill_app_core::keys::bind("cmd-9", ActivateWorkspace9, ctx),
+        KeyBinding::new(&keys::tab_index_key(1), ActivateTab1, ctx),
+        KeyBinding::new(&keys::tab_index_key(2), ActivateTab2, ctx),
+        KeyBinding::new(&keys::tab_index_key(3), ActivateTab3, ctx),
+        KeyBinding::new(&keys::tab_index_key(4), ActivateTab4, ctx),
+        KeyBinding::new(&keys::tab_index_key(5), ActivateTab5, ctx),
+        KeyBinding::new(&keys::tab_index_key(6), ActivateTab6, ctx),
+        KeyBinding::new(&keys::tab_index_key(7), ActivateTab7, ctx),
+        KeyBinding::new(&keys::tab_index_key(8), ActivateTab8, ctx),
+        KeyBinding::new(&keys::tab_index_key(9), ActivateTab9, ctx),
+        krill_app_core::keys::bind("cmd-b", ToggleSidebar, ctx),
+        krill_app_core::keys::bind("cmd-shift-b", OpenBots, ctx),
+        krill_app_core::keys::bind("cmd-shift-0", FocusSidebar, ctx),
+        krill_app_core::keys::bind("cmd-shift-e", ToggleExplorer, ctx),
+        krill_app_core::keys::bind("cmd-shift-f", ToggleSearch, ctx),
+        krill_app_core::keys::bind("cmd-alt-b", TogglePanel, ctx),
+        krill_app_core::keys::bind("cmd-l", TogglePanel, ctx),
+        krill_app_core::keys::bind("cmd-shift-j", ToggleChatView, ctx),
+        krill_app_core::keys::bind("cmd-shift-g", ToggleChanges, ctx),
+        krill_app_core::keys::bind("cmd-q", Quit, None),
+        krill_app_core::keys::bind("cmd-j", Jump, ctx),
+        krill_app_core::keys::bind("cmd-shift-p", CommandPalette, ctx),
+        krill_app_core::keys::bind("cmd-f", Find, ctx),
+        krill_app_core::keys::bind("cmd-g", FindNext, ctx),
+        // OWE-868: ⇧⌘G는 검색 바가 열려 있을 때만 이전 찾기다. 바깥에서는 기존 TogglePanel(우측 패널)을 유지한다.
+        krill_app_core::keys::bind(
+            "cmd-shift-g",
+            FindPrev,
+            Some(krill_app_core::search::CONTEXT),
+        ),
+        krill_app_core::keys::bind("cmd-c", Copy, ctx),
+        krill_app_core::keys::bind("cmd-shift-c", CopyClean, ctx),
+        krill_app_core::keys::bind("cmd-alt-l", QuoteChat, ctx),
+        krill_app_core::keys::bind("cmd-v", Paste, ctx),
+    ]);
+    #[cfg(target_os = "windows")]
+    bind_windows_paste(cx);
+    // macOS gpui는 ⇧+[ / ⇧+]를 { / }로 정규화하며 Shift 플래그를 지운다.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-}", NextTab, ctx),
+        KeyBinding::new("cmd-{", PrevTab, ctx),
+        KeyBinding::new("ctrl-alt-left", ResizePaneLeft, ctx),
+        KeyBinding::new("ctrl-alt-right", ResizePaneRight, ctx),
+        KeyBinding::new("ctrl-alt-up", ResizePaneUp, ctx),
+        KeyBinding::new("ctrl-alt-down", ResizePaneDown, ctx),
+    ]);
+    // Windows/Linux에서는 cmd-alt-화살표가 ctrl-alt-화살표로 매핑되므로 alt-shift-화살표를 쓴다.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("alt-shift-left", ResizePaneLeft, ctx),
+        KeyBinding::new("alt-shift-right", ResizePaneRight, ctx),
+        KeyBinding::new("alt-shift-up", ResizePaneUp, ctx),
+        KeyBinding::new("alt-shift-down", ResizePaneDown, ctx),
+    ]);
+    new_session::bind_keys(cx);
+    files::bind_keys(cx);
+    popout::bind_keys(cx);
+    sidebar::bind_keys(cx);
+    cx.on_action(|_: &Quit, cx| files::quit_app(cx));
+    security::bind_keys(cx);
+}
+
+/// Windows users expect Ctrl+V to paste text even when the foreground TUI
+/// interprets the raw control byte as an image-paste command (for example Gemini).
+/// Keep Ctrl+Shift+V available as well; child text inputs retain their own binding.
+#[cfg(any(target_os = "windows", all(test, unix)))]
+fn bind_windows_paste(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT))]);
+}
+
+/// 드래그 중인 분할선. 분할은 활성 탭 루트에서의 경로로 가리킨다.
+#[derive(Clone, Debug, PartialEq)]
+enum Drag {
+    Sidebar,
+    Panel,
+    Split(Vec<Branch>),
+}
+
+/// 드래그 중 커서를 따라다니는 미리보기. 분할선은 보여줄 것이 없다.
+struct DragGhost;
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct HostSource {
+    specs: Vec<krill_app_core::hosts::RemoteHostSpec>,
+    external: Vec<(
+        krill_app_core::hosts::RemoteHostSpec,
+        PathBuf,
+        krill_hosts::HostConnectionInfo,
+    )>,
+    paths: Option<Paths>,
+}
+
+/// Minimum terminal columns needed before hiding the scrollbar on very narrow panes.
+const SCROLLBAR_MIN_COLS: u16 = 5;
+/// Minimum scrollbar thumb length in logical pixels so deep scrollback stays grabbable.
+const SCROLLBAR_MIN_THUMB_PX: f32 = 12.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    pane: PaneId,
+    /// Pointer Y offset from the top of the thumb when the drag began.
+    grab_offset_px: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarGeometry {
+    thumb_ratio: f32,
+    top_ratio: f32,
+}
+
+const fn should_show_scrollbar(
+    alt_screen: bool,
+    cols: u16,
+    fetched: usize,
+    offset: usize,
+    dragging: bool,
+) -> bool {
+    !alt_screen && cols >= SCROLLBAR_MIN_COLS && fetched > 0 && (offset > 0 || dragging)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
+)]
+fn scrollbar_geometry(lines: usize, fetched: usize, offset: usize) -> Option<ScrollbarGeometry> {
+    if fetched == 0 {
+        return None;
+    }
+    let lines = lines.max(1) as f32;
+    let fetched_f = fetched as f32;
+    let shown = offset.min(fetched) as f32;
+    let thumb_ratio = (lines / (lines + fetched_f)).clamp(0.05, 1.0);
+    let top_ratio = ((1.0 - shown / fetched_f) * (1.0 - thumb_ratio)).clamp(0.0, 1.0 - thumb_ratio);
+    Some(ScrollbarGeometry {
+        thumb_ratio,
+        top_ratio,
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "clamped finite offset in 0..=fetched"
+)]
+fn scrollbar_offset_for_y(
+    pointer_y: f32,
+    track_top: f32,
+    track_height: f32,
+    thumb_ratio: f32,
+    grab_offset_px: f32,
+    fetched: usize,
+) -> usize {
+    if fetched == 0 || !track_height.is_finite() || track_height <= 1.0 {
+        return 0;
+    }
+    let thumb_px = (track_height * thumb_ratio)
+        .max(SCROLLBAR_MIN_THUMB_PX)
+        .min(track_height);
+    let travel = (track_height - thumb_px).max(0.0);
+    if travel <= f32::EPSILON {
+        return 0;
+    }
+    let thumb_top = (pointer_y - track_top - grab_offset_px).clamp(0.0, travel);
+    let fraction_from_bottom = (1.0 - thumb_top / travel).clamp(0.0, 1.0);
+    (fraction_from_bottom * fetched as f32).round() as usize
+}
+
+fn wheel_scroll_delta(pixel_y: f32, alt_boost: bool, scroll_speed: f32) -> f32 {
+    let boost = if alt_boost { 5.0 } else { 1.0 };
+    let speed = if scroll_speed.is_finite() {
+        scroll_speed.clamp(
+            krill_app_core::settings::TERMINAL_SCROLL_SPEED_MIN,
+            krill_app_core::settings::TERMINAL_SCROLL_SPEED_MAX,
+        )
+    } else {
+        krill_app_core::settings::DEFAULT_TERMINAL_SCROLL_SPEED
+    };
+    pixel_y * 1.15 * boost * speed
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent window, panel, layout restore and service lifecycle flags"
+)]
+pub struct Shell {
+    language: krill_app_core::i18n::Language,
+    sidebar: gpui::Entity<sidebar::Sidebar>,
+    _sidebar_selection: Subscription,
+    _sidebar_new_session: Subscription,
+    _sidebar_close_session: Subscription,
+    _sidebar_continue_session: Subscription,
+    _sidebar_reconnect: Subscription,
+    _sidebar_tabs: Subscription,
+    layout: Layout,
+    sidebar_collapsed: bool,
+    panel_collapsed: bool,
+    path: Option<PathBuf>,
+    saver: persist::Saver,
+    layout_save_requests: persist::Requests,
+    quit_layout_ready: std::cell::Cell<bool>,
+    _layout_save_task: Task<()>,
+    layout_loading: bool,
+    restore_session: Option<(krill_app_core::hosts::HostId, krill_proto::SessionId)>,
+    pub(super) restore_session_chat: bool,
+    restore_workspace: Option<(krill_app_core::hosts::HostId, PathBuf)>,
+    local_generation: u64,
+    ssh_generation: u64,
+    orch_snapshot: Arc<krill_proto::orchestration::OrchestrationStore>,
+    remote_orch_snapshots:
+        HashMap<krill_app_core::hosts::HostId, Arc<krill_proto::orchestration::OrchestrationStore>>,
+    remote_orch_generations: HashMap<krill_app_core::hosts::HostId, u64>,
+    remote_orch_in_flight: HashSet<krill_app_core::hosts::HostId>,
+    orch_poll: Option<Task<()>>,
+    fits: fit::Pending,
+    focus: FocusHandle,
+    focus_observed_window: Option<AnyWindowHandle>,
+    focus_subscriptions: Vec<Subscription>,
+    terminal_focus_owned: bool,
+    pub(super) active_split_drag: Option<Vec<Branch>>,
+    /// 세션 데몬 감시 연결 상태(MK-025·MK-026). 재연결 상태는 우하단 알림으로 보인다.
+    link: Link,
+    daemon_task: Option<Task<()>>,
+    /// 데몬 경로. [`Shell::connect_daemon`] 전에는 칸을 세션에 붙이지 않는다(레이아웃 테스트).
+    paths: Option<Paths>,
+    recording: krill_app_core::recording::Status,
+    update_ready: Option<PathBuf>,
+    /// 보이는 칸의 세션 연결(OWE-490).
+    live: HashMap<PaneId, Live>,
+    pane_liveness: Option<Task<()>>,
+    liveness_monitor: liveness::LivenessMonitor,
+    creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
+    restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
+    restore_attempted: std::collections::HashSet<krill_proto::SessionId>,
+    /// 재개 요청 전에 실패한 숨은 칸. sync마다가 아니라 다음 재접속(`set_link`가 Up으로 바뀔 때) 한 번만 다시 시도한다.
+    restore_on_reconnect: std::collections::HashSet<krill_proto::SessionId>,
+    /// 재접속 세대. `set_link`가 Up으로 바뀔 때마다 는다. 시도 중에 재접속이 지나갔는지 가린다.
+    restore_generation: u64,
+    restarting_panes: std::collections::HashSet<PaneId>,
+    /// 세션을 만드는 요청(Create·Resume)을 보냈지만 답을 잃은 칸과 그 안내 문구. 이미 아는 세션에만 다시 붙고
+    /// 새로 만들지 않는다(PTY 중복 방지). 만들어졌다면 사이드바에 보인다.
+    outcome_unknown: HashMap<PaneId, String>,
+    observed_sessions:
+        std::collections::HashSet<(krill_app_core::hosts::HostId, krill_proto::SessionId)>,
+    /// krilld가 `NoSession`으로 끝났다고 확정한 세션. 이 세션을 가진 칸은 reconcile이 거둔다.
+    gone_sessions:
+        std::collections::HashSet<(krill_app_core::hosts::HostId, krill_proto::SessionId)>,
+    /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
+    titles: HashMap<PaneId, String>,
+    agents: Option<AgentSettings>,
+    agents_busy: bool,
+    agents_reload_queued: bool,
+    agents_pending_permission: Option<Permission>,
+    agent_task: Option<Task<()>>,
+    agent_client: Arc<dyn pane::AgentClient>,
+    /// 마지막 입력 알림(누르면 닫힘).
+    notice: Option<String>,
+    /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
+    handoff_errors: HashSet<String>,
+    notifications: notifications::Notifications,
+    /// CLI·모바일·원격 호스트가 바꾼 기본 계정 감지.
+    external_switch: external_switch::ExternalSwitchTracker,
+    /// 마지막 생존 시각 주기 저장([`away::HEARTBEAT`]).
+    heartbeat: Option<Task<()>>,
+    app_quit: Option<Subscription>,
+    window: Option<AnyWindowHandle>,
+    activation: Option<Subscription>,
+    bounds_observer: Option<Subscription>,
+    diff: gpui::Entity<krill_app_core::diff::Panel>,
+    _diff_collapse: Subscription,
+    _diff_send: Subscription,
+    /// 어느 칸에도 없는 세션(OWE-492). 칸·탭을 닫아도 세션은 여기 남는다.
+    detached: gpui::Entity<detached::Panel>,
+    _detached_open: Subscription,
+    /// 열린 Jump 팔레트(MK-057)와 그 이벤트 구독.
+    jump: Option<(gpui::Entity<jump::Palette>, Subscription)>,
+    /// OWE-723 프로젝트 추가 모달.
+    add_project: Option<(
+        gpui::Entity<krill_app_core::add_project::Dialog>,
+        Subscription,
+    )>,
+    /// MK-182 새 세션에 요약 이어하기 모달.
+    continue_session: Option<(
+        gpui::Entity<krill_app_core::continue_session::Dialog>,
+        Subscription,
+    )>,
+    /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
+    onboarding: Option<overlays::OnboardingModal>,
+    /// OWE-903 페어링 모달(메인 창 안 `ui::modal_backdrop`).
+    /// OWE-903 렌더에서 지연 생성할 모달 요청.
+    pending: overlays::PendingOverlays,
+    /// 인앱 에이전트 대시보드 모달.
+    pub(crate) dashboard: Option<gpui::Entity<popout::Dashboard>>,
+    /// 열린 터미널 검색 바(MK-059)와 그 이벤트 구독.
+    search: Option<(gpui::Entity<krill_app_core::search::Bar>, Subscription)>,
+    last_search_query: String,
+    /// Resource Manager(MK-071).
+    resources: gpui::Entity<krill_app_core::resources::Panel>,
+    _resources_open: Subscription,
+    /// OWE-851: 열려 있는 상태바 드롭다운 메뉴 수. 0이 아니면 호버 툴팁을 숨긴다.
+    status_menus_open: usize,
+    history: gpui::Entity<krill_app_core::agent_history::Panel>,
+    _history_open: Subscription,
+    appearance: Option<Box<dyn std::io::Write>>,
+    terminal_theme: Theme,
+    cell_pixels: Option<CellSize>,
+    /// 포커스 칸 커서 깜박임 타이머와 꺼진 순간 여부(OWE-658). 깜박일 커서가 없으면 `None`(유휴 프레임 0).
+    cursor_blink: Option<(Task<()>, bool)>,
+    /// 데몬 연결 중 계정 사용량 주기 갱신(OWE-702). 링크가 끊기면 `None`(취소).
+    accounts_poll: Option<Task<()>>,
+    /// 기동 시점 및 4시간 주기 백그라운드 앱 업데이트 점검(MK-156).
+    update_poll: Option<Task<()>>,
+    _theme_observer: Subscription,
+    _config_observer: Subscription,
+    system_appearance: Option<Subscription>,
+    security: krill_app_core::security::State,
+    paste_queue: security::PasteQueue,
+    character_input_keys: BTreeSet<String>,
+    /// 가운데 영역 파일(에디터) 탭(MK-119).
+    files: files::Files,
+    #[cfg(test)]
+    close_call: Option<krill_app_core::resources::Call>,
+    #[cfg(test)]
+    ime_discards: Rc<std::cell::Cell<usize>>,
+    /// 닫기로 데몬 종료를 요청한 세션(테스트 확인용).
+    #[cfg(test)]
+    closed_sessions: Vec<krill_proto::SessionId>,
+    /// 워크스페이스별로 최근 닫은 탭의 표시·실행 정보를 보관한다(각 10개).
+    closed_tabs: Vec<tabs::ClosedTab>,
+    pub(super) usage_refresh: Option<Task<()>>,
+    /// 상태바 사용량 팝업의 "사용량 초기화" 1단계(무장). 메뉴가 닫혔다 다시 열리면 확인 행을 보인다.
+    pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
+    account_handoff_poll: Option<Task<()>>,
+    remote_account_handoff_polls: BTreeMap<krill_app_core::hosts::HostId, Task<()>>,
+    account_cancel: Option<account_input::Cancel>,
+    account_recovery: account_input::Recovery,
+    account_holds:
+        BTreeMap<(krill_app_core::hosts::HostId, krill_proto::SessionId), account_input::Hold>,
+    account_hold_serial: u64,
+    account_epochs: BTreeMap<krill_app_core::hosts::HostId, u64>,
+    /// Banner dismissals keep the target account they declined; a newer target shows again.
+    dismissed_stale_account_banners:
+        BTreeMap<(krill_app_core::hosts::HostId, krill_proto::SessionId), String>,
+    account_mutations: BTreeMap<krill_app_core::hosts::HostId, usize>,
+    account_deferred: Vec<(
+        Option<krill_app_core::hosts::HostTarget>,
+        account_input::DeferredMutation,
+    )>,
+    pub(super) accounts_snapshot: Arc<krill_proto::usage::AccountsSnapshot>,
+    pub(super) remote_accounts:
+        BTreeMap<krill_app_core::hosts::HostId, Arc<krill_proto::usage::AccountsSnapshot>>,
+    pub(super) ssh_hosts: Vec<krill_app_core::ssh_hosts::SshHost>,
+    pub(super) host_manager: krill_app_core::hosts::HostManager,
+    /// 같은 기기를 가리키는 중복 등록 id → 대표 id(`ssh -G` 기준, 백그라운드에서 구한다).
+    host_aliases: BTreeMap<String, String>,
+    host_statuses: Vec<(
+        krill_app_core::hosts::RemoteHostSpec,
+        krill_app_core::hosts::HostStatus,
+    )>,
+    host_targets: HashMap<krill_app_core::hosts::HostId, krill_app_core::hosts::HostTarget>,
+    host_generation: u64,
+    #[cfg(test)]
+    pub(super) host_sync_count: usize,
+    #[cfg(test)]
+    next_host_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    host_source: Option<HostSource>,
+    host_refresh_running: bool,
+    host_refresh_again: bool,
+    host_pending_reconnects: Vec<String>,
+    external_hosts: Vec<krill_hosts::ExternalHost>,
+    link_hosts: Option<Arc<krill_app_core::hosts::link::LinkHosts>>,
+    link_poll: Option<Task<()>>,
+    pub(super) launch_host: krill_app_core::hosts::HostId,
+    /// 마지막으로 실행 위치에 반영한 워크스페이스 선택(Orca `activeWorktreeId` 패리티).
+    /// 메뉴에서 고른 실행 위치는 다음 선택 변경까지 유지한다.
+    last_synced_selection: Option<(krill_app_core::hosts::HostId, PathBuf)>,
+    /// Ignore sessions removed by an explicit terminate action while the sidebar's
+    /// previous snapshot still contains them.
+    workspace_closing:
+        std::collections::HashSet<(krill_app_core::hosts::HostId, krill_proto::SessionId)>,
+    /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
+    /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
+    ports_cache:
+        std::cell::RefCell<HashMap<(krill_app_core::hosts::HostId, u64), popout::PortCache>>,
+    artifacts_cache: Option<gpui::Entity<krill_app_core::artifacts::View>>,
+    bots_cache: Option<gpui::Entity<krill_bots_ui::bots::View>>,
+    pub(super) bots_attention_count: usize,
+    /// Rows of the sidebar Bots section, refreshed with the attention badge.
+    pub(super) sidebar_bots: Vec<krill_bots_ui::bots::SidebarBot>,
+    /// Multi-bot group rooms displayed in the sidebar Bots section and right panel.
+    pub(in crate::shell) sidebar_groups: Vec<bot_section::SidebarGroup>,
+    /// Orca's sidebar Bots section, New bot and templates dialogs.
+    bot_ui: bot_section::BotUi,
+    voice: voice::ShellVoiceState,
+    /// Orca's empty split/new-tab pane launcher state, keyed by pane id.
+    split_launchers: HashMap<PaneId, split_launcher::SplitLauncher>,
+    /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
+    #[cfg(not(test))]
+    bots_poll: Option<Task<()>>,
+    #[cfg(test)]
+    pub(super) bot_rpc_override: Option<krill_bots_ui::bots::BotRpcCall>,
+    /// Per-host bot RPC for tests that tell hosts apart (falls back to `bot_rpc_override`).
+    #[cfg(test)]
+    pub(super) bot_rpc_overrides:
+        std::collections::HashMap<krill_app_core::hosts::HostId, krill_bots_ui::bots::BotRpcCall>,
+    modal: Option<Modal>,
+    /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
+    pub(super) role: WindowRole,
+    pending_focus: PendingFocus,
+    /// OWE-734: 탭 우클릭 컨텍스트 메뉴 `(탭 안의 칸, 클릭 위치)`.
+    pub(super) tab_context_menu: Option<(PaneId, Point<Pixels>)>,
+    tab_menu_focus: FocusHandle,
+    tab_menu_previous_focus: Option<FocusHandle>,
+    /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 안의 칸.
+    pub(super) confirm_close_tab: Option<PaneId>,
+    recent_tab_scroll: gpui::ScrollHandle,
+    tab_dialog_focus: FocusHandle,
+    tab_dialog_was_open: bool,
+    tab_dialog_previous_focus: Option<FocusHandle>,
+    /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
+    pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
+    /// 기본 계정 전환 뒤 옮길 실행 중 세션을 고르는 모달.
+    session_switch: Option<session_switch_modal::SessionSwitchModal>,
+    /// OWE-870: 탭 이름 인라인 편집.
+    tab_rename: Option<tabs::TabRename>,
+    pane_rename: Option<tabs::TabRename>,
+    surface_bounds: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
+    pub(super) nav_history: NavHistory,
+    /// OWE-946 / MK-243: 데스크톱 Hybrid Chat `[Chat | Term]` 오버레이 상태.
+    pub(super) chat: chat::ChatState,
+    /// 터미널 상단 고정 프롬프트 바(제안 C)에서 최근 턴 히스토리 타임라인 팝오버를 펼친 패인 집합.
+    pub(super) expanded_prompt_panes: HashSet<PaneId>,
+    /// 시작 복원된 터미널 탭들의 대표 칸 큐(상한 64). 초기 Cmd+T로 현재 활성이 `$HOME`이어도 늦게 도착한 데몬 세션을 놓치지 않는다.
+    startup_reconcile_panes: Vec<PaneId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindowRole {
+    Main,
+    Floating,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingFocus {
+    None,
+    Modal,
+    Workspace,
+}
+
+/// The one large in-window modal. Mobile is `Settings` with its mobile page flag set.
+#[derive(Clone)]
+enum Modal {
+    Settings(gpui::Entity<krill_app_core::settings::SettingsView>),
+    Artifacts(gpui::Entity<krill_app_core::artifacts::View>),
+    Automations(gpui::Entity<krill_app_core::automations::View>),
+    Bots(gpui::Entity<krill_bots_ui::bots::View>),
+}
+
+impl Modal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Settings(v) => v.read(cx).focus_handle(),
+            Self::Artifacts(v) => v.read(cx).focus_handle(),
+            Self::Automations(v) => v.read(cx).focus_handle(),
+            Self::Bots(v) => v.read(cx).focus_handle(),
+        }
+    }
+}
+
+fn same_external_hosts(a: &[krill_hosts::ExternalHost], b: &[krill_hosts::ExternalHost]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(l, r)| l.spec == r.spec && l.socket == r.socket && l.info == r.info)
+}
+
+fn daemon_upgrade_rebind_needed(server: &krill_proto::ipc::ServerHello) -> bool {
+    use krill_proto::control::{FEAT_UPGRADE, FEAT_WINDOWS_UPGRADE, is_newer};
+    server.features & FEAT_UPGRADE != 0
+        && (!cfg!(windows) || server.features & FEAT_WINDOWS_UPGRADE != 0)
+        && is_newer(krill_proto::build_id(), &server.build) == Some(true)
+}
+
+fn rebind_after_daemon_upgrade_with<F>(
+    target: &krill_app_core::hosts::HostTarget,
+    hello: &krill_proto::ipc::ClientHello,
+    conn: daemon::Connection,
+    upgrade: F,
+) -> daemon::Connection
+where
+    F: FnOnce(
+        &krill_app_core::hosts::HostTarget,
+        &krill_proto::ipc::ClientHello,
+    ) -> std::io::Result<Option<krill_proto::ipc::ServerHello>>,
+{
+    match upgrade(target, hello) {
+        Ok(Some(new_server)) => {
+            if new_server.instance_id != conn.server.instance_id {
+                drop(conn);
+                return target.reconnect_until(hello);
+            }
+        }
+        Ok(None) => {
+            if daemon_upgrade_rebind_needed(&conn.server) {
+                // Another client may have replaced the daemon between `conn` and `upgrade`.
+                drop(conn);
+                return target.reconnect_until(hello);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(kind = ?error.kind(), "daemon upgrade failed");
+            if daemon_upgrade_rebind_needed(&conn.server)
+                && let Ok(fresh) = target.connect(hello)
+            {
+                drop(conn);
+                return fresh;
+            }
+        }
+    }
+    conn
+}
+
+impl Shell {
+    /// 저장된 레이아웃으로 시작한다. 없거나 읽을 수 없으면 기본 레이아웃.
+    pub fn new(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        Self::new_inner(
+            path,
+            #[cfg(all(test, unix))]
+            None,
+            cx,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn new_with_restore_gate(
+        path: Option<PathBuf>,
+        gate: tokio::sync::oneshot::Receiver<()>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(path, Some(gate), cx)
+    }
+
+    fn new_inner(
+        path: Option<PathBuf>,
+        #[cfg(all(test, unix))] restore_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if cx.has_global::<gpui_component::Theme>() {
+            let mode = match krill_app_core::settings::current(cx).theme {
+                krill_app_core::settings::ThemeChoice::Light => gpui_component::ThemeMode::Light,
+                krill_app_core::settings::ThemeChoice::Dark => gpui_component::ThemeMode::Dark,
+                krill_app_core::settings::ThemeChoice::System => cx.window_appearance().into(),
+            };
+            krill_app_core::ui::apply(mode, cx);
+        }
+        let notice = None;
+        let layout = Layout::default();
+        let restore_path = path.clone();
+        let sidebar_collapsed = layout.sidebar_collapsed;
+        let panel_collapsed = layout.panel_collapsed;
+        let panel_tab = layout.panel_tab;
+        let sidebar_path = path.as_deref().map(|p| p.with_file_name("sidebar.bin"));
+        let sidebar = cx.new(|cx| {
+            let mut s = sidebar::Sidebar::new(sidebar_path);
+            if sidebar_collapsed {
+                s.set_visible(false, cx);
+            }
+            s
+        });
+        let sidebar_tabs = cx.observe(&sidebar, |this, sidebar, cx| {
+            let projects = this.sync_live_cwds(sidebar.read(cx));
+            if !projects.is_empty() {
+                sidebar.update(cx, |sidebar, cx| {
+                    for (host, path) in projects {
+                        sidebar.add_project_on(&host, path, cx);
+                    }
+                });
+            }
+            if let Some(settings) = this.settings() {
+                let identities = sidebar.read(cx).machine_identities();
+                let statuses = sidebar
+                    .read(cx)
+                    .remote_hosts()
+                    .iter()
+                    .map(|host| {
+                        (
+                            krill_app_core::hosts::HostId::Remote(host.id.clone()),
+                            host.status,
+                        )
+                    })
+                    .collect();
+                settings.update(cx, |view, cx| {
+                    view.sync_machine_observations(identities, cx);
+                    view.sync_machine_remote_statuses(statuses, cx);
+                });
+            }
+            // Orca `activeWorktreeId` 패리티: 워크스페이스 선택이 바뀌면 다음 Cmd+T·새 에이전트의
+            // 실행 위치도 그 호스트를 따른다. 메뉴에서 직접 고른 실행 위치는 선택이 다시 바뀔 때까지 둔다.
+            if let Some(selected) = sidebar.read(cx).selected_workspace()
+                && this.last_synced_selection.as_ref() != Some(&selected)
+            {
+                this.last_synced_selection = Some(selected.clone());
+                this.launch_host = selected.0;
+            }
+            let connected_remotes: Vec<krill_app_core::hosts::HostId> = sidebar
+                .read(cx)
+                .connected_remote_hosts()
+                .map(|r| krill_app_core::hosts::HostId::Remote(r.id.clone()))
+                .collect();
+            if this.bot_ui.last_observed_remotes != connected_remotes {
+                this.bot_ui.last_observed_remotes = connected_remotes;
+                this.refresh_bots_badge(cx);
+            }
+            this.reconcile_workspace_sessions(cx);
+            this.sync_chat_interrupt_latches(cx);
+            this.sync_diff_workspace(cx);
+            this.refresh_jump(cx);
+            cx.notify();
+        });
+        cx.subscribe(
+            &sidebar,
+            |this, _, event: &sidebar::WorkspaceSelected, cx| {
+                let _scroll = this.sidebar.read(cx).preserve_scroll();
+                this.open_workspace_on(event.host.clone(), event.path.clone(), cx);
+                this.files.refocus = event.focus_terminal;
+                if let Some(handle) = this.window {
+                    let sb = this.sidebar.clone();
+                    let focus = this.focus.clone();
+                    let focus_terminal = event.focus_terminal;
+                    cx.update_window(handle, |_, window, cx| {
+                        if focus_terminal {
+                            window.focus(&focus, cx);
+                        } else {
+                            sb.update(cx, |s, cx| s.focus(focus, window, cx));
+                        }
+                    })
+                    .ok();
+                }
+            },
+        )
+        .detach();
+        let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
+            let _scroll = sidebar.read(cx).preserve_scroll();
+            let host = sidebar
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(krill_app_core::hosts::HostId::Local);
+            // Orca `activeWorktreeId` 패리티: 워크스페이스를 고르면 다음 Cmd+T·새 에이전트의
+            // 실행 위치도 그 호스트를 따른다.
+            this.launch_host = host.clone();
+            this.open_session_on(host, e.0, cx);
+        });
+        cx.subscribe(&sidebar, |this, _, e: &sidebar::OpenWorkspace, cx| {
+            this.open_saved_workspace(e.host.clone(), &e.cwd, cx);
+        })
+        .detach();
+        let new_session = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::NewSession, cx| {
+            let host = sidebar
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(krill_app_core::hosts::HostId::Local);
+            this.launch_host = host.clone();
+            let initial_prompt = sidebar.update(cx, |s, _| s.take_initial_prompt(&e.cwd));
+            this.new_folder_tab_on(host, &e.cwd, e.program.clone(), cx);
+            if let Some(prompt) = initial_prompt
+                && let Some(pane) = this.layout.focused()
+            {
+                let agent_id = match &e.program {
+                    krill_proto::control::Program::Agent { id } => id.clone(),
+                    _ => "shell".to_owned(),
+                };
+                this.start_handoff_delivery(
+                    pane,
+                    agent_id,
+                    prompt.into_bytes(),
+                    handoff::BOOT_TIMEOUT,
+                    cx,
+                );
+            }
+            if let Some(win) = this.window {
+                let focus = this.focus.clone();
+                win.update(cx, |_, window, cx| window.focus(&focus, cx))
+                    .ok();
+            }
+        });
+        let sidebar_reconnect =
+            cx.subscribe(&sidebar, |this, _, e: &sidebar::ReconnectHost, cx| {
+                if let Some(id) = e.0.remote_id() {
+                    this.sync_hosts_after_reconnect(Some(id.to_owned()), cx);
+                }
+                this.sync_hosts(cx);
+                this.sync(cx);
+                cx.notify();
+            });
+        let close_session =
+            cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::CloseSession, cx| {
+                let host = sidebar
+                    .update(cx, |s, _| s.take_action_host())
+                    .unwrap_or(krill_app_core::hosts::HostId::Local);
+                this.request_close_sidebar_session(host, e.0, cx);
+            });
+        let continue_session = cx.subscribe(
+            &sidebar,
+            |this, sidebar, e: &sidebar::ContinueSession, cx| {
+                let host = sidebar
+                    .update(cx, |s, _| s.take_action_host())
+                    .unwrap_or(krill_app_core::hosts::HostId::Local);
+                this.continue_sidebar_session(&host, e.0, cx);
+            },
+        );
+        cx.subscribe(
+            &sidebar,
+            |this, _, target: &sidebar::SwitchSessionAccount, cx| {
+                this.on_chat_account_switch_requested(
+                    &(target.host.clone(), target.session),
+                    &target.account_id,
+                    cx,
+                );
+                this.switch_sidebar_session_account(target.clone(), cx);
+            },
+        )
+        .detach();
+        // OWE-854: 사이드바 세션 '이름 변경'은 그 세션 탭을 열고(없으면 새로) 탭 이름 변경(OWE-870)을 띄운다.
+        cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::RenameSession, cx| {
+            let host = sidebar
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(krill_app_core::hosts::HostId::Local);
+            this.open_session_on(host, e.0, cx);
+            let (Some(win), tab) = (this.window, this.layout.active()) else {
+                return;
+            };
+            let shell = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                win.update(cx, |_, window, cx| {
+                    shell
+                        .update(cx, |s, cx| s.begin_tab_rename(tab, window, cx))
+                        .ok();
+                })
+                .ok();
+            });
+        })
+        .detach();
+        // OWE-654·723: 사이드바 폴더 아이콘·빈 상태 '폴더 열기'는 Orca처럼 프로젝트 추가 모달을 연다.
+        cx.subscribe(&sidebar, |this, _, _: &sidebar::OpenFolder, cx| {
+            let Some(win) = this.window else {
+                Self::choose_folder(cx);
+                return;
+            };
+            let shell = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                win.update(cx, |_, window, cx| {
+                    shell
+                        .update(cx, |s, cx| s.open_add_project(window, cx))
+                        .ok();
+                })
+                .ok();
+            });
+        })
+        .detach();
+        let detached = cx.new(|_| detached::Panel::default());
+        let detached_open = cx.subscribe(&detached, |this, _, &detached::Open(s), cx| {
+            this.open_session(s, cx);
+        });
+        // 바이너리 단위 테스트는 라이브러리를 cfg(test) 없이 링크하므로, 기본 Panel이면 이 Mac의 실제 krilld에 붙어
+        // 사용자 기록 볼트 결과가 팔레트에 섞인다. 테스트에서는 데몬 호출을 끊는다.
+        #[cfg(not(test))]
+        let history = cx.new(|_| krill_app_core::agent_history::Panel::default());
+        #[cfg(test)]
+        let history = cx.new(|_| {
+            krill_app_core::agent_history::Panel::new(std::sync::Arc::new(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "daemon disabled in unit tests",
+                ))
+            }))
+        });
+        let history_open = cx.subscribe(
+            &history,
+            |this, _, event: &krill_app_core::agent_history::Open, cx| {
+                if !this.panel_collapsed
+                    && this.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::History
+                {
+                    this.toggle_panel(cx);
+                }
+                this.open_session_on(event.host.clone(), event.session, cx);
+            },
+        );
+        cx.subscribe(
+            &history,
+            |this, _, _: &krill_app_core::agent_history::Toggle, cx| {
+                this.toggle_history(cx);
+            },
+        )
+        .detach();
+        cx.observe(&history, |_, _, cx| cx.notify()).detach();
+        // OWE-851: 리소스 행 클릭도 메인 창 해당 세션으로 이동한다.
+        let resources_sidebar = sidebar.clone();
+        let resources = cx.new(|_| {
+            let mut panel = krill_app_core::resources::Panel::default();
+            panel.set_sidebar(&resources_sidebar);
+            panel
+        });
+        let resources_open = cx.subscribe(
+            &resources,
+            |this, _, &krill_app_core::resources::Open(s), cx| {
+                this.open_session(s, cx);
+            },
+        );
+        let folder = layout
+            .focused()
+            .and_then(|p| layout.launch(p))
+            .map_or_else(folder::default_folder, |c| {
+                PathBuf::from(std::ffi::OsString::from_vec(c.cwd.clone()))
+            });
+        let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
+            this.push_appearance(cx);
+        });
+        let config_observer = cx.observe_global::<krill_app_core::settings::Config>(|this, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
+            this.on_config_changed(cx);
+        });
+        if !cx.has_global::<krill_app_core::hosts::link::ConnectionsChanged>() {
+            cx.set_global(krill_app_core::hosts::link::ConnectionsChanged::default());
+        }
+        cx.observe_global::<krill_app_core::hosts::link::ConnectionsChanged>(|this, cx| {
+            this.sync(cx);
+            this.sync_hosts(cx);
+            cx.notify();
+        })
+        .detach();
+        // 점검 스냅샷이 바뀌면 상태바 경고도 다시 그린다(구독은 앱 수명 동안 둔다).
+        cx.observe_global::<krill_app_core::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
+            .detach();
+        // 필요한 순간에만 뜨는 조치 배너(OWE-714).
+        cx.observe_global::<krill_app_core::onboarding::actions::FixNeeds>(|_, cx| cx.notify())
+            .detach();
+        cx.observe_global::<krill_app_core::accounts::installed::Installed>(|_, cx| cx.notify())
+            .detach();
+        let diff = cx.new(|cx| {
+            let mut panel = krill_app_core::diff::Panel::unconnected(folder, cx);
+            panel.set_split_center(true);
+            panel.set_tab(panel_tab, cx);
+            if panel_collapsed {
+                panel.set_visible(false, cx);
+            }
+            panel.set_history(history.clone(), cx);
+            panel
+        });
+        let mut had_center_diff = diff.read(cx).has_center_diff();
+        cx.observe(&diff, move |this, diff, cx| {
+            let d = diff.read(cx);
+            let tab = d.active_tab();
+            let has_center = d.has_center_diff();
+            if this.layout.set_panel_tab(tab) {
+                this.save();
+            }
+            if had_center_diff && !has_center {
+                this.files.refocus = true;
+                cx.notify();
+            } else if !had_center_diff && has_center {
+                cx.notify();
+            }
+            had_center_diff = has_center;
+        })
+        .detach();
+        let diff_send = Self::subscribe_diff(&diff, cx);
+        cx.subscribe(&diff, |this, _, e: &krill_app_core::diff::OpenFile, cx| {
+            // 단일 클릭 미리보기면 같은 칸을 재사용하고, 고정 열기면 탭을 확정한다(OWE-849).
+            let preview = this.diff.update(cx, |d, _| d.take_open_file_preview());
+            if preview {
+                this.open_file_preview(e.0.clone(), cx);
+            } else {
+                this.open_file(e.0.clone(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(
+            &diff,
+            |this, _, e: &krill_app_core::diff::OpenFileAt, cx| {
+                this.open_file_at(e.path.clone(), e.line, e.column, cx);
+            },
+        )
+        .detach();
+        let diff_collapse = cx.subscribe(
+            &diff,
+            |this, _, _: &krill_app_core::diff::ToggleCollapse, cx| {
+                this.toggle_panel(cx);
+            },
+        );
+        let terminal_theme = krill_app_core::ui::terminal_theme(cx);
+        let accounts_snapshot = Arc::new(krill_proto::usage::AccountsSnapshot::default());
+        let ssh_hosts = Vec::new();
+        let host_manager = krill_app_core::hosts::HostManager::new();
+
+        let weak = cx.weak_entity();
+        krill_app_core::settings::register_host(cx, move |cmd, cx| {
+            let entity = weak.upgrade()?;
+            if entity.read(cx).role == WindowRole::Floating {
+                return Some(false);
+            }
+            Some(entity.update(cx, |this, cx| match cmd {
+                krill_app_core::settings::HostCommand::Open { tab, window } => {
+                    if window.is_some_and(|w| this.window != Some(w)) {
+                        return false;
+                    }
+                    this.open_settings(tab, None, cx);
+                    if window.is_none()
+                        && let Some(host_window) = this.window
+                    {
+                        cx.defer(move |cx| {
+                            host_window
+                                .update(cx, |_, window, _| window.activate_window())
+                                .ok();
+                        });
+                    }
+                    true
+                }
+                krill_app_core::settings::HostCommand::Close { window, view } => {
+                    let Some(active_view) = this.settings() else {
+                        return false;
+                    };
+                    if let Some(view_id) = view {
+                        if active_view.entity_id() != view_id {
+                            return false;
+                        }
+                    } else if this.window != Some(window) {
+                        return false;
+                    }
+                    this.close_settings(None, cx);
+                    true
+                }
+            }))
+        });
+        let (layout_save_requests, receiver) = persist::Requests::new();
+        let layout_save_task = persist::schedule(receiver, cx);
+        let mut shell = Self {
+            language: krill_app_core::i18n::language(),
+            sidebar,
+            appearance: None,
+            terminal_theme,
+            cell_pixels: None,
+            cursor_blink: None,
+            _theme_observer: theme_observer,
+            _config_observer: config_observer,
+            system_appearance: None,
+            _sidebar_selection: selection,
+            _sidebar_new_session: new_session,
+            _sidebar_close_session: close_session,
+            _sidebar_continue_session: continue_session,
+            _sidebar_reconnect: sidebar_reconnect,
+            _sidebar_tabs: sidebar_tabs,
+            layout,
+            sidebar_collapsed,
+            panel_collapsed,
+            layout_loading: path.is_some(),
+            restore_session: None,
+            restore_session_chat: false,
+            restore_workspace: None,
+            path,
+            saver: persist::Saver::new(cx),
+            layout_save_requests,
+            quit_layout_ready: std::cell::Cell::new(false),
+            _layout_save_task: layout_save_task,
+            local_generation: 0,
+            ssh_generation: 0,
+            orch_snapshot: Arc::default(),
+            remote_orch_snapshots: HashMap::new(),
+            remote_orch_generations: HashMap::new(),
+            remote_orch_in_flight: HashSet::new(),
+            orch_poll: None,
+            fits: fit::Pending::default(),
+            focus: cx.focus_handle(),
+            focus_observed_window: None,
+            focus_subscriptions: Vec::new(),
+            terminal_focus_owned: true,
+            active_split_drag: None,
+            link: Link::Connecting,
+            daemon_task: None,
+            paths: None,
+            recording: krill_app_core::recording::Status::default(),
+            update_ready: None,
+            live: HashMap::new(),
+            pane_liveness: None,
+            liveness_monitor: liveness::LivenessMonitor::default(),
+            creations: HashMap::new(),
+            restoring_sessions: std::collections::HashSet::new(),
+            restore_attempted: std::collections::HashSet::new(),
+            restore_on_reconnect: std::collections::HashSet::new(),
+            restore_generation: 0,
+            restarting_panes: std::collections::HashSet::new(),
+            outcome_unknown: HashMap::new(),
+            observed_sessions: std::collections::HashSet::new(),
+            gone_sessions: std::collections::HashSet::new(),
+            titles: HashMap::new(),
+            agents: None,
+            agents_busy: false,
+            agents_reload_queued: false,
+            agents_pending_permission: None,
+            agent_task: None,
+            agent_client: Arc::new(pane::DaemonAgents),
+            notice,
+            handoff_errors: HashSet::new(),
+            notifications: notifications::Notifications::default(),
+            external_switch: external_switch::ExternalSwitchTracker::default(),
+            heartbeat: None,
+            app_quit: None,
+            window: None,
+            activation: None,
+            bounds_observer: None,
+            diff,
+            _diff_collapse: diff_collapse,
+            _diff_send: diff_send,
+            detached,
+            _detached_open: detached_open,
+            jump: None,
+            add_project: None,
+            continue_session: None,
+            onboarding: None,
+            pending: overlays::PendingOverlays::default(),
+            dashboard: None,
+            search: None,
+            last_search_query: String::new(),
+            history,
+            _history_open: history_open,
+            resources,
+            _resources_open: resources_open,
+            status_menus_open: 0,
+            security: {
+                let mut security = krill_app_core::security::State::default();
+                security.set_secure_keyboard(
+                    krill_app_core::settings::current(cx).secure_keyboard_entry,
+                );
+                security
+            },
+            paste_queue: security::PasteQueue::default(),
+            character_input_keys: BTreeSet::new(),
+            files: files::Files::default(),
+            #[cfg(test)]
+            close_call: None,
+            #[cfg(test)]
+            ime_discards: Rc::default(),
+            #[cfg(test)]
+            closed_sessions: Vec::new(),
+            closed_tabs: Vec::new(),
+            accounts_snapshot,
+            remote_accounts: BTreeMap::new(),
+            usage_refresh: None,
+            reset_armed: None,
+            account_handoff_poll: None,
+            remote_account_handoff_polls: BTreeMap::new(),
+            account_cancel: None,
+            account_recovery: account_input::Recovery::default(),
+            account_holds: BTreeMap::new(),
+            account_hold_serial: 0,
+            account_epochs: BTreeMap::new(),
+            dismissed_stale_account_banners: BTreeMap::new(),
+            account_mutations: BTreeMap::new(),
+            account_deferred: Vec::new(),
+            accounts_poll: None,
+            update_poll: None,
+            ssh_hosts,
+            host_aliases: BTreeMap::new(),
+            host_manager,
+            host_statuses: Vec::new(),
+            host_targets: HashMap::new(),
+            host_generation: 0,
+            #[cfg(test)]
+            host_sync_count: 0,
+            #[cfg(test)]
+            next_host_io: None,
+            host_source: None,
+            host_refresh_running: false,
+            host_refresh_again: false,
+            host_pending_reconnects: Vec::new(),
+            external_hosts: Vec::new(),
+            link_hosts: None,
+            link_poll: None,
+            launch_host: krill_app_core::hosts::HostId::Local,
+            last_synced_selection: None,
+            workspace_closing: std::collections::HashSet::new(),
+            ports_cache: std::cell::RefCell::default(),
+            artifacts_cache: None,
+            bots_cache: None,
+            bots_attention_count: 0,
+            sidebar_bots: Vec::new(),
+            sidebar_groups: Vec::new(),
+            bot_ui: bot_section::BotUi::default(),
+            voice: voice::ShellVoiceState::default(),
+            split_launchers: HashMap::new(),
+            #[cfg(not(test))]
+            bots_poll: None,
+            #[cfg(test)]
+            bot_rpc_override: None,
+            #[cfg(test)]
+            bot_rpc_overrides: std::collections::HashMap::new(),
+            modal: None,
+            role: WindowRole::Main,
+            pending_focus: PendingFocus::None,
+            tab_context_menu: None,
+            tab_menu_focus: cx.focus_handle(),
+            tab_menu_previous_focus: None,
+            confirm_close_tab: None,
+            recent_tab_scroll: gpui::ScrollHandle::new(),
+            tab_dialog_focus: cx.focus_handle(),
+            tab_dialog_was_open: false,
+            tab_dialog_previous_focus: None,
+            pending_running_close: None,
+            session_switch: None,
+            tab_rename: None,
+            pane_rename: None,
+            surface_bounds: Rc::default(),
+            scrollbar_drag: None,
+            nav_history: NavHistory::default(),
+            chat: chat::ChatState::default(),
+            expanded_prompt_panes: HashSet::new(),
+            startup_reconcile_panes: Vec::new(),
+        };
+        // Unexpected entity release still hands the latest state to the
+        // app-owned writer before Saver::drop disconnects it.
+        cx.on_release(|shell, _| {
+            shell.flush_layout_snapshot();
+        })
+        .detach();
+        shell.sync_sidebar_tab_state(cx);
+        shell.record_workspace_nav(cx);
+        Self::register_overlay_hosts(cx);
+        Self::register_account_switch_host(cx);
+        shell.refresh_local_state(cx);
+        shell.orch_poll = Some(Self::poll_orchestration(cx));
+        #[cfg(not(test))]
+        {
+            shell.bots_poll = Some(Self::poll_sidebar_bots(cx));
+        }
+        if let Some(path) = restore_path {
+            shell.restore_layout(
+                path,
+                #[cfg(all(test, unix))]
+                restore_gate,
+                cx,
+            );
+        }
+        shell
+    }
+
+    /// Restore without holding the UI executor over filesystem reads or migration.
+    fn restore_layout(
+        &mut self,
+        path: PathBuf,
+        #[cfg(all(test, unix))] gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        let baseline = self.layout.clone();
+        cx.spawn(async move |this, cx| {
+            #[cfg(all(test, unix))]
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
+            let (loaded, writable) = cx
+                .background_executor()
+                .spawn(async move {
+                    let loaded = Layout::load(&path);
+                    let writable = (loaded.is_ok()
+                        || loaded
+                            .as_ref()
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+                        || matches!(path.try_exists(), Ok(false));
+                    (loaded, writable)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.layout_loading = false;
+                if this.role != WindowRole::Main {
+                    return;
+                }
+                if !writable {
+                    this.path = None;
+                }
+                let bounds = this.layout.window_bounds();
+                let mut baseline = baseline;
+                if let Some(bounds) = bounds {
+                    baseline.set_window_bounds(bounds);
+                }
+                let mut retained_panes = this.files.retained_startup_panes();
+                for (&pane, live) in &this.live {
+                    if live.pane.has_pending_input()
+                        || live.ime.is_composing()
+                        || live.ime.pending().is_some()
+                    {
+                        retained_panes.insert(pane);
+                    }
+                }
+                retained_panes.extend(this.paste_queue.pending_panes());
+                if let Some(rename) = &this.tab_rename {
+                    retained_panes.insert(rename.pane);
+                }
+                if let Some(rename) = &this.pane_rename {
+                    retained_panes.insert(rename.pane);
+                }
+                retained_panes.extend(this.confirm_close_tab);
+                retained_panes.extend(this.tab_context_menu.map(|(pane, _)| pane));
+                if let Some((PendingRunningClose::Tab(pane) | PendingRunningClose::Pane(pane), _)) =
+                    this.pending_running_close
+                {
+                    retained_panes.insert(pane);
+                }
+                let edited_while_loading = this.layout != baseline || !retained_panes.is_empty();
+                match loaded {
+                    Ok(mut layout) => {
+                        if let Some(bounds) = bounds {
+                            layout.set_window_bounds(bounds);
+                        }
+                        let saved_tab_count = layout.tabs().len();
+                        let saved_active = layout.active();
+                        // 로딩 중 사용자가 탭을 열거나 파일·입력·이름 편집을 시작했어도 저장된 레이아웃을 버리지 않고
+                        // 초기 칸 번호를 보존한 채 그 위에 합친다(ARCHITECTURE §4.1, APP-RUNTIME-004).
+                        if edited_while_loading {
+                            let edited = std::mem::replace(&mut this.layout, layout);
+                            this.layout
+                                .absorb_startup_edits(&baseline, &edited, &retained_panes);
+                            this.forget_closed_tab_targets();
+                            if this
+                                .tab_rename
+                                .as_ref()
+                                .is_some_and(|r| !this.layout.pane_exists(r.pane))
+                            {
+                                this.tab_rename = None;
+                            }
+                            if this
+                                .pane_rename
+                                .as_ref()
+                                .is_some_and(|r| !this.layout.pane_exists(r.pane))
+                            {
+                                this.pane_rename = None;
+                            }
+                            this.shift_closed_tabs_after_restore(saved_tab_count, cx);
+                        } else {
+                            this.layout = layout;
+                            this.confirm_close_tab = None;
+                            this.tab_context_menu = None;
+                            this.pending_running_close = None;
+                            this.tab_rename = None;
+                            this.pane_rename = None;
+                        }
+                        let layout_ref = &this.layout;
+                        this.titles.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.expanded_prompt_panes
+                            .retain(|p| layout_ref.pane_exists(*p));
+                        this.live.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.creations.retain(|p, _| layout_ref.pane_exists(*p));
+                        this.nav_history.prune_missing_panes(&this.layout);
+                        this.cancel_closed_pastes(cx);
+                        this.enqueue_startup_workspaces(saved_tab_count, saved_active);
+                        this.sidebar_collapsed = this.layout.sidebar_collapsed;
+                        this.panel_collapsed = this.layout.panel_collapsed;
+                        let panel_tab = this.layout.panel_tab;
+                        this.sidebar
+                            .update(cx, |s, cx| s.set_visible(!this.sidebar_collapsed, cx));
+                        this.diff.update(cx, |d, cx| {
+                            d.set_visible(!this.panel_collapsed, cx);
+                            d.set_tab(panel_tab, cx);
+                        });
+                        this.sync_focused_session(cx);
+                        this.sync_sidebar_tab_state(cx);
+                        this.record_workspace_nav(cx);
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        let message = if writable {
+                            text::LAYOUT_RECOVERED.get()
+                        } else {
+                            text::LAYOUT_UNREADABLE.get()
+                        };
+                        this.notice = Some(format!("{message}: {e}"));
+                    }
+                    _ => {}
+                }
+                this.sync(cx);
+                this.reconcile_workspace_sessions(cx);
+                this.sync_diff_workspace(cx);
+                let restore_chat = this.restore_session_chat;
+                this.restore_session_chat = false;
+                if let Some((host, session)) = this.restore_session.take() {
+                    this.open_session_on(host, session, cx);
+                    if restore_chat && let Some(pane) = this.layout.focused() {
+                        this.set_pane_chat_view(pane, true, cx);
+                    }
+                }
+                if let Some((host, folder)) = this.restore_workspace.take() {
+                    this.open_saved_workspace(host, &folder, cx);
+                }
+                if edited_while_loading {
+                    this.save();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn orch_snapshot_for(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+    ) -> Option<&krill_proto::orchestration::OrchestrationStore> {
+        match host {
+            krill_app_core::hosts::HostId::Local => Some(self.orch_snapshot.as_ref()),
+            krill_app_core::hosts::HostId::Remote(_) => {
+                self.remote_orch_snapshots.get(host).map(Arc::as_ref)
+            }
+        }
+    }
+
+    pub(super) fn prune_remote_orchestration(&mut self, cx: &mut Context<Self>) {
+        let targets = &self.host_targets;
+        self.remote_orch_snapshots
+            .retain(|host, _| targets.contains_key(host));
+        self.remote_orch_generations
+            .retain(|host, _| targets.contains_key(host));
+        let keep: HashSet<krill_app_core::hosts::HostId> = targets.keys().cloned().collect();
+        self.sidebar.update(cx, |sb, cx| {
+            sb.retain_remote_orchestration(|h| keep.contains(h), cx);
+        });
+    }
+
+    pub(super) fn fetch_remote_orchestration(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        if !host.is_remote() || self.remote_orch_in_flight.contains(&host) {
+            return;
+        }
+        let Some(target) = self.host_targets.get(&host).cloned() else {
+            return;
+        };
+        let prev_generation = self.remote_orch_generations.get(&host).copied();
+        self.remote_orch_in_flight.insert(host.clone());
+        let fetch_target = target.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fetch_remote_orchestration_snapshot(&fetch_target, prev_generation)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.remote_orch_in_flight.remove(&host);
+                if this.host_targets.get(&host) == Some(&target)
+                    && let Ok(RemoteOrchFetch::Updated { store, generation }) = result
+                {
+                    if let Some(generation) = generation {
+                        this.remote_orch_generations
+                            .insert(host.clone(), generation);
+                    } else {
+                        this.remote_orch_generations.remove(&host);
+                    }
+                    let changed = this
+                        .remote_orch_snapshots
+                        .insert(host.clone(), store.clone())
+                        .as_ref()
+                        != Some(&store);
+                    this.sidebar.update(cx, |sb, cx| {
+                        sb.set_remote_orchestration(host.clone(), store, cx);
+                    });
+                    if changed {
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Snapshot reads and file locks happen only on this serial background loop.
+    fn poll_orchestration(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let mut tick: u64 = 0;
+            loop {
+                let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
+                    let cache = this.ports_cache.borrow();
+                    let mut previous = HashMap::new();
+                    let screens = this
+                        .live
+                        .iter()
+                        .filter_map(|(pane, live)| {
+                            let id = (this.layout.host(*pane).clone(), live.pane.session()?.0);
+                            let screen = live.pane.shown();
+                            // 직전 결과는 새 결과가 올 때까지 캐시에 남겨 계속 표시한다.
+                            if let Some(old) = cache.get(&id) {
+                                if old.matches(&screen) {
+                                    return None;
+                                }
+                                previous.insert(id.clone(), old.data());
+                            }
+                            Some((id, screen))
+                        })
+                        .collect::<Vec<_>>();
+                    let old_ports = previous
+                        .iter()
+                        .map(|(id, (_, entries))| (id.clone(), entries.clone()))
+                        .collect::<HashMap<_, _>>();
+                    (this.state_dir(cx), screens, previous, old_ports)
+                }) else {
+                    return;
+                };
+                let copies = screens
+                    .iter()
+                    .map(|(id, screen)| (id.clone(), (**screen).clone()))
+                    .collect::<Vec<_>>();
+                let (snapshot, prompts, ports) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let prompts = dir
+                            .as_deref()
+                            .map(krill_proto::git::load_session_prompt_histories);
+                        let snapshot = dir.map(|dir| {
+                            Arc::new(krill_proto::orchestration::OrchestrationStore::load_cached(
+                                &dir,
+                            ))
+                        });
+                        let ports = copies
+                            .into_iter()
+                            .map(|(id, screen)| {
+                                let result =
+                                    popout::detect_ports(id.1, &screen, previous.remove(&id));
+                                (id, result)
+                            })
+                            .collect::<HashMap<_, _>>();
+                        (snapshot, prompts, ports)
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let mut changed = false;
+                        if let Some(prompts) = prompts {
+                            changed |= this
+                                .sidebar
+                                .update(cx, |s, cx| s.sync_prompt_histories(prompts, cx));
+                        }
+                        if let Some(snapshot) = snapshot
+                            && this.orch_snapshot != snapshot
+                        {
+                            this.orch_snapshot = snapshot;
+                            changed = true;
+                        }
+                        this.prune_remote_orchestration(cx);
+                        let mut orch_hosts: Vec<krill_app_core::hosts::HostId> = Vec::new();
+                        if this.launch_host.is_remote() {
+                            orch_hosts.push(this.launch_host.clone());
+                        }
+                        for bot in &this.sidebar_bots {
+                            if bot.host.is_remote() && !orch_hosts.contains(&bot.host) {
+                                orch_hosts.push(bot.host.clone());
+                            }
+                        }
+                        for host in orch_hosts {
+                            if !this.remote_orch_snapshots.contains_key(&host)
+                                || tick.is_multiple_of(3)
+                            {
+                                this.fetch_remote_orchestration(host, cx);
+                            }
+                        }
+                        let mut cache = this.ports_cache.borrow_mut();
+                        cache.retain(|id, entry| {
+                            let retained = this.live.iter().any(|(pane, live)| {
+                                this.layout.host(*pane) == &id.0
+                                    && live.pane.session().is_some_and(|sid| sid.0 == id.1)
+                            });
+                            changed |= !retained && !entry.entries().is_empty();
+                            retained
+                        });
+                        cache.extend(ports.into_iter().filter_map(|(id, (text, entries))| {
+                            let (_, screen) = screens.iter().find(|(sid, _)| sid == &id)?;
+                            this.live
+                                .iter()
+                                .any(|(pane, live)| {
+                                    this.layout.host(*pane) == &id.0
+                                        && live.pane.session().is_some_and(|sid| sid.0 == id.1)
+                                })
+                                .then(|| {
+                                    changed |=
+                                        old_ports.get(&id).map(Vec::as_slice).unwrap_or_default()
+                                            != entries.as_slice();
+                                    (id, popout::PortCache::from_result(screen, text, entries))
+                                })
+                        }));
+                        drop(cache);
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                tick = tick.wrapping_add(1);
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+            }
+        })
+    }
+
+    /// Project tab titles and structural session order from the persisted Layout.
+    pub(super) fn sync_sidebar_tab_state(&self, cx: &mut Context<Self>) {
+        let mut custom = std::collections::BTreeMap::new();
+        let mut order = Vec::new();
+        for (i, tab) in self.layout.tabs().iter().enumerate() {
+            for pane in self.layout.tab_panes(i) {
+                if let Some(session) = self.layout.session(pane) {
+                    order.push((self.layout.host(pane).clone(), session));
+                }
+            }
+            let Some(title) = self.layout.tab_title(i) else {
+                continue;
+            };
+            if let Some(sid) = self.layout.session(tab.focused) {
+                custom.insert(sid, title.to_owned());
+            }
+            for pane in self.layout.tab_panes(i) {
+                if let Some(sid) = self.layout.session(pane) {
+                    custom.entry(sid).or_insert_with(|| title.to_owned());
+                }
+            }
+        }
+        self.sidebar.update(cx, |s, cx| {
+            s.set_custom_titles(custom, cx);
+            s.set_session_order(order, cx);
+        });
+    }
+
+    /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
+    /// 일반 cd는 `layout.launches`의 폴더를 바꾸지 않는다. 프로젝트 생성 작업은 실제 성공 cwd를 확인한 뒤 전환한다.
+    /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
+    pub(super) fn sync_live_cwds(
+        &mut self,
+        sidebar: &sidebar::Sidebar,
+    ) -> Vec<(krill_app_core::hosts::HostId, PathBuf)> {
+        let mut changed = false;
+        let mut projects = std::collections::BTreeSet::new();
+        let panes: Vec<PaneId> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .collect();
+        for pane in panes {
+            let Some(sid) = self.layout.session(pane) else {
+                continue;
+            };
+            let host = self.layout.host(pane).clone();
+            let Some(live_cwd) = sidebar
+                .session_on(&host, sid)
+                .and_then(|s| s.cwd.as_deref())
+                .filter(|p| !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            let cwd_bytes = live_cwd.as_os_str().as_bytes();
+            if self.layout.respawn_cwd(pane) != Some(cwd_bytes) {
+                changed |= self.layout.set_respawn_cwd(pane, cwd_bytes.to_vec());
+            }
+            if let Some(completed) = self
+                .layout
+                .launch(pane)
+                .and_then(|launch| folder::completed_project(launch, live_cwd))
+            {
+                projects.insert((host.clone(), live_cwd.to_path_buf()));
+                self.layout.set_launch(pane, completed);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
+        projects.into_iter().collect()
+    }
+
+    /// 칸이 사이드바의 로컬 git 워크트리에 속할 때만 그 워크트리 루트 경로를 돌려준다.
+    /// 비-git 폴더 탭·에디터 파일 탭·원격 호스트 탭은 `None`이다(OWE-757).
+    pub(super) fn worktree_for_pane(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
+        if self.layout.file(pane).is_some() || self.layout.host(pane).is_remote() {
+            return None;
+        }
+        let sidebar = self.sidebar.read(cx);
+        if let Some(sid) = self.layout.session(pane)
+            && let Some(folder) = sidebar.folder_on(&krill_app_core::hosts::HostId::Local, sid)
+            && let Some(wt) = sidebar.worktree_for_path(folder)
+        {
+            return Some(wt);
+        }
+        let launch = self.layout.launch(pane)?;
+        let cwd = std::path::Path::new(std::ffi::OsStr::from_bytes(&launch.cwd));
+        sidebar.worktree_for_path(cwd)
+    }
+
+    fn find_pane_for_worktree(&self, wt: &std::path::Path, cx: &App) -> Option<(usize, PaneId)> {
+        for i in 0..self.layout.tabs().len() {
+            for p in self.layout.tab_panes(i) {
+                if self.worktree_for_pane(p, cx).as_deref() == Some(wt) {
+                    return Some((i, p));
+                }
+            }
+        }
+        None
+    }
+
+    /// 현재 포커스된 워크스페이스 칸(탭·세션·워크트리)을 탐색 히스토리에 기록한다.
+    pub(super) fn record_workspace_nav(&mut self, cx: &App) {
+        if self.page_open() {
+            return;
+        }
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let session = self.layout.session(pane);
+        let worktree = self.worktree_for_pane(pane, cx);
+        self.nav_history.push(NavEntry::Workspace {
+            pane,
+            session,
+            worktree,
+        });
+    }
+
+    fn is_entry_reachable(&self, entry: &NavEntry, cx: &App) -> bool {
+        match entry {
+            NavEntry::Settings(_)
+            | NavEntry::Mobile
+            | NavEntry::Artifacts
+            | NavEntry::Automations
+            | NavEntry::Bots => true,
+            NavEntry::Workspace {
+                pane,
+                session,
+                worktree,
+            } => {
+                if self.layout.pane_exists(*pane) {
+                    return true;
+                }
+                let sidebar = self.sidebar.read(cx);
+                if let Some(wt) = worktree {
+                    if sidebar.has_trees() && !sidebar.contains_worktree(wt) {
+                        return false;
+                    }
+                    if self.find_pane_for_worktree(wt, cx).is_some() {
+                        return true;
+                    }
+                }
+                session.is_some_and(|sid| sidebar.session(sid).is_some())
+            }
+        }
+    }
+
+    fn is_same_nav_target(cur: Option<&NavEntry>, cand: &NavEntry) -> bool {
+        match (cur, cand) {
+            (
+                Some(NavEntry::Workspace { pane: cur_pane, .. }),
+                NavEntry::Workspace {
+                    pane: cand_pane, ..
+                },
+            ) => cur_pane == cand_pane,
+            (Some(cur), cand) => cur == cand,
+            (None, _) => false,
+        }
+    }
+
+    fn prev_nav_index(&self, cx: &App) -> Option<usize> {
+        if self.nav_history.index >= self.nav_history.entries.len() {
+            return None;
+        }
+        let cur = self.nav_history.entries.get(self.nav_history.index);
+        let end = self.nav_history.index.min(self.nav_history.entries.len());
+        (0..end).rev().find(|&i| {
+            let Some(cand) = self.nav_history.entries.get(i) else {
+                return false;
+            };
+            !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
+        })
+    }
+
+    fn next_nav_index(&self, cx: &App) -> Option<usize> {
+        if self.nav_history.index >= self.nav_history.entries.len() {
+            return None;
+        }
+        let cur = self.nav_history.entries.get(self.nav_history.index);
+        ((self.nav_history.index + 1)..self.nav_history.entries.len()).find(|&i| {
+            let Some(cand) = self.nav_history.entries.get(i) else {
+                return false;
+            };
+            !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
+        })
+    }
+
+    #[must_use]
+    pub fn can_navigate_back(&self, cx: &App) -> bool {
+        self.prev_nav_index(cx).is_some()
+    }
+
+    #[must_use]
+    pub fn can_navigate_forward(&self, cx: &App) -> bool {
+        self.next_nav_index(cx).is_some()
+    }
+
+    /// 탐색 히스토리에서 이전 워크트리·탭·설정 뷰로 이동한다(`⌘⌥←`).
+    pub fn navigate_back(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) -> bool {
+        let Some(target_idx) = self.prev_nav_index(cx) else {
+            return false;
+        };
+        let Some(entry) = self.nav_history.entries.get(target_idx).cloned() else {
+            return false;
+        };
+        self.nav_history.index = target_idx;
+        self.apply_nav_entry(entry, window, cx);
+        true
+    }
+
+    /// 탐색 히스토리에서 다음 워크트리·탭·설정 뷰로 이동한다(`⌘⌥→`).
+    pub fn navigate_forward(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target_idx) = self.next_nav_index(cx) else {
+            return false;
+        };
+        let Some(entry) = self.nav_history.entries.get(target_idx).cloned() else {
+            return false;
+        };
+        self.nav_history.index = target_idx;
+        self.apply_nav_entry(entry, window, cx);
+        true
+    }
+
+    fn apply_nav_entry(
+        &mut self,
+        entry: NavEntry,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav_history.navigating = true;
+        match entry {
+            NavEntry::Artifacts => self.open_artifacts(window, cx),
+            NavEntry::Automations => self.open_automations(window, cx),
+            NavEntry::Bots => self.open_bots(window, cx),
+            NavEntry::Mobile => self.open_mobile_page(window, cx),
+            NavEntry::Settings(tab) => {
+                self.open_settings(tab, window, cx);
+            }
+            NavEntry::Workspace {
+                pane,
+                session,
+                worktree,
+            } => {
+                let mut window = window;
+                if self.dashboard.is_some() {
+                    self.close_dashboard(window.as_deref_mut(), cx);
+                }
+                if self.page_open() {
+                    self.close_settings(window.as_deref_mut(), cx);
+                }
+                let mut target_tab_pane = self
+                    .layout
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, t)| t.root.contains(pane).then_some((i, pane)));
+                if target_tab_pane.is_none()
+                    && let Some(wt) = &worktree
+                {
+                    target_tab_pane = self.find_pane_for_worktree(wt, cx);
+                }
+                if let Some((tab_idx, target_pane)) = target_tab_pane {
+                    self.change(true, cx, |l| {
+                        l.activate(tab_idx);
+                        l.focus(target_pane);
+                    });
+                    if let Some(w) = window {
+                        w.focus(&self.focus, cx);
+                    }
+                } else if let Some(sid) = session {
+                    let host = self
+                        .sidebar
+                        .read(cx)
+                        .host_for_session(sid)
+                        .unwrap_or(krill_app_core::hosts::HostId::Local);
+                    self.open_session_on(host, sid, cx);
+                }
+                self.sidebar.update(cx, sidebar::Sidebar::reveal_focused);
+            }
+        }
+        self.nav_history.navigating = false;
+        cx.notify();
+    }
+
+    /// 인앱 설정 페이지(`SettingsView`)를 열거나 지정한 탭으로 전환한다.
+    pub(super) fn open_settings(
+        &mut self,
+        tab: krill_app_core::settings::AdminTab,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_surface(tab, false, NavEntry::Settings(tab), window, cx);
+    }
+
+    fn open_settings_surface(
+        &mut self,
+        tab: krill_app_core::settings::AdminTab,
+        mobile_page: bool,
+        nav_entry: NavEntry,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_global::<krill_app_core::settings::Config>() {
+            let dir = self.state_dir(cx);
+            krill_app_core::settings::init_at(dir, cx);
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.cancel_pending_paste_for(pane, cx);
+            self.commit_ime(pane, window.as_deref(), cx);
+        }
+        if self.role == WindowRole::Floating {
+            cx.defer(move |cx| krill_app_core::settings::open_window_at_tab(tab, cx));
+            return;
+        }
+        self.record_workspace_nav(cx);
+        self.jump = None;
+        self.continue_session = None;
+        self.dashboard = None;
+        self.sync_sidebar_visibility(cx);
+        self.files.close_quick_open();
+        if self.search.take().is_some()
+            && let Some(l) = self.focused_live()
+        {
+            l.pane.clear_search();
+        }
+        let view = if let Some(existing) = self.settings() {
+            existing.update(cx, |v, cx| {
+                v.set_tab(tab, cx);
+                v.set_mobile_page(mobile_page, cx);
+            });
+            existing.clone()
+        } else {
+            let created = cx.new(|cx| {
+                let mut v = krill_app_core::settings::SettingsView::new(cx);
+                v.set_tab(tab, cx);
+                if mobile_page {
+                    v.set_mobile_page(true, cx);
+                }
+                krill_app_core::settings::SettingsView::sync_recording_paused(cx);
+                v
+            });
+            self.replace_modal(Some(Modal::Settings(created.clone())), cx);
+            created
+        };
+        self.sync_settings_account_hosts(cx);
+        if tab == krill_app_core::settings::AdminTab::Accounts {
+            let active_host = self.active_account_host();
+            if active_host.is_remote() {
+                view.update(cx, |v, cx| v.select_account_host(active_host, cx));
+            }
+        }
+        let visible = window.as_deref().is_some_and(Window::is_window_active);
+        view.update(cx, |view, cx| view.set_visible(visible, cx));
+        self.nav_history.push(nav_entry);
+        self.sync_focused_session(cx);
+        if let Some(window) = &window {
+            self.window = Some(window.window_handle());
+        }
+        self.focus_modal_or_workspace(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn open_mobile_page(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.open_settings_surface(
+            krill_app_core::settings::AdminTab::Mobile,
+            true,
+            NavEntry::Mobile,
+            window,
+            cx,
+        );
+    }
+
+    /// 사이드바 'Krill 모바일' 페이지가 열려 있다.
+    pub(super) fn mobile_page_open(&self, cx: &App) -> bool {
+        self.settings().is_some_and(|s| s.read(cx).mobile_page())
+    }
+
+    /// 인앱 설정 페이지를 닫고 터미널 워크스페이스로 돌아간다.
+    pub(super) fn close_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if !self.replace_modal(None, cx) {
+            return;
+        }
+        self.record_workspace_nav(cx);
+        self.sync_focused_session(cx);
+        self.refresh_local_state(cx);
+        self.voice.shortcut_loaded = false;
+        self.ensure_voice_shortcut_synced(cx);
+        self.files.refocus = true;
+        self.focus_modal_or_workspace(window, cx);
+        cx.notify();
+    }
+
+    /// 인앱 에이전트 대시보드 모달을 닫고 이전 화면(설정 또는 워크스페이스)으로 포커스를 돌려준다.
+    pub(super) fn close_dashboard(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.dashboard.take().is_none() {
+            return;
+        }
+        self.sync_sidebar_visibility(cx);
+        self.sync_focused_session(cx);
+        if !self.page_open() {
+            self.files.refocus = true;
+        }
+        self.focus_modal_or_workspace(window, cx);
+        cx.notify();
+    }
+
+    /// Cmd+J: Jump 팔레트를 열거나(사이드바 스냅샷으로) 닫는다. 설정이 열려 있으면 먼저 닫고 연다(OWE-860).
+    /// 열 때 칸의 조합 중 글자는 확정한다(포커스 이탈).
+    /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫는다.
+    fn toggle_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_open() {
+            self.close_settings(Some(&mut *window), cx);
+        }
+        if self.jump.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        self.files.close_quick_open();
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
+        }
+        let (items, worktrees) = self.jump_entries(cx);
+        let ws = self.sync_history_host(cx);
+        let history = self.history.clone();
+        let (actions, quick_commands) = Self::palette_entries(cx);
+        let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
+        palette.update(cx, |p, cx| {
+            p.set_worktrees(worktrees, cx);
+            p.set_actions(actions, cx);
+            p.set_quick_commands(quick_commands, cx);
+            p.set_scope_paths(ws, Vec::new(), cx);
+            p.connect_history(&history, cx);
+            p.focus(window, cx);
+        });
+        let events = cx.subscribe_in(
+            &palette,
+            window,
+            |this, palette, e: &jump::Event, window, cx| {
+                this.on_palette_event(palette, e, window, cx);
+            },
+        );
+        self.jump = Some((palette, events));
+        cx.notify();
+    }
+
+    /// 수신한 스냅샷만 읽고 호스트별 현재 위치·MRU를 맞춘다.
+    fn jump_entries(&self, cx: &gpui::App) -> (Vec<jump::Item>, Vec<jump::WorktreeItem>) {
+        let sidebar = self.sidebar.read(cx);
+        let mut items = sidebar.jump_items();
+        let mut worktrees = sidebar.jump_worktrees();
+        let focused = self.layout.focused().and_then(|pane| {
+            self.layout
+                .session(pane)
+                .map(|id| (self.layout.host(pane), id))
+        });
+        let folder = focused.and_then(|(host, id)| sidebar.folder_on(host, id));
+        let mut recent = std::collections::BTreeMap::new();
+        for (rank, index) in self.layout.mru_order().into_iter().enumerate() {
+            if let Some(tab) = self.layout.tabs().get(index)
+                && let Some(id) = self.layout.session(tab.focused)
+            {
+                recent
+                    .entry((self.layout.host(tab.focused), id))
+                    .or_insert(rank);
+            }
+        }
+        for item in &mut items {
+            item.is_current_tab = focused == Some((&item.host, item.id));
+            item.is_current_worktree = !item.is_current_tab
+                && focused.is_some_and(|(host, _)| host == &item.host)
+                && folder.is_some()
+                && folder
+                    == Some(std::path::Path::new(if item.worktree_path.is_empty() {
+                        &item.cwd
+                    } else {
+                        &item.worktree_path
+                    }));
+        }
+        items.sort_by_key(|item| {
+            (
+                item.is_current_tab,
+                recent
+                    .get(&(&item.host, item.id))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        for entry in &mut worktrees {
+            entry.is_current = focused.is_some_and(|(host, _)| host == &entry.host)
+                && folder == Some(entry.path.as_path());
+        }
+        (items, worktrees)
+    }
+
+    fn refresh_jump(&self, cx: &mut Context<Self>) {
+        if let Some((palette, _)) = &self.jump {
+            let (items, worktrees) = self.jump_entries(cx);
+            palette.update(cx, |palette, cx| {
+                palette.set_snapshot(items, worktrees, cx);
+            });
+        }
+    }
+
+    /// Cmd+G/⇧Cmd+G: 열린 터미널 검색 바의 검색어로 다음/이전 일치를 찾는다(OWE-868). 바가 닫혀 있으면 무시한다.
+    fn step_search(&mut self, direction: krill_proto::search::Direction, cx: &mut Context<Self>) {
+        if self.is_active_chat_view_in(cx) && self.chat_find_is_open(cx) {
+            self.step_chat_find(direction, cx);
+            return;
+        }
+        let query = self
+            .search
+            .as_ref()
+            .map(|(bar, _)| (bar.read(cx).query().to_owned(), bar.read(cx).options()));
+        if let Some((query, options)) = query
+            && !query.is_empty()
+            && let Some(l) = self.focused_live()
+        {
+            l.pane.search_with_options(&query, direction, options);
+        }
+    }
+
+    /// OWE-865: 팔레트 빠른 액션(내장 8개)과 설정의 빠른 명령 목록.
+    fn palette_entries(
+        cx: &gpui::App,
+    ) -> (
+        Vec<jump::ActionEntry>,
+        Vec<krill_app_core::commands::QuickCommand>,
+    ) {
+        use jump::ActionKind as Kind;
+        use krill_app_core::i18n::catalog::jump as jtext;
+        let actions = [
+            (Kind::NewWorktree, jtext::ACT_NEW_WORKTREE.get()),
+            (Kind::NewTab, jtext::ACT_NEW_TAB.get()),
+            (Kind::SplitRight, jtext::ACT_SPLIT_RIGHT.get()),
+            (Kind::SplitDown, jtext::ACT_SPLIT_DOWN.get()),
+            (Kind::OpenSettings, jtext::ACT_OPEN_SETTINGS.get()),
+            (Kind::ToggleSidebar, jtext::ACT_TOGGLE_SIDEBAR.get()),
+            (Kind::ToggleExplorer, jtext::ACT_TOGGLE_EXPLORER.get()),
+            (Kind::ToggleSearch, jtext::ACT_TOGGLE_SEARCH.get()),
+            (Kind::ToggleChatView, jtext::ACT_TOGGLE_CHAT_VIEW.get()),
+            (
+                Kind::ImportTerminalThemes,
+                jtext::ACT_IMPORT_TERMINAL_THEMES.get(),
+            ),
+            (Kind::OpenChecks, jtext::ACT_OPEN_CHECKS.get()),
+            (Kind::OpenDisk, jtext::ACT_OPEN_DISK.get()),
+            (Kind::OpenAutomations, jtext::ACT_OPEN_AUTOMATIONS.get()),
+            (Kind::OpenMobile, jtext::ACT_OPEN_MOBILE.get()),
+            (
+                Kind::EditQuickCommands,
+                jtext::ACT_EDIT_QUICK_COMMANDS.get(),
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, label)| jump::ActionEntry::new(kind, label.to_owned()))
+        .collect();
+        (
+            actions,
+            krill_app_core::settings::current(cx).quick_commands,
+        )
+    }
+
+    /// ⇧⌘P: 명령 팔레트(OWE-865). Jump와 같은 슬롯을 쓰되 액션부터 보여주고,
+    /// 파일 빠른 열기가 열려 있으면 닫고 시작한다.
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        self.files.close_quick_open();
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
+        }
+        let (items, worktrees) = self.jump_entries(cx);
+        let ws = self.sync_history_host(cx);
+        let history = self.history.clone();
+        let (actions, quick_commands) = Self::palette_entries(cx);
+        let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
+        palette.update(cx, |p, cx| {
+            p.set_mode(jump::Mode::Commands, cx);
+            p.set_worktrees(worktrees, cx);
+            p.set_actions(actions, cx);
+            p.set_quick_commands(quick_commands, cx);
+            p.set_scope_paths(ws, Vec::new(), cx);
+            p.connect_history(&history, cx);
+            p.input().update(cx, |input, cx| {
+                input.set_placeholder(
+                    krill_app_core::i18n::catalog::jump::PLACEHOLDER_COMMANDS.get(),
+                    window,
+                    cx,
+                );
+            });
+            p.focus(window, cx);
+        });
+        let events = cx.subscribe_in(
+            &palette,
+            window,
+            |this, palette, e: &jump::Event, window, cx| {
+                this.on_palette_event(palette, e, window, cx);
+            },
+        );
+        self.jump = Some((palette, events));
+        cx.notify();
+    }
+
+    /// Jump·명령 팔레트 이벤트를 한곳에서 처리한다(OWE-865).
+    fn on_palette_event(
+        &mut self,
+        palette: &gpui::Entity<jump::Palette>,
+        event: &jump::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vault_target = match event {
+            jump::Event::ResumeVault { target, context } => {
+                context.clone().map(|context| (target.clone(), context))
+            }
+            _ => None,
+        };
+        let worktree = match *event {
+            jump::Event::OpenWorktree(idx) => palette.read(cx).worktree_entry(idx).cloned(),
+            _ => None,
+        };
+        self.jump = None;
+        let focus_before = window.focused(cx);
+        let mut refocus_shell = true;
+        match *event {
+            jump::Event::Confirm(id) => self.open_session(id, cx),
+            jump::Event::ConfirmOn(ref host, id) => self.open_session_on(host.clone(), id, cx),
+            jump::Event::OpenWorktree(_) => {
+                if let Some(entry) = worktree {
+                    self.open_palette_worktree(&entry, cx);
+                }
+            }
+            jump::Event::Action(kind) => {
+                let wants_shell_focus = self.run_palette_action(kind, window, cx);
+                let opened_surface = self.has_blocking_overlay()
+                    || self.modal.is_some()
+                    || self.onboarding.is_some()
+                    || self.pending.onboarding.is_some()
+                    || self.continue_session.is_some()
+                    || self.add_project.is_some();
+                refocus_shell =
+                    wants_shell_focus || (!opened_surface && window.focused(cx) == focus_before);
+            }
+            jump::Event::ResumeVault { .. } => {
+                if let Some((target, context)) = vault_target {
+                    self.history.update(cx, |h, cx| {
+                        if h.context() == context {
+                            h.resume_vault(target, cx);
+                        }
+                    });
+                }
+            }
+            jump::Event::Dismiss => {}
+        }
+        if refocus_shell {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// OWE-865: 팔레트에서 고른 워크트리 열기. 세션이 있으면 그 세션으로,
+    /// 없으면 새 탭에 새 세션을 만든다(사이드바 카드 클릭과 같다).
+    fn open_palette_worktree(&mut self, entry: &jump::WorktreeItem, cx: &mut Context<Self>) {
+        if let Some(id) = entry.session_id {
+            self.open_session_on(entry.host.clone(), id, cx);
+        } else {
+            self.open_saved_workspace(entry.host.clone(), &entry.path, cx);
+        }
+    }
+
+    /// OWE-865: 팔레트 빠른 액션 실행. 모두 이미 구현된 기능만 둔다.
+    /// Returns `true` when focus should return to the shell terminal after running the action.
+    fn run_palette_action(
+        &mut self,
+        kind: jump::ActionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match kind {
+            jump::ActionKind::NewWorktree => {
+                self.open_new_worktree_dialog(window, cx);
+                false
+            }
+            jump::ActionKind::NewTab => {
+                self.new_tab_on_launch_host(cx);
+                true
+            }
+            jump::ActionKind::SplitRight => {
+                self.split_active(Axis::Horizontal, cx);
+                true
+            }
+            jump::ActionKind::SplitDown => {
+                self.split_active(Axis::Vertical, cx);
+                true
+            }
+            jump::ActionKind::OpenSettings => {
+                self.open_settings(
+                    krill_app_core::settings::AdminTab::Appearance,
+                    Some(window),
+                    cx,
+                );
+                false
+            }
+            jump::ActionKind::ToggleSidebar => {
+                self.toggle_sidebar(cx);
+                true
+            }
+            jump::ActionKind::ToggleExplorer => {
+                self.toggle_explorer(window, cx);
+                false
+            }
+            jump::ActionKind::ToggleSearch => {
+                self.toggle_workspace_search(window, cx);
+                false
+            }
+            jump::ActionKind::ToggleChatView => {
+                self.toggle_chat_view_with_focus(window, cx);
+                false
+            }
+            jump::ActionKind::OpenChecks => {
+                krill_app_core::onboarding::open_checks_current(cx);
+                false
+            }
+            jump::ActionKind::OpenDisk => {
+                self.open_settings(krill_app_core::settings::AdminTab::Disk, Some(window), cx);
+                false
+            }
+            jump::ActionKind::OpenAutomations => {
+                // 사이드바에서 숨긴 자동화를 되돌리는 경로이기도 하다.
+                krill_app_core::settings::edit(cx, |s| s.show_automations_button = true);
+                self.open_automations(Some(window), cx);
+                false
+            }
+            jump::ActionKind::OpenMobile => {
+                // 사용자가 사이드바에서 숨긴 설정은 유지한 채 모바일 페이지만 연다.
+                self.open_mobile_page(Some(window), cx);
+                false
+            }
+            jump::ActionKind::EditQuickCommands => {
+                self.open_settings(
+                    krill_app_core::settings::AdminTab::QuickCommands,
+                    Some(window),
+                    cx,
+                );
+                false
+            }
+            jump::ActionKind::ImportTerminalThemes => {
+                let imported = krill_app_core::settings::import_terminal_themes(cx);
+                cx.spawn(async move |this, cx| {
+                    let message = imported.await;
+                    this.update(cx, |this, cx| {
+                        this.notice = Some(message);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+                true
+            }
+            jump::ActionKind::QuickCommand(index) => {
+                if let Some(command) = krill_app_core::settings::current(cx)
+                    .quick_commands
+                    .get(index)
+                    .cloned()
+                {
+                    self.inject_command(&command, window, cx);
+                }
+                true
+            }
+        }
+    }
+
+    /// OWE-865: Jump 팔레트가 열려 있으면 ⌘1~9를 탭 전환 대신 N번째 행 즉시
+    /// 실행으로 쓴다. 팔레트가 없으면 false(기존 탭 전환이 이어진다).
+    fn jump_to_palette_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        let Some((palette, _)) = &self.jump else {
+            return false;
+        };
+        let palette = palette.clone();
+        palette.update(cx, |p, cx| {
+            p.jump_to_row(row, cx);
+        });
+        true
+    }
+
+    /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 파일 탭이 포커스면
+    /// 에디터 내장 검색을 열며(OWE-874), 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
+    fn terminal_search_visible(&self, cx: &App) -> bool {
+        !self.diff.read(cx).has_center_diff()
+            && !self.is_active_chat_view_in(cx)
+            && self.layout.focused().is_some_and(|pane| {
+                self.live.contains_key(&pane) && self.layout.file(pane).is_none()
+            })
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.is_some() {
+            return;
+        }
+        if let Some(settings) = self.settings().cloned() {
+            settings.update(cx, |v, cx| v.focus_search(window, cx));
+            return;
+        }
+        if self.diff.read(cx).has_center_diff() {
+            return;
+        }
+        if let Some(pane) = self.layout.focused()
+            && self.open_editor_search(pane, window, cx)
+        {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            self.toggle_chat_find(window, cx);
+            return;
+        }
+        // OWE-868: 빈 탭에서는 터미널 검색 바를 열지 않는다(열어도 동작하지 않는다).
+        // 파일 탭은 위에서 에디터 내장 검색으로 처리된다(OWE-874).
+        if self.focused_live().is_none() {
+            return;
+        }
+        if let Some((bar, _)) = &self.search {
+            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
+            return;
+        }
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
+        }
+        let bar = cx.new(|cx| krill_app_core::search::Bar::new(window, cx));
+        let options_supported = self
+            .focused_live()
+            .is_some_and(|l| l.pane.search_options_supported());
+        bar.update(cx, |b, cx| {
+            b.set_options_supported(options_supported);
+            b.set_query(&self.last_search_query, window, cx);
+            b.focus(window, cx);
+        });
+        let events = cx.subscribe_in(
+            &bar,
+            window,
+            |this, bar, e: &krill_app_core::search::Event, window, cx| {
+                match e {
+                    krill_app_core::search::Event::Query(q) => {
+                        let options = bar.read(cx).options();
+                        if let Some(l) = this.focused_live() {
+                            if q.is_empty() {
+                                l.pane.clear_search();
+                            } else {
+                                l.pane.search_with_options(
+                                    q,
+                                    krill_proto::search::Direction::Next,
+                                    options,
+                                );
+                            }
+                        }
+                    }
+                    krill_app_core::search::Event::Step(dir) => {
+                        let q = bar.read(cx).query().to_owned();
+                        let options = bar.read(cx).options();
+                        if !q.is_empty()
+                            && let Some(l) = this.focused_live()
+                        {
+                            l.pane.search_with_options(&q, *dir, options);
+                        }
+                    }
+                    krill_app_core::search::Event::Dismiss => {
+                        bar.read(cx).query().clone_into(&mut this.last_search_query);
+                        this.search = None;
+                        if let Some(l) = this.focused_live() {
+                            l.pane.clear_search();
+                        }
+                        window.focus(&this.focus, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.search = Some((bar, events));
+        cx.notify();
+    }
+
+    /// krilld에 붙어(없으면 띄운다) 감시 연결을 들고 있는다. 끊기면 바로 "재연결 중" 배너를 띄우고 조작 없이 다시
+    /// 붙는다(MK-026, 정책은 `krill_proto::daemon` "끊김과 재연결"). ping/pong heartbeat(OWE-586)로 EOF 없이
+    /// 멈춘 데몬도 감지한다. 소켓·프로세스 대기는 백그라운드에서 한다.
+    // ponytail: 감시 연결의 막히는 read가 백그라운드 스레드 하나를 앱 수명 동안 쥔다. 세션 연결(OWE-490)이 생기면
+    // 그 연결들의 EOF로 대신할 수 있다.
+    pub fn connect_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_task.is_some() {
+            return;
+        }
+        self.daemon_task = Some(cx.spawn(async move |this, cx| {
+            let paths = cx.background_executor().spawn(async { Paths::dev() }).await;
+            this.update(cx, |this, cx| match paths {
+                Ok(paths) => this.connect_daemon_with_paths(paths, cx),
+                Err(e) => {
+                    this.daemon_task = None;
+                    krill_app_core::errors::daemon_connection_failed(cx, &e);
+                    this.link = Link::connect_failure(&daemon::Error::Io(e));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn connect_daemon_with_paths(&mut self, paths: Paths, cx: &mut Context<Self>) {
+        self.invalidate_account_cancel(&krill_app_core::hosts::HostId::Local);
+        let target = krill_app_core::hosts::HostTarget::local(paths.clone());
+        self.paths = Some(paths);
+        self.start_away_tracking(cx);
+        self.sidebar
+            .update(cx, |s, cx| s.connect(target.clone(), cx));
+        // 활성 작업공간이 원격이면 Changes 패널을 이 Mac의 저장소에 붙이지 않는다(같은 경로의 로컬 저장소는
+        // 다른 저장소다, APP-F01·F05). 원격 타깃은 `sync_hosts`가 끝난 뒤 `sync_diff_workspace`가 잇는다.
+        if self.active_workspace(cx).host.is_local() {
+            self.diff.update(cx, |d, cx| d.connect(target.clone(), cx));
+        }
+        self.sync_hosts(cx);
+        self.start_link_hosts(cx);
+        self.daemon_task = Some(cx.spawn(async move |this, cx| {
+            let hello = daemon::heartbeat_hello(ClientRole::App, "krill-app");
+            let bg = cx.background_executor().clone();
+            let (t, h) = (target.clone(), hello.clone());
+            let mut conn = match bg.spawn(async move { t.connect(&h) }).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "initial daemon connection failed; retrying");
+                    let link = Link::connect_failure(&e);
+                    let detail = e.to_string();
+                    let pending_report = cx.update(|cx| {
+                        krill_app_core::errors::defer_daemon_connection_failed(cx, &detail)
+                    });
+                    if this.update(cx, |this, cx| this.set_link(link, cx)).is_err() {
+                        return;
+                    }
+                    let (t, h) = (target.clone(), hello.clone());
+                    let conn = bg.spawn(async move { t.reconnect_until(&h) }).await;
+                    drop(pending_report);
+                    conn
+                }
+            };
+            // MK-062: 앱이 새 빌드면 구 krilld를 교체한다. 교체가 일어났거나 동시 교체가 감지되면
+            // 구 데몬의 감시 스트림으로 `wait_responsive`에 들어가기 전에 새 데몬으로 다시 붙는다.
+            let (t, h) = (target.clone(), hello.clone());
+            conn = bg
+                .spawn(async move {
+                    rebind_after_daemon_upgrade_with(&t, &h, conn, pane::upgrade_daemon)
+                })
+                .await;
+            loop {
+                let t = target.clone();
+                let appearance = bg
+                    .spawn(async move { krill_app_core::appearance::connect(&t) })
+                    .await;
+                let recording = bg.spawn(async { krill_app_core::recording::check() }).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.recording = recording;
+                        this.appearance = appearance
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(kind = ?error.kind(), "theme connection failed");
+                                None
+                            })
+                            .map(|writer| Box::new(writer) as Box<dyn std::io::Write>);
+                        this.push_appearance(cx);
+                        this.set_link(Link::Up, cx);
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if conn.launched {
+                    // 앱 기동 밖에서 찍히면 krilld가 holder 상실을 알린 것이다(고아 재결합).
+                    tracing::info!("daemon connection launched a new holder");
+                }
+                let features = conn.negotiated.features;
+                let mut stream = conn.stream;
+                if bg
+                    .spawn(async move { daemon::wait_responsive(&mut stream, features) })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("daemon stopped responding, reconnecting");
+                }
+                if this
+                    .update(cx, |this, cx| this.set_link(Link::Down, cx))
+                    .is_err()
+                {
+                    return;
+                }
+                let (t, h) = (target.clone(), hello.clone());
+                conn = bg.spawn(async move { t.reconnect_until(&h) }).await;
+            }
+        }));
+    }
+
+    fn apply_link_host_poll(
+        &mut self,
+        registrations: Option<Vec<krill_hosts::ExternalHost>>,
+        statuses: &[(
+            krill_hosts::RemoteHostSpec,
+            krill_app_core::hosts::HostStatus,
+        )],
+        info: &[(String, Option<krill_hosts::HostConnectionInfo>)],
+        last_info: &mut Option<Vec<(String, Option<krill_hosts::HostConnectionInfo>)>>,
+        cx: &mut Context<Self>,
+    ) {
+        let external_changed = registrations
+            .as_ref()
+            .is_some_and(|hosts| !same_external_hosts(hosts, &self.external_hosts));
+        let stale_target = self
+            .host_targets
+            .values()
+            .any(|target| !target.is_current());
+        let status_or_info_changed = !self.host_refresh_running
+            && (statuses != self.host_statuses.as_slice()
+                || last_info
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_slice() != info));
+        if !self.host_refresh_running {
+            *last_info = Some(info.to_vec());
+        }
+        if external_changed || stale_target || status_or_info_changed {
+            if let Some(hosts) = registrations {
+                self.external_hosts = hosts;
+            }
+            self.sync_hosts(cx);
+        }
+    }
+
+    fn start_link_hosts(&mut self, cx: &mut Context<Self>) {
+        if self.link_poll.is_some() {
+            return;
+        }
+        let Some(state) = self.state_dir(cx) else {
+            return;
+        };
+        let manager = self.host_manager.clone();
+        self.link_poll = Some(cx.spawn(async move |this, cx| {
+            let bg = cx.background_executor().clone();
+            let source_state = state.clone();
+            let service = bg
+                .spawn(async move {
+                    let executable = krill_app_core::hosts::link::executable();
+                    krill_app_core::hosts::link::LinkHosts::shared(state, executable)
+                })
+                .await;
+            let installed = this
+                .update(cx, |this, cx| {
+                    if this.state_dir(cx).as_ref() != Some(&source_state) {
+                        return false;
+                    }
+                    this.link_hosts = Some(service.clone());
+                    true
+                })
+                .unwrap_or(false);
+            if !installed {
+                return;
+            }
+            let mut last_info: Option<Vec<(String, Option<krill_hosts::HostConnectionInfo>)>> =
+                None;
+            loop {
+                let service = service.clone();
+                let manager = manager.clone();
+                let (registrations, statuses, info) = bg
+                    .spawn(async move {
+                        let registrations = service.registrations();
+                        let statuses = manager.statuses();
+                        let info: Vec<_> = statuses
+                            .iter()
+                            .map(|(spec, _)| (spec.id.clone(), manager.connection_info(&spec.id)))
+                            .collect();
+                        (registrations, statuses, info)
+                    })
+                    .await;
+                if this
+                    .update(cx, |shell, cx| {
+                        shell.apply_link_host_poll(
+                            registrations.ok(),
+                            &statuses,
+                            &info,
+                            &mut last_info,
+                            cx,
+                        );
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                bg.timer(Duration::from_secs(1)).await;
+            }
+        }));
+    }
+
+    pub(crate) fn sync_hosts(&mut self, cx: &mut Context<Self>) {
+        self.sync_hosts_after_reconnect(None, cx);
+    }
+
+    /// Every manager API may lock a slot owned by an SSH connection attempt.
+    /// UI code reads only these accepted snapshots; backend updates are ordered.
+    fn sync_hosts_after_reconnect(&mut self, reconnect: Option<String>, cx: &mut Context<Self>) {
+        if self.role == WindowRole::Floating {
+            return;
+        }
+        let hosts = self.ssh_hosts.clone();
+        let specs = krill_app_core::hosts::specs_from_ssh_hosts(&hosts);
+        let external = self.external_hosts.clone();
+        let allowed = specs.iter().chain(external.iter().map(|host| &host.spec));
+        let allowed = allowed.cloned().collect::<Vec<_>>();
+        self.host_statuses
+            .retain(|(spec, _)| allowed.contains(spec));
+        self.host_targets.retain(|host, _| {
+            self.host_statuses
+                .iter()
+                .any(|(spec, _)| *host == krill_app_core::hosts::HostId::Remote(spec.id.clone()))
+        });
+        self.purge_stale_remote_session_authority();
+        if let krill_app_core::hosts::HostId::Remote(id) = &self.launch_host
+            && !allowed.iter().any(|spec| &spec.id == id)
+        {
+            self.launch_host = krill_app_core::hosts::HostId::Local;
+        }
+        let source = HostSource {
+            specs: specs.clone(),
+            external: external
+                .iter()
+                .map(|host| (host.spec.clone(), host.socket.clone(), host.info.clone()))
+                .collect(),
+            paths: self.paths.clone(),
+        };
+        if self.host_source.as_ref() != Some(&source) {
+            self.host_generation = self.host_generation.wrapping_add(1);
+            self.host_source = Some(source);
+        }
+        if let Some(id) = reconnect {
+            self.host_generation = self.host_generation.wrapping_add(1);
+            self.host_pending_reconnects.push(id);
+        }
+        if self.host_refresh_running {
+            // One active operation and one latest refresh, independent of tick count.
+            self.host_refresh_again = true;
+            return;
+        }
+        self.host_refresh_running = true;
+        self.host_refresh_again = false;
+        #[cfg(test)]
+        {
+            self.host_sync_count += 1;
+        }
+        let generation = self.host_generation;
+        let reconnects = std::mem::take(&mut self.host_pending_reconnects);
+        let link_hosts = self.link_hosts.clone();
+        let manager = self.host_manager.clone();
+        let paths = self.paths.clone();
+        let (complete, result) = tokio::sync::oneshot::channel();
+        #[cfg(test)]
+        let gate = self.next_host_io.take();
+        cx.background_executor()
+            .spawn(async move {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.await.ok();
+                }
+                let aliases: BTreeMap<String, String> =
+                    krill_app_core::ssh_hosts::duplicate_hosts(&hosts)
+                        .into_iter()
+                        .collect();
+                let specs = specs
+                    .into_iter()
+                    .filter(|s| !aliases.contains_key(&s.id))
+                    .collect::<Vec<_>>();
+                manager.set_aliases(aliases.clone());
+                manager.sync_specs(&specs);
+                manager.sync_external_hosts(external);
+                for id in reconnects {
+                    if let Some(raw_id) = id.strip_prefix("iroh:")
+                        && let Some(service) = &link_hosts
+                    {
+                        service.paired(raw_id);
+                    }
+                    manager.reconnect_now(&id);
+                }
+                let statuses = manager.statuses();
+                let targets = statuses
+                    .iter()
+                    .filter_map(|(spec, _)| {
+                        let host = krill_app_core::hosts::HostId::Remote(spec.id.clone());
+                        manager
+                            .target_for(&host, paths.as_ref())
+                            .map(|target| (host, target))
+                    })
+                    .collect();
+                complete.send((statuses, targets, paths, aliases)).ok();
+            })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            let result = result.await;
+            this.update(cx, |this, cx| {
+                this.host_refresh_running = false;
+                if let Ok((statuses, targets, paths, aliases)) = result
+                    && this.host_generation == generation
+                    && this.paths == paths
+                {
+                    this.host_aliases = aliases;
+                    this.host_statuses = statuses;
+                    let prev_targets = std::mem::replace(&mut this.host_targets, targets);
+                    let invalidated: Vec<krill_app_core::hosts::HostId> = prev_targets
+                        .into_iter()
+                        .filter(|(host, old_target)| {
+                            this.host_targets.get(host) != Some(old_target)
+                        })
+                        .map(|(host, _)| host)
+                        .collect();
+                    if !invalidated.is_empty() {
+                        for host in &invalidated {
+                            krill_bots_ui::bots::invalidate_host_connections(host);
+                        }
+                        this.gone_sessions
+                            .retain(|(host, _)| !invalidated.contains(host));
+                        this.observed_sessions
+                            .retain(|(host, _)| !invalidated.contains(host));
+                        this.remote_orch_generations
+                            .retain(|host, _| !invalidated.contains(host));
+                    }
+                    this.purge_stale_remote_session_authority();
+                    this.prune_remote_orchestration(cx);
+                    this.remote_accounts
+                        .retain(|host, _| this.host_targets.contains_key(host));
+                    this.remote_account_handoff_polls
+                        .retain(|host, _| this.host_targets.contains_key(host));
+                    if this.launch_host.is_remote()
+                        && this.host_targets.contains_key(&this.launch_host)
+                        && !this.remote_orch_snapshots.contains_key(&this.launch_host)
+                    {
+                        let host = this.launch_host.clone();
+                        this.fetch_remote_orchestration(host, cx);
+                    }
+                    let connected_remotes: Vec<krill_app_core::hosts::HostId> = this
+                        .host_statuses
+                        .iter()
+                        .filter(|(_, status)| {
+                            *status == krill_app_core::hosts::HostStatus::Connected
+                        })
+                        .map(|(spec, _)| krill_app_core::hosts::HostId::Remote(spec.id.clone()))
+                        .collect();
+                    for host in connected_remotes {
+                        if !this.remote_accounts.contains_key(&host)
+                            && this.host_targets.contains_key(&host)
+                        {
+                            this.refresh_accounts_for_host(
+                                host,
+                                krill_proto::usage::UsageRequest::ListAccounts,
+                                cx,
+                            );
+                        }
+                    }
+                    if this.paths.is_some() {
+                        let manager = this.host_manager.clone();
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
+                    }
+                    this.sync_settings_account_hosts(cx);
+                    this.sync(cx);
+                    this.sync_diff_workspace(cx);
+                    this.refresh_bots_badge(cx);
+                    cx.notify();
+                }
+                if this.host_refresh_again || !this.host_pending_reconnects.is_empty() {
+                    this.sync_hosts_after_reconnect(None, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn local_target(&self) -> Option<krill_app_core::hosts::HostTarget> {
+        self.paths
+            .clone()
+            .map(krill_app_core::hosts::HostTarget::local)
+    }
+
+    pub(super) fn target_for_host(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+    ) -> Option<krill_app_core::hosts::HostTarget> {
+        match host {
+            krill_app_core::hosts::HostId::Local => self.local_target(),
+            krill_app_core::hosts::HostId::Remote(_) => self.host_targets.get(host).cloned(),
+        }
+    }
+
+    pub(super) fn target_for_pane(
+        &self,
+        pane: PaneId,
+    ) -> Option<krill_app_core::hosts::HostTarget> {
+        let host = self.layout.host(pane);
+        self.target_for_host(host)
+    }
+
+    fn purge_stale_remote_session_authority(&mut self) {
+        let keep = |host: &krill_app_core::hosts::HostId| {
+            host.is_local() || self.host_targets.contains_key(host)
+        };
+        self.gone_sessions.retain(|(host, _)| keep(host));
+        self.observed_sessions.retain(|(host, _)| keep(host));
+    }
+
+    fn has_active_account_handoff(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        let handoffs = &self.accounts_for_host(host).details.handoffs;
+        let sidebar = self.sidebar.read(cx);
+        let max_hops = handoffs.len().saturating_add(1);
+        handoffs.iter().any(|h| {
+            if h.from != session {
+                return false;
+            }
+            if h.to.is_none() {
+                return h.error.is_none();
+            }
+            let Some(mut target) = h.to else {
+                return false;
+            };
+            for _ in 0..max_hops {
+                let Some(next) = handoffs
+                    .iter()
+                    .find(|nh| nh.from == target)
+                    .and_then(|nh| nh.to)
+                else {
+                    break;
+                };
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            let target_closed = sidebar
+                .session_on(host, target)
+                .is_some_and(sidebar::Session::is_exited)
+                || sidebar.is_session_closed_on(host, target)
+                || self.gone_sessions.contains(&(host.clone(), target));
+            !target_closed
+        })
+    }
+
+    pub(super) fn expecting_account_replacement(
+        &self,
+        pane: PaneId,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.live
+            .get(&pane)
+            .is_some_and(|l| l.pane.awaiting_account_replacement() || l.pane.holds_account_input())
+            || self.sidebar.read(cx).session_account_pending(host, session)
+            || self.has_active_account_handoff(host, session, cx)
+    }
+
+    pub(super) fn blocks_session_prune(
+        &self,
+        pane: PaneId,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.expecting_account_replacement(pane, host, session, cx)
+    }
+
+    /// 상태바·새 세션·설정 진입 시 우선할 계정 대상 호스트.
+    /// 메뉴에서 원격 실행 위치(`launch_host`)를 골랐거나 원격 칸이 포커스된 상태면 그 원격 호스트를,
+    /// 그 외에는 로컬 호스트를 돌려준다.
+    pub(super) fn active_account_host(&self) -> krill_app_core::hosts::HostId {
+        if self.launch_host.is_remote() {
+            return self.launch_host.clone();
+        }
+        if !self.page_open()
+            && self.dashboard.is_none()
+            && let Some(pane) = self.layout.focused()
+            && self.layout.host(pane).is_remote()
+        {
+            return self.layout.host(pane).clone();
+        }
+        krill_app_core::hosts::HostId::Local
+    }
+
+    pub(super) fn accounts_for_host(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+    ) -> Arc<krill_proto::usage::AccountsSnapshot> {
+        match host {
+            krill_app_core::hosts::HostId::Local => self.accounts_snapshot.clone(),
+            krill_app_core::hosts::HostId::Remote(_) => {
+                self.remote_accounts.get(host).cloned().unwrap_or_else(|| {
+                    if self.host_targets.contains_key(host) {
+                        Arc::default()
+                    } else {
+                        self.accounts_snapshot.clone()
+                    }
+                })
+            }
+        }
+    }
+
+    fn machine_local_status(&self) -> krill_app_core::hosts::HostStatus {
+        match self.link {
+            Link::Up => krill_app_core::hosts::HostStatus::Connected,
+            Link::Connecting | Link::Down => krill_app_core::hosts::HostStatus::Connecting,
+            Link::Failed(_) | Link::Restricted => krill_app_core::hosts::HostStatus::Disconnected,
+        }
+    }
+
+    pub(super) fn sync_settings_account_hosts(&self, cx: &mut Context<Self>) {
+        let Some(settings) = self.settings() else {
+            return;
+        };
+        let mut hosts: Vec<(
+            krill_app_core::hosts::HostId,
+            String,
+            Option<krill_app_core::hosts::HostTarget>,
+        )> = self
+            .execution_locations(cx)
+            .into_iter()
+            .map(|(host, label)| {
+                let target = self.target_for_host(&host);
+                (host, label, target)
+            })
+            .collect();
+        let sidebar = self.sidebar.read(cx);
+        for (host, target) in &self.host_targets {
+            if !hosts.iter().any(|(h, _, _)| h == host) && !sidebar.is_suppressed_remote_host(host)
+            {
+                hosts.push((
+                    host.clone(),
+                    host.remote_id().unwrap_or_else(|| host.as_key()).to_owned(),
+                    Some(target.clone()),
+                ));
+            }
+        }
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(
+            krill_app_core::hosts::HostId::Local,
+            (*self.accounts_snapshot).clone(),
+        );
+        for (host, snap) in &self.remote_accounts {
+            snapshots.insert(host.clone(), (**snap).clone());
+        }
+        let settings = settings.clone();
+        let identities = self.sidebar.read(cx).machine_identities();
+        let statuses = self
+            .sidebar
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .map(|host| {
+                (
+                    krill_app_core::hosts::HostId::Remote(host.id.clone()),
+                    host.status,
+                )
+            })
+            .collect();
+        settings.update(cx, |v, cx| {
+            v.sync_account_hosts(hosts, snapshots, cx);
+            v.sync_machine_observations(identities, cx);
+            v.sync_machine_local_status(self.machine_local_status(), cx);
+            v.sync_machine_remote_statuses(statuses, cx);
+        });
+    }
+
+    pub(super) fn remote_target_for_pane(
+        &self,
+        pane: PaneId,
+    ) -> Option<(
+        krill_app_core::hosts::HostId,
+        krill_app_core::hosts::HostTarget,
+    )> {
+        let host = self.layout.host(pane);
+        if !host.is_remote() {
+            return None;
+        }
+        Some((host.clone(), self.target_for_host(host)?))
+    }
+
+    /// 터미널에서 클릭한 URL을 브라우저로 연다.
+    /// 원격 호스트 패인의 루프백 URL(`localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]`)이면
+    /// 로컬 포워딩 리스너(유휴 10분 뒤 자동 해제)를 먼저 준비하고 포워딩된 로컬 URL로 연다.
+    pub(super) fn open_terminal_url(&mut self, pane: PaneId, uri: &str, cx: &mut Context<Self>) {
+        let Some(uri) = krill_app_core::terminal::path_link::sanitize_external_url(uri) else {
+            return;
+        };
+        if let Some(remote_port) = krill_app_core::remote_fs::parse_loopback_http_url(&uri)
+            && self.layout.host(pane).is_remote()
+        {
+            let Some((host, target)) = self.remote_target_for_pane(pane) else {
+                self.notice = Some(format!(
+                    "{}: {}",
+                    self.layout.host(pane),
+                    krill_app_core::i18n::catalog::sidebar::HOST_DISCONNECTED.get()
+                ));
+                cx.notify();
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let forwarded = cx
+                    .background_executor()
+                    .spawn(async move {
+                        krill_app_core::remote_fs::ensure_port_forward(&host, &target, remote_port)
+                    })
+                    .await;
+                this.update(cx, |this, cx| match forwarded {
+                    Ok(local_port) => {
+                        let rewritten =
+                            krill_app_core::remote_fs::rewrite_loopback_url_port(&uri, local_port);
+                        cx.open_url(&rewritten);
+                    }
+                    Err(err) => {
+                        this.notice = Some(krill_app_core::errors::user_io_error(&err));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        cx.open_url(&uri);
+    }
+
+    fn sync_history_host(&self, cx: &mut Context<Self>) -> Option<String> {
+        let ws = self.active_workspace(cx);
+        let folder = self
+            .layout
+            .focused()
+            .map(|_| self.folder())
+            .unwrap_or_default();
+        let folder = if folder.as_os_str().is_empty() {
+            ws.folder
+        } else {
+            folder
+        };
+        let workspace = (!folder.as_os_str().is_empty()).then(|| folder.display().to_string());
+        let target = self.target_for_host(&ws.host);
+        self.history.update(cx, |history, cx| {
+            history.set_context(ws.host, target, workspace.clone(), Vec::new(), cx);
+        });
+        workspace
+    }
+
+    pub(super) fn sync_diff_workspace(&mut self, cx: &mut Context<Self>) {
+        let _ = self.sync_history_host(cx);
+        if self.layout.focused().is_none() {
+            return;
+        }
+        let ws = self.active_workspace(cx);
+        // Orca's bot page: the bot folder is the workspace, whatever the chat's cwd says yet.
+        let bot_home = self.focused_bot().and_then(|b| self.bot_folder(b));
+        let folder = bot_home.unwrap_or_else(|| {
+            let focused_folder = self.folder();
+            if focused_folder.as_os_str().is_empty() {
+                ws.folder
+            } else {
+                focused_folder
+            }
+        });
+        let target = self.target_for_host(&ws.host);
+        self.diff.update(cx, |d, cx| {
+            match target {
+                Some(target) => d.connect(target, cx),
+                // 원격 호스트인데 전송이 아직(시작 중) 없거나 더는(호스트 제거) 없다: 로컬 저장소에 붙은
+                // 채로 두지 않고 원격 모드로 닫아 둔다(APP-F01·F05). 로컬 호스트는 그대로 둔다.
+                None => d.disconnect_remote(&ws.host, cx),
+            }
+            if !folder.as_os_str().is_empty() {
+                d.set_repo(folder, cx);
+            }
+        });
+    }
+
+    pub(super) fn new_tab_on_launch_host(&mut self, cx: &mut Context<Self>) {
+        let host = self.launch_host.clone();
+        // Orca `createNewTerminalTab(activeWorktreeId)` 패리티: 선택된 워크스페이스가
+        // 실행 위치와 같은 호스트면 그 경로에서 새 세션을 시작한다.
+        if let Some((sel_host, folder)) = self.sidebar.read(cx).selected_workspace()
+            && sel_host == host
+        {
+            self.new_folder_tab_on(host, &folder, Program::Login, cx);
+            return;
+        }
+        // A live or restored active tab may predate the sidebar selection/poll.
+        // Keep its launch workspace instead of falling back to the default folder.
+        if let Some(pane) = self.layout.focused()
+            && self.layout.host(pane) == &host
+        {
+            let folder = self.folder();
+            self.new_folder_tab_on(host, &folder, Program::Login, cx);
+            return;
+        }
+        self.change(true, cx, |l| {
+            l.new_tab();
+            if host.is_remote()
+                && let Some(pane) = l.focused()
+            {
+                l.set_host(pane, host);
+            }
+        });
+    }
+
+    fn push_appearance(&mut self, cx: &mut Context<Self>) {
+        let theme = krill_app_core::ui::terminal_theme(cx);
+        self.terminal_theme = theme;
+        let push = Push {
+            theme,
+            cell: self.cell_pixels,
+        };
+        if let Err(error) = krill_app_core::appearance::push(self.appearance.as_mut(), push) {
+            tracing::warn!(kind = ?error.kind(), "theme push failed");
+        }
+        cx.notify();
+    }
+
+    pub(super) fn state_dir(&self, cx: &App) -> Option<PathBuf> {
+        self.path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(PathBuf::from)
+            .or_else(|| {
+                let parent = self.paths.as_ref()?.socket.parent()?;
+                if parent.file_name().is_some_and(|n| n == "run") {
+                    parent.parent().map(PathBuf::from)
+                } else {
+                    Some(parent.to_path_buf())
+                }
+            })
+            .or_else(|| krill_app_core::settings::state_dir(cx))
+    }
+
+    fn on_config_changed(&mut self, cx: &mut Context<Self>) {
+        // 터미널 테마만 바뀌면 앱 Theme는 그대로라 전역 테마 관찰자가 호출되지 않는다.
+        if self.terminal_theme != krill_app_core::ui::terminal_theme(cx) {
+            self.push_appearance(cx);
+        }
+        if let Some(settings) = self.settings() {
+            let (selected_host, selected_snap) = {
+                let view = settings.read(cx);
+                (view.account_host().clone(), view.accounts().clone())
+            };
+            if selected_host.is_remote() {
+                self.remote_accounts
+                    .insert(selected_host, Arc::new(selected_snap));
+            }
+        }
+        self.refresh_local_state(cx);
+        let active_host = self.active_account_host();
+        if active_host.is_remote() && self.host_targets.contains_key(&active_host) {
+            self.refresh_accounts_for_host(
+                active_host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+        }
+        self.sidebar
+            .update(cx, krill_app_core::sidebar::Sidebar::reload_external);
+        if let Some(host) = krill_app_core::settings::take_pending_ssh_connect(cx) {
+            self.close_settings(None, cx);
+            self.connect_ssh_host(&host, None, cx);
+            if let Some(win) = self.window {
+                let focus = self.focus.clone();
+                cx.defer(move |cx| {
+                    win.update(cx, |_, window, cx| {
+                        window.activate_window();
+                        window.focus(&focus, cx);
+                    })
+                    .ok();
+                });
+            }
+        }
+        let cmd_host = krill_app_core::settings::take_pending_terminal_host(cx)
+            .unwrap_or(krill_app_core::hosts::HostId::Local);
+        let mut ran_terminal_cmd = false;
+        while let Some(cmd) = krill_app_core::settings::take_pending_terminal_command(cx) {
+            if !ran_terminal_cmd {
+                self.close_settings(None, cx);
+                ran_terminal_cmd = true;
+            }
+            self.run_terminal_command_on(&cmd_host, &cmd, None, cx);
+        }
+        if ran_terminal_cmd && let Some(win) = self.window {
+            let focus = self.focus.clone();
+            cx.defer(move |cx| {
+                win.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    window.focus(&focus, cx);
+                })
+                .ok();
+            });
+        }
+        let permission = krill_app_core::settings::take_pending_permission(cx);
+        let agents_changed = krill_app_core::settings::take_pending_agents_reload(cx);
+        if permission.is_some() || agents_changed {
+            self.load_agents(permission, cx);
+        }
+        // 설정 창이 닫힌 뒤에도 보여야 할 안내(예: ssh-copy-id 비밀번호 입력)를 메인 창 배너로 잇는다(OWE-884).
+        if let Some(msg) = krill_app_core::settings::take_pending_notice(cx) {
+            self.notice = Some(msg);
+        }
+        cx.notify();
+    }
+
+    /// AS-10: 계정 스냅샷·SSH 호스트 읽기를 백그라운드로 미룬다. 설정 토글·1초 폴링·
+    /// 외부 변경 때마다 호출되므로 동기 IO(`~/.codex/sessions` 재귀 stat 등)면 매번
+    /// UI 스레드가 멈춘다. 결과는 UI 스레드에서 반영한다.
+    /// OWE-697: 데몬이 연결돼 있으면 계정은 데몬 `ListAccounts` 응답만 쓴다. 로컬 파일은 데몬이
+    /// 없을 때 읽기 전용으로만 읽는다.
+    fn refresh_local_state(&mut self, cx: &mut Context<Self>) {
+        self.local_generation = self.local_generation.wrapping_add(1);
+        let generation = self.local_generation;
+        if self.link == Link::Up {
+            self.refresh_accounts_for_host(
+                krill_app_core::hosts::HostId::Local,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+            self.refresh_ssh_hosts(cx);
+            self.refresh_bots_badge(cx);
+            return;
+        }
+        let home = krill_app_core::accounts::default_home();
+        let dir = self.state_dir(cx);
+        let Some(stamp) = self.account_read_stamp(&krill_app_core::hosts::HostId::Local) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let hosts = krill_app_core::ssh_hosts::load_hosts(dir.as_deref());
+                    let snap = krill_app_core::accounts::refresh_local(&home, dir.as_deref());
+                    (hosts, snap)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.local_generation != generation
+                    || this.link == Link::Up
+                    || !this.account_read_is_current(&stamp)
+                {
+                    return;
+                }
+                let (hosts, snap) = loaded;
+                this.ssh_hosts = hosts;
+                this.sync_hosts(cx);
+                this.apply_accounts_snapshot(snap, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// AS-10: SSH 호스트 목록만 백그라운드에서 다시 읽는다(재연결 때마다 UI를 막지 않게).
+    fn refresh_ssh_hosts(&mut self, cx: &mut Context<Self>) {
+        self.ssh_generation = self.ssh_generation.wrapping_add(1);
+        let generation = self.ssh_generation;
+        let dir = self.state_dir(cx);
+        cx.spawn(async move |this, cx| {
+            let hosts = cx
+                .background_executor()
+                .spawn(async move { krill_app_core::ssh_hosts::load_hosts(dir.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.ssh_generation != generation {
+                    return;
+                }
+                this.ssh_hosts = hosts;
+                this.sync_hosts(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_link(&mut self, link: Link, cx: &mut Context<Self>) {
+        if self.link != link {
+            self.invalidate_account_cancel(&krill_app_core::hosts::HostId::Local);
+        }
+        if link != Link::Up {
+            krill_app_core::alert::disconnected(cx);
+            self.appearance = None;
+        }
+        let reconnecting = link == Link::Down;
+        self.sidebar
+            .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
+        if self.link != Link::Up && link == Link::Up {
+            self.restore_generation = self.restore_generation.wrapping_add(1);
+            for old in self.restore_on_reconnect.drain() {
+                self.restore_attempted.remove(&old);
+            }
+        }
+        self.link = link;
+        if let Some(settings) = self.settings() {
+            settings.update(cx, |view, cx| {
+                view.sync_machine_local_status(self.machine_local_status(), cx);
+            });
+        }
+        self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
+        if self.link == Link::Up {
+            self.load_agents(None, cx);
+            self.refresh_accounts_for_host(
+                krill_app_core::hosts::HostId::Local,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+            self.refresh_ssh_hosts(cx);
+            if self.role == WindowRole::Main
+                && self.update_poll.is_none()
+                && let Some(bg_dir) = self.state_dir(cx)
+            {
+                self.update_poll = Some(Self::poll_updates(bg_dir, cx));
+            }
+            self.sync(cx);
+            self.refresh_detached(cx);
+            self.refresh_bots_badge(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn refresh_usage_manually(&mut self, cx: &mut Context<Self>) {
+        if self.usage_refresh.is_some() {
+            return;
+        }
+        let host = self.active_account_host();
+        let target = match &host {
+            krill_app_core::hosts::HostId::Local => self
+                .paths
+                .clone()
+                .filter(|_| self.link == Link::Up)
+                .map(krill_app_core::hosts::HostTarget::local),
+            krill_app_core::hosts::HostId::Remote(_) => self.target_for_host(&host),
+        };
+        let Some(target) = target else {
+            self.refresh_accounts_for_host(
+                host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+            return;
+        };
+        let Some(stamp) = self.account_read_stamp(&host) else {
+            return;
+        };
+        cx.notify();
+        self.usage_refresh = Some(cx.spawn(async move |this, cx| {
+            let first = cx
+                .background_executor()
+                .spawn({
+                    let target = target.clone();
+                    async move {
+                        // 사용자가 누른 새로고침만 조회 주기를 무시한다. 구 데몬은 `ListAccounts`로.
+                        krill_app_core::accounts::request_target(
+                            &target,
+                            &krill_proto::usage::UsageRequest::RefreshUsage,
+                        )
+                        .or_else(|_| {
+                            krill_app_core::accounts::request_target(
+                                &target,
+                                &krill_proto::usage::UsageRequest::ListAccounts,
+                            )
+                        })
+                    }
+                })
+                .await;
+            let ok = this
+                .update(cx, |this, cx| {
+                    if !this.account_read_is_current(&stamp) {
+                        this.usage_refresh = None;
+                        return false;
+                    }
+                    match first {
+                        Ok(snap) => {
+                            this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
+                            true
+                        }
+                        Err(e) => {
+                            this.usage_refresh = None;
+                            this.notice = Some(e);
+                            cx.notify();
+                            false
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            if !ok {
+                return;
+            }
+            for delay_ms in [700_u64, 1_100] {
+                cx.background_executor()
+                    .timer(Duration::from_millis(delay_ms))
+                    .await;
+                let Ok(Some(stamp)) =
+                    this.read_with(cx, |this, _| this.account_read_stamp_for(&host, &target))
+                else {
+                    continue;
+                };
+                let follow = cx
+                    .background_executor()
+                    .spawn({
+                        let target = target.clone();
+                        async move {
+                            krill_app_core::accounts::request_target(
+                                &target,
+                                &krill_proto::usage::UsageRequest::ListAccounts,
+                            )
+                        }
+                    })
+                    .await;
+                if let Ok(snap) = follow {
+                    let host = host.clone();
+                    this.update(cx, |this, cx| {
+                        if this.account_read_is_current(&stamp) {
+                            this.apply_accounts_snapshot_for_host(host, snap, cx);
+                        }
+                    })
+                    .ok();
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.usage_refresh = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 주기·정상 종료 때 마지막 생존 시각을 레이아웃에 쓴다.
+    fn start_away_tracking(&mut self, cx: &mut Context<Self>) {
+        if self.path.is_none() || self.role != WindowRole::Main || self.heartbeat.is_some() {
+            return;
+        }
+        self.heartbeat = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(away::HEARTBEAT).await;
+                if this.update(cx, |this, _| this.touch_last_seen()).is_err() {
+                    return;
+                }
+            }
+        }));
+        // 정상 종료·업데이트 재시작(`cx.quit`)은 종료 직전 시각을 디스크까지 쓴다. kill -9는 마지막 주기 저장값이 남는다.
+        self.app_quit = Some(cx.on_app_quit(|this, cx| {
+            if !this.quit_layout_ready.replace(false) {
+                this.touch_last_seen();
+            }
+            let barrier = this.layout_barrier(cx);
+            async move {
+                let _ = barrier.await;
+            }
+        }));
+    }
+
+    fn touch_last_seen(&mut self) {
+        // A lifecycle timestamp is not a user edit and must not invalidate the
+        // baseline while the saved layout is still being read.
+        if self.layout_loading {
+            return;
+        }
+        self.layout.set_last_seen_unix_ns(away::now_ns());
+        self.save();
+    }
+
+    fn poll_updates(state_dir: PathBuf, cx: &mut Context<Self>) -> Task<()> {
+        // 4시간이면 앱을 켠 뒤 낸 릴리스가 반나절 가까이 안 보였다(사용자 지적). 매니페스트 한 번 받는 일이라 30분마다 본다.
+        const UPDATE_POLL_INTERVAL: Duration = Duration::from_mins(30);
+        const DISK_FULL_RETRY_INTERVAL: Duration = Duration::from_hours(6);
+        cx.spawn(async move |this, cx| {
+            loop {
+                let dir = state_dir.clone();
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { krill_app_core::updater::poll_env_update(&dir) })
+                    .await;
+                let retry_interval = if res
+                    .as_ref()
+                    .is_err_and(krill_app_core::updater::Error::is_disk_full)
+                {
+                    DISK_FULL_RETRY_INTERVAL
+                } else {
+                    UPDATE_POLL_INTERVAL
+                };
+                if let Ok(Some(staged)) = res {
+                    let automatic = this
+                        .read_with(cx, |_, cx| {
+                            krill_app_core::settings::current(cx).auto_restart_update
+                        })
+                        .unwrap_or(false);
+                    let keep_going = this
+                        .update(cx, |_, cx| {
+                            if staged.relaunched {
+                                files::quit_app(cx);
+                                return;
+                            }
+                            let mut u = cx
+                                .try_global::<krill_app_core::updater::UpdateState>()
+                                .cloned()
+                                .unwrap_or_default();
+                            if u.restart.is_starting() {
+                                return;
+                            }
+                            if u.staged.as_ref() != Some(&staged) {
+                                u.restart = krill_app_core::updater::RestartStatus::Idle;
+                            }
+                            u.staged = Some(staged.clone());
+                            u.status = krill_app_core::updater::CheckStatus::Ready(staged.clone());
+                            u.card_collapsed = false;
+                            cx.set_global(u);
+                            cx.refresh_windows();
+                            cx.notify();
+                            if automatic {
+                                krill_app_core::updater::restart_staged_update(staged, cx);
+                            }
+                        })
+                        .is_ok();
+                    if !keep_going {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(retry_interval).await;
+            }
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn refresh_accounts(
+        &mut self,
+        req: krill_proto::usage::UsageRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.active_account_host();
+        self.refresh_accounts_for_host(host, req, cx);
+    }
+
+    pub(super) fn refresh_accounts_for_host(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        req: krill_proto::usage::UsageRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let mutating = !matches!(req, krill_proto::usage::UsageRequest::ListAccounts);
+        if mutating && self.defer_account_mutation(&host) {
+            let source = self.target_for_host(&host);
+            self.account_deferred
+                .push((source, account_input::DeferredMutation::Refresh(host, req)));
+            return;
+        }
+        let read_stamp = (!mutating)
+            .then(|| self.account_read_stamp(&host))
+            .flatten();
+        if !mutating && read_stamp.is_none() {
+            return;
+        }
+        if mutating {
+            self.invalidate_account_cancel(&host);
+        }
+        if let krill_proto::usage::UsageRequest::SwitchAccount {
+            provider,
+            account_id,
+        }
+        | krill_proto::usage::UsageRequest::SwitchAccountOnly {
+            provider,
+            account_id,
+        } = &req
+        {
+            krill_app_core::accounts::mark_in_app_switch(
+                host.clone(),
+                *provider,
+                account_id.clone(),
+                cx,
+            );
+        }
+        let switch_sessions = match &req {
+            krill_proto::usage::UsageRequest::SwitchSelectedSessions { sessions, .. } => {
+                sessions.clone()
+            }
+            krill_proto::usage::UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            } => {
+                let targets = self
+                    .sidebar
+                    .read(cx)
+                    .live_sessions_for_account_switch(&host, *provider, account_id);
+                if !targets.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for &sid in &targets {
+                            s.mark_session_account_pending(
+                                host.clone(),
+                                sid,
+                                account_id.clone(),
+                                cx,
+                            );
+                        }
+                    });
+                }
+                targets
+            }
+            _ => Vec::new(),
+        };
+        if host.is_remote() {
+            let Some(target) = self.target_for_host(&host) else {
+                if !switch_sessions.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
+                        }
+                    });
+                }
+                if mutating {
+                    self.notice = Some(
+                        krill_app_core::i18n::catalog::sidebar::HOST_DISCONNECTED
+                            .get()
+                            .into(),
+                    );
+                    cx.notify();
+                }
+                return;
+            };
+            if mutating {
+                self.begin_account_mutation(&host);
+            }
+            let operation_stamp = self.account_operation_stamp(&host);
+            cx.spawn(async move |this, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        krill_app_core::accounts::request_target_with_features(&target, &req)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                    if mutating {
+                        this.finish_account_mutation(&host, cx);
+                    }
+                    let apply_ok = current
+                        && (mutating
+                            || read_stamp
+                                .as_ref()
+                                .is_some_and(|stamp| this.account_read_is_current(stamp)));
+                    if apply_ok {
+                        match res {
+                            Ok((snap, features)) => {
+                                this.sidebar.update(cx, |s, cx| {
+                                    s.set_session_account_features(host.clone(), features, cx);
+                                });
+                                this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
+                                if mutating {
+                                    cx.defer(krill_app_core::settings::notify_external_change);
+                                }
+                            }
+                            Err(e) => {
+                                if mutating {
+                                    this.notice = Some(e);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }
+                    if !switch_sessions.is_empty() {
+                        this.sidebar.update(cx, |s, cx| {
+                            for sid in &switch_sessions {
+                                s.finish_session_account_switch(&host, *sid, cx);
+                            }
+                        });
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
+            let state_dir = self.state_dir(cx);
+            // OWE-697: 실제 상태 디렉터리에서 데몬 없이 계정을 바꾸지 않는다(읽기 전용).
+            // 로컬 변이는 데몬 없는 임시 상태 디렉터리(테스트)에서만 쓴다.
+            if mutating && state_dir == krill_proto::daemon::state_dir() {
+                if !switch_sessions.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
+                        }
+                    });
+                }
+                self.notice = Some(
+                    krill_app_core::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED
+                        .get()
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+            self.local_generation = self.local_generation.wrapping_add(1);
+            let generation = self.local_generation;
+            if mutating {
+                self.begin_account_mutation(&host);
+            }
+            let operation_stamp = self.account_operation_stamp(&host);
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        krill_app_core::accounts::request_local(
+                            &krill_app_core::accounts::default_home(),
+                            state_dir.as_deref(),
+                            &req,
+                        )
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                    if mutating {
+                        this.finish_account_mutation(&host, cx);
+                    }
+                    let apply_ok = current
+                        && (mutating
+                            || read_stamp
+                                .as_ref()
+                                .is_some_and(|stamp| this.account_read_is_current(stamp)))
+                        && this.local_generation == generation
+                        && this.link != Link::Up;
+                    if apply_ok && let Ok(snap) = result {
+                        this.apply_accounts_snapshot(snap, cx);
+                        if mutating {
+                            cx.defer(krill_app_core::settings::notify_external_change);
+                        }
+                    }
+                    if !switch_sessions.is_empty() {
+                        this.sidebar.update(cx, |s, cx| {
+                            for sid in &switch_sessions {
+                                s.finish_session_account_switch(&host, *sid, cx);
+                            }
+                        });
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        };
+        if mutating {
+            self.begin_account_mutation(&host);
+        }
+        let operation_stamp = self.account_operation_stamp(&host);
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    krill_app_core::accounts::request_target_with_features(
+                        &krill_app_core::hosts::HostTarget::local(paths),
+                        &req,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let current = !mutating || this.account_operation_is_current(&operation_stamp);
+                if mutating {
+                    this.finish_account_mutation(&host, cx);
+                }
+                let apply_ok = current
+                    && (mutating
+                        || read_stamp
+                            .as_ref()
+                            .is_some_and(|stamp| this.account_read_is_current(stamp)));
+                if apply_ok {
+                    match res {
+                        Ok((snap, features)) => {
+                            this.sidebar.update(cx, |s, cx| {
+                                s.set_session_account_features(
+                                    krill_app_core::hosts::HostId::Local,
+                                    features,
+                                    cx,
+                                );
+                            });
+                            this.apply_accounts_snapshot(snap, cx);
+                            if mutating {
+                                cx.defer(krill_app_core::settings::notify_external_change);
+                            }
+                        }
+                        Err(e) => {
+                            if mutating {
+                                this.notice = Some(e);
+                                cx.notify();
+                            } else {
+                                tracing::debug!(error = %e, "background account refresh failed");
+                            }
+                        }
+                    }
+                }
+                if !switch_sessions.is_empty() {
+                    this.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
+                        }
+                    });
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Codex banked reset 크레딧 소진(상태바 사용량 팝업의 "사용량 초기화" 확인 단계).
+    /// 데몬 전용이다. 성공하면 스냅샷을 적용하고 소진 결과를 배너로 알린 뒤,
+    /// 백그라운드 재조회가 끝날 때까지 숫자를 당겨오게 새로고침을 예약한다.
+    pub(super) fn consume_reset_credit(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.active_account_host();
+        self.consume_reset_credit_for_host(host, provider, account_id, cx);
+    }
+
+    pub(super) fn consume_reset_credit_for_host(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::usage::{ResetConsumeOutcome, UsageRequest};
+        self.reset_armed = None;
+        let req = UsageRequest::ConsumeResetCredit {
+            provider,
+            account_id,
+        };
+        let target = match &host {
+            krill_app_core::hosts::HostId::Local => self
+                .paths
+                .clone()
+                .filter(|_| self.link == Link::Up)
+                .map(krill_app_core::hosts::HostTarget::local),
+            krill_app_core::hosts::HostId::Remote(_) => self.target_for_host(&host),
+        };
+        let Some(target) = target else {
+            self.notice = Some(
+                krill_app_core::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED
+                    .get()
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(stamp) = self.account_read_stamp(&host) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    krill_app_core::accounts::consume_reset_credit_target(&target, &req)
+                })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(consumed) => {
+                    if this.account_read_is_current(&stamp) {
+                        this.apply_accounts_snapshot_for_host(host, consumed.snapshot, cx);
+                    }
+                    this.notice = Some(match consumed.outcome {
+                        ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
+                            krill_app_core::i18n::catalog::status::PROVIDER_RESET_USAGE_DONE
+                                .format(&[("n", &consumed.windows_reset.to_string())])
+                        }
+                        ResetConsumeOutcome::NothingToReset => {
+                            krill_app_core::i18n::catalog::status::PROVIDER_RESET_USAGE_NOTHING
+                                .get()
+                                .to_owned()
+                        }
+                        ResetConsumeOutcome::NoCredit => {
+                            krill_app_core::i18n::catalog::status::PROVIDER_RESET_USAGE_NO_CREDIT
+                                .get()
+                                .to_owned()
+                        }
+                    });
+                    cx.defer(krill_app_core::settings::notify_external_change);
+                    this.refresh_usage_manually(cx);
+                }
+                Err(e) => {
+                    this.notice = Some(e);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn apply_accounts_snapshot(
+        &mut self,
+        snap: krill_proto::usage::AccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_accounts_snapshot_for_host(krill_app_core::hosts::HostId::Local, snap, cx);
+    }
+
+    pub(super) fn apply_accounts_snapshot_for_host(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        snap: krill_proto::usage::AccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.observe_external_switches(&host, &snap, cx);
+        if snap.details.supported {
+            for handoff in &snap.details.handoffs {
+                if handoff.to.is_none() {
+                    self.observe_account_hold(&host, handoff);
+                }
+            }
+        }
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.sync_session_accounts(&host, Arc::new(snap.clone()), cx);
+        });
+        self.prune_stale_account_dismissals(&host, cx);
+        let mut input_notices = Vec::new();
+        let mut failed_detached = Vec::new();
+        for (pane, live) in &mut self.live {
+            if self.layout.host(*pane) != &host || !snap.details.supported {
+                continue;
+            }
+            let session = self.layout.session(*pane);
+            let handoff = session
+                .and_then(|session| snap.details.handoffs.iter().find(|h| h.from == session));
+            match handoff {
+                Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
+                Some(h) if h.to.is_some() => {} // moved below, retaining unsent input
+                Some(_) => {
+                    // A pane that kept its picture for the replacement learns the original's fate again.
+                    if live.pane.awaiting_account_replacement() && !live.pane.is_linked() {
+                        failed_detached.push(*pane);
+                    }
+                    input_notices.extend(live.pane.resume_account_input(true, Now::get()));
+                }
+                None => {
+                    // Observations cannot authorize delivery to the original account. If a pane
+                    // was detached awaiting a switch with no held bytes and no pending RPC, let it
+                    // reconnect so it is never stranded disconnected after a cancelled switch.
+                    if live.pane.awaiting_account_replacement()
+                        && !live.pane.is_linked()
+                        && !live.pane.holds_account_input()
+                        && session.is_some_and(|sid| {
+                            !self.sidebar.read(cx).session_account_pending(&host, sid)
+                        })
+                    {
+                        input_notices.extend(live.pane.resume_account_input(false, Now::get()));
+                        failed_detached.push(*pane);
+                    }
+                }
+            }
+        }
+        for pane in failed_detached {
+            if let Some(target) = self.target_for_pane(pane) {
+                let task = Self::spawn_pane(pane, target, None, cx);
+                if let Some(live) = self.live.get_mut(&pane) {
+                    live.task = task;
+                }
+            }
+        }
+        let mut rebound = false;
+        let mut rebound_bot = false;
+        let mut reconnect = std::collections::BTreeSet::new();
+        // Durable handoffs can form A -> B -> C while this window is closed.
+        for _ in 0..snap.details.handoffs.len().min(128) {
+            let mut changed = false;
+            for handoff in &snap.details.handoffs {
+                if let Some(to) = handoff.to.filter(|to| *to != handoff.from) {
+                    if !self.account_hold_target_matches(&host, handoff.from) {
+                        continue;
+                    }
+                    let bot_sidebar_rebound = self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.rebind_bot_session(&host, handoff.from, to, cx)
+                    });
+                    let bot_ui_rebound = self.rebind_bot_session_ui(&host, handoff.from, to);
+                    rebound_bot |= bot_sidebar_rebound || bot_ui_rebound;
+                    let panes = self.layout.rebind_session(&host, handoff.from, to);
+                    if !panes.is_empty() {
+                        self.account_holds.remove(&(host.clone(), handoff.from));
+                        self.dismissed_stale_account_banners
+                            .remove(&(host.clone(), handoff.from));
+                        self.gone_sessions.remove(&(host.clone(), handoff.from));
+                        self.gone_sessions.remove(&(host.clone(), to));
+                        self.workspace_closing.remove(&(host.clone(), handoff.from));
+                        self.workspace_closing.remove(&(host.clone(), to));
+                        // View choices, transcript, draft, and scroll position stay on the rebound panes.
+                        self.rebind_chat_session(&host, handoff.from, to, &panes);
+                        self.on_chat_session_rebound(&host, handoff.from, to, cx);
+                    }
+                    changed |= !panes.is_empty();
+                    for pane in panes {
+                        self.drop_stale_pastes_for_pane(pane, Some(to), cx);
+                        if let Some(live) = self.live.get_mut(&pane) {
+                            live.cut();
+                            input_notices.extend(live.pane.handoff_account(to));
+                            live.ime.clear_pending();
+                            live.echo = EchoDraw::default();
+                            live.painted = Rc::default();
+                            live.error = None;
+                            live.clear_selection();
+                            reconnect.insert(pane);
+                        }
+                    }
+                } else if let Some(error) = &handoff.error
+                    && self.layout.sessions_for_host(&host).contains(&handoff.from)
+                    && !self
+                        .account_holds
+                        .get(&(host.clone(), handoff.from))
+                        .is_some_and(|hold| self.can_recover_account_input(hold, cx))
+                    && self.handoff_errors.insert(error.clone())
+                {
+                    // Failure preserves held input until an explicit cancellation is acknowledged.
+                    self.notice = Some(krill_app_core::i18n::sanitize_handoff_error(error));
+                }
+            }
+            rebound |= changed;
+            if !changed {
+                break;
+            }
+        }
+        if host.is_local() {
+            self.handoff_errors.retain(|error| {
+                snap.details
+                    .handoffs
+                    .iter()
+                    .any(|h| h.error.as_ref() == Some(error))
+            });
+        }
+        let pending = snap
+            .details
+            .handoffs
+            .iter()
+            .any(|h| h.to.is_none() && h.error.is_none());
+        if let Some(settings) = self.settings() {
+            let host_clone = host.clone();
+            let snap_clone = snap.clone();
+            settings.update(cx, |settings, cx| {
+                settings.update_accounts_snapshot_for_host(&host_clone, snap_clone, cx);
+            });
+        }
+        if host.is_local() {
+            self.accounts_snapshot = Arc::new(snap);
+        } else {
+            self.remote_accounts.insert(host.clone(), Arc::new(snap));
+        }
+        if rebound {
+            for pane in reconnect {
+                if let Some(target) = self.target_for_pane(pane) {
+                    let task = Self::spawn_pane(pane, target, None, cx);
+                    if let Some(live) = self.live.get_mut(&pane) {
+                        live.task = task;
+                    }
+                }
+            }
+            self.sync(cx);
+            self.sync_focused_session(cx);
+            self.sync_sidebar_tab_state(cx);
+            self.save();
+            self.refresh_detached(cx);
+            self.poll_visible_chats(cx);
+        }
+        if rebound_bot {
+            self.refresh_bots_badge(cx);
+        }
+        for notice in &input_notices {
+            self.show(Some(notice), cx);
+        }
+        self.recover_account_input(cx);
+        self.reconcile_workspace_sessions(cx);
+        self.sync_auto_continue_for_host(&host, cx);
+        if pending {
+            if host.is_local() {
+                if self.account_handoff_poll.is_none()
+                    && self.paths.is_some()
+                    && self.link == Link::Up
+                {
+                    self.account_handoff_poll = Some(cx.spawn(async move |this, cx| {
+                        for _ in 0..120 {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(500))
+                                .await;
+                            let pending = this
+                                .update(cx, |this, cx| {
+                                    this.refresh_accounts_for_host(
+                                        krill_app_core::hosts::HostId::Local,
+                                        krill_proto::usage::UsageRequest::ListAccounts,
+                                        cx,
+                                    );
+                                    this.accounts_snapshot
+                                        .details
+                                        .handoffs
+                                        .iter()
+                                        .any(|h| h.to.is_none() && h.error.is_none())
+                                })
+                                .unwrap_or(false);
+                            if !pending {
+                                break;
+                            }
+                        }
+                        this.update(cx, |this, _| {
+                            this.account_handoff_poll = None;
+                        })
+                        .ok();
+                    }));
+                }
+            } else if !self.remote_account_handoff_polls.contains_key(&host)
+                && self.target_for_host(&host).is_some()
+            {
+                let poll_host = host.clone();
+                let task = cx.spawn(async move |this, cx| {
+                    for _ in 0..120 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(500))
+                            .await;
+                        let host_for_update = poll_host.clone();
+                        let pending = this
+                            .update(cx, |this, cx| {
+                                this.refresh_accounts_for_host(
+                                    host_for_update.clone(),
+                                    krill_proto::usage::UsageRequest::ListAccounts,
+                                    cx,
+                                );
+                                this.accounts_for_host(&host_for_update)
+                                    .details
+                                    .handoffs
+                                    .iter()
+                                    .any(|h| h.to.is_none() && h.error.is_none())
+                            })
+                            .unwrap_or(false);
+                        if !pending {
+                            break;
+                        }
+                    }
+                    this.update(cx, |this, _| {
+                        this.remote_account_handoff_polls.remove(&poll_host);
+                    })
+                    .ok();
+                });
+                self.remote_account_handoff_polls.insert(host, task);
+            }
+        }
+        cx.notify();
+    }
+
+    fn rebind_bot_session_ui(
+        &mut self,
+        host: &krill_app_core::hosts::HostId,
+        from: krill_proto::SessionId,
+        to: krill_proto::SessionId,
+    ) -> bool {
+        let mut touched = false;
+        for bot in &mut self.sidebar_bots {
+            if &bot.host != host {
+                continue;
+            }
+            for session in &mut bot.sessions {
+                if session.session_id == from {
+                    session.session_id = to;
+                    session.live = true;
+                    touched = true;
+                }
+            }
+        }
+        if let Some(entry) = self.bot_ui.hosts.get_mut(host) {
+            for bot in &mut entry.snapshot.bots {
+                for session in &mut bot.sessions {
+                    if session.session_id == from {
+                        session.session_id = to;
+                        session.live = true;
+                        touched = true;
+                    }
+                }
+            }
+        }
+        let from_key = (host.clone(), from);
+        let to_key = (host.clone(), to);
+        if self.bot_ui.folded_chats.remove(&from_key) {
+            self.bot_ui.folded_chats.insert(to_key.clone());
+            touched = true;
+        }
+        if let Some(steps) = self.bot_ui.chat_steps.remove(&from_key) {
+            self.bot_ui.chat_steps.insert(to_key.clone(), steps);
+            touched = true;
+        }
+        if self.bot_ui.panel.chat_folded.remove(&from_key) {
+            self.bot_ui.panel.chat_folded.insert(to_key);
+            touched = true;
+        }
+        if touched {
+            self.bot_ui.panel.stale = true;
+        }
+        touched
+    }
+
+    pub(super) fn connect_ssh_host(
+        &mut self,
+        host: &krill_app_core::ssh_hosts::SshHost,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = krill_app_core::ssh_hosts::build_connect_command(host);
+        self.run_terminal_command(&cmd, window, cx);
+    }
+
+    /// Orca 스타일 설정/온보딩 터미널 자동 실행: 현재 포커스된 패인이 유휴 로컬 셸이 아니면 새 탭을 열고,
+    /// 명령어와 개행(`\n`)을 PTY에 바로 입력해 실행한다.
+    pub(super) fn run_terminal_command(
+        &mut self,
+        command: &str,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_terminal_command_on(&krill_app_core::hosts::HostId::Local, command, window, cx);
+    }
+
+    pub(super) fn run_terminal_command_on(
+        &mut self,
+        host: &krill_app_core::hosts::HostId,
+        command: &str,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let cmd = format!("{trimmed}\n");
+        let focused = self.layout.focused();
+        let same_host = focused.is_some_and(|p| self.layout.host(p) == host);
+        let was_remote = focused.is_some_and(|p| !self.layout.host(p).is_local());
+        let open_new_tab = self.focused_live().is_none()
+            || !same_host
+            || focused.is_none_or(|focused| {
+                (host.is_local() && self.link == Link::Up && self.layout.session(focused).is_some())
+                    || matches!(
+                        self.layout.launch(focused).map(|c| &c.program),
+                        Some(Program::Agent { .. } | Program::Custom { .. })
+                    )
+                    || self.live.get(&focused).is_some_and(|l| {
+                        l.launch.is_some()
+                            || l.pane.is_closed()
+                            || l.pane.is_cold()
+                            || l.pane.modes().mouse()
+                            || l.pane.modes().kitty != 0
+                    })
+            });
+        if open_new_tab {
+            let cwd = if host.is_remote() {
+                Vec::new()
+            } else {
+                (!was_remote)
+                    .then(|| {
+                        focused
+                            .and_then(|p| self.layout.launch(p))
+                            .map(|c| c.cwd.clone())
+                            .filter(|cwd| !cwd.is_empty())
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| folder::default_folder().as_os_str().as_bytes().to_vec())
+            };
+            let target_host = host.clone();
+            self.change(true, cx, |l| {
+                l.new_tab();
+                if let Some(pane) = l.focused() {
+                    if target_host.is_remote() {
+                        l.set_host(pane, target_host);
+                    }
+                    l.set_launch(
+                        pane,
+                        Create {
+                            account: None,
+                            program: Program::Login,
+                            cwd,
+                            cols: pane::SIZE.0,
+                            rows: pane::SIZE.1,
+                        },
+                    );
+                }
+            });
+        }
+        let Some(l) = self.focused_live() else {
+            return;
+        };
+        let mut out = l.ime.commit();
+        out.pty = keys::tui::text(&out.pty, l.pane.modes());
+        out.pty.extend_from_slice(cmd.as_bytes());
+        self.send(&out, window, cx);
+    }
+
+    #[cfg(test)]
+    fn record_closed_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(session) = self.layout.session(pane) {
+            self.closed_sessions.push(session);
+        }
+        let _ = (pane, cx);
+    }
+
+    /// 칸이 아직 레이아웃에 있으면 true(확인 대화상자를 기다리는 동안 닫혔을 수 있다).
+    fn has_pane(&self, pane: PaneId) -> bool {
+        self.layout.tabs().iter().any(|t| t.root.contains(pane))
+    }
+
+    /// OWE-872: 칸을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
+    /// 아니면 바로 닫는다.
+    pub(super) fn maybe_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.has_pane(pane)
+            && self.pane_is_running(pane, cx)
+            && krill_app_core::settings::confirm_running_close(cx)
+        {
+            self.pending_running_close = Some((PendingRunningClose::Pane(pane), false));
+            cx.notify();
+            return;
+        }
+        self.do_close_pane(pane, cx);
+    }
+
+    /// OWE-872: 칸을 실제로 닫는다(줌 해제·닫은 기록 포함).
+    pub(super) fn do_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if !self.has_pane(pane) {
+            cx.notify();
+            return;
+        }
+        self.layout.set_zoomed_pane(None);
+        if let Some(index) = self
+            .layout
+            .tabs()
+            .iter()
+            .position(|t| t.root == PaneTree::Leaf(pane))
+        {
+            self.do_close_tab(index, cx);
+            return;
+        }
+        #[cfg(test)]
+        self.record_closed_pane(pane, cx);
+        self.close_layout(cx, |l| {
+            l.focus(pane);
+            l.close_pane();
+        });
+    }
+
+    pub(super) fn record_closed_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.closed_sessions.extend(
+            self.layout
+                .tab_panes(tab_idx)
+                .iter()
+                .filter_map(|pane| self.layout.session(*pane)),
+        );
+        self.remember_closed_tab(tab_idx, cx);
+    }
+
+    fn open_new_worktree_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘N을 누르면 설정을 닫고 대화상자를 연다.
+        if self.page_open() {
+            self.close_settings(Some(&mut *window), cx);
+        }
+        let (host, repo) =
+            if let Some((sel_host, sel_folder)) = self.sidebar.read(cx).selected_workspace() {
+                (sel_host, sel_folder)
+            } else {
+                let host = self
+                    .layout
+                    .focused()
+                    .map_or_else(|| self.launch_host.clone(), |p| self.layout.host(p).clone());
+                (host, self.folder())
+            };
+        if self.sidebar_collapsed {
+            self.toggle_sidebar(cx);
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.new_worktree_on(&host, repo, window, cx));
+    }
+
+    fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘1~9를 누르면 설정을 닫고 해당 탭으로 전환한다.
+        if self.page_open() {
+            self.close_settings(None, cx);
+        }
+        let tabs = self.workspace_tabs(cx);
+        let len = tabs.len();
+        if len == 0 {
+            return;
+        }
+        let target = if index < len {
+            index
+        } else {
+            return;
+        };
+        let Some(&tab) = tabs.get(target) else {
+            return;
+        };
+        self.change(true, cx, |l| l.activate(tab));
+    }
+
+    fn cycle_session_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.close_settings(None, cx);
+        let workspaces = self.sidebar.read(cx).visible_workspaces();
+        if workspaces.is_empty() {
+            return;
+        }
+        let current = self.tab_workspace(self.layout.active(), cx);
+        let pos = workspaces.iter().position(|(_, host, folder)| {
+            current
+                .as_ref()
+                .is_some_and(|w| &w.host == host && &w.folder == folder)
+        });
+        let next = pos.map_or(if delta < 0 { workspaces.len() - 1 } else { 0 }, |i| {
+            (i.cast_signed() + delta)
+                .rem_euclid(workspaces.len().cast_signed())
+                .cast_unsigned()
+        });
+        self.sidebar
+            .update(cx, |s, cx| s.activate_workspace_index(next, cx));
+    }
+
+    fn scroll_terminal(&mut self, lines: isize, cx: &mut Context<Self>) {
+        if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        if let Some(live) = self.focused_live() {
+            live.pane.scroll(lines);
+            cx.notify();
+        }
+    }
+
+    /// 전역 설정은 데몬 응답을 받은 뒤 반영한다. 실패하면 현재 값을 유지하고 이유를 보인다.
+    fn load_agents(&mut self, permission: Option<Permission>, cx: &mut Context<Self>) {
+        if self.agents_busy {
+            self.agents_reload_queued = true;
+            if permission.is_some() {
+                self.agents_pending_permission = permission;
+            }
+            return;
+        }
+        let Some(target) = self.local_target() else {
+            return;
+        };
+        self.agents_busy = true;
+        let client = Arc::clone(&self.agent_client);
+        self.agent_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.settings_for(&target, permission) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.agents_busy = false;
+                match result {
+                    Ok(settings) => {
+                        let profiles = settings.profiles.clone();
+                        this.agents = Some(settings);
+                        this.sidebar.update(cx, |s, cx| s.set_agents(profiles, cx));
+                    }
+                    Err(e) => this.notice = Some(krill_app_core::errors::user_io_error(&e)),
+                }
+                if this.agents_reload_queued || this.agents_pending_permission.is_some() {
+                    this.agents_reload_queued = false;
+                    let queued_permission = this.agents_pending_permission.take();
+                    this.load_agents(queued_permission, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 새 탭에서 에이전트를 선택된 워크스페이스(MK-055 + Orca `activeWorktreeId` 패리티)로 띄운다.
+    /// 선택이 실행 위치와 같은 호스트면 그 경로에서, 원격인데 포커스가 다른 호스트면 원격 기본 디렉터리에서 시작한다.
+    fn new_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        self.new_agent_with_optional_account(id, None, cx);
+    }
+
+    pub(super) fn new_agent_with_optional_account(
+        &mut self,
+        id: String,
+        account: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.launch_host.clone();
+        let selected = self
+            .sidebar
+            .read(cx)
+            .selected_workspace()
+            .filter(|(sel_host, _)| sel_host == &host)
+            .map(|(_, folder)| folder);
+        let cwd = if let Some(folder) = selected {
+            folder
+        } else if host.is_remote()
+            && self
+                .layout
+                .focused()
+                .is_none_or(|focused| *self.layout.host(focused) != host)
+        {
+            PathBuf::new()
+        } else {
+            self.folder()
+        };
+        krill_app_core::star_nag::record_agent_start(cx);
+        self.change(true, cx, |l| {
+            l.new_tab();
+            let pane = l.active_tab().focused;
+            if host.is_remote() {
+                l.set_host(pane, host);
+            }
+            l.set_launch(
+                pane,
+                Create {
+                    account,
+                    program: Program::Agent { id },
+                    cwd: cwd.as_os_str().as_bytes().to_vec(),
+                    cols: pane::SIZE.0,
+                    rows: pane::SIZE.1,
+                },
+            );
+        });
+    }
+
+    /// 첫 Attached 성공 때만 업데이트 health 신호를 보낸다.
+    pub fn arm_update_ready(&mut self, state: PathBuf) {
+        self.update_ready = Some(state);
+    }
+
+    /// 보이는 칸만 세션에 붙어 있게 한다: 안 보이는 칸의 연결은 닫고, 새로 보이는 칸은 붙이기 시작한다.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        if self.layout_loading {
+            return;
+        }
+        let visible = self.layout.visible();
+        self.restore_hidden_sessions(&visible, cx);
+        self.forget_closed_tab_targets();
+        self.prune_chat_sessions();
+        let layout = &self.layout;
+        let paste_queue = &self.paste_queue;
+        self.creations.retain(|p, _| layout.pane_exists(*p));
+        self.outcome_unknown.retain(|p, _| layout.pane_exists(*p));
+        self.split_launchers.retain(|p, _| layout.pane_exists(*p));
+        self.live.retain(|p, live| {
+            visible.contains(p)
+                || layout.pane_exists(*p)
+                    && (live.pane.keep_account_input()
+                        || live.pane.has_pending_input()
+                        || live.pane.session().is_none()
+                        || paste_queue.has_pending_for(*p))
+        });
+        self.fits.tasks.retain(|p, _| self.live.contains_key(p));
+        let mut notices = Vec::new();
+        for (id, live) in &mut self.live {
+            if live.target.as_ref().is_some_and(|target| {
+                !target.is_current()
+                    || target.host().is_remote()
+                        && !self.host_targets.contains_key(layout.host(*id))
+            }) {
+                live.cut();
+                live.task = Task::ready(());
+                live.target = None;
+                live.suspended = true;
+                live.error = Some(
+                    krill_app_core::i18n::catalog::sidebar::HOST_DISCONNECTED
+                        .get()
+                        .into(),
+                );
+                notices.extend(live.pane.unlink());
+            }
+        }
+        for notice in &notices {
+            self.show(Some(notice), cx);
+        }
+        self.security.retain_panes(&visible);
+        self.refresh_pending_paste_banner(cx);
+        if self.paths.is_none() && self.host_targets.is_empty() {
+            return;
+        }
+        let mut to_connect = visible;
+        for (&pane, live) in &self.live {
+            if !to_connect.contains(&pane)
+                && self.layout.pane_exists(pane)
+                && live.suspended
+                && live.pane.session().is_none()
+                && (live.pane.has_pending_input() || self.paste_queue.has_pending_for(pane))
+            {
+                to_connect.push(pane);
+            }
+        }
+        let mut any_terminal = false;
+        let mut recovered = false;
+        for p in to_connect {
+            // 복원 중 집합은 로컬 ID다. 원격 칸은 숫자가 같아도 그대로 붙인다.
+            if self.layout.host(p).is_local()
+                && self
+                    .layout
+                    .session(p)
+                    .is_some_and(|id| self.restoring_sessions.contains(&id))
+            {
+                continue;
+            }
+            if self.layout.file(p).is_some() {
+                continue; // 파일 칸은 세션에 붙지 않는다(MK-119)
+            }
+            if self.split_launchers.contains_key(&p) {
+                continue; // 빈 분할·새 탭 런처 칸은 사용자가 고를 때까지 PTY를 만들지 않는다
+            }
+            if self.is_group_pane(p) {
+                continue; // 멀티 봇 그룹 페이지 칸은 PTY를 만들지 않는다
+            }
+            // 업데이트 health는 로컬 칸 연결로 판정한다. 원격 칸만 보이면 호스트가 꺼졌거나 SSH가 느릴 때
+            // 30초 안에 붙지 못해 업데이트가 매번 롤백됐다(설 실기, v0.1.10→0.1.11).
+            any_terminal |= self.layout.host(p).is_local();
+            if self.layout.launch(p).is_none() {
+                self.layout.set_launch(p, self.launch_for(p));
+                self.save();
+            }
+            let Some(target) = self
+                .target_for_pane(p)
+                .filter(krill_app_core::hosts::HostTarget::is_current)
+            else {
+                continue;
+            };
+            match self.live.entry(p) {
+                Entry::Vacant(entry) => {
+                    let creation = Arc::clone(self.creations.entry(p).or_default());
+                    // 숨긴 사이 Create는 끝났지만 `settled`가 취소돼 레이아웃에 ID가 없는 칸: 발행된 ID로
+                    // 같은 세션에 다시 붙는다(APP-RUNTIME-001). 명시적으로 닫힌 생성은 돌려주지 않는다.
+                    if self.layout.session(p).is_none()
+                        && let Some(session) = close::Creation::published(&creation)
+                    {
+                        self.layout.set_session(p, session);
+                        recovered = true;
+                    }
+                    let mut live = Live::new(Self::spawn_pane(p, target.clone(), None, cx));
+                    live.target = Some(target);
+                    live.creation = creation;
+                    entry.insert(live);
+                    Self::redraw_after_grace(cx);
+                }
+                Entry::Occupied(mut entry) => {
+                    let live = entry.get_mut();
+                    if live.suspended || live.target.as_ref().is_some_and(|old| old != &target) {
+                        let was_suspended = live.suspended;
+                        if self.layout.session(p).is_none()
+                            && let Some(session) = close::Creation::published(&live.creation)
+                        {
+                            self.layout.set_session(p, session);
+                            recovered = true;
+                        }
+                        live.cut();
+                        let notice = live.pane.unlink();
+                        live.task = Self::spawn_pane(p, target.clone(), None, cx);
+                        live.target = Some(target.clone());
+                        live.suspended = false;
+                        live.error = None;
+                        if was_suspended {
+                            live.born = Instant::now();
+                        }
+                        self.show(notice.as_ref(), cx);
+                        if was_suspended {
+                            Self::redraw_after_grace(cx);
+                        }
+                    } else if live.target.is_none() {
+                        live.target = Some(target);
+                    }
+                }
+            }
+        }
+        if recovered {
+            self.sync_sidebar_tab_state(cx);
+            self.save();
+        }
+        if !any_terminal && let Some(state) = self.update_ready.take() {
+            cx.background_spawn(async move {
+                krill_app_core::updater::mark_ready(&state, krill_proto::release_version());
+            })
+            .detach();
+        }
+    }
+
+    /// [`CONNECTING_GRACE`]가 지나도 못 붙은 칸이 "연결 중" 문구를 그리도록 한 번 다시 그린다.
+    fn redraw_after_grace(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONNECTING_GRACE).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// 칸 하나의 IO 태스크: 세션을 정해 붙고, 프레임을 읽어 UI에 넘기고, 끊기면 다시 붙는다. 칸이 안 보이게 되면
+    /// ([`Live`]가 지워짐) 끝난다.
+    // ponytail: 프레임마다 백그라운드 작업 하나(소켓을 옮겨 다님)와 막힌 read 하나가 칸마다 스레드 하나를 쥔다.
+    // 보이는 칸은 많아야 수십이라 그대로 둔다. 늘면 연결 하나에 세션 여러 개(MK-023 오웬 확인 항목)로.
+    fn spawn_pane(
+        pane: PaneId,
+        target: krill_app_core::hosts::HostTarget,
+        resume: Option<krill_proto::SessionId>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let bg = cx.background_executor().clone();
+            let mut attempt = 0u32;
+            let is_remote = target.host().is_remote();
+            loop {
+                if !target.is_current() {
+                    return;
+                }
+                let Ok(Some((
+                    layout_session,
+                    had_registered_target,
+                    want,
+                    known,
+                    launch,
+                    creation,
+                    allow_cold_resume,
+                    uncertain,
+                ))) = this.read_with(cx, |t, _| {
+                    let l = t.live.get(&pane)?;
+                    let layout_session = t.layout.session(pane);
+                    let had_registered_target = t.target_for_pane(pane).is_some();
+                    // 레이아웃에 아직 없는 ID라도 이 칸이 이미 발행한 세션이면 그 세션에 붙는다(APP-RUNTIME-001).
+                    let want = layout_session.or_else(|| close::Creation::published(&l.creation));
+                    let host = t.layout.host(pane);
+                    let allow_cold_resume = want.is_some_and(|w| {
+                        !t.observed_sessions.contains(&(host.clone(), w))
+                            && !t.workspace_closing.contains(&(host.clone(), w))
+                            && l.pane.session().is_none()
+                    });
+                    let mut launch = t.launch_for(pane);
+                    if let Some((cols, rows)) = l.pane.grid().or_else(|| t.initial_pane_grid(pane))
+                    {
+                        (launch.cols, launch.rows) = (cols, rows); // 새 세션도 칸 크기로(OWE-534)
+                    }
+                    // OWE-842: 죽은 세션 자리 재스폰은 셸 내부 `cd` 포함 최신 cwd로.
+                    // 폴더(`launches`)는 워크트리 루트를 유지하므로 세션 없는 새 칸에는 덮지 않는다.
+                    if want.is_some()
+                        && let Some(respawn) = t.layout.respawn_cwd(pane)
+                    {
+                        apply_respawn_cwd(&mut launch.cwd, respawn, host.is_remote());
+                    }
+                    Some((
+                        layout_session,
+                        had_registered_target,
+                        want,
+                        want.and_then(|w| l.pane.known(w)),
+                        launch,
+                        l.creation.clone(),
+                        allow_cold_resume,
+                        t.outcome_unknown.contains_key(&pane),
+                    ))
+                })
+                else {
+                    return;
+                };
+                let settled_attempt = SettledAttempt {
+                    layout_session,
+                    target: target.clone(),
+                    had_registered_target,
+                };
+                let p = target.clone();
+                let old = resume.filter(|r| want.is_none() || want == Some(*r));
+                let got = bg
+                    .spawn(async move {
+                        let diagnostic = pane::StartAttempt {
+                            pane: pane.get(),
+                            wanted_session: want,
+                            attempt,
+                            remote: is_remote,
+                        };
+                        let report = |operation: &'static str, error: &std::io::Error| {
+                            pane::record_start_failure(operation, error, Some(diagnostic));
+                        };
+                        // A session already seen alive can attach directly. Avoid
+                        // hook setup and Hibernation/List on every tab switch.
+                        // Launch metadata is still queried because hooks can rebind
+                        // another agent to the same PTY. Refusal falls back to
+                        // the normal handoff/cold path; transient errors never
+                        // create or resume a process.
+                        if old.is_none()
+                            && !allow_cold_resume
+                            && let Some(session) = want
+                        {
+                            match pane::attach(&p, session, known) {
+                                Ok(linked) => {
+                                    return Ok(Got::Live {
+                                        session,
+                                        linked: Ok(linked),
+                                        prior_cold: None,
+                                    });
+                                }
+                                Err(error) if !is_permanent_error(&error) => {
+                                    report("attach", &error);
+                                    return Ok(Got::Live {
+                                        session,
+                                        linked: Err(error),
+                                        prior_cold: None,
+                                    });
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        let (session, prior_cold, preloaded_launch) = match old {
+                            // 앞서 보낸 생성 요청의 결과를 모른다: 아는 세션만 찾고 만들지 않는다.
+                            _ if uncertain => match want {
+                                Some(want) => {
+                                    match pane::find_session_in(&p, want).inspect_err(|e| {
+                                        report("find_session", e);
+                                    })? {
+                                        Some(pane::Found::Live(session, _)) => {
+                                            (session, None, None)
+                                        }
+                                        Some(pane::Found::Cold(session, cold)) => {
+                                            return Ok(Got::Cold(session, cold));
+                                        }
+                                        None => return Ok(Got::Stopped),
+                                    }
+                                }
+                                None => return Ok(Got::Stopped),
+                            },
+                            Some(old) => {
+                                match pane::resume_session_with_launch(&p, Some(old), &launch)
+                                    .inspect_err(|e| report("resume", e))
+                                {
+                                    Ok((session, preloaded)) => (
+                                        session,
+                                        pane::load_cold(&p, old).map(|c| (old, c)),
+                                        preloaded,
+                                    ),
+                                    // 사용자가 직접 누른 "다시 시작"인데 옛 세션이 이미 닫혔다: 새 세션으로 잇는다.
+                                    Err(e) if pane::is_session_gone(&e) => {
+                                        let (session, preloaded) =
+                                            pane::resume_session_with_launch(&p, None, &launch)
+                                                .inspect_err(|e| report("create", e))?;
+                                        (session, None, preloaded)
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            None => {
+                                let (resolved, preloaded) = if !allow_cold_resume
+                                    && let Some(want_id) = want
+                                {
+                                    (
+                                        pane::resolve_observed_session_in(&p, want_id, &launch)
+                                            .inspect_err(|e| report("restore", e))?,
+                                        None,
+                                    )
+                                } else {
+                                    pane::ensure_session_with_launch(&p, want, &launch)
+                                        .inspect_err(|e| {
+                                            report(
+                                                if want.is_some() { "restore" } else { "create" },
+                                                e,
+                                            );
+                                        })?
+                                };
+                                match resolved {
+                                    pane::Found::Live(session, _) => (session, None, preloaded),
+                                    // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
+                                    // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
+                                    // 이전 세션의 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다.
+                                    // 이미 라이브로 관찰된 세션이 닫혀 사라진 경우에는 자동 재스폰하지 않는다.
+                                    pane::Found::Cold(cold_session, cold) => {
+                                        if !allow_cold_resume {
+                                            return Ok(Got::Cold(cold_session, cold));
+                                        }
+                                        match pane::resume_session_with_launch(
+                                            &p,
+                                            Some(cold_session),
+                                            &launch,
+                                        )
+                                        .inspect_err(|e| {
+                                            report("resume_cold", e);
+                                        }) {
+                                            Ok((new_session, preloaded)) => {
+                                                (new_session, Some((cold_session, cold)), preloaded)
+                                            }
+                                            Err(e) if pane::is_unknown_outcome(&e) => {
+                                                return Ok(Got::ColdUnknown(cold_session, cold, e));
+                                            }
+                                            // 데몬이 이미 이어졌다고 확정한 옛 세션: 콜드 칸으로 남기지 않는다.
+                                            Err(e) if pane::is_session_gone(&e) => return Err(e),
+                                            Err(_) => return Ok(Got::Cold(cold_session, cold)),
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        // 명시적 닫기가 Create 응답보다 먼저 와도 새 세션을 남기지 않는다.
+                        if !close::Creation::publish(&creation, session) {
+                            close::send(
+                                &krill_app_core::resources::daemon_call_for(Some(p)),
+                                session,
+                            )?;
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
+                        let known = known.filter(|_| want == Some(session));
+                        match pane::attach_with_launch(&p, session, known, preloaded_launch)
+                            .inspect_err(|e| report("attach", e))
+                        {
+                            Ok(linked) => Ok(Got::Live {
+                                session,
+                                linked: Ok(linked),
+                                prior_cold,
+                            }),
+                            // AS-27: attach 직전 세션이 끝나도(`Refused`→`NotFound`) 디스크 마지막
+                            // 화면을 보여준다. 백그라운드에서 읽어 UI 스레드를 막지 않는다.
+                            Err(e) if is_permanent_error(&e) => {
+                                Ok(match pane::load_cold(&p, session) {
+                                    Some(cold) => Got::Cold(session, cold),
+                                    None => Got::Live {
+                                        session,
+                                        linked: Err(e),
+                                        prior_cold,
+                                    },
+                                })
+                            }
+                            Err(e) => Ok(Got::Live {
+                                session,
+                                linked: Err(e),
+                                prior_cold,
+                            }),
+                        }
+                    })
+                    .await;
+                let next = this.update(cx, |t, cx| {
+                    t.settled_for_attempt(pane, &settled_attempt, got, cx)
+                });
+                let mut reader = match next {
+                    Ok(Next::Read(r)) => r,
+                    Ok(Next::Retry) => {
+                        let delay = if is_remote {
+                            krill_app_core::hosts::HostManager::backoff_delay(
+                                attempt.saturating_add(1),
+                            )
+                        } else {
+                            retry_delay(attempt)
+                        };
+                        bg.timer(delay).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    Ok(Next::Gone) | Err(_) => return,
+                };
+                attempt = 0;
+                loop {
+                    let (r, frame) = bg
+                        .spawn(async move {
+                            let f = ipc::read_frame(&mut reader);
+                            (reader, f)
+                        })
+                        .await;
+                    reader = r;
+                    let Ok(Some((k, body))) = frame else { break };
+                    match this.update(cx, |t, cx| t.on_frame(pane, k, &body, cx)) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(_) => return,
+                    }
+                }
+                let alive = this.update(cx, |t, cx| {
+                    let host = t.layout.host(pane).clone();
+                    let session = t
+                        .layout
+                        .session(pane)
+                        .or_else(|| t.live.get(&pane).and_then(|l| l.pane.session()));
+                    let expecting = session
+                        .is_some_and(|sid| t.expecting_account_replacement(pane, &host, sid, cx));
+                    let l = t.live.get_mut(&pane)?;
+                    l.cut();
+                    if l.pane.is_closed() || expecting {
+                        return None;
+                    }
+                    let n = l.pane.unlink();
+                    if let Some(key) = t.chat_key(pane) {
+                        t.chat.review_pending_prompt(&key);
+                    }
+                    t.show(n.as_ref(), cx);
+                    Some(())
+                });
+                if !matches!(alive, Ok(Some(()))) {
+                    return;
+                }
+                bg.timer(retry_delay(0)).await;
+            }
+        })
+    }
+
+    fn settled_target_is_current(&self, pane: PaneId, attempt: &SettledAttempt) -> bool {
+        let current_target_matches = if attempt.had_registered_target {
+            self.target_for_pane(pane).as_ref() == Some(&attempt.target)
+        } else {
+            self.target_for_pane(pane)
+                .is_none_or(|cur| cur == attempt.target)
+        };
+        self.layout.pane_exists(pane)
+            && self.layout.host(pane) == attempt.target.host()
+            && attempt.target.is_current()
+            && current_target_matches
+    }
+
+    fn settled_for_attempt(
+        &mut self,
+        pane: PaneId,
+        attempt: &SettledAttempt,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        if !self.settled_target_is_current(pane, attempt) {
+            self.restarting_panes.remove(&pane);
+            return Next::Gone;
+        }
+        if self.layout.session(pane) != attempt.layout_session {
+            self.restarting_panes.remove(&pane);
+            return Next::Retry;
+        }
+        self.settled_attempt(pane, attempt.layout_session, got, cx)
+    }
+
+    /// 붙기 시도가 끝났다. `got`은 세션 정하기의 결과와, 정했다면 그 세션에 붙기의 결과. 정한 세션은 붙기가 실패해도
+    /// 레이아웃에 적는다 — 안 적으면 다음 시도가 세션을 또 만든다(OWE-506). 콜드 기록이면 읽기 전용 화면을 띄운다(MK-032).
+    fn settled_attempt(
+        &mut self,
+        pane: PaneId,
+        want: Option<krill_proto::SessionId>,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        // 응답을 기다리는 사이 칸이 다른 세션으로 옮겨졌다면 옛 세션의 끝을 새 세션의 끝으로 적지 않는다.
+        if got.as_ref().err().is_some_and(pane::is_session_gone)
+            && self
+                .layout
+                .session(pane)
+                .is_some_and(|now| Some(now) != want)
+        {
+            return Next::Retry;
+        }
+        self.settled(pane, got, cx)
+    }
+
+    fn settled(&mut self, pane: PaneId, got: std::io::Result<Got>, cx: &mut Context<Self>) -> Next {
+        let next = self.settled_inner(pane, got, cx);
+        // Keep an in-flight first Create/Attach alive across tab switches until
+        // its session ID (or uncertain result) has reached the layout. Hidden
+        // panes then release their connection instead of retaining a stream.
+        if !self.layout.visible().contains(&pane)
+            && !self.paste_queue.has_pending_for(pane)
+            && !self
+                .live
+                .get(&pane)
+                .is_some_and(|live| live.pane.keep_account_input() || live.pane.has_pending_input())
+        {
+            self.live.remove(&pane);
+            return Next::Gone;
+        }
+        next
+    }
+
+    fn settled_inner(
+        &mut self,
+        pane: PaneId,
+        got: std::io::Result<Got>,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        self.restarting_panes.remove(&pane);
+        let got = match got {
+            Ok(Got::Cold(session, cold)) => return self.cold(pane, session, cold, cx),
+            Ok(Got::ColdUnknown(session, cold, e)) => {
+                let error = start_error_text(&e);
+                self.outcome_unknown.insert(pane, error.clone());
+                let next = self.cold(pane, session, cold, cx);
+                if let Some(l) = self.live.get_mut(&pane) {
+                    l.error = Some(error);
+                }
+                return next;
+            }
+            Ok(Got::Stopped) => {
+                if let Some(l) = self.live.get_mut(&pane)
+                    && l.error.is_none()
+                {
+                    l.error = self.outcome_unknown.get(&pane).cloned();
+                }
+                cx.notify();
+                return Next::Gone;
+            }
+            Ok(Got::Live {
+                session,
+                linked,
+                prior_cold,
+            }) => Ok((session, linked, prior_cold)),
+            Err(e) => Err(e),
+        };
+        let got = got.and_then(|(session, linked, prior_cold)| {
+            let had_session = self
+                .live
+                .get(&pane)
+                .and_then(|l| l.pane.session())
+                .is_some();
+            let prior_cold_id = prior_cold.as_ref().map(|(id, _)| *id);
+            if let Some((cold_session, cold)) = prior_cold {
+                self.bind_paste_queue_first_session(pane, had_session, cold_session);
+                if let Some(l) = self.live.get_mut(&pane)
+                    && !l.pane.is_cold()
+                {
+                    l.pane.show_cold(cold_session, cold).ok();
+                }
+            } else {
+                self.bind_paste_queue_first_session(pane, had_session, session);
+            }
+            let prev_session = self.layout.session(pane);
+            let fresh = prev_session != Some(session);
+            if fresh {
+                let host = self.layout.host(pane).clone();
+                if host.is_local() {
+                    self.layout.clear_session(pane);
+                }
+                self.layout.set_session(pane, session);
+                if let Some(old) = prior_cold_id.or(prev_session).filter(|&id| id != session) {
+                    let bot_sidebar_rebound = self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.rebind_bot_session(&host, old, session, cx)
+                    });
+                    let bot_ui_rebound = self.rebind_bot_session_ui(&host, old, session);
+                    if bot_sidebar_rebound || bot_ui_rebound {
+                        self.rebind_chat_session(&host, old, session, &[pane]);
+                        self.refresh_bots_for_host(&host, true, cx);
+                    }
+                }
+                self.sync_sidebar_tab_state(cx);
+                self.sync_focused_session(cx);
+                self.record_workspace_nav(cx);
+                self.save();
+                self.refresh_detached(cx);
+                self.reconcile_workspace_sessions(cx);
+            }
+            // 새 탭은 예약한 ID로 칸에 먼저 묶여 `fresh`가 아니다. 탭 이름은 사이드바 스냅샷에서 오므로
+            // 모르는 세션이면 접혀 있어도 한 번 읽는다.
+            if self.layout.host(pane).is_local()
+                && self
+                    .sidebar
+                    .read(cx)
+                    .session_on(&krill_app_core::hosts::HostId::Local, session)
+                    .is_none()
+            {
+                self.sidebar.update(cx, sidebar::Sidebar::refresh);
+            }
+            linked.map(|l| (session, l))
+        });
+        match got {
+            Ok((session, linked)) => self.linked(pane, session, linked, cx),
+            Err(e) => {
+                let permanent = is_permanent_error(&e);
+                // krilld가 이 칸을 영구히 거절했다(이미 이어졌거나 닫힌 세션 등)는 건 앱과 데몬이 정상적으로 대화 중이라는
+                // 뜻이다. 복원 칸이 전부 이렇게 거절돼도 ready를 보내야 한다. 안 보내면 업데이트가 30초 health 기한을
+                // 넘겨 롤백되고, 구버전이 다시 업데이트를 시도하며 앱이 34초마다 갈아엎어진다(2026-10-29 v0.2.28 실측 9회+).
+                if permanent && let Some(state) = self.update_ready.take() {
+                    cx.background_spawn(async move {
+                        krill_app_core::updater::mark_ready(&state, krill_proto::release_version());
+                    })
+                    .detach();
+                }
+                let old = self.layout.session(pane);
+                let host = self.layout.host(pane).clone();
+                // 계정 전환 중이면 옛 세션의 끝은 예정된 일이다. 화면·입력을 그대로 두면 재바인딩이 칸을 다시 붙인다.
+                let awaiting = self
+                    .live
+                    .get(&pane)
+                    .is_some_and(|l| l.pane.awaiting_account_replacement());
+                let expecting = old.is_some_and(|session| {
+                    self.expecting_account_replacement(pane, &host, session, cx)
+                });
+                let held = awaiting
+                    || expecting
+                    || self
+                        .live
+                        .get(&pane)
+                        .is_some_and(|l| l.pane.holds_account_input());
+                if pane::is_session_gone(&e) && expecting {
+                    if let Some(l) = self.live.get_mut(&pane) {
+                        l.error = None;
+                        l.pane.pause_account_input();
+                    }
+                    self.refresh_accounts_for_host(
+                        host,
+                        krill_proto::usage::UsageRequest::ListAccounts,
+                        cx,
+                    );
+                    cx.notify();
+                    return Next::Gone;
+                }
+                // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
+                if pane::is_session_gone(&e)
+                    && !held
+                    && let Some(session) = old
+                {
+                    self.gone_sessions.insert((host.clone(), session));
+                    // 계정 이어받기가 남긴 사이드바 사본 행이 reconcile을 막지 않게 먼저 지운다.
+                    if self
+                        .sidebar
+                        .read(cx)
+                        .session_on(&host, session)
+                        .is_some_and(|s| !s.is_exited())
+                        || (host.is_local() && self.sidebar.read(cx).is_unread(session))
+                    {
+                        self.sidebar
+                            .update(cx, |s, cx| s.mark_session_exited_on(&host, session, cx));
+                    }
+                    self.reconcile_workspace_sessions(cx);
+                    if !self.layout.pane_exists(pane) {
+                        return Next::Gone;
+                    }
+                }
+                match self.live.get_mut(&pane) {
+                    Some(l) => {
+                        if permanent
+                            && !held
+                            && !l.pane.is_cold()
+                            && !l.pane.is_closed()
+                            && let Some(session) = l.pane.session().or(old)
+                        {
+                            l.pane
+                                .show_cold(
+                                    session,
+                                    krill_proto::control::Cold {
+                                        screen: Vec::new(),
+                                        history: Vec::new(),
+                                    },
+                                )
+                                .ok();
+                        }
+                        if !awaiting && !expecting {
+                            l.error = Some(start_error_text(&e));
+                        }
+                        cx.notify();
+                        // 생성 요청이 닿았는지 모르면 다시 보내지 않는다. 연결·조회 실패는 계속 다시 붙는다.
+                        if pane::is_unknown_outcome(&e) {
+                            self.outcome_unknown.insert(pane, start_error_text(&e));
+                            Next::Gone
+                        } else if permanent {
+                            Next::Gone
+                        } else {
+                            Next::Retry
+                        }
+                    }
+                    None => Next::Gone,
+                }
+            }
+        }
+    }
+
+    /// 칸의 세션이 사라졌다: 디스크 기록의 마지막 화면을 읽기 전용으로 띄운다. 레이아웃의 세션은 그대로 둔다
+    /// ("다시 시작"을 누를 때까지 앱을 다시 띄워도 같은 콜드 화면).
+    fn cold(
+        &mut self,
+        pane: PaneId,
+        session: krill_proto::SessionId,
+        cold: krill_proto::control::Cold,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        let host = self.layout.host(pane).clone();
+        if self.expecting_account_replacement(pane, &host, session, cx) {
+            self.refresh_accounts_for_host(
+                host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
+            cx.notify();
+            return Next::Gone;
+        }
+        let had_session = self
+            .live
+            .get(&pane)
+            .and_then(|l| l.pane.session())
+            .is_some();
+        self.bind_paste_queue_first_session(pane, had_session, session);
+        let show = self.live.get_mut(&pane).map(|l| {
+            let result = l.pane.show_cold(session, cold);
+            (result, l.pane.screen().title.clone())
+        });
+        let Some((show, title)) = show else {
+            return Next::Gone;
+        };
+        if let Err(e) = show {
+            if let Some(l) = self.live.get_mut(&pane) {
+                l.error = Some(e.to_string());
+            }
+            cx.notify();
+            return Next::Retry;
+        }
+        // AS-27: attach 실패 뒤 콜드로 온 세션도 레이아웃에 적는다(다음 시도가 또 만들지 않게).
+        if self.layout.session(pane) != Some(session) {
+            self.layout.clear_session(pane);
+            self.layout.set_session(pane, session);
+            self.sync_sidebar_tab_state(cx);
+            self.sync_focused_session(cx);
+            self.record_workspace_nav(cx);
+            self.save();
+            self.refresh_detached(cx);
+        }
+        // 읽기 전용 옛 화면이라 낙관적 확정 글자와 준비 중·확인 대기 붙여넣기를 지운다(OWE-615 원인 1, APP-RUNTIME-003).
+        self.drop_stale_pastes_for_pane(pane, None, cx);
+        if let Some(l) = self.live.get_mut(&pane) {
+            l.ime.clear_pending();
+            l.error = self.outcome_unknown.get(&pane).cloned();
+        }
+        if let Some(state) = self.update_ready.take() {
+            cx.background_spawn(async move {
+                krill_app_core::updater::mark_ready(&state, krill_proto::release_version());
+            })
+            .detach();
+        }
+        self.titles.insert(pane, title);
+        cx.notify();
+        Next::Gone
+    }
+
+    /// 콜드·종료 화면의 "다시 시작"(MK-032·MK-052): 칸에서 옛 세션을 떼고 에이전트 재개(`claude --resume`,
+    /// `codex resume`) 또는 새 셸에 붙인다. 옛 기록은 보존 기간 동안 디스크에 남는다.
+    ///
+    /// 잠정 결정 의존: OWE-397 [MK-032] 콜드 복원 뷰. 거부되면 이 함수를 새 세션 생성으로 되돌린다.
+    fn restart(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.drop_stale_pastes_for_pane(pane, None, cx);
+        if let Some(target) = self
+            .target_for_pane(pane)
+            .filter(|_| self.layout.visible().contains(&pane))
+        {
+            self.restarting_panes.insert(pane);
+            // 사용자가 직접 다시 시작했다: 결과를 모르던 생성 요청과 별개로 새로 만들어도 된다.
+            self.outcome_unknown.remove(&pane);
+            let old = self
+                .live
+                .get(&pane)
+                .and_then(|l| l.pane.session())
+                .or_else(|| self.layout.session(pane));
+            let task = Self::spawn_pane(pane, target.clone(), old, cx);
+            if let Some(l) = self.live.get_mut(&pane) {
+                if l.pane.session().is_none() {
+                    l.pane = pane::Pane::default();
+                }
+                l.error = None;
+                l.ime.clear_pending();
+                l.task = task;
+                l.target = Some(target);
+                l.suspended = false;
+            } else {
+                let mut live = Live::new(task);
+                live.target = Some(target);
+                live.creation = Arc::clone(self.creations.entry(pane).or_default());
+                self.live.insert(pane, live);
+                Self::redraw_after_grace(cx);
+            }
+            cx.notify();
+        } else {
+            self.live.remove(&pane);
+            self.change(true, cx, |l| l.clear_session(pane));
+        }
+    }
+
+    /// 칸이 세션에 붙었다. 보류 입력을 보낸다. 읽을 소켓을 돌려준다.
+    fn linked(
+        &mut self,
+        pane: PaneId,
+        session: krill_proto::SessionId,
+        linked: pane::Linked,
+        cx: &mut Context<Self>,
+    ) -> Next {
+        self.start_pane_liveness(cx);
+        let Some(had_session) = self.live.get(&pane).map(|l| l.pane.session().is_some()) else {
+            return Next::Gone;
+        };
+        self.bind_paste_queue_first_session(pane, had_session, session);
+        self.outcome_unknown.remove(&pane);
+        if let Some(launch) = &linked.launch
+            && self.layout.host(pane).is_local()
+        {
+            krill_app_core::onboarding::actions::note_agent_session(&launch.profile, cx);
+        }
+        let Some(l) = self.live.get_mut(&pane) else {
+            return Next::Gone;
+        };
+        l.error = None;
+        l.launch = linked.launch;
+        l.sock = linked.reader.try_clone().ok();
+        let notices = l.pane.link(
+            session,
+            linked.instance,
+            linked.writer,
+            linked.features,
+            Now::get(),
+        );
+        l.pane.set_searchable(linked.search);
+        // 새 화면이 오면 낙관적 확정 글자는 옛 세션의 잔상이라 지운다(OWE-615 원인 1).
+        l.ime.clear_pending();
+        if let Some(state) = self.update_ready.take() {
+            cx.background_spawn(async move {
+                krill_app_core::updater::mark_ready(&state, krill_proto::release_version());
+            })
+            .detach();
+        }
+        for n in &notices {
+            self.show(Some(n), cx);
+        }
+        self.flush_clipboard_pastes(cx);
+        self.rebind_account_input_target(pane);
+        self.recover_account_input(cx);
+        cx.notify();
+        Next::Read(linked.reader)
+    }
+
+    /// krilld 프레임 하나. 연결을 이어 가면 `true`.
+    fn on_frame(&mut self, pane: PaneId, k: u8, body: &[u8], cx: &mut Context<Self>) -> bool {
+        if k == krill_proto::screen::kind::CLOSED {
+            let session = self
+                .layout
+                .session(pane)
+                .or_else(|| self.live.get(&pane).and_then(|l| l.pane.session()));
+            let host = self.layout.host(pane).clone();
+            if let Some(session) = session
+                && self.expecting_account_replacement(pane, &host, session, cx)
+                && <krill_proto::screen::Closed as krill_proto::screen::Msg>::decode(k, body)
+                    .is_ok()
+            {
+                // The retired session's PTY closes right before the next ListAccounts poll carries
+                // its replacement handoff. Keep the tab, pane, picture, and held input intact and
+                // fetch the handoff immediately so the pane rebinds in place instead of vanishing.
+                let notice = if let Some(l) = self.live.get_mut(&pane) {
+                    l.cut();
+                    l.error = None;
+                    l.pane.pause_account_input();
+                    l.pane.unlink()
+                } else {
+                    None
+                };
+                self.show(notice.as_ref(), cx);
+                self.refresh_accounts_for_host(
+                    host,
+                    krill_proto::usage::UsageRequest::ListAccounts,
+                    cx,
+                );
+                cx.notify();
+                return false;
+            }
+        }
+        let Some(l) = self.live.get_mut(&pane) else {
+            return false;
+        };
+        let Ok(ev) = l.pane.frame(k, body) else {
+            l.cut();
+            return false;
+        };
+        if let Some(notice) = ev.history_notice {
+            // History availability is independent of the live stream. Keep the
+            // current viewport and selection, and leave this status in place
+            // until an explicit reset/reconnect or a later error replaces it.
+            self.notice = Some(notice.clone());
+            l.error = Some(notice);
+            cx.notify();
+        }
+        if ev.closed {
+            l.cut();
+            l.error = None;
+            l.ime = Ime::default();
+            l.echo = EchoDraw::default();
+            l.clear_selection();
+        }
+        if ev.redraw {
+            let s = l.pane.screen();
+            let c = s.cursor;
+            l.ime.set_cursor(
+                CellPoint {
+                    line: usize::from(c.line),
+                    column: usize::from(c.column),
+                },
+                c.visible,
+            );
+            // 커서 전진으로 확인하지 못한 확정 글자는 시간으로 지운다(OWE-615 원인 1).
+            l.ime.expire_pending(Instant::now());
+            let title = krill_app_core::security::sanitize_title(&s.title);
+            let search_res = l.pane.search_result().cloned();
+            if let Some(w) = self.window {
+                l.echo.screen_changed(w, cx);
+            }
+            if self.layout.host(pane).is_local()
+                && let Some(session) = self.layout.session(pane)
+            {
+                self.sidebar
+                    .update(cx, |s, cx| s.set_title(session, &title, cx));
+            }
+            self.titles.insert(pane, title);
+            if self.layout.focused() == Some(pane)
+                && let Some((bar, _)) = &self.search
+            {
+                bar.update(cx, |b, cx| b.set_result(search_res.as_ref(), cx));
+            }
+            // AS-17: 출력 스크롤·리사이즈·재접속으로 선택 자리 글자가 바뀌면 선택을 지운다.
+            // 끌기 중이거나 글자가 그대로면(커서만 움직임 등) 유지한다.
+            // 휠 스크롤은 버퍼 기준 줄이라 그대로 두고, 버린 스크롤백처럼 읽을 수 없는 행이면 판정하지 않는다.
+            if !l.selecting
+                && let (Some(current), Some(before)) = (l.read_selection(), &l.selection_text)
+                && &current != before
+            {
+                l.clear_selection();
+            }
+            let diverged_fit = (self.layout.focused() == Some(pane))
+                .then(|| {
+                    let s = l.pane.screen();
+                    l.pane
+                        .grid()
+                        .filter(|&want| s.cols > 0 && s.lines > 0 && (s.cols, s.lines) != want)
+                })
+                .flatten();
+            if self.layout.focused() == Some(pane) {
+                self.maybe_poll_active_chat(cx);
+            }
+            if let Some(want) = diverged_fit {
+                self.schedule_fit(pane, want, cx);
+            }
+            cx.notify();
+        }
+        if ev.closed {
+            if let Some(session) = self
+                .layout
+                .session(pane)
+                .or_else(|| self.live.get(&pane).and_then(|live| live.pane.session()))
+            {
+                let host = self.layout.host(pane).clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.mark_session_exited_on(&host, session, cx);
+                });
+                self.workspace_closing.insert((host.clone(), session));
+                self.close_session_panes(&host, session, close::Policy::Preserve, cx);
+            }
+            return false;
+        }
+        if ev.bell && krill_app_core::settings::notification_sound(cx) {
+            platform::beep();
+        }
+        if ev.bell
+            && let Some(id) = self.layout.session(pane)
+        {
+            let title = self.titles.get(&pane).cloned().unwrap_or_default();
+            krill_app_core::alert::notify_bell(id, &title, cx);
+        }
+        if let Some(text) = ev.clipboard {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if ev.notice.is_some()
+            && let Some(key) = self.chat_key(pane)
+        {
+            self.chat.review_pending_prompt(&key);
+        }
+        self.show(ev.notice.as_ref(), cx);
+        !ev.closed
+    }
+
+    fn show(&mut self, notice: Option<&Notice>, cx: &mut Context<Self>) {
+        if let Some(n) = notice {
+            // Delivery uncertainty is diagnostic only. Never log the input text.
+            if n.fate == krill_proto::input::Fate::Uncertain {
+                tracing::debug!(
+                    bytes = n.bytes.len(),
+                    "input delivery uncertain; not resent"
+                );
+                return;
+            }
+            self.notice = Some(notice_text(n));
+            cx.notify();
+        }
+    }
+
+    /// 포커스 칸에 PTY 바이트를 보낸다(IME 결과). 조합을 끊었으면 플랫폼 IME 쪽 조합도 버린다.
+    /// IME 바깥 요인(포커스 칸 변경·탭 전환·창 비활성화·붙여넣기 확정)에서만 부른다. 키 이벤트 안에서는
+    /// `handleEvent:` 재진입 중이라 `discardMarkedText`를 부르면 IMK 오토마타가 꼬여 다음 글자가
+    /// 분리되므로 [`Shell::send_in_key`]를 쓴다(OWE-615 원인 2).
+    fn send(&mut self, out: &Output, window: Option<&Window>, cx: &mut Context<Self>) -> bool {
+        self.send_inner(out, true, window, cx)
+    }
+
+    /// 키 이벤트(`on_key_down`·`on_key_up`) 안에서 PTY 바이트를 보낸다. IME 자신이 그 키를 처리
+    /// 중이므로 `discardMarkedText`를 동기 재진입으로 부르지 않는다(OWE-615 원인 2). 위젯이 직접
+    /// 확정한 글자의 늦은 `insertText:` 중복은 `krill_term::ime`의 `committed`로 버린다.
+    fn send_in_key(
+        &mut self,
+        out: &Output,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.send_inner(out, false, window, cx)
+    }
+
+    fn sync_ime_expiry(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let Some(at) = l.ime.pending_at() else {
+            l.ime_expiry = None;
+            return;
+        };
+        if l.ime_expiry.as_ref().is_some_and(|(armed, _)| *armed == at) {
+            return;
+        }
+        let delay = krill_term::ime::PENDING_TTL.saturating_sub(at.elapsed());
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |s, cx| {
+                if let Some(l) = s.live.get_mut(&pane)
+                    && l.ime.pending_at() == Some(at)
+                {
+                    l.ime.clear_pending();
+                    l.ime_expiry = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        l.ime_expiry = Some((at, task));
+    }
+
+    fn send_inner(
+        &mut self,
+        out: &Output,
+        allow_discard: bool,
+        window: Option<&Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if out.discard_ime
+            && allow_discard
+            && let Some(w) = window
+        {
+            platform::discard_marked_text(w);
+        }
+        let Some(pane) = self.layout.focused() else {
+            return false;
+        };
+        self.sync_ime_expiry(pane, cx);
+        if out.pty.is_empty() {
+            cx.notify();
+            return false;
+        }
+        self.recover_account_input(cx);
+        if self.queue_input_behind_paste(pane, &out.pty) {
+            cx.notify();
+            return true;
+        }
+        let Some(l) = self.ensure_input_live(pane) else {
+            return false;
+        };
+        l.clear_selection();
+        l.echo.key_sent(Instant::now());
+        let n = l.pane.input(&out.pty, Now::get());
+        self.show(n.as_ref(), cx);
+        cx.notify();
+        n.is_none()
+    }
+
+    fn is_terminal_pane(&self, pane: PaneId) -> bool {
+        self.layout.pane_exists(pane)
+            && self.layout.file(pane).is_none()
+            && !self.is_group_pane(pane)
+    }
+
+    /// 세션 연결이 시작되기 전(`layout_loading` 중이거나 `target` 준비 전)에도 보이는 터미널 칸의
+    /// 키·IME·붙여넣기 입력을 저널·큐에 보관할 수 있게 보류(`suspended = true`) 상태의 [`Live`]를 만든다.
+    fn ensure_input_live(&mut self, pane: PaneId) -> Option<&mut Live> {
+        if !self.is_terminal_pane(pane) {
+            return None;
+        }
+        if !self.live.contains_key(&pane) {
+            let mut live = Live::new(Task::ready(()));
+            live.suspended = true;
+            live.creation = Arc::clone(self.creations.entry(pane).or_default());
+            self.live.insert(pane, live);
+        }
+        self.live.get_mut(&pane)
+    }
+
+    fn ensure_focused_input_live(&mut self) -> Option<&mut Live> {
+        let pane = self.layout.focused()?;
+        self.ensure_input_live(pane)
+    }
+
+    fn focused_live(&mut self) -> Option<&mut Live> {
+        let pane = self.layout.focused()?;
+        self.live.get_mut(&pane)
+    }
+
+    fn on_key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // 에이전트 대시보드가 열려 있을 때는 Esc가 대시보드만 닫고 뒷배경 세션 PTY로 `\x1b`를 보내지 않는다.
+        if self.dashboard.is_some() {
+            if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                self.close_dashboard(Some(window), cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        if self.confirm_close_tab.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.cancel_close_pinned_tab(cx),
+                "enter" => self.confirm_close_pinned_tab(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // OWE-872: 실행 중 닫기 확인 대화상자가 열려 있으면 Enter로 닫고 Esc로 취소한다.
+        if self.pending_running_close.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.cancel_running_close(cx),
+                "enter" => self.confirm_running_close(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.has_blocking_overlay() {
+            return;
+        }
+        // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
+        if self.tab_rename.is_some() && e.keystroke.key == "escape" {
+            self.cancel_tab_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.pane_rename.is_some() && e.keystroke.key == "escape" {
+            self.cancel_pane_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if e.keystroke.key == "escape" && self.close_link_menu(cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.tab_context_menu.is_some() && e.keystroke.key == "escape" {
+            self.tab_context_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.layout.mru_switching() {
+            if e.keystroke.key == "escape" {
+                self.layout.cancel_mru();
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            if !e.keystroke.modifiers.control {
+                self.commit_mru_switcher(cx);
+            }
+        }
+        // MK-156: 우하단 플로팅 UpdateCard가 열려 있을 때 Esc 키를 누르면 상태바 배지로 축소한다.
+        // 리소스 팝오버·세션 기록 패널이 열려 있을 때도 Esc로 닫는다.
+        // 닫지 않으면 `\x1b`가 터미널 PTY로 전달된다.
+        if e.keystroke.key == "escape"
+            && !e.keystroke.modifiers.modified()
+            && (self.resources.read(cx).is_open() || self.history.read(cx).is_open())
+        {
+            self.resources
+                .update(cx, krill_app_core::resources::Panel::close);
+            if self.history.read(cx).is_open()
+                && !self.panel_collapsed
+                && self.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::History
+            {
+                self.toggle_panel(cx);
+            } else {
+                self.history
+                    .update(cx, krill_app_core::agent_history::Panel::close);
+            }
+            window.focus(&self.focus, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.role == WindowRole::Main
+            && e.keystroke.key == "escape"
+            && !e.keystroke.modifiers.modified()
+            && cx
+                .try_global::<krill_app_core::updater::UpdateState>()
+                .is_some_and(|u| u.staged.is_some() && !u.card_collapsed)
+        {
+            let mut u = cx
+                .try_global::<krill_app_core::updater::UpdateState>()
+                .cloned()
+                .unwrap_or_default();
+            u.card_collapsed = true;
+            cx.set_global(u);
+            cx.stop_propagation();
+            cx.refresh_windows();
+            cx.notify();
+            return;
+        }
+        if self.role == WindowRole::Main
+            && e.keystroke.key == "escape"
+            && !e.keystroke.modifiers.modified()
+            && !self.has_notifications(cx)
+            && krill_app_core::star_nag::dismiss_on_escape(cx)
+        {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // 가운데 diff가 터미널을 덮고 있으면 Esc로 닫고, 다른 키는 가려진 터미널로 보내지 않는다.
+        if self.diff.read(cx).has_center_diff() {
+            if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                self.close_center_diff(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        // AltGr/dead-key text must reach the platform input handler, including
+        // Kitty modes. Remember it so a later release cannot leak a Ctrl+Alt key.
+        if e.prefer_character_input {
+            self.character_input_keys.insert(e.keystroke.key.clone());
+            return;
+        }
+        self.character_input_keys.remove(&e.keystroke.key);
+        // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
+        // Non-Latin layouts (Cyrillic, Greek, Hebrew, Arabic) send localized `key` characters;
+        // map to their ASCII equivalent when Control or Alt is pressed so Ctrl+C/D/Z and Meta work.
+        let mapped_ks;
+        let ks = if (e.keystroke.modifiers.control || e.keystroke.modifiers.alt)
+            && !e.keystroke.key.is_ascii()
+        {
+            mapped_ks = cx
+                .keyboard_mapper()
+                .map_key_equivalent(e.keystroke.clone(), true);
+            mapped_ks.inner()
+        } else {
+            &e.keystroke
+        };
+        let Some(pane) = self
+            .layout
+            .focused()
+            .filter(|&p| self.is_terminal_pane(p) && !self.is_pane_chat_view(p, cx))
+        else {
+            return;
+        };
+        if !e.is_held
+            && ks.key == "c"
+            && ks.modifiers.control
+            && !ks.modifiers.shift
+            && !ks.modifiers.alt
+            && !ks.modifiers.platform
+            && self
+                .live
+                .get(&pane)
+                .and_then(Live::selected_text)
+                .is_some_and(|t| !t.is_empty())
+        {
+            self.copy(window, cx);
+            if let Some(l) = self.live.get_mut(&pane) {
+                l.clear_selection();
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        let (composing, modes) = self
+            .live
+            .get(&pane)
+            .map_or((false, krill_proto::term_modes::Modes::default()), |l| {
+                (l.ime.is_composing(), l.pane.modes())
+            });
+        ime_trace(format_args!(
+            "key_down {ks:?} held={} composing={composing}",
+            e.is_held,
+        ));
+        let event = if e.is_held {
+            keys::tui::Event::Repeat
+        } else {
+            keys::tui::Event::Press
+        };
+        let meta = krill_app_core::settings::option_as_meta(cx);
+        let Some(bytes) =
+            keys::tui::key_with_policy(ks, modes, event, self.input_policy_for(pane, cx))
+                .or_else(|| keys::tui::meta(ks, meta))
+        else {
+            return; // 글자 키는 IME 확정 텍스트(replace_text_in_range)로 온다
+        };
+        let Some(l) = self.ensure_input_live(pane) else {
+            return;
+        };
+        // 조합 중 Backspace·방향키 등은 IME가 `handleEvent:` 안에서 먼저 처리하고, 처리했으면
+        // `doCommandBySelector:`가 오지 않아 여기까지 오지 않는다. 여기 온 키는 IME가 처리하지
+        // 않은 키라 조합을 먼저 확정하고 보낸다. `discardMarkedText`는 재진입이라 부르지 않는다.
+        let mut out = l.ime.commit();
+        // 삭제·이동·전송 뒤 내용은 예측할 수 없다. 확정 글자를 계속 덧그리면
+        // PTY에서는 지운 글자가 화면에 남으므로 이후에는 실제 그리드를 따른다.
+        l.ime.clear_pending();
+        out.pty = keys::tui::text(&out.pty, modes);
+        out.pty.extend(bytes);
+        self.send_in_key(&out, Some(window), cx);
+        cx.stop_propagation();
+    }
+
+    fn on_key_up(&mut self, e: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.character_input_keys.remove(&e.keystroke.key) {
+            return;
+        }
+        // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
+        // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
+        if self.has_blocking_overlay()
+            || self.dashboard.is_some()
+            || !self.focus.is_focused(window)
+            || self
+                .layout
+                .focused()
+                .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
+        let Some(l) = self.focused_live() else { return };
+        ime_trace(format_args!(
+            "key_up {:?} composing={}",
+            e.keystroke,
+            l.ime.is_composing()
+        ));
+        // 조합 중 일반 문자 키의 Release는 IME 자모 키를 뗀 것인데 영문 키 Release 시퀀스가 되어
+        // `echo.key_sent`를 유발한다. 보내지 않고 삼킨다(OWE-615 원인 4).
+        if l.ime.is_composing() && is_plain_char_key(&e.keystroke) {
+            cx.stop_propagation();
+            return;
+        }
+        let mapped_ks;
+        let ks = if (e.keystroke.modifiers.control || e.keystroke.modifiers.alt)
+            && !e.keystroke.key.is_ascii()
+        {
+            mapped_ks = cx
+                .keyboard_mapper()
+                .map_key_equivalent(e.keystroke.clone(), true);
+            mapped_ks.inner()
+        } else {
+            &e.keystroke
+        };
+        if let Some(pty) = keys::tui::key(ks, l.pane.modes(), keys::tui::Event::Release) {
+            self.send_in_key(
+                &Output {
+                    pty,
+                    discard_ime: false,
+                },
+                Some(window),
+                cx,
+            );
+            cx.stop_propagation();
+        }
+    }
+
+    fn mouse_input(
+        &mut self,
+        pane: PaneId,
+        event: keys::tui::Mouse,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let bit = match event {
+            keys::tui::Mouse::Press(b)
+            | keys::tui::Mouse::Release(b)
+            | keys::tui::Mouse::Move(Some(b))
+                if b < 3 =>
+            {
+                1u8 << b
+            }
+            _ => 0,
+        };
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let active_drag = bit != 0 && (l.mouse_down & bit) != 0;
+        // 왼쪽 클릭을 프로그램에 넘기면(pi 전체 화면처럼 앱이 직접 선택·복사) 이전 Krill 선택은 끝난 것이다.
+        // 남겨 두면 화면 밖이라 안 보이는 옛 선택 글자를 ⌘C가 다시 복사해 앱이 복사한 내용을 덮는다.
+        if matches!(event, keys::tui::Mouse::Press(0)) && l.selection.is_some() {
+            l.clear_selection();
+            cx.notify();
+        }
+        if matches!(event, keys::tui::Mouse::Release(_)) {
+            l.mouse_down &= !bit;
+        } else if matches!(event, keys::tui::Mouse::Move(None)) {
+            l.mouse_down = 0;
+        }
+        // 파일 드롭(gpui가 왼쪽 버튼 이동·놓기로 바꿔 보낸다)은 프로그램에 마우스 보고로 보내지 않는다.
+        if cx.has_active_drag() {
+            return;
+        }
+        let is_drag_or_release = active_drag && !matches!(event, keys::tui::Mouse::Press(_));
+        let Some((column, line)) = (if is_drag_or_release {
+            krill_app_core::terminal::cell_at_clamped(&l.painted, l.pane.screen(), position)
+        } else {
+            cell_at(&l.painted, l.pane.screen(), position)
+        }) else {
+            return;
+        };
+        let effective_modifiers = if is_drag_or_release {
+            Modifiers {
+                shift: false,
+                alt: false,
+                platform: false,
+                ..modifiers
+            }
+        } else {
+            modifiers
+        };
+        let Some(bytes) =
+            keys::tui::mouse(l.pane.modes(), event, column, line, effective_modifiers)
+        else {
+            return;
+        };
+        if matches!(event, keys::tui::Mouse::Press(_)) {
+            l.mouse_down |= bit;
+        }
+        let n = l.pane.report(&bytes);
+        self.show(n.as_ref(), cx);
+        cx.stop_propagation();
+    }
+
+    fn on_scroll(
+        &mut self,
+        pane: PaneId,
+        e: &ScrollWheelEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line = cell_size(window, cx).height;
+        let scroll_speed = krill_app_core::settings::terminal_scroll_speed(cx);
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let dy = wheel_scroll_delta(
+            f32::from(e.delta.pixel_delta(line).y),
+            e.modifiers.alt,
+            scroll_speed,
+        ) + l.scroll_rem;
+        let lines = (dy / f32::from(line)).trunc();
+        l.scroll_rem = dy - lines * f32::from(line);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "휠 한 번은 수백 행 안이고 abs 뒤에만 usize로 바꾼다"
+        )]
+        if lines != 0. {
+            if let Some((column, line)) = cell_at(&l.painted, l.pane.screen(), e.position)
+                && let Some(bytes) = keys::tui::mouse(
+                    l.pane.modes(),
+                    keys::tui::Mouse::Wheel(lines > 0.),
+                    column,
+                    line,
+                    e.modifiers,
+                )
+            {
+                let mut report = Vec::new();
+                for _ in 0..(lines.abs() as usize).min(100) {
+                    report.extend_from_slice(&bytes);
+                }
+                let n = l.pane.report(&report);
+                self.show(n.as_ref(), cx);
+                cx.stop_propagation();
+            } else if let Some(bytes) = keys::tui::wheel_arrows(l.pane.modes(), lines > 0.) {
+                let mut input = Vec::new();
+                for _ in 0..(lines.abs() as usize).min(100) {
+                    input.extend_from_slice(bytes);
+                }
+                let notice = l.pane.input(&input, Now::get());
+                self.show(notice.as_ref(), cx);
+                cx.stop_propagation();
+            } else if l.pane.scroll(lines as isize) {
+                cx.notify();
+            }
+        }
+    }
+
+    /// 앱이 보고할 수 있는 SGR 마우스 모드에서만 프로그램에 넘긴다.
+    /// 지원하지 않는 보고 형식은 선택까지 막지 않으며 Shift·Alt는 로컬 선택을 우선한다.
+    fn selects(&self, pane: PaneId, modifiers: Modifiers) -> bool {
+        self.live.get(&pane).is_some_and(|l| {
+            let modes = l.pane.modes();
+            modifiers.shift
+                || modifiers.alt
+                || !modes.mouse()
+                || !modes.contains(krill_proto::term_modes::Modes::SGR_MOUSE)
+        })
+    }
+
+    /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
+    /// 더블클릭은 단어, 트리플클릭은 줄, ⌥(Alt)+클릭은 사각형(열 구간)을 선택한다. 그리드 밖이면 그대로.
+    fn select_begin(
+        &mut self,
+        pane: PaneId,
+        position: Point<Pixels>,
+        click_count: usize,
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
+            return;
+        };
+        let at = select::Point { line, column };
+        if modifiers.shift
+            && let Some(sel) = l.selection
+        {
+            l.selection = Some(Anchored {
+                anchor: sel.anchor,
+                head: l.anchor_point(at),
+                block: modifiers.alt || sel.block,
+            });
+            l.selection_text = None;
+            l.selecting = true;
+            l.selecting_kind = SelectKind::Char;
+            l.selecting_origin = None;
+            cx.notify();
+            return;
+        }
+        let (selection, kind) = if modifiers.alt {
+            (Selection::new_block(at), SelectKind::Char)
+        } else if click_count >= 3 {
+            (Selection::line_at(&screen, at), SelectKind::Line)
+        } else if click_count == 2 {
+            (Selection::word_at(&screen, at), SelectKind::Word)
+        } else {
+            (Selection::new(at), SelectKind::Char)
+        };
+        let anchored = Anchored::from_view(selection, l.pane.scroll_offset());
+        l.selecting_origin = (kind != SelectKind::Char).then(|| {
+            if anchored.anchor <= anchored.head {
+                (anchored.anchor, anchored.head)
+            } else {
+                (anchored.head, anchored.anchor)
+            }
+        });
+        l.selection = Some(anchored);
+        l.selection_text = None;
+        l.selecting = true;
+        l.selecting_kind = kind;
+        cx.notify();
+    }
+
+    /// 선택 끌기 중 끝점 이동: 누름 때 정한 단위(글자·단어·줄)를 유지한다(OWE-866).
+    fn select_move(&mut self, pane: PaneId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
+            return;
+        };
+        let at = select::Point { line, column };
+        let (Some(mut sel), selecting, kind) = (l.selection, l.selecting, l.selecting_kind) else {
+            return;
+        };
+        if !selecting {
+            return;
+        }
+        let point = l.anchor_point(at);
+        match kind {
+            SelectKind::Char => {
+                sel.head = point;
+            }
+            SelectKind::Word => {
+                let word = Selection::word_at(&screen, at);
+                let ws = l.anchor_point(word.anchor);
+                let we = l.anchor_point(word.head);
+                let (ws, we) = if ws <= we { (ws, we) } else { (we, ws) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if point >= os {
+                        sel.anchor = os;
+                        sel.head = we.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ws.min(os);
+                    }
+                } else {
+                    sel.head = if point >= sel.anchor { we } else { ws };
+                }
+            }
+            SelectKind::Line => {
+                let line = Selection::line_at(&screen, at);
+                let ls = l.anchor_point(line.anchor);
+                let le = l.anchor_point(line.head);
+                let (ls, le) = if ls <= le { (ls, le) } else { (le, ls) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if ls >= os {
+                        sel.anchor = os;
+                        sel.head = le.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ls.min(os);
+                    }
+                } else {
+                    sel.head = if point.0 >= sel.anchor.0 { le } else { ls };
+                }
+            }
+        }
+        l.selection = Some(sel);
+        cx.notify();
+    }
+
+    /// 선택 끌기를 마친다. 움직이지 않은 클릭이면 선택을 지운다(OWE-866: 단어·줄
+    /// 선택은 한 칸짜리라도 유지한다). 끌던 중이었으면 `true`.
+    fn select_end(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
+        let Some(l) = self.live.get_mut(&pane).filter(|l| l.selecting) else {
+            return false;
+        };
+        l.selecting = false;
+        let keep_single = l.selecting_kind != SelectKind::Char;
+        l.selecting_kind = SelectKind::Char;
+        l.selecting_origin = None;
+        if l.selection.is_some_and(|s| s.anchor == s.head) && !keep_single {
+            l.clear_selection();
+        } else {
+            l.snapshot_selection();
+        }
+        cx.notify();
+        true
+    }
+
+    /// 포커스 칸 커서가 깜박여야 하면(프로그램 지정 또는 설정 기본값, OWE-658) 타이머로 숨김을 뒤집는다.
+    /// 깜박일 커서가 없으면 타이머를 버린다.
+    fn sync_cursor_blink(&mut self, terminal_focused: bool, cx: &mut Context<Self>) {
+        let default = krill_app_core::settings::terminal_cursor(cx);
+        let blink = terminal_focused
+            && self.security.is_window_active()
+            && !self.has_workspace_focus_blocker(cx)
+            && !self.is_active_chat_view_in(cx)
+            && self
+                .layout
+                .focused()
+                .filter(|pane| self.layout.file(*pane).is_none())
+                .and_then(|pane| self.live.get(&pane))
+                .is_some_and(|l| {
+                    let screen = l.pane.shown();
+                    screen.cursor.visible
+                        && krill_app_core::terminal::effective_cursor(
+                            screen.cursor_style,
+                            screen.cursor_explicit,
+                            default,
+                        )
+                        .blink
+                });
+        if !blink {
+            self.cursor_blink = None;
+        } else if self.cursor_blink.is_none() {
+            let task = cx.spawn(async move |this, cx| {
+                let bg = cx.background_executor().clone();
+                loop {
+                    bg.timer(CURSOR_BLINK).await;
+                    let flipped = this.update(cx, |t, cx| {
+                        if let Some((_, hidden)) = &mut t.cursor_blink {
+                            *hidden = !*hidden;
+                            cx.notify();
+                        }
+                    });
+                    if flipped.is_err() {
+                        return;
+                    }
+                }
+            });
+            self.cursor_blink = Some((task, false));
+        }
+    }
+
+    fn copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            let text = gpui_component::TextSelection::selected_text(window, cx);
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
+        let Some(l) = self.focused_live() else { return };
+        let Some(text) = l.selected_text() else {
+            return;
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn copy_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            let raw = gpui_component::TextSelection::selected_text(window, cx);
+            let cleaned = select::clean_text(&raw);
+            if !cleaned.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(cleaned));
+            }
+            return;
+        }
+        let Some(l) = self.focused_live() else { return };
+        let Some(text) = l.selected_text().map(|t| select::clean_text(&t)) else {
+            return;
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx)
+            && let Some(pane) = self.layout.focused()
+            && let Some(key) = self.chat_key(pane)
+        {
+            self.intercept_chat_clipboard_paste(&key, window, cx);
+            return;
+        }
+        self.paste_clipboard(window, cx);
+    }
+
+    /// 포커스를 잃은 칸의 IME 조합을 확정한다(탭 전환·창 비활성화, MK-028 규칙 4).
+    /// AS-02: `window`가 없어도 저장된 창 핸들로 플랫폼 조합을 버린다. 같은 창의
+    /// `inputContext` 하나를 쓰므로 버리지 않으면 다음 자모가 새 칸에서 이어지거나
+    /// 늦은 `insertText`가 새 칸에 중복된다. 키 이벤트 밖(마우스·사이드바·Jump)이라
+    /// `handleEvent:` 재진입이 없어 `discardMarkedText`를 직접 불러도 된다.
+    fn commit_ime(&mut self, pane: PaneId, window: Option<&Window>, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let mut out = l.ime.commit();
+        out.pty = keys::tui::text(&out.pty, l.pane.modes());
+        if out.discard_ime {
+            if let Some(w) = window {
+                platform::discard_marked_text(w);
+            } else if let Some(handle) = self.window {
+                #[cfg(test)]
+                let discards = self.ime_discards.clone();
+                // 마우스·액션 처리 중 현재 창은 이미 빌려져 있다. 이벤트가 끝난 뒤
+                // 다시 빌려야 `window not found`로 조합 폐기가 누락되지 않는다.
+                cx.defer(move |cx| {
+                    handle
+                        .update(cx, |_, window, _| {
+                            platform::discard_marked_text(window);
+                            #[cfg(test)]
+                            discards.set(discards.get() + 1);
+                        })
+                        .ok();
+                });
+            }
+        }
+        if !out.pty.is_empty() {
+            if self.queue_input_behind_paste(pane, &out.pty) {
+                return;
+            }
+            let Some(l) = self.live.get_mut(&pane) else {
+                return;
+            };
+            let n = l.pane.input(&out.pty, Now::get());
+            self.show(n.as_ref(), cx);
+        }
+    }
+
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
+    }
+
+    /// 레이아웃을 바꾸고 저장한다. 드래그 중에는 `save = false`로 그리기만 하고 놓을 때 저장한다.
+    /// 포커스 칸이 바뀌면 이전 칸의 IME 조합을 확정하고, 보이는 칸이 바뀌면 연결을 맞춘다.
+    fn change(&mut self, save: bool, cx: &mut Context<Self>, f: impl FnOnce(&mut Layout)) {
+        self.change_with_policy(save, close::Policy::Preserve, cx, f);
+    }
+
+    pub(super) fn change_with_launcher(
+        &mut self,
+        bot_id: Option<krill_proto::bots::BotId>,
+        root_folder: Option<PathBuf>,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout) -> Option<PaneId>,
+    ) {
+        self.change_with_policy_and_hook(
+            true,
+            close::Policy::Preserve,
+            cx,
+            f,
+            |this, created_pane| {
+                if let Some(pane) = created_pane {
+                    this.register_split_launcher(pane, bot_id, root_folder);
+                }
+            },
+        );
+    }
+
+    fn change_with_policy(
+        &mut self,
+        save: bool,
+        policy: close::Policy,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout),
+    ) {
+        self.change_with_policy_and_hook(save, policy, cx, f, |_, ()| {});
+    }
+
+    fn change_with_policy_and_hook<R>(
+        &mut self,
+        save: bool,
+        policy: close::Policy,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout) -> R,
+        after_layout: impl FnOnce(&mut Self, R),
+    ) {
+        let focused = self.layout.focused();
+        let before = self.layout.clone();
+        let out = f(&mut self.layout);
+        after_layout(self, out);
+        if !self.layout.tabs().is_empty() {
+            krill_app_core::onboarding::dismiss_welcome(cx);
+        }
+        self.forget_closed_file_tabs();
+        self.cancel_closed_pastes(cx);
+        if policy == close::Policy::Terminate {
+            for index in 0..before.tabs().len() {
+                for pane in before.tab_panes(index) {
+                    if !self.layout.pane_exists(pane)
+                        && let Some(session) = before.session(pane)
+                    {
+                        self.workspace_closing
+                            .insert((before.host(pane).clone(), session));
+                    }
+                }
+            }
+            self.close_removed_sessions(&before, cx);
+        }
+        let now_focused = self.layout.focused();
+        // 같은 탭 안의 포커스 이동은 확대를 풀고, 탭 전환은 탭별 상태를 유지한다.
+        if self
+            .layout
+            .zoomed_pane()
+            .is_some_and(|z| Some(z) != now_focused)
+        {
+            self.layout.set_zoomed_pane(None);
+        }
+        if now_focused != focused {
+            self.files.refocus = true;
+            if let Some(old) = focused {
+                self.cancel_pending_paste_for(old, cx);
+                self.commit_ime(old, None, cx);
+            }
+            self.diff
+                .update(cx, krill_app_core::diff::Panel::clear_selection);
+        } else if self.layout != before {
+            // 비활성 탭 닫기 버튼(close-tab-{i}) 등 레이아웃 변경 시 버튼으로 빠져나간 포커스를 활성 칸으로 되돌린다.
+            self.files.refocus = true;
+        }
+        if save || now_focused != focused {
+            self.sync_focused_session(cx);
+        }
+        self.sync_sidebar_tab_state(cx);
+        // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
+        if now_focused.is_some() {
+            self.sync_diff_workspace(cx);
+        }
+        self.sync(cx);
+        if now_focused != focused {
+            self.poll_active_chat(cx);
+        }
+        if save && self.layout != before {
+            self.close_dashboard(None, cx);
+            self.close_settings(None, cx);
+            self.record_workspace_nav(cx);
+            self.save();
+            self.refresh_detached(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn focused_session(
+        &self,
+    ) -> Option<(krill_app_core::hosts::HostId, krill_proto::SessionId)> {
+        if self.page_open() || self.dashboard.is_some() {
+            return None;
+        }
+        let pane = self.layout.focused()?;
+        if self.layout.file(pane).is_some() {
+            return None;
+        }
+        Some((self.layout.host(pane).clone(), self.layout.session(pane)?))
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn focused_local_session(&self) -> Option<krill_proto::SessionId> {
+        self.focused_session()
+            .and_then(|(host, session)| host.is_local().then_some(session))
+    }
+
+    pub(super) fn sync_focused_session(&self, cx: &mut Context<Self>) {
+        let focused = self.focused_session();
+        let local = focused
+            .as_ref()
+            .and_then(|(host, session)| host.is_local().then_some(*session));
+        krill_app_core::alert::focus(local, cx);
+        self.sidebar.update(cx, |s, cx| match focused {
+            Some((host, session)) => s.set_focused_on(host, Some(session), cx),
+            None => s.set_focused(None, cx),
+        });
+    }
+
+    /// 세션을 보인다: 어떤 탭의 칸에 있으면 그 탭·칸으로, 없으면(분리된 세션) 새 탭에 붙인다.
+    pub(super) fn open_session(&mut self, session: krill_proto::SessionId, cx: &mut Context<Self>) {
+        self.open_session_on(krill_app_core::hosts::HostId::Local, session, cx);
+    }
+
+    pub(super) fn open_session_on(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout_loading {
+            self.restore_session = Some((host, session));
+            self.restore_session_chat = false;
+            return;
+        }
+        self.dashboard = None;
+        self.workspace_closing.remove(&(host.clone(), session));
+        self.sync_sidebar_visibility(cx);
+        self.close_settings(None, cx);
+        // CLI에서 만든 세션도 워크트리(비-git이면 작업 디렉터리)가 Open in·새 에이전트의 폴더가 된다(MK-055).
+        let folder = self
+            .sidebar
+            .read(cx)
+            .folder_on(&host, session)
+            .map(std::path::Path::to_path_buf);
+        if let Some(old) = self.layout.focused() {
+            self.commit_ime(old, None, cx);
+        }
+        let target = self.tab_pane_for_machine_session(&host, session, cx);
+        self.change(true, cx, |l| {
+            if let Some((tab, pane)) = target {
+                l.activate(tab);
+                l.focus(pane);
+            } else {
+                l.new_tab();
+                if let Some(pane) = l.focused() {
+                    l.set_host(pane, host);
+                    l.set_session(pane, session);
+                }
+            }
+            if let Some(folder) = folder
+                && let Some(pane) = l.focused()
+                && (target.is_none() || l.launch(pane).is_none_or(|launch| launch.cwd.is_empty()))
+            {
+                let mut launch = l.launch(pane).cloned().unwrap_or(Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: Vec::new(),
+                    cols: pane::SIZE.0,
+                    rows: pane::SIZE.1,
+                });
+                launch.cwd = folder.as_os_str().as_bytes().to_vec();
+                l.set_launch(pane, launch);
+            }
+        });
+        self.sidebar.update(cx, sidebar::Sidebar::reveal_focused);
+        if let Some(handle) = self.window {
+            let focus = self.focus.clone();
+            cx.update_window(handle, |_, window, cx| window.focus(&focus, cx))
+                .ok();
+        }
+    }
+
+    /// 지정한 호스트·세션이 붙은 칸을 찾는다(탭 인덱스·칸). OWE-854 사이드바 이어하기가 쓴다.
+    fn tab_pane_for_session_on(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+    ) -> Option<(usize, PaneId)> {
+        for i in 0..self.layout.tabs().len() {
+            let mut layout = self.layout.clone();
+            layout.activate(i);
+            if let Some(pane) = layout
+                .visible()
+                .into_iter()
+                .find(|&p| layout.session(p) == Some(session) && layout.host(p) == host)
+            {
+                return Some((i, pane));
+            }
+        }
+        None
+    }
+
+    fn tab_pane_for_machine_session(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> Option<(usize, PaneId)> {
+        if let Some(found) = self.tab_pane_for_session_on(host, session) {
+            return Some(found);
+        }
+        let sidebar = self.sidebar.read(cx);
+        for i in 0..self.layout.tabs().len() {
+            let mut layout = self.layout.clone();
+            layout.activate(i);
+            if let Some(pane) = layout.visible().into_iter().find(|&p| {
+                layout.session(p) == Some(session)
+                    && sidebar.same_machine_host(layout.host(p), host)
+            }) {
+                return Some((i, pane));
+            }
+        }
+        None
+    }
+
+    /// OWE-854: 사이드바 세션 행의 '새 세션에 이어하기…'. 칸에 없으면 먼저 붙이고 모달을 연다.
+    fn continue_sidebar_session(
+        &mut self,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let mut target = self.tab_pane_for_machine_session(host, session, cx);
+        if target.is_none() {
+            self.open_session_on(host.clone(), session, cx);
+            target = self.tab_pane_for_machine_session(host, session, cx);
+        }
+        let Some((_, pane)) = target else {
+            return;
+        };
+        let Some(handle) = self.window.and_then(|h| h.downcast::<Shell>()) else {
+            self.notice = Some(text::SIDEBAR_NO_WINDOW.get().to_owned());
+            cx.notify();
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |this, window, cx| {
+                    this.open_continue_session(pane, window, cx);
+                })
+                .ok();
+        });
+    }
+
+    /// OWE-854: 사이드바 세션 행의 '세션 종료…'. 확인 후 해당 호스트 데몬에 `Request::Close`를 보낸다.
+    fn request_close_sidebar_session(
+        &mut self,
+        host: krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target_for_host(&host).is_none() {
+            self.notice = Some(text::DAEMON_FAILED.get().to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(handle) = self.window.and_then(|h| h.downcast::<Shell>()) else {
+            self.notice = Some(text::SIDEBAR_NO_WINDOW.get().to_owned());
+            cx.notify();
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |this, window, cx| {
+                    this.confirm_close_sidebar_session(&host, session, window, cx);
+                })
+                .ok();
+        });
+    }
+
+    /// '세션 종료…' 확인 대화상자 뒤에 호스트 데몬에 종료를 요청한다. 결과는 알림에 남긴다.
+    fn confirm_close_sidebar_session(
+        &mut self,
+        host: &krill_app_core::hosts::HostId,
+        session: krill_proto::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_app_core::i18n::catalog::resources as rtext;
+        if self.target_for_host(host).is_none() {
+            self.notice = Some(text::DAEMON_FAILED.get().to_owned());
+            cx.notify();
+            return;
+        }
+        let name = {
+            let sidebar = self.sidebar.read(cx);
+            sidebar.session_on(host, session).map_or_else(
+                || format!("{} {}", rtext::SESSION.get(), session.0),
+                |s| sidebar.session_label(s).0,
+            )
+        };
+        let title = rtext::KILL_TITLE_NAMED.format(&[("name", &name)]);
+        let detail = rtext::KILL_DETAIL.get().to_owned();
+        let yes = rtext::KILL_CONFIRM.get().to_owned();
+        let no = rtext::CANCEL.get().to_owned();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &[yes.as_str(), no.as_str()],
+            cx,
+        );
+        let host = host.clone();
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.close_sidebar_session(&host, session, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_detached(&mut self, cx: &mut Context<Self>) {
+        if let Some(target) = self.local_target() {
+            let attached = self
+                .layout
+                .sessions_for_host(&krill_app_core::hosts::HostId::Local);
+            self.detached
+                .update(cx, |d, cx| d.refresh(target, attached, cx));
+        }
+    }
+
+    fn save(&self) {
+        self.quit_layout_ready.set(false);
+        if !self.layout_loading && self.path.is_some() {
+            self.layout_save_requests.request();
+        }
+    }
+
+    /// The only production Layout clone for persistence. Close/quit use this
+    /// before their durable barrier; ordinary changes wait for UI quiet time.
+    fn flush_layout_snapshot(&self) -> bool {
+        if !self.layout_save_requests.is_pending() {
+            return true;
+        }
+        if self.layout_loading {
+            return false;
+        }
+        let Some(path) = &self.path else { return true };
+        if !self.layout_save_requests.take() {
+            return true;
+        }
+        if self.saver.save_snapshot(path, self.layout.clone()) {
+            return true;
+        }
+        self.layout_save_requests.request();
+        false
+    }
+
+    fn layout_barrier(&self, cx: &App) -> Task<bool> {
+        if self.flush_layout_snapshot() {
+            self.saver.barrier(cx)
+        } else {
+            Task::ready(false)
+        }
+    }
+
+    pub(super) fn sync_sidebar_visibility(&self, cx: &mut Context<Self>) {
+        let visible = !self.sidebar_collapsed || self.dashboard.is_some();
+        self.sidebar.update(cx, |s, cx| s.set_visible(visible, cx));
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
+        // OWE-860: 설정에서 ⌘B를 누르면 설정을 닫고 사이드바를 전환한다.
+        if self.page_open() {
+            self.close_settings(None, cx);
+        }
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.layout.sidebar_collapsed = self.sidebar_collapsed;
+        self.files.refocus = true;
+        self.save();
+        self.sync_sidebar_visibility(cx);
+        cx.notify();
+    }
+
+    fn toggle_history(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
+        if self.page_open() {
+            self.close_settings(None, cx);
+        }
+        if !self.panel_collapsed
+            && self.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::History
+        {
+            self.toggle_panel(cx);
+            self.pending_focus = PendingFocus::Workspace;
+        } else {
+            self.panel_collapsed = false;
+            self.layout.panel_collapsed = false;
+            self.diff.update(cx, |d, cx| {
+                d.set_tab(krill_app_core::diff::PanelTab::History, cx);
+                d.set_visible(true, cx);
+            });
+            self.save();
+            cx.notify();
+        }
+    }
+
+    fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
+        // OWE-860: 설정에서 ⌘L 등을 누르면 설정을 닫고 패널을 전환한다.
+        if self.page_open() {
+            self.close_settings(None, cx);
+        }
+        self.panel_collapsed = !self.panel_collapsed;
+        self.layout.panel_collapsed = self.panel_collapsed;
+        self.files.refocus = true;
+        self.save();
+        let visible = !self.panel_collapsed && self.security.is_window_active();
+        self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
+        cx.notify();
+    }
+
+    fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A bot page or group page has no Changes tab (Orca hides it there).
+        if self.has_blocking_overlay()
+            || self.focused_bot().is_some()
+            || self.focused_bot_group().is_some()
+        {
+            return;
+        }
+        if self.panel_collapsed {
+            self.panel_collapsed = false;
+            let visible = self.security.is_window_active();
+            self.diff.update(cx, |d, cx| {
+                d.set_visible(visible, cx);
+                d.show_changes(window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        if self.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::Changes {
+            self.panel_collapsed = true;
+            self.diff.update(cx, |d, cx| d.set_visible(false, cx));
+            window.focus(&self.focus, cx);
+        } else {
+            self.diff.update(cx, |d, cx| {
+                d.show_changes(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
+        // OWE-860: 설정에서 ⌘⇧E를 누르면 설정을 닫고 탐색기로 전환한다.
+        if self.page_open() {
+            self.close_settings(Some(&mut *window), cx);
+        }
+        // A group page has no Files/Search panel tabs (it shows BotGroupItemsPanel).
+        if self.focused_bot_group().is_some() {
+            return;
+        }
+        // A bot page shows its Files tab in place of the usual panel tabs.
+        let bot_page = self.focused_bot().is_some();
+        let files_tab_hidden = bot_page && self.bot_ui.panel.tab != bot_panel::BotPanelTab::Files;
+        if bot_page {
+            self.bot_ui.panel.tab = bot_panel::BotPanelTab::Files;
+        }
+        if self.panel_collapsed {
+            self.panel_collapsed = false;
+            self.layout.panel_collapsed = false;
+            let visible = self.security.is_window_active();
+            self.diff.update(cx, |d, cx| {
+                d.set_visible(visible, cx);
+                d.show_files(window, cx);
+            });
+            let _ = self
+                .layout
+                .set_panel_tab(krill_app_core::diff::PanelTab::Files);
+            self.save();
+            cx.notify();
+            return;
+        }
+        if self.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::Files
+            && !files_tab_hidden
+        {
+            self.panel_collapsed = true;
+            self.layout.panel_collapsed = true;
+            self.save();
+            self.diff.update(cx, |d, cx| d.set_visible(false, cx));
+            window.focus(&self.focus, cx);
+        } else {
+            self.diff.update(cx, |d, cx| d.show_files(window, cx));
+            if self
+                .layout
+                .set_panel_tab(krill_app_core::diff::PanelTab::Files)
+            {
+                self.save();
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
+        // A bot page or group page has no Search tab (Orca hides it there).
+        if !self.page_open() && (self.focused_bot().is_some() || self.focused_bot_group().is_some())
+        {
+            return;
+        }
+        // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
+        if self.page_open() {
+            self.close_settings(Some(&mut *window), cx);
+        }
+        if self.panel_collapsed {
+            self.panel_collapsed = false;
+            self.layout.panel_collapsed = false;
+            let visible = self.security.is_window_active();
+            self.diff.update(cx, |d, cx| {
+                d.set_visible(visible, cx);
+                d.show_search(window, cx);
+            });
+            let _ = self
+                .layout
+                .set_panel_tab(krill_app_core::diff::PanelTab::Search);
+            self.save();
+            cx.notify();
+            return;
+        }
+        if self.diff.read(cx).active_tab() == krill_app_core::diff::PanelTab::Search {
+            self.panel_collapsed = true;
+            self.layout.panel_collapsed = true;
+            self.save();
+            self.diff.update(cx, |d, cx| d.set_visible(false, cx));
+            self.files.refocus = true;
+            window.focus(&self.focus, cx);
+        } else {
+            self.diff.update(cx, |d, cx| d.show_search(window, cx));
+            if self
+                .layout
+                .set_panel_tab(krill_app_core::diff::PanelTab::Search)
+            {
+                self.save();
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_column_drag(&mut self, event: &DragMoveEvent<Drag>, cx: &mut Context<Self>) {
+        let drag = event.drag(cx).clone();
+        let x = f32::from(event.event.position.x);
+        let left = f32::from(event.bounds.left());
+        let total = f32::from(event.bounds.size.width);
+        let l = &self.layout;
+        let sidebar = if self.sidebar_collapsed {
+            0.0
+        } else {
+            l.sidebar_width
+        };
+        let panel = if self.panel_collapsed {
+            0.0
+        } else {
+            l.panel_width
+        };
+        match drag {
+            Drag::Sidebar => self.change(false, cx, |l| {
+                l.sidebar_width = layout::clamp_column(x - left, total, panel);
+            }),
+            Drag::Panel => self.change(false, cx, |l| {
+                l.panel_width = layout::clamp_column(left + total - x, total, sidebar);
+            }),
+            Drag::Split(_) => {}
+        }
+    }
+
+    fn render_sidebar_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = krill_app_core::ui::palette(cx);
+        let can_back = self.can_navigate_back(cx);
+        let can_forward = self.can_navigate_forward(cx);
+        div()
+            .id("sidebar-titlebar")
+            .h(krill_app_core::ui::TITLEBAR_HEIGHT)
+            .w_full()
+            .flex_none()
+            .pl(traffic_light_pad(window))
+            .pr_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .bg(p.worktree_sidebar)
+            .border_b_1()
+            .border_color(p.worktree_sidebar_border)
+            .text_color(p.muted_foreground)
+            .child(
+                div()
+                    .id("titlebar-title")
+                    // K1 OWE-843: 좁은 사이드바·큰 UI 배율에서도 앱 이름을 찌그러뜨리지 않는다.
+                    .flex_none()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(krill_app_core::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(p.worktree_sidebar_foreground)
+                    .child(
+                        krill_app_core::ui::icons::krill_brand_icon(krill_app_core::ui::ICON_MD, p)
+                            .debug_selector(|| "titlebar-brand-mark".into()),
+                    )
+                    .child(div().truncate().child(text::APP_TITLE.get())),
+            )
+            .child(krill_app_core::ui::button_with_tooltip(
+                Button::new("toggle-sidebar")
+                    .icon(IconName::PanelLeft)
+                    .ghost()
+                    .xsmall()
+                    .debug_selector(|| "toggle-sidebar".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                "toggle-sidebar",
+                text::TOGGLE_SIDEBAR.get(),
+            ))
+            .child(
+                div()
+                    .id("sidebar-titlebar-drag")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .window_control_area(gpui::WindowControlArea::Drag),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(krill_app_core::ui::button_with_tooltip(
+                        Button::new("sidebar-history-prev")
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app_core::ui::icons::ARROW_LEFT_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_back)
+                            .debug_selector(|| "sidebar-history-prev".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate_back(Some(window), cx);
+                            })),
+                        "sidebar-history-prev",
+                        krill_app_core::i18n::catalog::settings::SC_NAV_BACK.get(),
+                    ))
+                    .child(krill_app_core::ui::button_with_tooltip(
+                        Button::new("sidebar-history-next")
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app_core::ui::icons::ARROW_RIGHT_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_forward)
+                            .debug_selector(|| "sidebar-history-next".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate_forward(Some(window), cx);
+                            })),
+                        "sidebar-history-next",
+                        krill_app_core::i18n::catalog::settings::SC_NAV_FORWARD.get(),
+                    )),
+            )
+    }
+
+    fn render_tree(
+        &mut self,
+        node: &PaneTree,
+        path: &mut Vec<Branch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (axis, ratio, first, second) = match node {
+            PaneTree::Leaf(id) => return self.render_pane(*id, window, cx),
+            PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => (*axis, *ratio, first, second),
+        };
+        let mine = path.clone();
+        path.push(Branch::First);
+        let first = self.render_tree(first, path, window, cx);
+        path.pop();
+        path.push(Branch::Second);
+        let second = self.render_tree(second, path, window, cx);
+        path.pop();
+
+        let dragging = self.active_split_drag.as_ref() == Some(&mine);
+        let gutter = pane_frame::split_gutter(mine.clone(), axis, dragging, cx);
+        let horizontal = axis == Axis::Horizontal;
+        div()
+            .flex()
+            .size_full()
+            .when(!horizontal, Styled::flex_col)
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<Drag>, _, cx| {
+                if *e.drag(cx) != Drag::Split(mine.clone()) {
+                    return;
+                }
+                this.active_split_drag = Some(mine.clone());
+                let (pos, start, len) = if horizontal {
+                    (e.event.position.x, e.bounds.left(), e.bounds.size.width)
+                } else {
+                    (e.event.position.y, e.bounds.top(), e.bounds.size.height)
+                };
+                let r = pane_frame::split_drag_ratio(pos, start, len);
+                let mine = mine.clone();
+                this.change(false, cx, move |l| l.set_ratio(&mine, r));
+            }))
+            .child(
+                div()
+                    .flex_basis(px(0.))
+                    .flex_grow(ratio)
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(first),
+            )
+            .child(gutter)
+            .child(
+                div()
+                    .flex_basis(px(0.))
+                    .flex_grow(1. - ratio)
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(second),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn host_name_for_pane(&self, pane: PaneId, cx: &App) -> Option<String> {
+        let krill_app_core::hosts::HostId::Remote(id) = self.layout.host(pane) else {
+            return None;
+        };
+        Some(self.remote_host_name(id, cx))
+    }
+
+    /// A remote host's name as the sidebar shows it (its id when nothing names it).
+    pub(super) fn remote_host_name(&self, id: &str, cx: &App) -> String {
+        if let Some(h) = self
+            .sidebar
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .find(|h| h.id == id)
+        {
+            return h.label.clone();
+        }
+        if let Some((spec, _)) = self
+            .host_statuses
+            .iter()
+            .find(|(s, _)| s.id == id || s.address == id)
+        {
+            return spec.display_name().to_owned();
+        }
+        if let Some(h) = self
+            .ssh_hosts
+            .iter()
+            .find(|h| h.id == id || h.destination == id)
+        {
+            let label = h.label.trim();
+            return if label.is_empty() {
+                h.destination.clone()
+            } else {
+                label.to_owned()
+            };
+        }
+        id.to_owned()
+    }
+
+    /// MK-131: 원격 호스트 세션 패인 헤더에 표시하는 호스트 이름 배지(상단 탭 바에는 공간 절약을 위해 표시하지 않는다).
+    pub(super) fn host_badge(
+        &self,
+        pane: PaneId,
+        prefix: &'static str,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let host_name = self.host_name_for_pane(pane, cx)?;
+        let p = krill_app_core::ui::palette(cx);
+        let id = pane.get();
+        Some(
+            div()
+                .debug_selector(move || format!("{prefix}-{id}"))
+                .flex_none()
+                .px_1p5()
+                .py_0p5()
+                .rounded(krill_app_core::ui::RADIUS_XS)
+                .bg(p.sidebar_accent)
+                .border_1()
+                .border_color(p.border)
+                .text_color(p.muted_foreground)
+                .text_size(krill_app_core::ui::TEXT_2XS)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .max_w(px(120.))
+                .truncate()
+                .child(host_name),
+        )
+    }
+
+    fn toggle_zoom_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.change(true, cx, |l| {
+            l.toggle_zoom_pane(id);
+        });
+        if self.layout.focused() == Some(id) {
+            self.files.refocus = true;
+            if !self.focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
+        }
+    }
+
+    fn resize_focused_pane(
+        &mut self,
+        dir: krill_app_core::layout::Direction,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        let bounds = self.surface_bounds.get();
+        let surface = (bounds.size.width > px(0.) && bounds.size.height > px(0.))
+            .then_some([f32::from(bounds.size.width), f32::from(bounds.size.height)]);
+        let step_px = krill_app_core::layout::KEYBOARD_RESIZE_STEP_PX
+            * krill_app_core::settings::current(cx).zoom();
+        let mut changed = false;
+        self.change(false, cx, |l| {
+            changed = l.resize_focused_pane(dir, step_px, surface);
+        });
+        if changed {
+            self.save();
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
+    )]
+    fn begin_scrollbar_drag(&mut self, id: PaneId, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&id) else {
+            return;
+        };
+        let bounds = l.scrollbar_track.get();
+        let track_top = f32::from(bounds.origin.y);
+        let track_h = f32::from(bounds.size.height);
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return;
+        };
+        if !track_h.is_finite() || track_h <= 1.0 {
+            return;
+        }
+        let thumb_px = (track_h * geom.thumb_ratio)
+            .max(SCROLLBAR_MIN_THUMB_PX)
+            .min(track_h);
+        let travel = (track_h - thumb_px).max(0.0);
+        let thumb_top = (1.0 - (offset.min(fetched) as f32 / fetched as f32)) * travel;
+        let rel_y = f32::from(pointer_y) - track_top;
+        let on_thumb = rel_y >= thumb_top && rel_y <= thumb_top + thumb_px;
+        let grab_offset_px = if on_thumb {
+            (rel_y - thumb_top).clamp(0.0, thumb_px)
+        } else {
+            thumb_px * 0.5
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag {
+            pane: id,
+            grab_offset_px,
+        });
+        if !on_thumb {
+            let target = scrollbar_offset_for_y(
+                f32::from(pointer_y),
+                track_top,
+                track_h,
+                geom.thumb_ratio,
+                grab_offset_px,
+                fetched,
+            );
+            l.pane.scroll_to_offset(target, true);
+        }
+        cx.notify();
+    }
+
+    fn update_scrollbar_drag(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let Some(l) = self.live.get_mut(&drag.pane) else {
+            self.scrollbar_drag = None;
+            return;
+        };
+        let bounds = l.scrollbar_track.get();
+        let track_top = f32::from(bounds.origin.y);
+        let track_h = f32::from(bounds.size.height);
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return;
+        };
+        let target = scrollbar_offset_for_y(
+            f32::from(pointer_y),
+            track_top,
+            track_h,
+            geom.thumb_ratio,
+            drag.grab_offset_px,
+            fetched,
+        );
+        if l.pane.scroll_to_offset(target, true) {
+            cx.notify();
+        }
+    }
+
+    fn end_scrollbar_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag.take() else {
+            return;
+        };
+        if let Some(l) = self.live.get_mut(&drag.pane) {
+            l.pane.finish_scroll_drag();
+        }
+        cx.notify();
+    }
+
+    /// OWE-873: 스크롤 중(바닥 위)일 때 터미널 칸 우측에 드래그 가능한 스크롤바와
+    /// '맨 아래로' 배지를 겹쳐 그린다. 대체 화면·5열 미만·바닥(비드래그)에서는 숨긴다.
+    fn scroll_chrome(&self, id: PaneId, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(l) = self.live.get(&id) else {
+            return Vec::new();
+        };
+        if l.pane.session().is_none() {
+            return Vec::new();
+        }
+        let alt_screen = l
+            .pane
+            .modes()
+            .contains(krill_proto::term_modes::Modes::ALT_SCREEN);
+        let cols = l.pane.screen().cols;
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        let dragging = self.scrollbar_drag.is_some_and(|d| d.pane == id);
+        if !should_show_scrollbar(alt_screen, cols, fetched, offset, dragging) {
+            return Vec::new();
+        }
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return Vec::new();
+        };
+        let p = krill_app_core::ui::palette(cx);
+        let track_cell = Rc::clone(&l.scrollbar_track);
+        let track_probe = canvas(|_, _, _| {}, move |bounds, (), _, _| track_cell.set(bounds))
+            .absolute()
+            .size_full();
+        let bar = div()
+            .id(("scrollbar", id.get()))
+            .debug_selector(|| "scrollbar".into())
+            .absolute()
+            .top(px(4.))
+            .bottom(px(4.))
+            .right(px(0.))
+            .w(px(10.))
+            .px(px(2.))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .child(track_probe)
+            .child(div().w_full().h(gpui::relative(geom.top_ratio)))
+            .child(
+                div()
+                    .debug_selector(|| "scrollbar-thumb".into())
+                    .w_full()
+                    .h(gpui::relative(geom.thumb_ratio))
+                    .min_h(px(SCROLLBAR_MIN_THUMB_PX))
+                    .rounded_full()
+                    .bg(if dragging { p.primary } else { p.ring }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                    this.begin_scrollbar_drag(id, e.position.y, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        let mut out = vec![bar.into_any_element()];
+        if offset > 0 {
+            let bottom = div()
+                .id(("scroll-to-bottom", id.get()))
+                .debug_selector(|| "scroll-to-bottom".into())
+                .absolute()
+                .bottom(px(10.))
+                .right(px(14.))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(l) = this.live.get_mut(&id) {
+                        l.pane.scroll(isize::MIN);
+                        cx.notify();
+                    }
+                }))
+                .child(krill_app_core::ui::badge(
+                    p,
+                    krill_app_core::ui::BadgeTone::Neutral,
+                    text::SCROLL_TO_BOTTOM.get(),
+                ));
+            out.push(bottom.into_any_element());
+        }
+        out
+    }
+
+    fn render_pane(
+        &mut self,
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const PANE_HEADER_GROUP: &str = "pane-header";
+        if self.is_split_launcher(id) {
+            return self.render_split_launcher_pane(id, window, cx);
+        }
+        if self.is_group_pane(id) {
+            return self.render_group_chat_pane(id, window, cx);
+        }
+        if self.layout.file(id).is_some() {
+            return self.render_file_pane(id, window, cx);
+        }
+        let focused = self.layout.focused() == Some(id);
+        let in_card = self.workspace_stage() == pane_frame::WorkspaceStage::CardStage;
+        let focus_state = self.pane_focus_state(id, window, cx);
+        let solid_cursor = focus_state.shows_solid_terminal_cursor();
+        let is_split = self.layout.visible().len() > 1;
+        let ended = self.live.get(&id).is_some_and(|live| {
+            live.pane.session().is_some() && (live.pane.is_cold() || live.pane.is_closed())
+        });
+        let pane_title = self.layout.pane_title(id).map(str::to_owned);
+        let renaming_pane = self
+            .pane_rename
+            .as_ref()
+            .filter(|r| r.pane == id)
+            .map(|r| r.input.clone());
+        let has_pane_name_ui = pane_title.is_some() || renaming_pane.is_some();
+        let show_ended_header = is_split || self.layout.host(id).is_remote() || has_pane_name_ui;
+        let show_floating_header = !ended
+            && (self.role == WindowRole::Main
+                || is_split
+                || self.layout.host(id).is_remote()
+                || has_pane_name_ui);
+        let p = krill_app_core::ui::palette(cx);
+        // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
+        // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
+        let host_badge = self.host_badge(id, "pane-host-badge", cx);
+        // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
+        let zoomed = self.layout.zoomed_pane() == Some(id);
+        let hover_bg = p.sidebar.opacity(0.92);
+        let hover_border = p.border;
+        // 실행 중인 패인은 터미널 우상단의 플로팅 오버레이 칩에 컨트롤만 두고
+        // 현재 활성(포커스) 패인의 오른쪽 분할 버튼만 Orca처럼 은은히 드러낸 채
+        // 나머지 컨트롤은 마우스를 올릴 때만 드러낸다.
+        // 종료·콜드 패인은 헤더를 일반 흐름에 넣어 UI 배율에 맞는 높이를 확보하고
+        // 아래 배너와 겹치지 않게 한다. 탭 바의 제목은 중복하지 않는다.
+        let pane_header_chip = div()
+            .font_family(krill_app_core::ui::FONT_UI)
+            .text_size(krill_app_core::ui::TEXT_XS)
+            .max_w_full()
+            .flex_wrap()
+            .justify_end()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .px_1()
+            .py_0p5()
+            .rounded(krill_app_core::ui::RADIUS_SM)
+            .border_1()
+            .when(ended, |d| d.bg(hover_bg).border_color(hover_border))
+            .when(!ended, |d| {
+                d.bg(krill_app_core::ui::transparent())
+                    .border_color(krill_app_core::ui::transparent())
+                    .group_hover(PANE_HEADER_GROUP, move |d| {
+                        d.bg(hover_bg).border_color(hover_border)
+                    })
+            })
+            .when_some(renaming_pane.clone(), |d, input| {
+                d.child(
+                    div()
+                        .id(("pane-rename-input", id.get()))
+                        .debug_selector(|| "pane-rename-input".into())
+                        .flex_none()
+                        .w(px(140.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(gpui_component::input::Input::new(&input).xsmall()),
+                )
+            })
+            .when(renaming_pane.is_none(), |d| {
+                d.when_some(pane_title, |d, title| {
+                    d.child(
+                        div()
+                            .id(("pane-title", id.get()))
+                            .debug_selector(move || format!("pane-title-{}", id.get()))
+                            .flex_none()
+                            .max_w(px(160.))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(krill_app_core::ui::RADIUS_XS)
+                            .bg(hover_bg)
+                            .border_1()
+                            .border_color(hover_border)
+                            .text_size(krill_app_core::ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .truncate()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                                if e.click_count() >= 2 {
+                                    cx.stop_propagation();
+                                    this.begin_pane_rename(id, window, cx);
+                                }
+                            }))
+                            .child(title),
+                    )
+                })
+            })
+            .when_some(host_badge, |d, badge| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(badge),
+                )
+            })
+            .when(zoomed, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(
+                            div()
+                                .id(("pane-zoom-badge", id.get()))
+                                .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
+                                .aria_label(text::ZOOMED_BADGE.get())
+                                .flex_none()
+                                .px_1()
+                                .rounded(krill_app_core::ui::RADIUS_XS)
+                                .bg(p.muted)
+                                .font_family(krill_app_core::ui::FONT_UI)
+                                .text_size(krill_app_core::ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::ZOOMED_BADGE.get()),
+                        )
+                        .child(krill_app_core::ui::button_with_tooltip(
+                            krill_app_core::ui::ghost(
+                                ("pane-unzoom", id.get()),
+                                text::PANE_UNZOOM.get(),
+                            )
+                            .xsmall()
+                            .debug_selector(move || format!("pane-unzoom-{}", id.get()))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_zoom_pane(id, window, cx);
+                                },
+                            )),
+                            format!("pane-unzoom-{}", id.get()),
+                            text::PANE_UNZOOM.get(),
+                        )),
+                )
+            })
+            .when(is_split && !zoomed, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(krill_app_core::ui::button_with_tooltip(
+                            Button::new(("pane-zoom", id.get()))
+                                .debug_selector(move || format!("pane-zoom-{}", id.get()))
+                                .icon(IconName::Maximize)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_zoom_pane(id, window, cx);
+                                })),
+                            format!("pane-zoom-{}", id.get()),
+                            text::PANE_ZOOM.get(),
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .when(!ended, |d| {
+                        d.invisible()
+                            .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                    })
+                    .child(krill_app_core::ui::button_with_tooltip(
+                        Button::new(("pane-split-down", id.get()))
+                            .debug_selector(move || format!("pane-split-down-{}", id.get()))
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app_core::ui::icons::SPLIT_VERTICAL_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.split_pane(id, Axis::Vertical, cx);
+                            })),
+                        format!("pane-split-down-{}", id.get()),
+                        text::SPLIT_DOWN.get(),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .when(!ended && !focused, |d| {
+                        d.invisible()
+                            .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                    })
+                    .when(!ended && focused, |d| {
+                        d.opacity(0.7)
+                            .group_hover(PANE_HEADER_GROUP, |s| s.opacity(1.0))
+                    })
+                    .child(krill_app_core::ui::button_with_tooltip(
+                        Button::new(("pane-split-right", id.get()))
+                            .debug_selector(move || format!("pane-split-right-{}", id.get()))
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app_core::ui::icons::SPLIT_HORIZONTAL_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.split_pane(id, Axis::Horizontal, cx);
+                            })),
+                        format!("pane-split-right-{}", id.get()),
+                        text::SPLIT_RIGHT.get(),
+                    )),
+            )
+            .when(is_split, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(krill_app_core::ui::button_with_tooltip(
+                            Button::new(("pane-close", id.get()))
+                                .debug_selector(move || format!("pane-close-{}", id.get()))
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
+                                    // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
+                                    this.maybe_close_pane(id, cx);
+                                })),
+                            format!("pane-close-{}", id.get()),
+                            text::CLOSE_PANE.get(),
+                        )),
+                )
+            });
+        let pane_header = div()
+            .id(("pane-header", id.get()))
+            .debug_selector(move || format!("pane-header-{}", id.get()))
+            .max_w(relative(1.))
+            .flex_none()
+            .flex()
+            .justify_end()
+            .when(!ended, |d| {
+                d.absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .group(PANE_HEADER_GROUP)
+            })
+            .when(ended, |d| d.self_end().mb_2())
+            .child(pane_header_chip);
+        let mut pane_header = Some(pane_header);
+        let body = match self.live.get(&id) {
+            Some(l) if l.pane.session().is_some() => {
+                let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme)
+                    .with_row_cache(l.row_cache.clone());
+                el.opacity = krill_app_core::settings::effective_terminal_opacity_alpha(cx);
+                el.cursor = krill_app_core::terminal::effective_cursor(
+                    el.screen.cursor_style,
+                    el.screen.cursor_explicit,
+                    krill_app_core::settings::terminal_cursor(cx),
+                );
+                el.cursor_hidden = solid_cursor && self.cursor_blink.as_ref().is_some_and(|b| b.1);
+                el.cursor_hollow = !solid_cursor;
+                el.painted = Some(Rc::clone(&l.painted));
+                el.selection = l.shown_selection();
+                el.highlight = l.pane.highlight();
+                el.highlights = l.pane.highlights().to_vec();
+                el.link = self.path_hover(id);
+                el.preedit = focused
+                    .then(|| l.ime.overlay_in_columns(usize::from(l.pane.screen().cols)))
+                    .flatten()
+                    .map(|o| Preedit {
+                        origin: o.origin,
+                        text: o.text.to_owned(),
+                        columns: o.columns,
+                        selected: l.ime.selected_columns(),
+                    });
+                // 확정 뒤 에코 대기 글자는 화면에 아직 없어도 그린다(OWE-615 원인 1).
+                el.pending = focused.then(|| l.ime.pending()).flatten().map(|p| Preedit {
+                    origin: p.origin,
+                    text: p.text.to_owned(),
+                    columns: p.columns,
+                    selected: None,
+                });
+                if l.pane.is_cold() || l.pane.is_closed() {
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        // Ended/cold panes reserve the header's measured height, including UI zoom.
+                        .when(show_ended_header, |d| d.children(pane_header.take()))
+                        // OWE-653: 배너는 테두리 있는 띠로, 문구는 본문 색·왼쪽, 버튼은 오른쪽 끝(다시 시작=주 버튼).
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .mb_1()
+                                .px_2()
+                                .py_1()
+                                .rounded(krill_app_core::ui::RADIUS_SM)
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.muted)
+                                .text_color(p.foreground)
+                                .text_size(krill_app_core::ui::TEXT_XS)
+                                .flex_wrap()
+                                .debug_selector(|| "session-ended".into())
+                                .child(div().min_w_0().child(text::COLD.get()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .max_w_full()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_1()
+                                        // 다시 시작 요청의 결과를 모르면 버튼으로 또 보내지 않는다(사이드바에서 확인).
+                                        .when(!self.outcome_unknown.contains_key(&id), |d| {
+                                            d.child(
+                                                Button::new(ElementId::Name(
+                                                    format!("restart-{}", id.get()).into(),
+                                                ))
+                                                .debug_selector(move || {
+                                                    format!("restart-{}", id.get())
+                                                })
+                                                .label(text::RESTART.get())
+                                                .primary()
+                                                .xsmall()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.restart(id, cx);
+                                                })),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(("close-ended-pane", id.get()))
+                                                .label(text::CLOSE_PANE.get())
+                                                .debug_selector(|| "close-ended-pane".into())
+                                                .ghost()
+                                                .xsmall()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
+                                                    this.layout.set_zoomed_pane(None);
+                                                    #[cfg(test)]
+                                                    this.record_closed_pane(id, cx);
+                                                    this.close_with_policy(
+                                                        close::Policy::Preserve,
+                                                        cx,
+                                                        |layout| {
+                                                            layout.focus(id);
+                                                            layout.close_pane();
+                                                        },
+                                                    );
+                                                })),
+                                        ),
+                                )
+                                .children(l.error.clone().map(|err| {
+                                    div()
+                                        .debug_selector(|| "pane-error".into())
+                                        .text_color(p.destructive)
+                                        .child(krill_app_core::i18n::cached_notice(&err))
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(el),
+                        )
+                        .into_any_element()
+                } else {
+                    el.into_any_element()
+                }
+            }
+            // 붙기 직전의 새 칸은 빈 터미널로 곧바로 보인다(즉시 반응 규칙). 오류는 바로 알린다.
+            Some(l) if l.error.is_none() && l.born.elapsed() < CONNECTING_GRACE => {
+                div().into_any_element()
+            }
+            Some(l) => div()
+                .text_size(krill_app_core::ui::TEXT_XS)
+                .child(l.error.as_deref().map_or_else(
+                    || text::CONNECTING.get().to_owned(),
+                    krill_app_core::i18n::cached_notice,
+                ))
+                .into_any_element(),
+            None => div()
+                .text_size(krill_app_core::ui::TEXT_XS)
+                .child(format!("{} {}", text::PANE.get(), id.get()))
+                .into_any_element(),
+        };
+        let term_bg = krill_app_core::ui::terminal_surface_alpha(
+            self.terminal_theme,
+            krill_app_core::settings::effective_terminal_opacity_pct(cx),
+        );
+        let pane_veil = pane_frame::pane_veil_alpha(
+            is_split,
+            focused,
+            self.layout.zoomed_pane().is_some(),
+            krill_app_core::settings::unfocused_pane_veil(cx),
+        )
+        .map(|alpha| {
+            pane_frame::render_pane_veil(
+                id,
+                krill_app_core::ui::terminal_surface(self.terminal_theme).opacity(alpha),
+            )
+        });
+        let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, in_card, cx) {
+            Some((bar, pop)) => (Some(bar), pop),
+            None => (None, None),
+        };
+        let has_sticky_bar = sticky_bar.is_some();
+        let stale_account_banner =
+            self.render_stale_account_banner(id, in_card && !has_sticky_bar, cx);
+        let pane =
+            div()
+                .id(ElementId::Name(format!("pane-{}", id.get()).into()))
+                .size_full()
+                .relative()
+                .overflow_hidden()
+                .when(!in_card, |d| d.bg(term_bg))
+                .text_color(p.muted_foreground)
+                .flex()
+                .flex_col()
+                .children(sticky_bar)
+                .children(stale_account_banner)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .p(krill_app_core::ui::SPACE_2)
+                        .child(
+                            div()
+                                .size_full()
+                                .relative()
+                                .child(body)
+                                .children(self.fit_probe(id, cx))
+                                .children(self.scroll_chrome(id, cx))
+                                .children(pane_veil)
+                                // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
+                                // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
+                                .children(pane_header.filter(|_| show_floating_header)),
+                        )
+                        .children(self.render_pane_chat_overlay(id, has_sticky_bar, window, cx))
+                        .children(sticky_popover),
+                )
+                .when(self.files.hover.as_ref().is_some_and(|h| h.0 == id), |d| {
+                    d.cursor_pointer()
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                        if keys::link_modifier(e.modifiers) {
+                            this.change(true, cx, |l| l.focus(id));
+                            let action = if e.modifiers.alt {
+                                terminal_menu::FileAction::OpenDefault
+                            } else {
+                                terminal_menu::FileAction::Open
+                            };
+                            let mut file = None;
+                            let mut url = None;
+                            if let Some(l) = this.live.get(&id) {
+                                let screen = l.pane.shown();
+                                if let Some(uri) = link_target(&screen, &l.painted, e.position) {
+                                    url = Some(uri.to_owned());
+                                } else if let Some(path) =
+                                    file_link_target(&screen, &l.painted, e.position)
+                                {
+                                    file = Some(path);
+                                } else if let Some((_, uri)) =
+                                    krill_app_core::terminal::url_link_target(
+                                        &screen, &l.painted, e.position,
+                                    )
+                                {
+                                    url = Some(uri);
+                                }
+                            }
+                            if let Some(uri) = url {
+                                this.open_terminal_url(id, &uri, cx);
+                            } else {
+                                // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
+                                match file {
+                                    Some(path) => {
+                                        this.open_terminal_file(path, e.position, action, cx);
+                                    }
+                                    None => {
+                                        if let Some((_, link)) =
+                                            this.path_link_at(id, e.position, Some(action), cx)
+                                        {
+                                            this.activate_terminal_file(link, action, cx);
+                                        }
+                                    }
+                                }
+                            }
+                            if this.layout.focused() == Some(id) {
+                                this.files.refocus = true;
+                                if !this.focus.is_focused(window) {
+                                    window.focus(&this.focus, cx);
+                                }
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        this.change(true, cx, |l| l.focus(id));
+                        this.files.refocus = true;
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
+                        }
+                        if this.selects(id, e.modifiers) {
+                            this.select_begin(id, e.position, e.click_count, e.modifiers, cx);
+                        } else {
+                            this.mouse_input(
+                                id,
+                                keys::tui::Mouse::Press(0),
+                                e.position,
+                                e.modifiers,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                        this.change(true, cx, |l| l.focus(id));
+                        this.files.refocus = true;
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
+                        }
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Press(1),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                        // 우클릭 메뉴의 복사·붙여넣기가 이 칸에 가도록 포커스를 옮긴다.
+                        this.change(true, cx, |l| l.focus(id));
+                        this.files.refocus = true;
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
+                        }
+                        if !this.selects(id, e.modifiers) {
+                            this.mouse_input(
+                                id,
+                                keys::tui::Mouse::Press(2),
+                                e.position,
+                                e.modifiers,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &gpui::MouseUpEvent, window, cx| {
+                        // 끌지 않은 맨 클릭이 링크 위면 대상 URL·복사·열기 팝오버를 띄운다(⌘ 없이도).
+                        let clicked = !e.modifiers.modified()
+                            && this.live.get(&id).is_some_and(|l| {
+                                l.selecting
+                                    && l.selecting_kind == SelectKind::Char
+                                    && l.selection.is_some_and(|s| s.anchor == s.head)
+                            });
+                        if this.select_end(id, cx) {
+                            if clicked {
+                                if let Some((_, uri)) = this.click_link_at(id, e.position) {
+                                    this.open_link_menu(id, uri, e.position, cx);
+                                    return;
+                                }
+                                if let Some(path) = this
+                                    .live
+                                    .get(&id)
+                                    .filter(|l| !l.pane.modes().mouse())
+                                    .and_then(|l| {
+                                        file_link_target(&l.pane.shown(), &l.painted, e.position)
+                                    })
+                                {
+                                    this.open_terminal_file(
+                                        path,
+                                        e.position,
+                                        terminal_menu::FileAction::Open,
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                if let Some((_, link)) = this.path_link_at(
+                                    id,
+                                    e.position,
+                                    Some(terminal_menu::FileAction::Open),
+                                    cx,
+                                ) {
+                                    this.activate_terminal_file(
+                                        link,
+                                        terminal_menu::FileAction::Open,
+                                        cx,
+                                    );
+                                    return;
+                                }
+                            }
+                            // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
+                            if krill_app_core::settings::copy_on_select(cx) {
+                                this.copy(window, cx);
+                            }
+                            return;
+                        }
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Release(0),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, e: &gpui::MouseUpEvent, window, cx| {
+                        // 패인 밖의 release도 시작한 선택·TUI 마우스 끌기를 확정한다. 다른 패인에는 입력을 보내지 않는다.
+                        if this.select_end(id, cx) {
+                            if krill_app_core::settings::copy_on_select(cx) {
+                                this.copy(window, cx);
+                            }
+                            return;
+                        }
+                        if this.live.get(&id).is_some_and(|l| l.mouse_down & 1 != 0) {
+                            this.mouse_input(
+                                id,
+                                keys::tui::Mouse::Release(0),
+                                e.position,
+                                e.modifiers,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Release(1),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                        if this.selects(id, e.modifiers)
+                            && this
+                                .live
+                                .get(&id)
+                                .is_none_or(|l| l.mouse_down & (1 << 2) == 0)
+                        {
+                            return;
+                        }
+                        this.mouse_input(
+                            id,
+                            keys::tui::Mouse::Release(2),
+                            e.position,
+                            e.modifiers,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
+                    if this.scrollbar_drag.is_some() {
+                        return;
+                    }
+                    this.update_path_hover(id, e.position, keys::link_modifier(e.modifiers), cx);
+                    if e.pressed_button == Some(MouseButton::Left)
+                        && this.live.get(&id).is_some_and(|l| l.selecting)
+                    {
+                        this.select_move(id, e.position, cx);
+                        return;
+                    }
+                    let b = match e.pressed_button {
+                        Some(MouseButton::Left) => Some(0),
+                        Some(MouseButton::Middle) => Some(1),
+                        Some(MouseButton::Right) => Some(2),
+                        _ => None,
+                    };
+                    this.mouse_input(id, keys::tui::Mouse::Move(b), e.position, e.modifiers, cx);
+                }))
+                .on_scroll_wheel(cx.listener(move |this, e: &ScrollWheelEvent, window, cx| {
+                    this.on_scroll(id, e, window, cx);
+                }))
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                    this.change(true, cx, |l| l.focus(id));
+                    if this.is_pane_chat_view(id, cx)
+                        && let Some(key) = this.chat_key(id)
+                    {
+                        this.attach_dropped_paths_to_chat(&key, paths, window, cx);
+                        return;
+                    }
+                    this.paste_dropped_paths(paths, window, cx);
+                }));
+        // 로컬 선택을 쓰는 패인에서는 지원하지 않는 마우스 모드여도 복사 메뉴를 연다.
+        // 프로그램이 마우스를 받는 패인도 ⇧·⌥를 누르고 있으면 메뉴를 연다(선택과 같은 규칙).
+        let menu = self
+            .live
+            .get(&id)
+            .filter(|_| self.selects(id, window.modifiers()))
+            .map(|_| cx.weak_entity());
+        let pane_el = match menu {
+            Some(weak) => pane
+                .context_menu(move |m, window, cx| terminal_menu::build(m, &weak, id, window, cx))
+                .into_any_element(),
+            None => pane.into_any_element(),
+        };
+        if in_card {
+            pane_frame::render_pane_card(id, focus_state, p, term_bg, pane_el)
+        } else {
+            pane_el
+        }
+    }
+
+    /// 제안 C: 터미널 패인 상단 고정 마지막 프롬프트 바(`Sticky Last Prompt Bar`) 및
+    /// 클릭 시 펼쳐지는 최근 5턴 히스토리 타임라인 팝오버를 그린다.
+    fn render_sticky_prompt_bar(
+        &self,
+        id: PaneId,
+        in_card: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyElement, Option<AnyElement>)> {
+        let host = self.layout.host(id);
+        let session_id = self
+            .layout
+            .session(id)
+            .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
+        // Orca's bot chat has no last-prompt bar: the chat itself is the conversation.
+        if self.chat_bot(&(host.clone(), session_id)).is_some() {
+            return None;
+        }
+        let sidebar_ref = self.sidebar.read(cx);
+        if sidebar_ref
+            .session_on(host, session_id)
+            .is_some_and(sidebar::Session::agent_ended)
+        {
+            return None;
+        }
+        let history = sidebar_ref
+            .session_prompt_history_on(host, session_id)?
+            .clone();
+        let single_line = history.single_line_summary()?;
+        let full_last = history
+            .display_last_prompt()
+            .unwrap_or_else(|| single_line.clone());
+        let now_ns = sidebar_ref.now_unix_ns();
+        let age_text = history
+            .latest_unix_ns()
+            .filter(|&ts| ts > 0)
+            .map(|ts| krill_app_core::jump::format_age_ns(ts, now_ns));
+        let expanded = self.expanded_prompt_panes.contains(&id);
+        let p = krill_app_core::ui::palette(cx);
+        let pane_num = id.get();
+        let turn_label = krill_app_core::i18n::catalog::sidebar::TURN_BADGE
+            .format(&[("n", &history.total_turns.to_string())]);
+        let history_btn_label = format!(
+            "{} ({}) {}",
+            krill_app_core::i18n::catalog::sidebar::PROMPT_HISTORY_BTN.get(),
+            history.turns.len(),
+            if expanded { "⌃" } else { "⌄" }
+        );
+        let copy_last = full_last.clone();
+
+        let bar = div()
+            .id(("sticky-prompt-bar", pane_num))
+            .debug_selector(move || format!("sticky-prompt-bar-{pane_num}"))
+            .w_full()
+            .min_w_0()
+            .px_2p5()
+            .py_1()
+            .when(in_card, |d| {
+                d.rounded_t(krill_app_core::ui::PANE_CARD_INNER_RADIUS)
+            })
+            .bg(p.sidebar)
+            .border_b_1()
+            .border_color(p.border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|s| s.bg(p.accent.opacity(0.35)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if !this.expanded_prompt_panes.remove(&id) {
+                    this.expanded_prompt_panes.insert(id);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        krill_app_core::ui::badge(
+                            p,
+                            krill_app_core::ui::BadgeTone::Accent,
+                            turn_label,
+                        )
+                        .debug_selector(move || format!("sticky-prompt-turn-{pane_num}")),
+                    )
+                    .when_some(age_text, |d, age| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(krill_app_core::ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(age),
+                        )
+                    })
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sticky-prompt-text-{pane_num}"))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(krill_app_core::ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(single_line),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(("sticky-prompt-copy", pane_num))
+                            .debug_selector(move || format!("sticky-prompt-copy-{pane_num}"))
+                            .label(krill_app_core::i18n::catalog::sidebar::PROMPT_COPY_BTN.get())
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_last.clone()));
+                                this.notice = Some(
+                                    krill_app_core::i18n::catalog::sidebar::PROMPT_COPIED
+                                        .get()
+                                        .to_owned(),
+                                );
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("sticky-prompt-toggle-{pane_num}"))
+                            .flex_none()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(krill_app_core::ui::RADIUS_XS)
+                            .text_size(krill_app_core::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(history_btn_label),
+                    ),
+            )
+            .into_any_element();
+
+        let popover = expanded.then(|| {
+            let items = history.turns.into_iter().enumerate().map(|(idx, turn)| {
+                let item_turn_badge = krill_app_core::i18n::catalog::sidebar::TURN_BADGE
+                    .format(&[("n", &turn.turn.to_string())]);
+                let item_tone = if idx == 0 {
+                    krill_app_core::ui::BadgeTone::Accent
+                } else {
+                    krill_app_core::ui::BadgeTone::Neutral
+                };
+                let item_age = (turn.unix_ns > 0)
+                    .then(|| krill_app_core::jump::format_age_ns(turn.unix_ns, now_ns));
+                let copy_turn = turn.text.clone();
+                div()
+                    .id(ElementId::Name(
+                        format!("sticky-prompt-turn-item-{pane_num}-{idx}").into(),
+                    ))
+                    .debug_selector(move || format!("sticky-prompt-turn-item-{pane_num}-{idx}"))
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(krill_app_core::ui::RADIUS_SM)
+                    .bg(if idx == 0 {
+                        p.accent.opacity(0.45)
+                    } else {
+                        p.card
+                    })
+                    .border_1()
+                    .border_color(p.border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(p.accent.opacity(0.65)))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_turn.clone()));
+                        this.notice = Some(
+                            krill_app_core::i18n::catalog::sidebar::PROMPT_COPIED
+                                .get()
+                                .to_owned(),
+                        );
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(krill_app_core::ui::badge(p, item_tone, item_turn_badge))
+                                    .when_some(item_age, |row, age| {
+                                        row.child(
+                                            div()
+                                                .text_size(krill_app_core::ui::TEXT_2XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(age),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(krill_app_core::ui::TEXT_2XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(
+                                        krill_app_core::i18n::catalog::sidebar::PROMPT_COPY_BTN
+                                            .get(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(krill_app_core::ui::TEXT_XS)
+                            .text_color(p.popover_foreground)
+                            .child(turn.text),
+                    )
+            });
+
+            div()
+                .id(("sticky-prompt-popover", pane_num))
+                .debug_selector(move || format!("sticky-prompt-popover-{pane_num}"))
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .max_w(px(580.))
+                .max_h(px(320.))
+                .min_h_0()
+                .overflow_y_scroll()
+                .occlude()
+                .rounded(krill_app_core::ui::RADIUS_MD)
+                .bg(p.popover)
+                .border_1()
+                .border_color(p.border)
+                .shadow_lg()
+                .p_2p5()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.popover_foreground)
+                                .child(
+                                    krill_app_core::i18n::catalog::sidebar::PROMPT_TIMELINE_TITLE
+                                        .get(),
+                                ),
+                        )
+                        .child(
+                            Button::new(("sticky-prompt-popover-close", pane_num))
+                                .debug_selector(move || {
+                                    format!("sticky-prompt-popover-close-{pane_num}")
+                                })
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.expanded_prompt_panes.remove(&id);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .children(items)
+                .into_any_element()
+        });
+
+        Some((bar, popover))
+    }
+}
+
+/// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
+/// OWE-871: 기본 선 색은 `p.split_divider`(STYLEGUIDE §3.1)이며, 분할 트리의 선(`reset` 있음)을
+/// 더블클릭하면 50:50(`ratio = 0.5`)으로 되돌린다.
+/// 타이틀바 첫 컨트롤의 왼쪽 여백. 전체화면에서는 신호등이 숨으므로 비우지 않는다(K11).
+fn traffic_light_pad(window: &Window) -> Pixels {
+    if window.is_fullscreen() {
+        krill_app_core::ui::SPACE_2
+    } else {
+        krill_app_core::ui::TRAFFIC_LIGHT_PAD
+    }
+}
+
+/// Fit visible side columns to the current window without overwriting the user's
+/// preferred widths. A smaller window must still leave room for the center pane.
+fn fitted_column_widths(width: Pixels, sidebar: f32, panel: f32) -> (f32, f32) {
+    let dividers = f32::from(u8::from(sidebar > 0.) + u8::from(panel > 0.));
+    let available =
+        (f32::from(width) - layout::MIN_PANE_PX - f32::from(DIVIDER_GRAB) * dividers).max(0.);
+    let requested = sidebar + panel;
+    let scale = if requested > available {
+        available / requested
+    } else {
+        1.
+    };
+    (sidebar * scale, panel * scale)
+}
+
+/// 분할선. 더블클릭하면 분할은 50:50, 사이드바·우측 패널은 기본 너비로 되돌린다.
+fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &mut Context<Shell>) -> impl IntoElement {
+    let p = krill_app_core::ui::palette(cx);
+    let line = div().bg(p.split_divider);
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .justify_center()
+        .hover(|d| d.bg(p.split_divider_strong))
+        .map(|d| match axis {
+            Axis::Horizontal => d
+                .w(DIVIDER_GRAB)
+                .h_full()
+                .cursor_col_resize()
+                .child(line.w(px(1.)).h_full()),
+            Axis::Vertical => d
+                .h(DIVIDER_GRAB)
+                .w_full()
+                .flex_col()
+                .cursor_row_resize()
+                .child(line.h(px(1.)).w_full()),
+        })
+        .on_drag(drag.clone(), |_, _, _, cx| cx.new(|_| DragGhost))
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            if e.click_count() < 2 {
+                return;
+            }
+            let reset = drag.clone();
+            this.change(false, cx, move |l| match reset {
+                Drag::Split(path) => l.set_ratio(&path, 0.5),
+                Drag::Sidebar => l.sidebar_width = Layout::default().sidebar_width,
+                Drag::Panel => l.panel_width = Layout::default().panel_width,
+            });
+            this.save();
+        }))
+}
+
+impl Shell {
+    /// OWE-855: 메인 창 제목. 포커스 칸 세션의 워크트리가 있으면 "Krill — <워크트리>".
+    fn main_window_title(&self, cx: &App) -> String {
+        let tree = self.layout.focused().and_then(|pane| {
+            let id = self.layout.session(pane)?;
+            let session = self
+                .sidebar
+                .read(cx)
+                .session_on(self.layout.host(pane), id)?;
+            let name = session.worktree.as_ref()?.file_name()?.to_string_lossy();
+            Some(krill_app_core::security::sanitize_title(&name))
+        });
+        match tree {
+            Some(name) if !name.is_empty() => format!("{} — {name}", text::APP_TITLE.get()),
+            _ => text::APP_TITLE.get().to_owned(),
+        }
+    }
+}
+
+/// 어느 메인 창·플로팅 창의 레이아웃에 같은 호스트 세션이 떠 있으면 true.
+fn session_shown(
+    host: &krill_app_core::hosts::HostId,
+    session: krill_proto::SessionId,
+    cx: &App,
+) -> bool {
+    cx.windows().into_iter().any(|w| {
+        let shell = if let Some(h) = w.downcast::<Shell>() {
+            h.entity(cx).ok()
+        } else if let Some(h) = w.downcast::<popout::Floating>() {
+            h.read(cx).ok().map(|f| f.shell.clone())
+        } else {
+            None
+        };
+        shell.is_some_and(|e| e.read(cx).layout.sessions_for_host(host).contains(&session))
+    })
+}
+
+impl Render for Shell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fits.next_frame();
+        #[cfg(windows)]
+        krill_app_core::platform::sync_window(
+            window,
+            cx.theme().mode == gpui_component::ThemeMode::Dark,
+        );
+        if self.tab_context_menu.is_some() && self.tab_menu_previous_focus.is_none() {
+            self.tab_menu_previous_focus = Some(
+                window
+                    .focused(cx)
+                    .unwrap_or_else(|| self.focus_handle().clone()),
+            );
+            self.tab_menu_focus.focus(window, cx);
+        } else if self.tab_context_menu.is_none()
+            && let Some(previous) = self.tab_menu_previous_focus.take()
+            && self.tab_menu_focus.contains_focused(window, cx)
+        {
+            previous.focus(window, cx);
+        }
+        let tab_dialog_open = self.confirm_close_tab.is_some()
+            || self.pending_running_close.is_some()
+            || self.session_switch.is_some();
+        if tab_dialog_open && !self.tab_dialog_was_open {
+            self.tab_dialog_previous_focus = window.focused(cx);
+            self.tab_dialog_focus.focus(window, cx);
+        } else if !tab_dialog_open
+            && self.tab_dialog_was_open
+            && let Some(focus) = self.tab_dialog_previous_focus.take()
+        {
+            focus.focus(window, cx);
+        }
+        self.tab_dialog_was_open = tab_dialog_open;
+        self.window = Some(window.window_handle());
+        self.sync_notifications(window, cx);
+        // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
+        self.open_pending_overlays(window, cx);
+        self.open_pending_bot_dialogs(window, cx);
+        let bot_dialogs = self.bot_dialogs(window, cx);
+        let chat_image_viewer = self.render_chat_image_viewer(window, cx);
+        // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
+        // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
+        // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
+        // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
+        if self.role == WindowRole::Main {
+            if self.settings().is_some() && !self.mobile_page_open(cx) {
+                window.set_window_title(krill_app_core::i18n::catalog::settings::TITLE.get());
+            } else {
+                window.set_window_title(&self.main_window_title(cx));
+            }
+        }
+        if self.language != krill_app_core::i18n::language() {
+            self.language = krill_app_core::i18n::language();
+            self.refresh_jump(cx);
+            for find in self.chat.finds.values() {
+                krill_app_core::i18n::sync_input_placeholder(
+                    &find.input,
+                    krill_app_core::i18n::catalog::chat::FIND_PLACEHOLDER.get(),
+                    window,
+                    cx,
+                );
+            }
+            if let Some((input, _)) = self.bot_ui.search.as_ref() {
+                krill_app_core::i18n::sync_input_placeholder(
+                    input,
+                    krill_app_core::i18n::catalog::bots::SB_SEARCH.get(),
+                    window,
+                    cx,
+                );
+            }
+        }
+        if self.system_appearance.is_none() {
+            self.system_appearance = Some(cx.observe_window_appearance(window, |_, window, cx| {
+                krill_app_core::settings::system_appearance_changed(window.appearance(), cx);
+            }));
+        }
+        if self.focus_observed_window != Some(window.window_handle()) {
+            self.focus_observed_window = Some(window.window_handle());
+            self.focus_subscriptions = vec![
+                cx.on_focus(&self.focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&self.focus, window, |_, _, cx| cx.notify()),
+            ];
+        }
+        if !cx.has_active_drag() {
+            self.active_split_drag = None;
+        }
+        match std::mem::replace(&mut self.pending_focus, PendingFocus::None) {
+            PendingFocus::None => {}
+            PendingFocus::Workspace => window.focus(&self.focus, cx),
+            PendingFocus::Modal => {
+                if let Some(modal) = &self.modal {
+                    window.focus(&modal.focus_handle(cx), cx);
+                }
+            }
+        }
+        if !self.page_open() {
+            self.sync_files(window, cx);
+        }
+        self.flush_pending_pane_focus(window, cx);
+        self.terminal_focus_owned = self.focus.is_focused(window);
+        self.sync_cursor_blink(window.is_window_active() && self.terminal_focus_owned, cx);
+        let cell = cell_size(window, cx);
+        let pixel = |p: Pixels| -> u16 {
+            // 글꼴 측정값은 유한한 양수이며 u16 범위로 제한한다.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded and clamped pixel size"
+            )]
+            {
+                (f32::from(p) * window.scale_factor())
+                    .round()
+                    .clamp(1., f32::from(u16::MAX)) as u16
+            }
+        };
+        let cell = Some(CellSize {
+            width: pixel(cell.width),
+            height: pixel(cell.height),
+        });
+        if self.cell_pixels != cell {
+            self.cell_pixels = cell;
+            self.push_appearance(cx);
+        }
+        if self.activation.is_none() {
+            self.activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                this.on_window_active_changed(active, cx);
+                if active {
+                    krill_app_core::onboarding::actions::recheck_needed(cx).detach();
+                }
+                if !active && let Some(pane) = this.layout.focused() {
+                    this.commit_ime(pane, Some(window), cx);
+                }
+            }));
+        }
+        if self.bounds_observer.is_none() && self.role == WindowRole::Main {
+            self.bounds_observer = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                #[cfg(target_os = "macos")]
+                crate::record_test_window_geometry(window, cx);
+                #[cfg(not(target_os = "macos"))]
+                let _ = cx;
+                if this.role == WindowRole::Main {
+                    let saved = saved_window_bounds_from_gpui(window.window_bounds());
+                    if this.layout.set_window_bounds(saved) {
+                        this.save();
+                    }
+                }
+            }));
+        }
+        if window.is_window_active() {
+            // OWE-662: 창으로 돌아와 보고 있는 세션의 미확인 표시를 끈다.
+            self.sync_focused_session(cx);
+            krill_app_core::alert::set_active(true, cx);
+        }
+        let (focus, me) = (self.focus.clone(), cx.entity());
+        let input = canvas(
+            |_, _, _| {},
+            move |bounds, (), window, cx| {
+                window.handle_input(&focus, ElementInputHandler::new(bounds, me.clone()), cx);
+            },
+        )
+        .absolute()
+        .size_full();
+        if let Some(settings) = self.settings() {
+            let visible = window.is_window_active() && self.dashboard.is_none();
+            settings.update(cx, |view, cx| view.set_visible(visible, cx));
+        }
+        let resources_visible =
+            window.is_window_active() && !self.page_open() && self.dashboard.is_none();
+        self.resources
+            .update(cx, |view, cx| view.set_visible(resources_visible, cx));
+        let root = if let Some(zoomed) = self.layout.zoomed_pane() {
+            Some(PaneTree::Leaf(zoomed))
+        } else {
+            self.layout.set_zoomed_pane(None);
+            self.layout
+                .tabs()
+                .get(self.layout.active())
+                .map(|t| t.root.clone())
+        };
+        let stage = self.workspace_stage();
+        let window_blur = krill_app_core::settings::window_blur(cx);
+        let opacity_pct = krill_app_core::settings::effective_terminal_opacity_pct(cx);
+        let translucent = window_blur || opacity_pct < 100;
+        let (surface_bg, tree) = match (stage, root) {
+            (pane_frame::WorkspaceStage::CardStage, Some(r)) => {
+                let stage_bg = krill_app_core::ui::workspace_surface_alpha(
+                    krill_app_core::ui::palette(cx),
+                    opacity_pct,
+                );
+                let rendered = self.render_tree(&r, &mut Vec::new(), window, cx);
+                (stage_bg, pane_frame::render_card_stage(rendered))
+            }
+            (_, Some(r)) => (
+                krill_app_core::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_tree(&r, &mut Vec::new(), window, cx),
+            ),
+            (_, None) => (
+                krill_app_core::ui::terminal_surface_alpha(self.terminal_theme, opacity_pct),
+                self.render_empty_workspace(window, cx),
+            ),
+        };
+        let center_diff = self.render_center_diff(window, cx);
+        let show_panel = !self.panel_collapsed;
+        let show_sidebar = !self.sidebar_collapsed;
+        // Shrink visible side columns to keep the center pane usable in a small
+        // window; saved preferred widths stay untouched.
+        let (sidebar_width, panel_width) = fitted_column_widths(
+            window.viewport_size().width,
+            if show_sidebar {
+                self.layout.sidebar_width
+            } else {
+                0.
+            },
+            if show_panel {
+                self.layout.panel_width
+            } else {
+                0.
+            },
+        );
+        // Orca's bot page: a chat in a bot's folder gets the bot's own right sidebar,
+        // and a group chat page gets the merged BotGroupItemsPanel.
+        let group_page = self.focused_bot_group().cloned();
+        let bot_page = if group_page.is_none() {
+            self.focused_bot().cloned()
+        } else {
+            None
+        };
+        self.sync_bot_files_chrome(bot_page.is_some(), cx);
+        let panel_body = if let Some(group) = group_page.filter(|_| show_panel) {
+            self.render_bot_group_panel(&group, panel_width, window, cx)
+        } else if let Some(bot) = bot_page.filter(|_| show_panel) {
+            self.render_bot_panel(&bot, panel_width, window, cx)
+        } else {
+            self.diff.clone().into_any_element()
+        };
+        let p = krill_app_core::ui::palette(cx);
+        let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
+        let shell_bg = if translucent {
+            krill_app_core::ui::transparent()
+        } else {
+            bg
+        };
+        let surface_bounds_cell = Rc::clone(&self.surface_bounds);
+        let surface_probe = canvas(
+            |_, _, _| {},
+            move |bounds, (), _, _| surface_bounds_cell.set(bounds),
+        )
+        .absolute()
+        .size_full();
+
+        div()
+            .relative()
+            .child(krill_app_core::telemetry::activity_observer())
+            // OWE-860: 설정 화면에서도 Shell 키 문맥을 유지해 전역 탐색 단축키(⌘J·⌘B·⌘P 등)와
+            // 커스텀 ClosePane(⌘W) 바인딩이 동작하게 한다. 터미널 편집 액션은 각 핸들러의 settings 가드가 막는다.
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(
+                |this, _: &krill_app_core::settings::OpenSettings, window, cx| {
+                    if this.has_dialog_or_viewer_overlay() {
+                        return;
+                    }
+                    // OWE-860: ⌘,는 설정 토글이다. 이미 열려 있으면 닫고(현재 탭 초기화 없음),
+                    // 닫혀 있을 때만 일반 탭으로 연다.
+                    if this.settings().is_some() {
+                        this.close_settings(Some(&mut *window), cx);
+                    } else {
+                        this.open_settings(
+                            krill_app_core::settings::AdminTab::Appearance,
+                            Some(window),
+                            cx,
+                        );
+                    }
+                },
+            ))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.on_new_tab_shortcut(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.request_close_tab(this.layout.active(), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.cycle_workspace_tab(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.cycle_workspace_tab(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextSameTypeTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                let editor = this.layout.is_editor_tab(this.layout.active());
+                this.cycle_workspace_tab_matching(1, Some(editor), cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevSameTypeTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                let editor = this.layout.is_editor_tab(this.layout.active());
+                this.cycle_workspace_tab_matching(-1, Some(editor), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextTerminalTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.cycle_workspace_tab_matching(1, Some(false), cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevTerminalTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.cycle_workspace_tab_matching(-1, Some(false), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextRecentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.on_recent_tab(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevRecentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.on_recent_tab(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
+                this.split_active(Axis::Horizontal, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
+                this.split_active(Axis::Vertical, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
+                if this.dashboard.is_some() {
+                    this.close_dashboard(Some(window), cx);
+                    return;
+                }
+                if this.close_topmost_blocking_overlay(window, cx) {
+                    return;
+                }
+                if this.diff.read(cx).has_center_diff() {
+                    this.close_center_diff(cx);
+                    return;
+                }
+                if this.layout.visible().len() == 1
+                    && this.layout.is_tab_pinned(this.layout.active())
+                {
+                    this.request_close_tab(this.layout.active(), cx);
+                    return;
+                }
+                // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다(줌 해제·기록은 확정 뒤에).
+                if let Some(pane) = this.layout.focused() {
+                    this.maybe_close_pane(pane, cx);
+                } else {
+                    // Empty workspaces still flush delayed geometry/layout
+                    // state before closing, through the same durable barrier.
+                    this.request_close(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| l.cycle_pane(1));
+            }))
+            .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| l.cycle_pane(-1));
+            }))
+            // OWE-871: 2차원 분할에서 상하좌우 기하 방향으로 포커스를 옮긴다.
+            .on_action(cx.listener(|this, _: &FocusPaneLeft, _, cx| {
+                if this.has_blocking_overlay() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app_core::layout::Direction::Left);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneRight, _, cx| {
+                if this.has_blocking_overlay() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app_core::layout::Direction::Right);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneUp, _, cx| {
+                if this.has_blocking_overlay() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app_core::layout::Direction::Up);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
+                if this.has_blocking_overlay() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app_core::layout::Direction::Down);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneLeft, _, cx| {
+                this.resize_focused_pane(krill_app_core::layout::Direction::Left, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneRight, _, cx| {
+                this.resize_focused_pane(krill_app_core::layout::Direction::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneUp, _, cx| {
+                this.resize_focused_pane(krill_app_core::layout::Direction::Up, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneDown, _, cx| {
+                this.resize_focused_pane(krill_app_core::layout::Direction::Down, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenamePane, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if let Some(pane) = this.layout.focused() {
+                    this.begin_pane_rename(pane, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleZoomPane, window, cx| {
+                if this.has_blocking_overlay()
+                    || this.dashboard.is_some()
+                    || this.bot_ui.renaming.is_some()
+                    || this.bot_ui.renaming_group.is_some()
+                    || this.tab_rename.is_some()
+                    || this.pane_rename.is_some()
+                {
+                    return;
+                }
+                let Some(focused) = this.layout.focused() else {
+                    return;
+                };
+                this.toggle_zoom_pane(focused, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
+                if this.has_blocking_overlay()
+                    || this.dashboard.is_some()
+                    || this.is_active_chat_view_in(cx)
+                {
+                    return;
+                }
+                let unlinked_session = this.layout.focused().and_then(|pane| {
+                    let l = this.live.get(&pane)?;
+                    (!l.pane.is_linked())
+                        .then(|| this.target_for_pane(pane).zip(l.pane.session()))
+                        .flatten()
+                });
+                if let Some(l) = this.focused_live() {
+                    // OWE-873 / OWE-873b: 받아 둔 스크롤백·선택·검색 하이라이트를 먼저 버리고 바닥에 고정하며,
+                    // 데몬이 FEAT_CLEAR_SCROLLBACK을 협상했으면 핫·콜드 스크롤백도 비운 뒤 셸에 화면 지우기를 요청한다.
+                    l.clear_selection();
+                    l.pane.clear_search();
+                    l.pane.clear_scrollback();
+                    cx.notify();
+                }
+                if let Some((target, session)) = unlinked_session {
+                    cx.background_executor()
+                        .spawn(async move {
+                            pane::clear_scrollback(target, session).ok();
+                        })
+                        .detach();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
+                    gpui_component::TextSelection::select_all(window, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Some(l) = this.focused_live() {
+                    let shown = l.pane.shown();
+                    let rows = u16::try_from(shown.rows.len()).unwrap_or(u16::MAX);
+                    let cols = shown.cols;
+                    if rows > 0 && cols > 0 {
+                        let offset = l.pane.scroll_offset();
+                        l.selection = Some(Anchored {
+                            anchor: Anchored::point(select::Point { line: 0, column: 0 }, offset),
+                            head: Anchored::point(
+                                select::Point {
+                                    line: rows.saturating_sub(1),
+                                    column: cols.saturating_sub(1),
+                                },
+                                offset,
+                            ),
+                            block: false,
+                        });
+                        l.snapshot_selection();
+                        l.selecting = false;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewAgentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.on_new_agent_tab_shortcut(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if this.page_open() {
+                    this.close_settings(None, cx);
+                }
+                this.reopen_closed_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.cycle_session_focus(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.cycle_session_focus(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                if this.has_dialog_or_viewer_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.navigate_back(Some(window), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                if this.has_dialog_or_viewer_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.navigate_forward(Some(window), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewWorktree, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.open_new_worktree_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScrollTop, _, cx| {
+                if !this.has_blocking_overlay() && this.dashboard.is_none() {
+                    if this.is_active_chat_view_in(cx) {
+                        this.scroll_chat_overlay_home(cx);
+                        return;
+                    }
+                    if let Some(live) = this.focused_live() {
+                        live.clear_selection();
+                        live.pane.scroll_top();
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ScrollBottom, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
+                    this.scroll_chat_overlay_end(cx);
+                    return;
+                }
+                this.scroll_terminal(isize::MIN, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
+                    this.scroll_chat_overlay_page(-1, cx);
+                    return;
+                }
+                let rows = this
+                    .focused_live()
+                    .map_or(1, |l| l.pane.screen().rows.len());
+                this.scroll_terminal(isize::try_from(rows).unwrap_or(isize::MAX), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
+                    this.scroll_chat_overlay_page(1, cx);
+                    return;
+                }
+                let rows = this
+                    .focused_live()
+                    .map_or(1, |l| l.pane.screen().rows.len());
+                this.scroll_terminal(-isize::try_from(rows).unwrap_or(isize::MAX), cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseEditors, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.close_all_editor_tabs(cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.begin_tab_rename(this.layout.active(), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace1, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(0, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(0, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace2, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(1, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(1, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace3, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(2, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(2, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace4, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(3, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(3, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace5, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(4, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(4, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace6, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(5, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(5, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace7, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(6, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(6, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace8, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(7, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(7, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateWorkspace9, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                if !this.jump_to_palette_row(8, cx) {
+                    this.sidebar
+                        .update(cx, |s, cx| s.activate_workspace_index(8, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(0, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(2, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(3, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(4, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(5, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(6, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(7, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.activate_tab_index(8, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                // OWE-860: 설정에서 호출하면 설정을 닫고 사이드바에 포커스를 둔다.
+                if this.page_open() {
+                    this.close_settings(Some(&mut *window), cx);
+                }
+                let back = this.focus.clone();
+                this.sidebar.update(cx, |s, cx| s.focus(back, window, cx));
+            }))
+            .map(|d| Self::new_session_actions(d, cx))
+            .map(|d| Self::file_actions(d, cx))
+            .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleChatView, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.toggle_chat_view_with_focus(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.search.is_some()
+                    || (this.is_active_chat_view_in(cx) && this.chat_find_is_open(cx))
+                {
+                    this.step_search(krill_proto::search::Direction::Previous, cx);
+                } else {
+                    this.toggle_changes(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
+                this.toggle_explorer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
+                this.toggle_workspace_search(window, cx);
+            }))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Replace, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_workspace_search(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &Jump, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.toggle_jump(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.toggle_command_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Find, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.toggle_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.step_search(krill_proto::search::Direction::Next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindPrev, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.step_search(krill_proto::search::Direction::Previous, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Copy, window, cx| this.copy(window, cx)))
+            .on_action(cx.listener(|this, _: &CopyClean, window, cx| this.copy_clean(window, cx)))
+            .on_action(cx.listener(|this, _: &QuoteChat, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.quote_chat_selection(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
+            .on_action(cx.listener(|this, _: &ForkSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if let Some(pane) = this.layout.focused() {
+                    this.fork_pane_session(pane, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ContinueInNewSession, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if let Some(pane) = this.layout.focused() {
+                    this.open_continue_session(pane, window, cx);
+                }
+            }))
+            .on_action(cx.listener(Self::on_toggle_secure_input))
+            .on_action(cx.listener(Self::on_float_terminal))
+            .on_action(cx.listener(Self::on_dashboard))
+            .on_action(cx.listener(|this, _: &OpenBots, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.open_bots(Some(window), cx);
+            }))
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                krill_app_core::star_nag::record_key_down(&e.keystroke.key, cx);
+                if !this.has_blocking_overlay()
+                    && !this.has_dialog_or_viewer_overlay()
+                    && this.handle_voice_shortcut(e, window, cx)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.dashboard.is_some()
+                    && e.keystroke.key == "escape"
+                    && !e.keystroke.modifiers.modified()
+                {
+                    this.close_dashboard(Some(window), cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_modifiers_changed(cx.listener(Self::on_link_modifiers))
+            .when(
+                !self.has_blocking_overlay()
+                    && self.dashboard.is_none()
+                    && !self.diff.read(cx).has_center_diff(),
+                |d| d.child(input),
+            )
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<Drag>, _, cx| this.on_column_drag(e, cx)),
+            )
+            .on_drop(cx.listener(|this, _: &Drag, _, cx| {
+                if this.active_split_drag.take().is_some() {
+                    cx.notify();
+                }
+                this.save();
+            }))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                if this.scrollbar_drag.is_some() {
+                    if e.pressed_button == Some(MouseButton::Left) {
+                        this.update_scrollbar_drag(e.position.y, cx);
+                    } else {
+                        this.end_scrollbar_drag(cx);
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.end_scrollbar_drag(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.end_scrollbar_drag(cx);
+                }),
+            )
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(shell_bg)
+            .text_color(fg)
+            .font_family(krill_app_core::ui::FONT_UI)
+            .text_size(krill_app_core::ui::TEXT_MD)
+            .child(gpui_component::TextSelectionLayer)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .when(show_sidebar, |d| {
+                        d.child(
+                            div()
+                                .id("sidebar-column")
+                                .debug_selector(|| "sidebar-column".into())
+                                .flex_none()
+                                .w(px(sidebar_width))
+                                .h_full()
+                                .bg(p.worktree_sidebar)
+                                .text_color(p.worktree_sidebar_foreground)
+                                .flex()
+                                .flex_col()
+                                .child(self.render_sidebar_header(window, cx))
+                                .child(self.render_agents(window, cx))
+                                .child(self.render_bots_section(cx))
+                                .child(self.bots_spinner_overlay())
+                                .child(
+                                    div().flex_1().min_h_0().child(
+                                        self.sidebar
+                                            .clone()
+                                            .cached(gpui::StyleRefinement::default().size_full()),
+                                    ),
+                                )
+                                // 사이드바 스피너는 여기(셸)서 돌려 틱마다 사이드바를 다시 렌더하지 않는다.
+                                .child(self.sidebar.read(cx).spinner_overlay())
+                                .child(self.detached.clone())
+                                .child(Self::render_sidebar_footer(cx)),
+                        )
+                        .child(divider(
+                            "divider-sidebar".into(),
+                            Drag::Sidebar,
+                            Axis::Horizontal,
+                            cx,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .bg(shell_bg)
+                            .child(self.render_tab_bar(window, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .relative()
+                                    .debug_selector(|| "terminal-surface".into())
+                                    .bg(surface_bg)
+                                    .child(surface_probe)
+                                    .child(tree)
+                                    .children(center_diff)
+                                    // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
+                                    // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
+                                    // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
+                                    .children(
+                                        self.terminal_search_visible(cx)
+                                            .then(|| {
+                                                self.search.as_ref().map(|(bar, _)| bar.clone())
+                                            })
+                                            .flatten(),
+                                    ),
+                            ),
+                    )
+                    .when(show_panel, |d| {
+                        d.child(divider(
+                            "divider-panel".into(),
+                            Drag::Panel,
+                            Axis::Horizontal,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .id("panel-column")
+                                .debug_selector(|| "panel-column".into())
+                                .flex_none()
+                                .w(px(panel_width))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .bg(sidebar_bg)
+                                .child(div().flex_1().min_h_0().child(panel_body)),
+                        )
+                    }),
+            )
+            .child(self.render_status_bar(window, cx))
+            .children(self.modal.clone().map(|modal| {
+                use krill_app_core::i18n::catalog;
+                // Import is Orca's small dialog, not the Bots page.
+                let dialog_width = match &modal {
+                    Modal::Bots(v) => v.read(cx).dialog_width(),
+                    _ => None,
+                };
+                let (backdrop_id, modal_id, label, view): (_, _, _, gpui::AnyView) = match modal {
+                    Modal::Settings(v) if v.read(cx).mobile_page() => (
+                        "admin-modal-backdrop",
+                        "admin-modal",
+                        catalog::sidebar::NAV_MOBILE.get(),
+                        v.into(),
+                    ),
+                    Modal::Settings(v) => (
+                        "admin-modal-backdrop",
+                        "admin-modal",
+                        catalog::settings::TITLE.get(),
+                        v.into(),
+                    ),
+                    Modal::Artifacts(v) => (
+                        "artifacts-modal-backdrop",
+                        "artifacts-modal",
+                        catalog::artifacts::TITLE.get(),
+                        v.into(),
+                    ),
+                    Modal::Automations(v) => (
+                        "automations-modal-backdrop",
+                        "automations-modal",
+                        catalog::sidebar::NAV_AUTOMATIONS.get(),
+                        v.into(),
+                    ),
+                    Modal::Bots(v) => (
+                        "bots-modal-backdrop",
+                        "bots-modal",
+                        catalog::sidebar::NAV_BOTS.get(),
+                        v.into(),
+                    ),
+                };
+                let viewport = window.viewport_size();
+                let modal = krill_app_core::ui::page_modal_size(viewport);
+                krill_app_core::ui::modal_backdrop(
+                    viewport,
+                    div()
+                        .id(backdrop_id)
+                        .debug_selector(move || backdrop_id.into())
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.close_settings(Some(window), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id(modal_id)
+                                .debug_selector(move || modal_id.into())
+                                .role(gpui::Role::Dialog)
+                                .aria_label(label)
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .w(dialog_width.unwrap_or(modal.width))
+                                .when(dialog_width.is_none(), |d| d.h(modal.height))
+                                .when(dialog_width.is_some(), |d| d.max_h(modal.height))
+                                .rounded(krill_app_core::ui::RADIUS_XL)
+                                .bg(p.background)
+                                .border_1()
+                                .border_color(p.border)
+                                .shadow_lg()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .child(view),
+                        ),
+                )
+            }))
+            .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))
+            .children(self.add_project.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(bot_dialogs)
+            .children(chat_image_viewer)
+            .children(
+                self.continue_session
+                    .as_ref()
+                    .map(|(dialog, _)| dialog.clone()),
+            )
+            // OWE-903: 온보딩·페어링은 메인 창 안 모달로 그린다(별도 OS 창 없음).
+            .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
+            .children(self.dashboard.clone())
+            .children(self.quick_open_palette())
+            .children(self.render_tab_context_menu(window, cx))
+            .children(self.render_link_menu(window, cx))
+            .children(self.render_pinned_close_dialog(window, cx))
+            .children(self.render_running_close_dialog(window, cx))
+            .children(self.render_session_switch_modal(window, cx))
+            .children(self.render_recent_tab_switcher(window, cx))
+            .children(self.notification_overlay())
+            // Action/safety toasts take priority in this corner. The update
+            // remains available from the status bar, and its card returns once
+            // notices are dismissed, so floating surfaces never cover buttons.
+            .children(
+                (self.role == WindowRole::Main && !self.has_notifications(cx))
+                    .then(|| {
+                        Self::render_update_card(window, cx)
+                            .map(IntoElement::into_any_element)
+                            .or_else(|| krill_app_core::star_nag::card(cx))
+                    })
+                    .flatten(),
+            )
+    }
+}
+
+impl Shell {
+    pub(super) fn has_dialog_or_viewer_overlay(&self) -> bool {
+        self.bot_ui.new_bot.is_some()
+            || self.bot_ui.templates.is_some()
+            || self.bot_ui.group_dialog.is_some()
+            || self.bot_ui.delete.is_some()
+            || self.bot_ui.delete_group.is_some()
+            || self.has_chat_image_viewer()
+            || self.confirm_close_tab.is_some()
+            || self.pending_running_close.is_some()
+            || self.session_switch.is_some()
+    }
+
+    pub(super) fn has_blocking_overlay(&self) -> bool {
+        self.page_open() || self.has_dialog_or_viewer_overlay()
+    }
+
+    fn close_topmost_blocking_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.session_switch.is_some() {
+            self.close_session_switch_modal(cx);
+            return true;
+        }
+        if self.pending_running_close.is_some() {
+            self.cancel_running_close(cx);
+            return true;
+        }
+        if self.confirm_close_tab.is_some() {
+            self.cancel_close_pinned_tab(cx);
+            return true;
+        }
+        if self.has_chat_image_viewer() {
+            self.close_chat_image_viewer(window, cx);
+            return true;
+        }
+        if self.bot_ui.delete_group.is_some() {
+            self.bot_ui.delete_group = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.delete.is_some() {
+            self.bot_ui.delete = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.group_dialog.is_some() {
+            self.bot_ui.group_dialog = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.templates.is_some() {
+            self.bot_ui.templates = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.new_bot.is_some() {
+            self.bot_ui.new_bot = None;
+            if std::mem::take(&mut self.bot_ui.back_to_templates) {
+                self.request_bot_templates(cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.page_open() {
+            self.close_settings(Some(window), cx);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        self.layout.set_zoomed_pane(None);
+        if let Some(focused) = self.layout.focused() {
+            self.split_pane(focused, axis, cx);
+        } else {
+            self.new_tab_on_launch_host(cx);
+        }
+    }
+
+    /// 첫 실행 빈 화면의 환영 패널. 닫거나 첫 탭을 열면 다시 나오지 않는다(OWE-904: 모달 없음).
+    fn render_welcome_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.role != WindowRole::Main || !krill_app_core::onboarding::welcome_pending(cx) {
+            return None;
+        }
+        let p = krill_app_core::ui::palette(cx);
+        let row = |id: &'static str,
+                   icon: AnyElement,
+                   title: &'static str,
+                   body: &'static str,
+                   controls: Option<gpui::Div>| {
+            div()
+                .debug_selector(move || id.into())
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .py_3()
+                .border_t_1()
+                .border_color(p.border)
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded(krill_app_core::ui::RADIUS_SM)
+                        .bg(p.muted)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(body),
+                        ),
+                )
+                .children(controls)
+        };
+        let svg = |bytes: &'static [u8]| {
+            krill_app_core::ui::icons::svg_box(
+                bytes,
+                krill_app_core::ui::ICON_MD,
+                p.muted_foreground,
+            )
+            .into_any_element()
+        };
+        let jump_label = krill_app_core::keys::shortcut_label(window, &Jump);
+        Some(
+            div()
+                .id("empty-welcome")
+                .debug_selector(|| "empty-welcome".into())
+                .w(px(520.))
+                .max_w_full()
+                .px_4()
+                .pt_3()
+                .pb_1()
+                .rounded(krill_app_core::ui::RADIUS_MD)
+                .bg(p.card)
+                .border_1()
+                .border_color(p.border)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .pb_2()
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(text::WELCOME_TITLE.get()),
+                        )
+                        .child(
+                            krill_app_core::ui::ghost(
+                                "empty-welcome-dismiss",
+                                text::WELCOME_DISMISS.get(),
+                            )
+                            .debug_selector(|| "empty-welcome-dismiss".into())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                krill_app_core::onboarding::dismiss_welcome(cx);
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(row(
+                    "empty-welcome-alive",
+                    svg(krill_app_core::ui::icons::HISTORY_SVG),
+                    text::WELCOME_ALIVE_TITLE.get(),
+                    text::WELCOME_ALIVE_BODY.get(),
+                    None,
+                ))
+                .child(row(
+                    "empty-welcome-jump",
+                    gpui_component::Icon::new(IconName::Search)
+                        .with_size(krill_app_core::ui::ICON_MD)
+                        .text_color(p.muted_foreground)
+                        .into_any_element(),
+                    text::WELCOME_JUMP_TITLE.get(),
+                    text::WELCOME_JUMP_BODY.get(),
+                    jump_label.map(|label| {
+                        krill_app_core::ui::controls().child(
+                            krill_app_core::ui::secondary("empty-welcome-jump-open", label)
+                                .debug_selector(|| "empty-welcome-jump-open".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_jump(window, cx);
+                                })),
+                        )
+                    }),
+                ))
+                .child(row(
+                    "empty-welcome-remote",
+                    svg(krill_app_core::ui::icons::SERVER_SVG),
+                    text::WELCOME_REMOTE_TITLE.get(),
+                    text::WELCOME_REMOTE_BODY.get(),
+                    Some(
+                        krill_app_core::ui::controls()
+                            .child(
+                                krill_app_core::ui::secondary(
+                                    "empty-welcome-remote-open",
+                                    text::WELCOME_REMOTE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-remote-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_settings(
+                                            krill_app_core::settings::AdminTab::Machines,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                krill_app_core::ui::secondary(
+                                    "empty-welcome-mobile-open",
+                                    text::WELCOME_MOBILE_BUTTON.get(),
+                                )
+                                .debug_selector(|| "empty-welcome-mobile-open".into())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_mobile_page(Some(window), cx);
+                                    },
+                                )),
+                            ),
+                    ),
+                ))
+                .child(row(
+                    "empty-welcome-cli",
+                    svg(krill_app_core::ui::icons::SQUARE_TERMINAL_SVG),
+                    text::WELCOME_CLI_TITLE.get(),
+                    text::WELCOME_CLI_BODY.get(),
+                    None,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    fn render_empty_workspace(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        krill_app_core::star_nag::ensure_checked(cx);
+        let has_projects = self.sidebar.read(cx).has_projects();
+        let welcome = self.render_welcome_panel(window, cx);
+        let p = krill_app_core::ui::palette(cx);
+        let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .cursor_pointer()
+                .px_3()
+                .py_1p5()
+                .rounded(krill_app_core::ui::RADIUS_SM)
+                .hover(|s| s.bg(p.accent))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .text_size(krill_app_core::ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(div().text_color(p.foreground).child(label))
+                .child(krill_app_core::ui::keycap(p, shortcut))
+        };
+        div()
+            .id("empty-workspace")
+            .debug_selector(|| "empty-workspace".into())
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_6()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        krill_app_core::ui::icons::brand_mark_tile(48.)
+                            .debug_selector(|| "empty-brand-tile".into()),
+                    )
+                    .child(
+                        div()
+                            .text_size(krill_app_core::ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(text::APP_TITLE.get()),
+                    )
+                    // 환영 패널의 첫 항목이 같은 내용이라 그동안은 한 줄 문구를 숨긴다.
+                    .when(welcome.is_none(), |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "empty-tagline".into())
+                                .text_size(krill_app_core::ui::TEXT_SM)
+                                .text_color(p.muted_foreground)
+                                .child(text::EMPTY_TAGLINE.get()),
+                        )
+                    }),
+            )
+            .children(welcome)
+            .child(
+                div()
+                    .w(px(240.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        action_row(
+                            "empty-new-terminal",
+                            text::NEW_TERMINAL.get(),
+                            text::SHORTCUT_NEW_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.new_tab_on_launch_host(cx);
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-new-agent",
+                            text::EMPTY_NEW_AGENT.get(),
+                            text::SHORTCUT_NEW_AGENT_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.link == Link::Up && this.agents.is_some() {
+                                this.new_default_agent(cx);
+                            } else {
+                                this.new_tab_on_launch_host(cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-open-file",
+                            text::EMPTY_OPEN_FILE.get(),
+                            text::SHORTCUT_QUICK_OPEN.get(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_quick_open(window, cx);
+                        })),
+                    ),
+            )
+            .children(krill_app_core::star_nag::landing_star_pill(
+                has_projects,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    // Design adapted from Orca (.ref/orca/src/renderer/src/components/UpdateCard.tsx,
+    // UpdateDownloadCardContent.tsx), MIT License — Copyright (c) 2026 Orca Contributors.
+    fn render_update_card(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        use gpui_component::button::{Button, ButtonVariants as _};
+        use krill_app_core::i18n::catalog::updater_relaunch as utext;
+        use krill_app_core::updater::UpdateState;
+
+        let state = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
+        if state.card_collapsed {
+            return None;
+        }
+        let staged = state.staged?;
+        let p = krill_app_core::ui::palette(cx);
+        let starting = state.restart.is_starting();
+        let restart_error = state.restart.error().map(str::to_owned);
+        let title = if restart_error.is_some() {
+            utext::CARD_RESTART_FAILED_TITLE.get()
+        } else {
+            utext::CARD_READY_TITLE.get()
+        };
+        let restart_label = if restart_error.is_some() {
+            utext::CARD_RETRY_BTN.get()
+        } else {
+            utext::CARD_RESTART_BTN.get()
+        };
+        let body = utext::CARD_READY_BODY.format(&[("version", &staged.to_version)]);
+        let subtitle = utext::CARD_READY_SUBTITLE.get();
+
+        Some(
+            div()
+                .id("update-card")
+                .debug_selector(|| "update-card".into())
+                .occlude()
+                .absolute()
+                .top(krill_app_core::ui::TITLEBAR_HEIGHT + krill_app_core::ui::SPACE_4)
+                .right(krill_app_core::ui::SPACE_3)
+                .w(px(300.))
+                .max_w(
+                    (window.viewport_size().width - krill_app_core::ui::SPACE_4 * 2.).max(px(0.)),
+                )
+                .max_h((window.viewport_size().height - px(50.)).max(px(0.)))
+                .overflow_y_scroll()
+                .p_3()
+                .rounded(krill_app_core::ui::RADIUS_MD)
+                .border_1()
+                .border_color(p.border)
+                .bg(p.popover)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_2p5()
+                .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
+                    if e.keystroke.key == "escape" {
+                        let mut u = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
+                        u.card_collapsed = true;
+                        cx.set_global(u);
+                        cx.stop_propagation();
+                        cx.refresh_windows();
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.popover_foreground)
+                                .child(title),
+                        )
+                        .child(krill_app_core::ui::button_with_tooltip(
+                            Button::new("update-card-minimize")
+                                .icon(gpui_component::IconName::Minus)
+                                .debug_selector(|| "update-card-minimize".into())
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    let mut u =
+                                        cx.try_global::<UpdateState>().cloned().unwrap_or_default();
+                                    u.card_collapsed = true;
+                                    cx.set_global(u);
+                                    cx.refresh_windows();
+                                    cx.notify();
+                                })),
+                            "update-card-minimize",
+                            utext::CARD_MINIMIZE_TOOLTIP.get(),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_XS)
+                                .text_color(p.popover_foreground)
+                                .child(body),
+                        )
+                        .child(
+                            div()
+                                .text_size(krill_app_core::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(subtitle),
+                        )
+                        .child(
+                            div().flex().items_center().child(
+                                Button::new("update-card-release-notes")
+                                    .label(utext::CARD_RELEASE_NOTES.get())
+                                    .debug_selector(|| "update-card-release-notes".into())
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(|_, _, cx| {
+                                        let mut u = cx
+                                            .try_global::<UpdateState>()
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        u.card_collapsed = true;
+                                        cx.set_global(u);
+                                        krill_app_core::settings::open_window_at_tab(
+                                            krill_app_core::settings::AdminTab::Updates,
+                                            cx,
+                                        );
+                                    }),
+                            ),
+                        ),
+                )
+                .children(restart_error.map(|error| {
+                    krill_app_core::ui::error_banner(p, error)
+                        .debug_selector(|| "update-card-restart-error".into())
+                }))
+                .child(
+                    div().w_full().child(
+                        krill_app_core::ui::button_with_reserved_label(
+                            "update-card-restart",
+                            restart_label,
+                            utext::CARD_RESTARTING_BTN.get(),
+                            starting,
+                        )
+                        .debug_selector(|| "update-card-restart".into())
+                        .primary()
+                        .small()
+                        .disabled(
+                            starting
+                                || matches!(
+                                    state.status,
+                                    krill_app_core::updater::CheckStatus::Checking
+                                ),
+                        )
+                        .w_full()
+                        .on_click(move |_, _, cx| {
+                            krill_app_core::updater::restart_staged_update(staged.clone(), cx);
+                        }),
+                    ),
+                ),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Shell {
+    /// 디바운스 저장 작업자의 대기분을 디스크에 반영한다(레이아웃 테스트용).
+    pub(crate) fn flush_layout(&self) {
+        assert!(self.flush_layout_snapshot());
+        self.saver.flush();
+    }
+
+    /// IO 태스크 없이 칸을 `sock`(krilld 쪽 대신)에 붙인다.
+    #[cfg(unix)]
+    fn attach_test(
+        &mut self,
+        pane: PaneId,
+        session: krill_proto::SessionId,
+        sock: UnixStream,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_pane_liveness(cx);
+        let had_session = self
+            .live
+            .get(&pane)
+            .and_then(|l| l.pane.session())
+            .is_some();
+        self.bind_paste_queue_first_session(pane, had_session, session);
+        let creation = Arc::clone(self.creations.entry(pane).or_default());
+        let l = self.live.entry(pane).or_insert_with(|| {
+            let mut live = Live::new(Task::ready(()));
+            live.creation = creation;
+            live
+        });
+        l.suspended = false;
+        l.pane.link(
+            session,
+            1,
+            pane::Writer::spawn(sock).unwrap(),
+            krill_proto::input::FEAT_INPUT,
+            Now::get(),
+        );
+        self.drain_paste_queue(cx);
+        cx.notify();
+    }
+}
+
+/// IME(`NSTextInputClient`) 메시지를 포커스 칸의 IME 상태기계로 옮긴다(MK-028, `krill_term::ime`).
+impl EntityInputHandler for Shell {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        // 문서 = preedit. `markedRange`가 가리키는 글자를 돌려줘야 IME가 조합을 이어 간다(W1).
+        let got = self.focused_live()?.ime.text_for_range_utf16(range.clone());
+        ime_trace(format_args!("textForRange {range:?} -> {got:?}"));
+        let (text, actual) = got?;
+        if actual != range {
+            *adjusted = Some(actual);
+        }
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let pane = self
+            .layout
+            .focused()
+            .filter(|&p| self.is_terminal_pane(p) && !self.is_pane_chat_view(p, cx))?;
+        let range = self
+            .live
+            .get(&pane)
+            .map_or(0..0, |l| l.ime.selected_range_utf16());
+        ime_trace(format_args!("selectedRange -> {range:?}"));
+        Some(UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let pane = self
+            .layout
+            .focused()
+            .filter(|&p| !self.is_pane_chat_view(p, cx))?;
+        let r = self.live.get(&pane)?.ime.marked_range_utf16();
+        ime_trace(format_args!("markedRange -> {r:?}"));
+        r
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ime_trace(format_args!("unmarkText"));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
+        let Some(l) = self.focused_live() else { return };
+        let modes = l.pane.modes();
+        let mut out = l.ime.unmark();
+        out.pty = keys::tui::text(&out.pty, modes);
+        self.send(&out, Some(window), cx);
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        ime_trace(format_args!("insertText {text:?} replace={range:?}"));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
+        if text.is_empty() && self.focused_live().is_none() {
+            return;
+        }
+        let Some(l) = self.ensure_focused_input_live() else {
+            return;
+        };
+        let modes = l.pane.modes();
+        let mut out = l.ime.insert(text);
+        out.pty = keys::tui::text(&out.pty, modes);
+        self.send(&out, Some(window), cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        ime_trace(format_args!(
+            "setMarkedText {new_text:?} sel={new_selected_range:?} replace={range:?}"
+        ));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
+        if new_text.is_empty() && self.focused_live().is_none() {
+            return;
+        }
+        let Some(l) = self.ensure_focused_input_live() else {
+            return;
+        };
+        l.ime.set_marked(new_text, new_selected_range);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return None;
+        }
+        let l = self.focused_live()?;
+        let (bounds, cell) = l.painted.get();
+        let at = l
+            .ime
+            .candidate_anchor_in_columns(range_utf16.start, usize::from(l.pane.screen().cols));
+        let n = |v: usize| f32::from(u16::try_from(v).unwrap_or(u16::MAX));
+        Some(Bounds::new(
+            point(
+                bounds.origin.x + cell.width * n(at.column),
+                bounds.origin.y + cell.height * n(at.line),
+            ),
+            cell,
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// `KRILL_IME_TRACE=<파일>`이면 IME 메시지와 키 이벤트를 한 줄씩 덧붙인다(실기 한글 IME 진단용, 기본 꺼짐).
+fn ime_trace(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    static SEND: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<String>>> =
+        std::sync::OnceLock::new();
+    let Some(send) = SEND.get_or_init(|| {
+        let path = std::env::var_os("KRILL_IME_TRACE").map(PathBuf::from)?;
+        let (send, recv) = std::sync::mpsc::sync_channel::<String>(1024);
+        std::thread::Builder::new()
+            .name("ime-trace".into())
+            .spawn(move || {
+                let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                else {
+                    return;
+                };
+                for line in recv {
+                    writeln!(file, "{line}").ok();
+                }
+            })
+            .ok()?;
+        Some(send)
+    }) else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    // Diagnostics must not apply backpressure to IME/key events.
+    send.try_send(format!("{ms} {line}")).ok();
+}
+
+/// 일반 문자 키인가(Ctrl·Alt·Cmd·Fn 없음, 한 글자·스페이스). 조합 중 `KeyUp` 차단(OWE-615 원인 4)
+/// 대상. `key`는 물리 키 이름이라 한글 자모 키도 한 글자로 온다(`key_char`는 테스트 파싱에 없어 보지 않는다).
+fn is_plain_char_key(ks: &gpui::Keystroke) -> bool {
+    if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform || ks.modifiers.function {
+        return false;
+    }
+    if ks.key == "space" {
+        return true;
+    }
+    let mut chars = ks.key.chars();
+    matches!(chars.next(), Some(ch) if !ch.is_control()) && chars.next().is_none()
+}
+
+/// 로컬 재스폰 시 `respawn_cwd`(셸 내 `cd` 경로)가 삭제되었고 워크트리 루트(`cwd`)는 살아 있으면
+/// 삭제된 하위 폴더 대신 워크트리 루트를 유지한다.
+pub(super) fn apply_respawn_cwd(cwd: &mut Vec<u8>, respawn: &[u8], is_remote: bool) {
+    use krill_proto::os::ffi::OsStrExt as _;
+    if is_remote {
+        *cwd = respawn.to_vec();
+        return;
+    }
+    let cleaned = std::str::from_utf8(respawn)
+        .map(krill_proto::orchestration::clean_workspace_path_str)
+        .map_or_else(|_| respawn.to_vec(), String::into_bytes);
+    let respawn_path = std::path::Path::new(std::ffi::OsStr::from_bytes(&cleaned));
+    let launch_path = std::path::Path::new(std::ffi::OsStr::from_bytes(cwd));
+    if !respawn_path.is_dir() && launch_path.is_dir() {
+        return;
+    }
+    *cwd = cleaned;
+}
+
+fn is_permanent_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// 세션을 만들거나 붙지 못한 이유를 칸에 보일 문구로 바꾼다. 생성 결과를 모르는 실패와 아는 krilld 거절은 다음 할
+/// 일을 담은 문구로, 나머지는 원문 그대로 둔다.
+fn start_error_text(err: &std::io::Error) -> String {
+    use krill_proto::control::Failure;
+    if pane::is_unknown_outcome(err) {
+        return text::START_UNCONFIRMED.get().to_owned();
+    }
+    let raw = err.to_string();
+    if raw == Failure::NoHolder.to_string() {
+        text::START_NO_HOLDER.get().to_owned()
+    } else if raw == Failure::UnknownAgent.to_string() {
+        text::START_UNKNOWN_AGENT.get().to_owned()
+    } else {
+        raw
+    }
+}
+
+enum RemoteOrchFetch {
+    Unchanged,
+    Updated {
+        store: Arc<krill_proto::orchestration::OrchestrationStore>,
+        generation: Option<u64>,
+    },
+}
+
+fn fetch_remote_orchestration_snapshot(
+    target: &krill_app_core::hosts::HostTarget,
+    prev_generation: Option<u64>,
+) -> std::io::Result<RemoteOrchFetch> {
+    use krill_proto::control::{FEAT_CONTROL, Reply, Request};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore,
+        SNAPSHOT_CHANGED_ERROR,
+    };
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+
+    let hello = daemon::client_hello(ClientRole::App, "krill-app-orch");
+    let mut conn = target.connect(&hello).map_err(std::io::Error::other)?;
+    if conn.negotiated.features & FEAT_CONTROL == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote krilld does not support FEAT_CONTROL",
+        ));
+    }
+    let timeout = Duration::from_secs(2);
+    conn.stream.set_read_timeout(Some(timeout))?;
+    conn.stream.set_write_timeout(Some(timeout))?;
+
+    let mut request = |action: &OrchAction| -> std::io::Result<OrchResponse> {
+        let encoded = Request::Orchestration(action.clone())
+            .encode()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        conn.stream.write_all(&encoded)?;
+        let (kind, body) =
+            ipc::read_frame(&mut conn.stream)?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        match Reply::decode(kind, &body)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        {
+            Reply::Orchestration(resp) => Ok(resp),
+            Reply::Failed(failure) => Err(std::io::Error::other(failure.to_string())),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected orchestration reply",
+            )),
+        }
+    };
+
+    if conn.negotiated.features & FEAT_ORCH_SNAPSHOT_PAGE != 0 {
+        let first = request(&OrchAction::SnapshotPage {
+            generation: None,
+            offset: 0,
+        })?;
+        let (mut cached_first, mut fetched_generation) = match first {
+            OrchResponse::SnapshotPage { generation, .. }
+                if prev_generation == Some(generation) =>
+            {
+                return Ok(RemoteOrchFetch::Unchanged);
+            }
+            page @ OrchResponse::SnapshotPage { generation, .. } => (Some(page), Some(generation)),
+            OrchResponse::Error(msg) if msg.contains(SNAPSHOT_CHANGED_ERROR) => (None, None),
+            OrchResponse::Error(msg) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected snapshot page reply",
+                ));
+            }
+        };
+        let store = OrchestrationStore::fetch_paged(|generation, offset| {
+            if generation.is_none()
+                && offset == 0
+                && let Some(page) = cached_first.take()
+            {
+                return Ok(page);
+            }
+            let resp = request(&OrchAction::SnapshotPage { generation, offset })?;
+            if let OrchResponse::SnapshotPage {
+                generation: page_gen,
+                ..
+            } = &resp
+            {
+                fetched_generation = Some(*page_gen);
+            }
+            Ok(resp)
+        })?;
+        return Ok(RemoteOrchFetch::Updated {
+            store: Arc::new(store),
+            generation: fetched_generation,
+        });
+    }
+
+    match request(&OrchAction::SnapshotV2)? {
+        OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store) => {
+            Ok(RemoteOrchFetch::Updated {
+                store: Arc::new(store),
+                generation: None,
+            })
+        }
+        OrchResponse::Error(msg) => Err(std::io::Error::other(msg)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected orchestration snapshot reply",
+        )),
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests;
+
+#[cfg(all(test, unix))]
+mod update_tests;
+
+#[cfg(all(test, unix))]
+mod selection_tests;
+
+#[cfg(all(test, unix))]
+mod sidebar_scroll_tests;
+
+#[cfg(all(test, unix))]
+mod history_tests;
