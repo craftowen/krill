@@ -2969,6 +2969,15 @@ impl Registry {
             {
                 UsageReply::Failed(Failure::BadRequest)
             }
+            UsageRequest::AntigravityAccounts(_)
+                if features & (switch_control | krill_proto::usage::FEAT_USAGE_AGY)
+                    != (switch_control | krill_proto::usage::FEAT_USAGE_AGY) =>
+            {
+                UsageReply::Failed(Failure::BadRequest)
+            }
+            UsageRequest::AntigravityAccounts(op) => UsageReply::AntigravityAccounts(
+                accounts::agy_native::handle_op(&home, state_ref, &op),
+            ),
             // Default only: running sessions keep their account until the user picks them.
             UsageRequest::SwitchAccountOnly {
                 provider,

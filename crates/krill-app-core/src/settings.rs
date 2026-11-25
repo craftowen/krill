@@ -22,6 +22,7 @@ use crate::ui::{DarkUiTheme, LightUiTheme};
 
 pub use crate::i18n::Language;
 
+mod antigravity;
 mod locale;
 mod location;
 mod machines;
@@ -3429,6 +3430,8 @@ pub struct SettingsView {
     opencode_key_open: bool,
     opencode_api_key_pending: bool,
     opencode_api_key_error: Option<SharedString>,
+    /// Native Antigravity (`agy`) account section state (1:1 Orca `AntigravityAccountsSection`).
+    antigravity: antigravity::AntigravityPanelState,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
     ssh_duplicates: Vec<(String, String)>,
@@ -3933,6 +3936,7 @@ impl SettingsView {
             opencode_key_open: false,
             opencode_api_key_pending: false,
             opencode_api_key_error: None,
+            antigravity: antigravity::AntigravityPanelState::default(),
             ssh_hosts: Vec::new(),
             ssh_duplicates: Vec::new(),
             ssh_duplicates_for: None,
@@ -4716,6 +4720,7 @@ impl SettingsView {
             self.accounts_offline = false;
             self.terminal_login_provider = None;
             self.terminal_login_account = None;
+            self.antigravity.reset_for_host_switch();
             self.removing = None;
             self.rename = None;
             self.disarm(cx);
@@ -4953,6 +4958,9 @@ impl SettingsView {
     }
 
     fn refresh_accounts_async(&mut self, cx: &mut Context<Self>) {
+        if self.antigravity.state.is_none() && !self.antigravity.busy {
+            self.run_antigravity_action(antigravity::AntigravityAction::List, cx);
+        }
         if self.accounts_refresh_pending {
             return;
         }
@@ -9139,6 +9147,17 @@ impl SettingsView {
                 if !self.not_installed_open {
                     continue;
                 }
+            }
+            // Antigravity (`agy`) uses Orca's native single-login account section 1:1
+            // (Save current / Select / Remove / Refresh usage — no isolated profile guide).
+            if provider == ProviderKind::Antigravity {
+                let section = self.render_antigravity_section(provider_installed, cx);
+                if provider_installed {
+                    root = root.child(section);
+                } else {
+                    not_installed.push(section);
+                }
+                continue;
             }
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
             accounts.sort_by_key(|a| !a.host_default);

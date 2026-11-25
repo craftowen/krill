@@ -473,7 +473,8 @@ pub fn request_target_with_features(
         UsageReply::Current(_)
         | UsageReply::Orphans(_)
         | UsageReply::Provisioning(_)
-        | UsageReply::SessionSwitchPlan(_) => AccountsSnapshot::default(),
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => AccountsSnapshot::default(),
         UsageReply::Failed(e) => return Err(failure_text(e)),
     };
     Ok((snapshot, features))
@@ -585,7 +586,22 @@ pub fn orphans_target(
         | UsageReply::Current(_)
         | UsageReply::Provisioning(_)
         | UsageReply::ResetConsumed { .. }
-        | UsageReply::SessionSwitchPlan(_) => Ok(Vec::new()),
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => Ok(Vec::new()),
+    }
+}
+
+/// 지정한 호스트 타깃(로컬·원격) 데몬에 네이티브 Antigravity 계정 동작을 요청한다.
+pub fn antigravity_accounts_target(
+    target: &krill_hosts::HostTarget,
+    op: krill_proto::usage::AntigravityAccountOp,
+) -> Result<krill_proto::usage::AntigravityAccountState, String> {
+    match exchange_target(target, &UsageRequest::AntigravityAccounts(op))? {
+        UsageReply::AntigravityAccounts(result) => result,
+        UsageReply::Failed(e) => Err(failure_text(e)),
+        _ => Err(crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()),
     }
 }
 
@@ -742,6 +758,7 @@ pub fn request_local(
         | UsageRequest::SetAdvancedPolicy(_)
         | UsageRequest::SetDirectUsage(_)
         | UsageRequest::ImportOrcaAntigravity { .. }
+        | UsageRequest::AntigravityAccounts(_)
         | UsageRequest::SetProvisioning(_)
         | UsageRequest::GetProvisioning
         | UsageRequest::ConsumeResetCredit { .. } => Err(io::Error::new(

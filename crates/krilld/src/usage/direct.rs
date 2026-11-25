@@ -1611,15 +1611,18 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
         return antigravity_auth_file(dir, false);
     }
-    // 호스트(OWE-901): `antigravity-oauth-token` 파일이 있으면 `agy -p /usage`가
-    // `SSH_CONNECTION=krill`로 파일 토큰을 읽으므로 신원 판정도 같은 파일 토큰을 먼저 본다.
-    // 파일이 없을 때만 키체인 로그인을 확인한다.
-    if let Some(status) = antigravity_auth_file(dir, true) {
-        return Some(status);
-    }
-    if let Some(raw) = keychain("gemini", "antigravity")
+    // 호스트(Orca native-credential-backend.ts & agy 1.5.16 패리티):
+    // AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 등 파일 저장 호스트가 아니면 키체인을 먼저 보고,
+    // 없을 때만 파일 토큰으로 폴백한다.
+    let env = accounts::agy_native::backend::current_process_env();
+    let force_file = accounts::agy_native::is_antigravity_file_storage_host(&env);
+    if !force_file
+        && let Some(raw) = keychain("gemini", "antigravity")
         && let Some(status) = parse_antigravity_auth(&raw)
     {
+        return Some(status);
+    }
+    if let Some(status) = antigravity_auth_file(dir, true) {
         return Some(status);
     }
     None
@@ -1786,15 +1789,19 @@ pub(crate) mod agy {
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
         )];
-        for a in &file.accounts {
-            if ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity) {
-                continue;
+        // When the native encrypted Antigravity vault owns accounts (Orca parity),
+        // only the active native host login is polled — never switch or probe inactive accounts.
+        if !accounts::agy_native::vault_path(home, state).is_file() {
+            for a in &file.accounts {
+                if ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity) {
+                    continue;
+                }
+                let dir = PathBuf::from(&a.profile_dir);
+                if dir.as_os_str().is_empty() || !dir.is_dir() {
+                    continue;
+                }
+                profiles.push((dir, false));
             }
-            let dir = PathBuf::from(&a.profile_dir);
-            if dir.as_os_str().is_empty() || !dir.is_dir() {
-                continue;
-            }
-            profiles.push((dir, false));
         }
         for (dir, host) in profiles {
             super::evict_if_credentials_changed(home, ProviderKind::Antigravity, &dir, host);
@@ -1866,6 +1873,20 @@ pub(crate) mod agy {
                     return;
                 }
                 let before = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
+                // Orca `beginUsageRead`: snapshot the active native login before running `agy -p /usage`
+                // so mid-read account switches cannot misattribute usage.
+                let usage_read_login = if host {
+                    accounts::agy_native::AntigravityAccountService::for_host(
+                        &job.0,
+                        state.as_deref(),
+                    )
+                    .begin_usage_read()
+                    .ok()
+                    .flatten()
+                    .and_then(|start| start.login)
+                } else {
+                    None
+                };
                 let usage = std::panic::catch_unwind(|| {
                     let exe = super::agy_exe()?;
                     fetch(&exe, &job.1, host)
@@ -1879,6 +1900,33 @@ pub(crate) mod agy {
                 }
                 lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, after);
                 if let Some((usage, meters)) = usage {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs());
+                    if host && let Some(login) = usage_read_login.as_ref() {
+                        let stored = krill_proto::usage::AntigravityStoredUsage {
+                            usage: usage.to_proto(),
+                            meters: meters.meters.clone(),
+                            updated_at: now.unwrap_or(0),
+                        };
+                        match accounts::agy_native::AntigravityAccountService::for_host(
+                            &job.0,
+                            state.as_deref(),
+                        )
+                        .finish_usage_read(login, Some(stored))
+                        {
+                            Ok(accounts::agy_native::AntigravityUsageReadFinish::Switched) => {
+                                // Native account changed mid-read; drop rather than misattribute.
+                                lock(&PENDING).remove(&job);
+                                return;
+                            }
+                            Ok(accounts::agy_native::AntigravityUsageReadFinish::Committed {
+                                ..
+                            })
+                            | Err(_) => {}
+                        }
+                    }
                     lock(&FAILED).remove(&job);
                     super::super::meters::remember(
                         &job.0,
@@ -1893,10 +1941,6 @@ pub(crate) mod agy {
                     {
                         accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
                     }
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs());
                     let mut cache = lock(&CACHE);
                     cache.retain(|_, (at, _)| at.elapsed() < TTL);
                     if cache.len() >= 256 {
@@ -1980,9 +2024,10 @@ pub(crate) mod agy {
         );
         // `--disable-slash-commands`는 절대 붙이지 않는다(OWE-901).
         debug_assert!(!argv.iter().any(|a| a.contains("disable-slash-commands")));
-        // 호스트 기본 프로필이 macOS 키체인만으로 로그인된 경우 `SSH_CONNECTION=krill`을 주면
-        // 파일 토큰(`antigravity-oauth-token`)만 찾다가 대화형 OAuth 대기에 빠진다.
-        let ssh_connection = !host || dir.join("antigravity-oauth-token").is_file() || cfg!(test);
+        // Orca parity: native host usage runs plain `agy -p /usage` without fake SSH_CONNECTION,
+        // letting agy 1.5.16+ read its native OS keyring (or file when AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1).
+        // Legacy isolated profile dirs (`!host`) force file storage into `--gemini_dir`.
+        let ssh_connection = !host;
         let body = run_agy(exe, &argv, ssh_connection, TIMEOUT, MAX_BYTES)?;
         let text = std::str::from_utf8(&body).ok()?;
         if has_model_turn_trace(text) {
@@ -2337,6 +2382,7 @@ pub(crate) mod agy {
         }
         let mut cmd = Command::new(exe);
         cmd.args(args)
+            .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -2525,16 +2571,19 @@ pub(crate) mod agy {
           ]}}
         }"#;
 
-        /// 가짜 agy: `--version`은 버전 출력, 그 밖은 인자 검증 뒤 봉투 출력.
-        /// `SSH_CONNECTION=krill` 및 `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`이 아니면 실패하고, `--disable-slash-commands`가 있으면 실패한다.
+        /// 가짜 agy: `--version`은 버전 출력, 그 밖은 인자·환경 검증 뒤 봉투 출력.
+        /// 프로필(`--gemini_dir=*`)은 `SSH_CONNECTION=krill` + `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`을 요구하고,
+        /// 호스트 조회는 가짜 `SSH_CONNECTION=krill` 없이 네이티브로 실행하며 항상 `AGY_CLI_DISABLE_AUTO_UPDATE=true`다.
         fn usage_script(version: &str, body: &str) -> String {
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = '--version' ]; then printf '%s\\n' '{version}'; exit 0; fi\n\
-                 [ \"$SSH_CONNECTION\" = krill ] || exit 3\n\
-                 [ \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 ] || exit 6\n\
+                 [ \"$AGY_CLI_DISABLE_AUTO_UPDATE\" = true ] || exit 2\n\
                  case \" $* \" in *'--disable-slash-commands'*) exit 4;; esac\n\
-                 case \"$1\" in --gemini_dir=*) shift;; esac\n\
+                 case \"$1\" in\n\
+                   --gemini_dir=*) [ \"$SSH_CONNECTION\" = krill ] && [ \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 ] || exit 3; shift;;\n\
+                   *) [ \"$SSH_CONNECTION\" != krill ] || exit 3;;\n\
+                 esac\n\
                  [ \"$1 $2 $3 $4 $5 $6\" = '-p /usage --output-format json --print-timeout 20s' ] || exit 5\n\
                  printf '%s' '{body}'\n",
             )
