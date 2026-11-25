@@ -3106,3 +3106,72 @@ fn fast_shell_launch_skips_startup_rc_files_and_keeps_wrapper_contract() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn preflight_injects_host_gemini_dir_without_forcing_ssh_or_file_storage() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-agy-preflight-gd-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agy_bin = bin.join("agy");
+    std::fs::write(
+        &agy_bin,
+        "#!/bin/sh\nprintf 'ARGS=%s|SSH=%s|FORCE=%s\\n' \"$*\" \"${SSH_CONNECTION-unset}\" \"${AGY_CLI_FORCE_FILE_TOKEN_STORAGE-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&agy_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. Standard native host launch: injects --gemini_dir=$HOME/.gemini, strips leaked
+    //    SSH_CONNECTION=krill, and does NOT force AGY_CLI_FORCE_FILE_TOKEN_STORAGE.
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            PREFLIGHT,
+            WRAPPER_ARG0,
+            "hint",
+            "agy",
+            "--mode",
+            "yolo",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("KRILL_ACCOUNT_PROVIDER", "agy")
+        .env("SSH_CONNECTION", "krill")
+        .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1")
+        .env("SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_gd = format!("--gemini_dir={}/.gemini --mode yolo", home.display());
+    assert!(
+        stdout.contains(&format!("ARGS={expected_gd}|SSH=unset|FORCE=unset")),
+        "unexpected stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Host with explicit AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 (without fake SSH_CONNECTION=krill)
+    //    preserves AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 and still injects host --gemini_dir.
+    let out2 = std::process::Command::new("/bin/sh")
+        .args(["-c", PREFLIGHT, WRAPPER_ARG0, "hint", "agy", "--version"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("KRILL_ACCOUNT_PROVIDER", "agy")
+        .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1")
+        .env("SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let expected_gd2 = format!("--gemini_dir={}/.gemini --version", home.display());
+    assert!(
+        stdout2.contains(&format!("ARGS={expected_gd2}|SSH=unset|FORCE=1")),
+        "unexpected stdout2={stdout2:?} stderr={:?}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

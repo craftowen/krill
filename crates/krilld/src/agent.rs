@@ -61,13 +61,23 @@ case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
   opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi; if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi;;
-  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; else unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
+  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; elif [ "${SSH_CONNECTION-}" = krill ]; then unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
 esac
 if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
-case "$(basename "$1")" in
-  agy|antigravity) for _a in "$@"; do case "$_a" in --gemini_dir=*) SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@";; esac; done;;
-esac
+if [ "$(basename "$1")" = agy ] || [ "$(basename "$1")" = antigravity ]; then
+  _krill_agy_gd=""
+  for _krill_a in "$@"; do
+    case "$_krill_a" in --gemini_dir=*) _krill_agy_gd="${_krill_a#--gemini_dir=}"; break;; --gemini_dir) _krill_agy_gd="__split__"; break;; esac
+  done
+  if [ -z "$_krill_agy_gd" ]; then
+    if [ -n "${HOME-}" ] && [ "${HOME#/}" != "$HOME" ]; then
+      _krill_agy_cmd=$1; shift; exec "$_krill_agy_cmd" "--gemini_dir=$HOME/.gemini" "$@"
+    fi
+  elif [ "$_krill_agy_gd" != "__split__" ] && [ "$_krill_agy_gd" != "${HOME-}/.gemini" ]; then
+    SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@"
+  fi
+fi
 exec "$@"
 )
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
@@ -919,6 +929,27 @@ pub(crate) fn resume_in_with_bot_mcp(
     let mut files_guard = SessionFilesGuard::new(state, session);
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, account);
+    if (is(profile, "agy") || is(profile, "antigravity"))
+        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+        && let Some(host_home) = trust_home_for_runtime()
+    {
+        let launch_env: std::collections::BTreeMap<String, String> = login
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        crate::usage::accounts::agy_native::prepare_antigravity_account_for_launch(
+            &host_home,
+            state,
+            &launch_env,
+        )
+        .map_err(io::Error::other)?;
+    }
     if bot_mcp.is_some() {
         merge_loopback_no_proxy(&mut login.env);
     }
@@ -1326,21 +1357,10 @@ fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> 
 fn active_account_in(home: &Path, state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
     let provider = ProviderKind::parse(program)?;
     let (id, dir) = if provider == ProviderKind::Antigravity {
-        if let Some(agy_state) =
-            crate::usage::accounts::agy_native::list_state_for_snapshot(home, state)
-            && let Some(active_id) = agy_state.active_account_id
+        if let Some(active_id) =
+            crate::usage::accounts::agy_native::active_account_for_launch(home, state)
         {
             (active_id, String::new())
-        } else if let Some((_, active)) = accounts::active_account_info(home, state, program) {
-            let host_agy = accounts::host_default_dir(home, ProviderKind::Antigravity);
-            let dir = if Path::new(&active.profile_dir) == host_agy
-                || crate::usage::accounts::agy_native::vault_has_account(home, state, &active.id)
-            {
-                String::new()
-            } else {
-                active.profile_dir
-            };
-            (active.id, dir)
         } else {
             (accounts::host_default_id(provider), String::new())
         }

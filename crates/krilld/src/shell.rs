@@ -145,6 +145,7 @@ const KEEP: &[&[u8]] = &[
     b"__CF_USER_TEXT_ENCODING",
     b"COMMAND_MODE",
     b"LANG",
+    b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
 ];
 
 /// 세션 셸 설정.

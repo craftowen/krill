@@ -92,10 +92,6 @@ pub(crate) struct AntigravityUsageReadStart {
 pub(crate) enum AntigravityUsageReadFinish {
     Switched,
     Committed {
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "inspected by usage-reading attribution tests")
-        )]
         account_id: Option<String>,
         #[cfg_attr(
             not(test),
@@ -507,6 +503,11 @@ impl AntigravityAccountService {
             return false;
         }
         account.credentials.clone_from(&current.contents);
+        if account.subject.is_none()
+            && let Some(identity) = current.identity.as_ref()
+        {
+            account.subject = Some(identity.subject.clone());
+        }
         if let Some(email) = current
             .identity
             .as_ref()
@@ -602,15 +603,25 @@ pub(crate) fn prepare_antigravity_account_for_launch(
 }
 
 /// Safe one-time migration of legacy Krill `accounts.toml` `agy` profiles whose token file still
-/// exists on disk into the encrypted native vault. Legacy profile folders (`~/.config/krill/profiles/agy/...`)
-/// are NEVER modified or deleted.
+/// exists on disk into the encrypted native vault, followed by pruning obsolete isolated `agy`
+/// rows from `accounts.toml` (never modifying Claude/Codex/OpenCode entries or legacy profile
+/// directories on disk).
 pub(crate) fn migrate_legacy_agy_profiles_once(home: &Path, state_dir: Option<&Path>) {
+    migrate_and_prune_legacy_agy_profiles(home, state_dir, !cfg!(test));
+}
+
+pub(crate) fn migrate_and_prune_legacy_agy_profiles(
+    home: &Path,
+    state_dir: Option<&Path>,
+    prune_accounts_toml: bool,
+) {
     let vault_file = vault_path(home, state_dir);
     let Some(vault_dir) = vault_file.parent() else {
         return;
     };
-    let marker = vault_dir.join(".legacy-migrated-v1");
-    if marker.exists() {
+    let migrated_marker = vault_dir.join(".legacy-migrated-v1");
+    let pruned_marker = vault_dir.join(".legacy-pruned-v2");
+    if migrated_marker.exists() && (!prune_accounts_toml || pruned_marker.exists()) {
         return;
     }
     let file = crate::usage::accounts::load_file(home, state_dir);
@@ -620,55 +631,91 @@ pub(crate) fn migrate_legacy_agy_profiles_once(home: &Path, state_dir: Option<&P
         .filter(|a| {
             krill_proto::usage::ProviderKind::parse(&a.provider)
                 == Some(krill_proto::usage::ProviderKind::Antigravity)
-                && !a.profile_dir.is_empty()
         })
         .collect();
     if legacy_agy.is_empty() {
+        if prune_accounts_toml && vault_dir.is_dir() {
+            std::fs::write(&pruned_marker, b"1").ok();
+        }
         return;
     }
-    let active_id = file.active.get("agy").map(String::as_str);
-    let now = default_now_ms();
-    let mut imported = Vec::new();
-    let mut selected = None;
-    for acc in legacy_agy {
-        let token_path = Path::new(&acc.profile_dir)
-            .join(".gemini")
-            .join("antigravity-cli")
-            .join("antigravity-oauth-token");
-        let Ok(Some(raw)) = super::backend::read_antigravity_credential_file(&token_path) else {
-            continue;
-        };
-        let Ok(parsed) = parse_antigravity_native_credential(&raw) else {
-            continue;
-        };
-        let email = parsed
-            .identity
-            .as_ref()
-            .and_then(|i| i.email.clone())
-            .or_else(|| parsed.email_hint.clone())
-            .or_else(|| acc.email.clone());
-        let subject = parsed.identity.as_ref().map(|i| i.subject.clone());
-        if active_id == Some(acc.id.as_str()) {
-            selected = Some(acc.id.clone());
+    if !migrated_marker.exists() {
+        let active_id = file.active.get("agy").map(String::as_str);
+        let now = default_now_ms();
+        let mut imported = Vec::new();
+        let mut selected = None;
+        for acc in &legacy_agy {
+            if acc.profile_dir.is_empty() {
+                continue;
+            }
+            let token_path = Path::new(&acc.profile_dir)
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token");
+            let Ok(Some(raw)) = super::backend::read_antigravity_credential_file(&token_path)
+            else {
+                continue;
+            };
+            let Ok(parsed) = parse_antigravity_native_credential(&raw) else {
+                continue;
+            };
+            let email = parsed
+                .identity
+                .as_ref()
+                .and_then(|i| i.email.clone())
+                .or_else(|| parsed.email_hint.clone())
+                .or_else(|| acc.email.clone());
+            let subject = parsed.identity.as_ref().map(|i| i.subject.clone());
+            if active_id == Some(acc.id.as_str()) {
+                selected = Some(acc.id.clone());
+            }
+            imported.push(StoredAntigravityAccount {
+                id: acc.id.clone(),
+                email,
+                subject,
+                auth_method: parsed.auth_method,
+                created_at: now,
+                updated_at: now,
+                credentials: parsed.contents,
+                usage: None,
+            });
         }
-        imported.push(StoredAntigravityAccount {
-            id: acc.id.clone(),
-            email,
-            subject,
-            auth_method: parsed.auth_method,
-            created_at: now,
-            updated_at: now,
-            credentials: parsed.contents,
-            usage: None,
-        });
+        if !imported.is_empty() {
+            let svc = AntigravityAccountService::for_host(home, state_dir);
+            if svc.import_snapshots(imported, selected.as_deref()).is_ok() {
+                std::fs::write(&migrated_marker, b"1").ok();
+            } else {
+                // Keep legacy accounts.toml rows intact if vault import failed.
+                return;
+            }
+        } else if vault_dir.is_dir() {
+            std::fs::write(&migrated_marker, b"1").ok();
+        }
     }
-    if !imported.is_empty() {
-        let svc = AntigravityAccountService::for_host(home, state_dir);
-        if svc.import_snapshots(imported, selected.as_deref()).is_ok() {
-            std::fs::write(&marker, b"1").ok();
+    if prune_accounts_toml && !pruned_marker.exists() {
+        match crate::usage::accounts::prune_legacy_agy_accounts(home, state_dir) {
+            Ok(_) => {
+                #[cfg(unix)]
+                {
+                    use krill_proto::os::fs::DirBuilderExt as _;
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(vault_dir)
+                        .ok();
+                }
+                #[cfg(not(unix))]
+                std::fs::create_dir_all(vault_dir).ok();
+                std::fs::write(&migrated_marker, b"1").ok();
+                std::fs::write(&pruned_marker, b"1").ok();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    kind = ?err.kind(),
+                    "skipped pruning legacy agy rows from accounts.toml"
+                );
+            }
         }
-    } else if vault_dir.is_dir() {
-        std::fs::write(&marker, b"1").ok();
     }
 }
 

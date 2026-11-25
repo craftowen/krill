@@ -1936,9 +1936,9 @@ pub(crate) mod agy {
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
         )];
-        // When the native encrypted Antigravity vault owns accounts (Orca parity),
-        // only the active native host login is polled — never switch or probe inactive accounts.
-        if !accounts::agy_native::vault_path(home, state).is_file() {
+        // Native Antigravity model (Orca parity): only the active native host login is polled —
+        // never probe stale legacy accounts.toml agy rows or switch inactive accounts.
+        if cfg!(test) && !accounts::agy_native::vault_path(home, state).is_file() {
             for a in &file.accounts {
                 if ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity) {
                     continue;
@@ -2014,7 +2014,7 @@ pub(crate) mod agy {
                     },
                     || {
                         let exe = super::agy_exe()?;
-                        fetch(&exe, &job.1, host)
+                        fetch(&exe, &job.0, &job.1, host)
                     },
                 );
             });
@@ -2084,6 +2084,7 @@ pub(crate) mod agy {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs());
+            let mut committed_vault_id: Option<String> = None;
             if host && let Some(login) = usage_read_login.as_ref() {
                 let stored = krill_proto::usage::AntigravityStoredUsage {
                     usage: usage.to_proto(),
@@ -2098,18 +2099,26 @@ pub(crate) mod agy {
                         lock(&PENDING).remove(job);
                         return;
                     }
-                    Ok(accounts::agy_native::AntigravityUsageReadFinish::Committed { .. })
-                    | Err(_) => {}
+                    Ok(accounts::agy_native::AntigravityUsageReadFinish::Committed {
+                        account_id,
+                        ..
+                    }) => {
+                        committed_vault_id = account_id;
+                    }
+                    Err(_) => {}
                 }
             }
             lock(&FAILED).remove(job);
             super::super::meters::remember(&job.0, ProviderKind::Antigravity, &job.1, meters);
             // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
             // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
-            if usage_max(&usage) < 100
-                && let Some(id) = account_id_for(&job.0, state, &job.1, host)
-            {
-                accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
+            if usage_max(&usage) < 100 {
+                if let Some(id) = account_id_for(&job.0, state, &job.1, host) {
+                    accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
+                }
+                if let Some(vault_id) = committed_vault_id.as_deref() {
+                    accounts::clear_rate_limited(ProviderKind::Antigravity, vault_id);
+                }
             }
             let mut cache = lock(&CACHE);
             cache.retain(|_, (at, _)| at.elapsed() < TTL);
@@ -2158,6 +2167,7 @@ pub(crate) mod agy {
     /// 테스트는 가짜 바이너리).
     fn fetch(
         exe: &Path,
+        home: &Path,
         dir: &Path,
         host: bool,
     ) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
@@ -2167,14 +2177,18 @@ pub(crate) mod agy {
         if !version_supported(exe) {
             return None;
         }
-        let gemini_dir;
-        let gemini_flag;
         let mut argv: Vec<String> = Vec::new();
         if !host {
-            gemini_dir = dir.join(".gemini");
+            let gemini_dir = dir.join(".gemini");
             let text = gemini_dir.to_str()?;
-            gemini_flag = format!("--gemini_dir={text}");
-            argv.push(gemini_flag);
+            argv.push(format!("--gemini_dir={text}"));
+        } else if home.is_absolute()
+            && let Some(text) = home.join(".gemini").to_str()
+        {
+            // Pass the absolute host `.gemini` dir so `agy 1.5.17` does not emit
+            // `Failed to resolve GeminiDir ".gemini": path is not absolute`, while
+            // keeping `ssh_connection = false` so native OS keyring stays active.
+            argv.push(format!("--gemini_dir={text}"));
         }
         argv.extend(
             [
@@ -2190,9 +2204,10 @@ pub(crate) mod agy {
         );
         // `--disable-slash-commands`는 절대 붙이지 않는다(OWE-901).
         debug_assert!(!argv.iter().any(|a| a.contains("disable-slash-commands")));
-        // Orca parity: native host usage runs plain `agy -p /usage` without fake SSH_CONNECTION,
-        // letting agy 1.5.16+ read its native OS keyring (or file when AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1).
-        // Legacy isolated profile dirs (`!host`) force file storage into `--gemini_dir`.
+        // Orca parity: native host usage runs `agy --gemini_dir=<home>/.gemini -p /usage`
+        // without fake SSH_CONNECTION, letting agy 1.5.16+ read its native OS keyring (or file
+        // when AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1). Legacy isolated profile dirs (`!host`) force
+        // file storage into `--gemini_dir`.
         let ssh_connection = !host;
         let body = run_agy(exe, &argv, ssh_connection, TIMEOUT, MAX_BYTES)?;
         let text = std::str::from_utf8(&body).ok()?;
@@ -2223,7 +2238,7 @@ pub(crate) mod agy {
     #[cfg(test)]
     #[cfg(unix)]
     pub(super) fn fetch_for_tests(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
-        fetch(exe, dir, host).map(|(usage, _)| usage)
+        fetch(exe, Path::new(""), dir, host).map(|(usage, _)| usage)
     }
 
     #[cfg(test)]

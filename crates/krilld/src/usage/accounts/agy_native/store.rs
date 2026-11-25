@@ -53,9 +53,7 @@ const KEYCHAIN_DUPLICATE: i32 = -25299;
 #[cfg(all(target_os = "macos", not(test)))]
 static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
 
-#[cfg(any(test, target_os = "linux", windows))]
 const KEY_FILE: &str = "vault.key";
-#[cfg(any(test, target_os = "linux", windows))]
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 static VAULT_IO_LOCK: Mutex<()> = Mutex::new(());
@@ -330,6 +328,10 @@ impl MasterKey {
 
     #[cfg(all(target_os = "macos", not(test)))]
     fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+        // Isolated E2E / temp HOME sandboxes must never pollute the real macOS user Keychain.
+        if !super::backend::is_real_home_for_state_path(root) {
+            return Self::load_or_create_file(root, allow_create);
+        }
         ensure_no_symlink(root)?;
         fs::DirBuilder::new()
             .recursive(true)
@@ -369,6 +371,10 @@ impl MasterKey {
 
     #[cfg(any(test, target_os = "linux", windows))]
     fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+        Self::load_or_create_file(root, allow_create)
+    }
+
+    fn load_or_create_file(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
         let _guard = lock(&KEY_FILE_LOCK);
         ensure_no_symlink(root)?;
         let path = root.join(KEY_FILE);
@@ -433,7 +439,7 @@ fn unseal_key(sealed: &[u8]) -> io::Result<MasterKey> {
     MasterKey::from_slice(raw.as_ref())
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "matches Windows DPAPI seal_key Result signature"
@@ -442,7 +448,7 @@ fn seal_key(raw: &[u8]) -> io::Result<Vec<u8>> {
     Ok(raw.to_vec())
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn unseal_key(raw: &[u8]) -> io::Result<MasterKey> {
     MasterKey::from_slice(raw)
 }

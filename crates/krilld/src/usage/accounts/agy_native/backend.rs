@@ -12,12 +12,15 @@ use std::collections::BTreeMap;
 use std::io;
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 use std::io::{Read as _, Write as _};
+#[cfg(all(target_os = "macos", not(test)))]
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use zeroize::Zeroizing;
 
@@ -57,20 +60,44 @@ pub(crate) trait AntigravityCredentialBackend: Send + Sync {
 }
 
 /// Whether `agy` may hold a login here, read without raising a keyring unlock dialog.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgyCredentialPresence {
     Present,
     Absent,
-    #[cfg_attr(
-        target_os = "windows",
-        expect(
-            dead_code,
-            reason = "constructed in Unix and non-test Windows presence checks"
-        )
-    )]
     Locked,
 }
+
+/// Failure reason from [`preflight_auth_with_backoff_using`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgyAuthPreflightError {
+    Absent,
+    Locked,
+}
+
+impl AgyAuthPreflightError {
+    #[must_use]
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Absent => {
+                "Antigravity is not signed in (auth_required). Sign in with `agy` in a terminal first."
+            }
+            Self::Locked => {
+                "Antigravity credentials are temporarily unavailable because the OS keyring is locked (auth_required)."
+            }
+        }
+    }
+}
+
+/// Default bounded backoff when the OS keyring is locked right after reboot (~1.7s total).
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "used by non-test background launch preflight")
+)]
+pub(crate) const REBOOT_KEYCHAIN_BACKOFF: &[Duration] = &[
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
 
 /// `agy` writes this after a keyring timeout and may read its file store for a while after.
 pub(crate) fn antigravity_keyring_fallback_marker(home: &Path) -> PathBuf {
@@ -183,6 +210,42 @@ pub(crate) fn is_real_home(home: &Path) -> bool {
             .ok()
             .zip(real_home.canonicalize().ok())
             .is_some_and(|(a, b)| a == b)
+}
+
+/// True when `path` resides under the real OS user's home directory (as opposed to an isolated
+/// `HOME=$(mktemp -d)` or offline test sandbox). Used on macOS to avoid polluting the user's
+/// real Keychain with temporary vault keys during isolated E2E runs.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn is_real_home_for_state_path(path: &Path) -> bool {
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some_and(|v| !v.is_empty() && v != "0") {
+        return false;
+    }
+    // Check whether the current process HOME matches the real OS user home from passwd.
+    let Some(env_home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let passwd_home = crate::sys::user()
+        .ok()
+        .filter(|u| !u.home.is_empty())
+        .map(|u| PathBuf::from(std::ffi::OsStr::from_bytes(&u.home)));
+    let Some(real_home) = passwd_home else {
+        return false;
+    };
+    let env_canon = env_home.canonicalize().unwrap_or(env_home);
+    let real_canon = real_home.canonicalize().unwrap_or(real_home);
+    if env_canon != real_canon {
+        return false;
+    }
+    let path_canon = path
+        .canonicalize()
+        .or_else(|_| {
+            path.parent()
+                .and_then(|p| p.canonicalize().ok())
+                .map(|p| p.join(path.file_name().unwrap_or_default()))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_or_else(|_| path.to_path_buf());
+    path_canon.starts_with(&real_canon)
 }
 
 pub(crate) fn read_antigravity_credential_file(
@@ -376,8 +439,15 @@ impl AntigravityCredentialBackend for HostCredentialBackend {
                 return Err(CONFLICT_MSG.to_owned());
             }
             Self::write_keyring(contents)?;
-        } else {
+        } else if self.file.read()?.is_some() {
             self.file.write(contents, expected)?;
+        } else {
+            // Neither keyring nor file currently holds a login (e.g. after external `agy /logout`).
+            // On a keyring-capable desktop host, restore into the OS keyring so `agy 1.5.16+`
+            // picks up the selected account natively without creating a competing file token.
+            if Self::write_keyring(contents).is_err() {
+                self.file.write(contents, expected)?;
+            }
         }
         if self.read()?.as_ref().map(|c| c.contents.as_str()) != Some(contents) {
             return Err(CONFLICT_MSG.to_owned());
@@ -389,9 +459,16 @@ impl AntigravityCredentialBackend for HostCredentialBackend {
 /// Non-prompting check whether `agy` may hold a login on this host (`agy-credential-presence.ts`).
 #[cfg(test)]
 pub(crate) fn agy_credential_presence(home: &Path) -> AgyCredentialPresence {
-    if antigravity_keyring_fallback_marker(home).exists() {
-        return AgyCredentialPresence::Present;
-    }
+    let env = current_process_env();
+    agy_credential_presence_with_env(home, &env)
+}
+
+/// Non-prompting check using an explicit launch environment (respects
+/// `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`, `SSH_CONNECTION`, and non-real-home sandboxes).
+pub(crate) fn agy_credential_presence_with_env(
+    home: &Path,
+    env: &BTreeMap<String, String>,
+) -> AgyCredentialPresence {
     let token_file_present = || {
         let p = antigravity_token_file_path(home);
         if std::fs::symlink_metadata(&p)
@@ -402,8 +479,10 @@ pub(crate) fn agy_credential_presence(home: &Path) -> AgyCredentialPresence {
             AgyCredentialPresence::Absent
         }
     };
-    let env = current_process_env();
-    if !is_real_home(home) || is_antigravity_file_storage_host(&env) {
+    if !is_real_home(home) || is_antigravity_file_storage_host(env) {
+        return token_file_present();
+    }
+    if antigravity_keyring_fallback_marker(home).exists() {
         return token_file_present();
     }
     #[cfg(target_os = "macos")]
@@ -450,6 +529,46 @@ pub(crate) fn agy_credential_presence(home: &Path) -> AgyCredentialPresence {
     {
         token_file_present()
     }
+}
+
+/// Read-only preflight with bounded backoff for locked OS keyrings (e.g. right after reboot).
+/// - `Present` -> `Ok(())` immediately.
+/// - `Absent` -> `Err(Absent)` immediately (no useless sleep when genuinely logged out).
+/// - `Locked` -> retries after each delay in `delays`, returning `Err(Locked)` if still locked.
+pub(crate) fn preflight_auth_with_backoff_using(
+    delays: &[Duration],
+    mut probe: impl FnMut() -> AgyCredentialPresence,
+) -> Result<(), AgyAuthPreflightError> {
+    let mut attempt = 0usize;
+    loop {
+        match probe() {
+            AgyCredentialPresence::Present => return Ok(()),
+            AgyCredentialPresence::Absent => return Err(AgyAuthPreflightError::Absent),
+            AgyCredentialPresence::Locked => {
+                let Some(&delay) = delays.get(attempt) else {
+                    return Err(AgyAuthPreflightError::Locked);
+                };
+                attempt = attempt.saturating_add(1);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "used by non-test background launch preflight")
+)]
+pub(crate) fn preflight_auth_for_host(
+    home: &Path,
+    launch_env: &BTreeMap<String, String>,
+    delays: &[Duration],
+) -> Result<(), AgyAuthPreflightError> {
+    preflight_auth_with_backoff_using(delays, || {
+        agy_credential_presence_with_env(home, launch_env)
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
@@ -595,7 +714,7 @@ pub(crate) fn run_helper_with_timeout(
 // macOS Keychain (`native-macos-credentials.ts`)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn has_macos_credential() -> Result<bool, ()> {
     let mut cmd = Command::new("/usr/bin/security");
     cmd.args(["find-generic-password", "-s", "gemini", "-a", "antigravity"]);

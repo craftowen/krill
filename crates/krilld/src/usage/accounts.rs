@@ -192,6 +192,33 @@ pub fn save_file(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> 
     Ok(())
 }
 
+/// Safely removes obsolete legacy isolated `agy` entries from `accounts.toml` while preserving
+/// all Claude, Codex, and `OpenCode` entries and existing TOML comments/formatting.
+pub(super) fn prune_legacy_agy_accounts(home: &Path, state_dir: Option<&Path>) -> io::Result<bool> {
+    let _guard = lock(&SAVE_LOCK);
+    let mut file = load_writable(home, state_dir)?;
+    let removed_ids: std::collections::BTreeSet<String> = file
+        .accounts
+        .iter()
+        .filter(|a| ProviderKind::parse(&a.provider) == Some(ProviderKind::Antigravity))
+        .map(|a| a.id.clone())
+        .collect();
+    if removed_ids.is_empty() {
+        return Ok(false);
+    }
+    file.accounts
+        .retain(|a| ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity));
+    if file
+        .active
+        .get(ProviderKind::Antigravity.as_str())
+        .is_some_and(|id| removed_ids.contains(id))
+    {
+        file.active.remove(ProviderKind::Antigravity.as_str());
+    }
+    save_inner(home, state_dir, &file)?;
+    Ok(true)
+}
+
 fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io::Result<()> {
     let path = config_path(home, state_dir);
     let text = krill_proto::config_document::save_toml(&path, file)?;
@@ -814,6 +841,10 @@ fn refresh_accounts_authenticated(
     state_dir: Option<&Path>,
     auth: &login::Statuses,
 ) -> AccountsSnapshot {
+    // Run native Antigravity migration/pruning and credential lookup BEFORE acquiring `SAVE_LOCK`
+    // so pruning legacy `agy` rows from `accounts.toml` cannot re-enter `SAVE_LOCK` and OS keyring
+    // I/O never holds `SAVE_LOCK`.
+    let agy_vault_state = agy_native::list_state_for_snapshot(home, state_dir);
     let save_guard = lock(&SAVE_LOCK);
     // 한도 기록은 잎 잠금이라 여기서 통째로 복사한다(중첩 역전 없음).
     let mut limited: BTreeMap<(String, String), u64> = lock(&RATE_LIMITED).clone();
@@ -1023,17 +1054,24 @@ fn refresh_accounts_authenticated(
     }
 
     // 3b. Native Antigravity encrypted vault projection (1:1 Orca native-account-service).
-    // When the vault exists, saved accounts supersede legacy accounts.toml agy rows and keep
-    // their persisted email and last verified per-account usage reading across refreshes.
-    let agy_vault_state = agy_native::list_state_for_snapshot(home, state_dir);
+    // Native Antigravity owns all non-host agy rows in production (and in tests once any native
+    // login or vault account exists), eliminating stale legacy `[Login required]` ghost rows.
     let mut agy_vault_meters: BTreeMap<String, krill_proto::usage::AccountMeters> = BTreeMap::new();
     let mut agy_vault_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Some(agy_state) = agy_vault_state.as_ref()
-        && (!agy_state.accounts.is_empty() || agy_state.current_account.is_some())
-    {
+    let host_agy_id = host_default_id(ProviderKind::Antigravity);
+    let native_owns_agy = agy_vault_state.as_ref().is_some_and(|agy_state| {
+        !cfg!(test) || !agy_state.accounts.is_empty() || agy_state.current_account.is_some()
+    });
+    let agy_host_native_logged_in = if native_owns_agy {
+        agy_vault_state
+            .as_ref()
+            .map(|s| s.current_account.is_some())
+    } else {
+        None
+    };
+    if native_owns_agy && let Some(agy_state) = agy_vault_state.as_ref() {
         let host_agy_dir = host_default_dir(home, ProviderKind::Antigravity);
         let host_agy_dir_str = host_agy_dir.display().to_string();
-        let host_agy_id = host_default_id(ProviderKind::Antigravity);
         let live_host_usage = all
             .iter()
             .find(|a| a.id == host_agy_id)
@@ -1045,15 +1083,16 @@ fn refresh_accounts_authenticated(
             .find(|a| a.id == host_agy_id)
             .map(|a| super::meters::read(home, a));
 
-        // Remove legacy non-host agy rows when native vault owns Antigravity accounts.
+        // Remove legacy non-host agy rows when native Antigravity model owns agy accounts.
         all.retain(|a| a.provider != ProviderKind::Antigravity || a.host_default);
         if agy_state.active_account_id.is_some() {
             // Active login belongs to a saved account; hide duplicate System default row (Orca parity).
             all.retain(|a| a.id != host_agy_id);
-        } else if let Some(host_acc) = all.iter_mut().find(|a| a.id == host_agy_id)
-            && let Some(curr) = agy_state.current_account.as_ref()
-        {
-            host_acc.email.clone_from(&curr.email);
+        } else if let Some(host_acc) = all.iter_mut().find(|a| a.id == host_agy_id) {
+            host_acc.email = agy_state
+                .current_account
+                .as_ref()
+                .and_then(|curr| curr.email.clone());
         }
         for saved in &agy_state.accounts {
             let is_active = agy_state.active_account_id.as_deref() == Some(saved.id.as_str());
@@ -1111,8 +1150,10 @@ fn refresh_accounts_authenticated(
     // 뒤에도 현재 활성 이메일은 비우되(`None`) 어느 계정인지 식별할 수 있게 유지한다.
     let mut email_dirty = false;
     for account in &mut all {
-        if agy_vault_ids.contains(&account.id) {
-            // Native Antigravity vault accounts preserve their verified email across refreshes.
+        if agy_vault_ids.contains(&account.id)
+            || (account.id == host_agy_id && agy_host_native_logged_in.is_some())
+        {
+            // Native Antigravity vault & host accounts preserve their verified identity from agy_native.
             continue;
         }
         let status = auth.get(&(account.provider, PathBuf::from(&account.profile_dir)));
@@ -1190,8 +1231,8 @@ fn refresh_accounts_authenticated(
 
         for acc in all.iter_mut().filter(|a| a.provider == provider) {
             if provider == ProviderKind::Antigravity
+                && native_owns_agy
                 && let Some(agy_state) = agy_vault_state.as_ref()
-                && (!agy_state.accounts.is_empty() || agy_state.current_account.is_some())
             {
                 if let Some(active_vault_id) = agy_state.active_account_id.as_deref() {
                     acc.active = acc.id == active_vault_id;
@@ -1254,6 +1295,20 @@ fn refresh_accounts_authenticated(
                     .is_none_or(|m| m.meters.is_empty())
                     && a.usage.is_empty();
                 classify_account(error.as_deref(), a.stale, empty, detected)
+            } else if a.id == host_agy_id
+                && let Some(logged_in) = agy_host_native_logged_in
+            {
+                if logged_in {
+                    let empty = details
+                        .accounts
+                        .iter()
+                        .find(|m| m.account_id == a.id)
+                        .is_none_or(|m| m.meters.is_empty())
+                        && a.usage.is_empty();
+                    classify_account(error.as_deref(), a.stale, empty, detected)
+                } else {
+                    (AccountStatus::NeedsLogin, None)
+                }
             } else if auth
                 .get(&(a.provider, profile_path))
                 .is_some_and(|status| !status.logged_in)
@@ -1286,6 +1341,14 @@ fn refresh_accounts_authenticated(
                 let path = Path::new(&a.profile_dir);
                 let status = if agy_vault_ids.contains(&a.id) {
                     krill_proto::usage::ConnectionStatus::Connected
+                } else if a.id == host_agy_id
+                    && let Some(logged_in) = agy_host_native_logged_in
+                {
+                    if logged_in {
+                        krill_proto::usage::ConnectionStatus::Connected
+                    } else {
+                        krill_proto::usage::ConnectionStatus::NeedsLogin
+                    }
                 } else if a.provider == ProviderKind::Codex
                     && super::direct::has_auth_failure(home, a.provider, path)
                 {

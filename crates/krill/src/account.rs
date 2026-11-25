@@ -86,6 +86,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                eprintln!(
+                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                );
+                return ExitCode::from(2);
+            }
             (
                 UsageRequest::AddAccount {
                     provider,
@@ -103,6 +109,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                eprintln!(
+                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                );
+                return ExitCode::from(2);
+            }
             (
                 UsageRequest::AddAccount {
                     provider,
@@ -120,6 +132,9 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                return run_remove_antigravity(id);
+            }
             (
                 UsageRequest::RemoveAccount {
                     provider,
@@ -302,6 +317,36 @@ fn run_provisioning(args: &[&str]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_remove_antigravity(account_id: &str) -> ExitCode {
+    let req = UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::Remove {
+        account_id: account_id.to_owned(),
+    });
+    match exchange(&req) {
+        Ok(UsageReply::AntigravityAccounts(Ok(_))) => match request(&UsageRequest::ListAccounts) {
+            Ok(snap) => {
+                print_snapshot(&snap);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("account: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(UsageReply::Failed(e)) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(_) => {
+            eprintln!("account: unexpected Antigravity account reply");
             ExitCode::FAILURE
         }
     }

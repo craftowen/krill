@@ -75,11 +75,32 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
         writeln!(io::stderr().lock(), "{}", hint.to_string_lossy()).ok();
         return ExitCode::from(127);
     };
-    let args: Vec<_> = args.collect();
-    // agy needs SSH mode with --gemini_dir even when no account marker is present.
-    if needs_agy_ssh_mode(&program, &args) {
-        command.env("SSH_CONNECTION", "krill");
-        command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
+    let mut args: Vec<_> = args.collect();
+    if is_agy_program(&program) {
+        let host_gemini = std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|p| p.join(".gemini"));
+        let explicit_gemini = args.iter().find_map(|arg| {
+            let lossy = arg.to_string_lossy();
+            lossy
+                .strip_prefix("--gemini_dir=")
+                .map(std::path::PathBuf::from)
+        });
+        let has_split_gemini = args.iter().any(|arg| arg == "--gemini_dir");
+        if let Some(explicit) = explicit_gemini {
+            if host_gemini.as_ref().is_none_or(|hg| hg != &explicit)
+                && needs_agy_ssh_mode(&program, &args)
+            {
+                // Only legacy isolated non-host --gemini_dir forces file storage.
+                command.env("SSH_CONNECTION", "krill");
+                command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
+            }
+        } else if !has_split_gemini && let Some(hg) = host_gemini {
+            let mut flag = OsString::from("--gemini_dir=");
+            flag.push(hg.as_os_str());
+            args.insert(0, flag);
+        }
     }
     crate::sys::console_utf8();
     if let Err(error) = crate::sys::protect_agent_launcher() {
@@ -111,13 +132,18 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
 }
 
 #[cfg(any(windows, test))]
-fn needs_agy_ssh_mode(program: &OsStr, args: &[OsString]) -> bool {
+fn is_agy_program(program: &OsStr) -> bool {
     std::path::Path::new(program)
         .file_stem()
         .and_then(OsStr::to_str)
         .is_some_and(|name| {
             name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity")
         })
+}
+
+#[cfg(any(windows, test))]
+fn needs_agy_ssh_mode(program: &OsStr, args: &[OsString]) -> bool {
+    is_agy_program(program)
         && args
             .iter()
             .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))

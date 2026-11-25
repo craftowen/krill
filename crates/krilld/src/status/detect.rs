@@ -99,14 +99,18 @@ impl Detector {
             self.pending_question_since = None;
             false
         };
-        let menu = self
-            .rules
-            .menu_hit(screen)
-            .map(|hit| match hit {
-                MenuHit::Blocked => AgentState::Blocked,
-                MenuHit::Waiting => AgentState::Waiting,
-            })
-            .or(pending_question.then_some(AgentState::Waiting));
+        let agy_auth_blocked = krill_proto::screen::agy::auth_login_text(screen);
+        let menu = if agy_auth_blocked {
+            Some(AgentState::Blocked)
+        } else {
+            self.rules
+                .menu_hit(screen)
+                .map(|hit| match hit {
+                    MenuHit::Blocked => AgentState::Blocked,
+                    MenuHit::Waiting => AgentState::Waiting,
+                })
+                .or(pending_question.then_some(AgentState::Waiting))
+        };
         let title_state = self.title_state(title);
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && matches!(status.source, Some(Source::Hook | Source::Screen))
