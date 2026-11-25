@@ -305,6 +305,8 @@ pub struct SkillSyncReport {
     pub updated: usize,
     pub unchanged: usize,
     pub failures: Vec<String>,
+    /// Targets skipped intentionally because the user or another tool (e.g. Orca) owns the path.
+    pub skipped_external: Vec<String>,
     /// Roots another installer (app, daemon, or CLI) was writing; it publishes the same bundle,
     /// and every later launch or session start retries, so this is expected, not a failure.
     pub busy: Vec<PathBuf>,
@@ -343,6 +345,17 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
                     ) || (cfg!(unix) && error.raw_os_error() == Some(1)) =>
                 {
                     break;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && error.to_string()
+                            == "skill paths belong to external skills or symlinks" =>
+                {
+                    report.skipped_external.push(format!(
+                        "{} ({}): {error}",
+                        skill.name,
+                        dir.display()
+                    ));
                 }
                 Err(error) => {
                     report

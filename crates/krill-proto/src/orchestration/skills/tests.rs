@@ -313,3 +313,29 @@ fn krig_bundle_uses_syntax_valid_markers_and_skips_developer_symlinks() {
 
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn external_skill_ownership_skip_is_not_reported_as_failure() {
+    let home = home("external-skip");
+    let claude_skills = home.join(".claude/skills");
+    let ext = claude_skills.join("krill-orchestration");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("SKILL.md"), "user custom orchestration skill\n").unwrap();
+
+    let report = sync_builtin_skills(std::slice::from_ref(&claude_skills));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+        report
+            .skipped_external
+            .iter()
+            .any(|entry| entry.contains("orchestration")),
+        "expected orchestration in skipped_external: {:?}",
+        report.skipped_external
+    );
+    assert_eq!(
+        fs::read_to_string(ext.join("SKILL.md")).unwrap(),
+        "user custom orchestration skill\n"
+    );
+    assert!(install_skill("orchestration", &claude_skills).is_err());
+    fs::remove_dir_all(home).unwrap();
+}

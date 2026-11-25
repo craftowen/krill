@@ -31,10 +31,11 @@ pub fn start(registry: &Arc<Registry>) {
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(10));
-                if replace_stale_holder(
+                if replace_stale_holder_with(
                     &dir,
                     holder,
                     unix_seconds(),
+                    Duration::from_secs(2),
                     krill_proto::os::bootstrap_dead,
                     kill,
                 ) {
@@ -54,14 +55,36 @@ const COOLDOWN: u64 = 5 * 60;
 
 /// 포트가 죽었음이 두 번 연속 확인되고 쿨다운이 지났으면 holder를 죽이고 `true`.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production calls replace_stale_holder_with")
+)]
 fn replace_stale_holder(
     dir: &std::path::Path,
     holder: u32,
     now: u64,
+    dead: impl FnMut() -> bool,
+    kill: impl FnOnce(u32),
+) -> bool {
+    replace_stale_holder_with(dir, holder, now, std::time::Duration::ZERO, dead, kill)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn replace_stale_holder_with(
+    dir: &std::path::Path,
+    holder: u32,
+    now: u64,
+    recheck_delay: std::time::Duration,
     mut dead: impl FnMut() -> bool,
     kill: impl FnOnce(u32),
 ) -> bool {
-    if !dead() || !dead() {
+    if !dead() {
+        return false;
+    }
+    if !recheck_delay.is_zero() {
+        std::thread::sleep(recheck_delay);
+    }
+    if !dead() {
         return false;
     }
     let path = dir.join("login-guard-restart");

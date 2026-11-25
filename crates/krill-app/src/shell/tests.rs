@@ -828,10 +828,8 @@ fn daemon_link_shows_banner(cx: &mut TestAppContext) {
     cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(failed, cx)));
     cx.run_until_parked();
     let b = banner(cx).unwrap();
-    assert!(
-        b.contains("krilld did not publish its socket within 5s"),
-        "{b}"
-    );
+    let expected = daemon::Error::Timeout.to_string();
+    assert!(b.contains(&expected), "{b}");
     cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(Link::Down, cx)));
     cx.run_until_parked();
     assert!(

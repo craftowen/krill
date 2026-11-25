@@ -303,7 +303,8 @@ pub const SUN_PATH_MAX: usize = 108;
 /// launchd 잡 소프트 fd 한도(launchd 기본 256, C2 실측). holder가 스스로 올리는 값과 같다.
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// macOS 앱 업데이트 직후 `launchd`·`syspolicyd` 콜드 스타트 지연을 흡수하도록 `UNDER_LOCK_BUDGET`(15s) 안에서 넉넉히 잡는다.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(12);
 /// 실패한 기동의 holder가 SIGTERM으로 끝나기를 기다리는 최대 시간(세션을 새 krilld에 넘기는 시간 포함).
 #[cfg(unix)]
 const STOP_TIMEOUT: Duration = Duration::from_secs(1);

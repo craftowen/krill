@@ -739,9 +739,9 @@ impl Shell {
         let now = std::time::Instant::now();
 
         let state = self.bot_ui.hosts.entry(host.clone()).or_default();
-        let endpoint_changed =
-            state.target != target_opt || state.transport_epoch != transport_epoch;
-        if endpoint_changed {
+        let target_changed = state.target != target_opt;
+        let epoch_changed = state.transport_epoch != transport_epoch;
+        if target_changed {
             state.target.clone_from(&target_opt);
             state.transport_epoch = transport_epoch;
             state.unsupported = None;
@@ -750,6 +750,12 @@ impl Shell {
             state.retry_task = None;
             state.in_flight = false;
             state.dirty = false;
+            krill_app::bots::invalidate_host_connections(host);
+        } else if epoch_changed {
+            // Transport epoch bumps on failed RPCs (record_outcome(false)) as well as reconnects.
+            // Drop stale pooled sockets without wiping active retry backoff, which would otherwise
+            // reset retry_secs back to 2s in a tight failure loop.
+            state.transport_epoch = transport_epoch;
             krill_app::bots::invalidate_host_connections(host);
         }
 
@@ -765,7 +771,7 @@ impl Shell {
                 return;
             }
         } else if let Some((_, checked_at)) = &state.unsupported
-            && !endpoint_changed
+            && !target_changed
             && now.saturating_duration_since(*checked_at) < UNSUPPORTED_RECHECK
         {
             // Even forced sidebar refreshes skip hosts already verified to lack FEAT_BOTS until
