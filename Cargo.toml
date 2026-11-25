@@ -18,6 +18,8 @@ krill-proto = { path = "crates/krill-proto" }
 krill-version = { path = "crates/krill-version" }
 krill-ui = { path = "crates/krill-ui" }
 krill-app-core = { path = "crates/krill-app-core" }
+krill-bots-ui = { path = "crates/krill-bots-ui" }
+krill-app-shell = { path = "crates/krill-app-shell" }
 krill-term = { path = "crates/krill-term" }
 krill-holder = { path = "crates/krill-holder" }
 krill-log = { path = "crates/krill-log" }

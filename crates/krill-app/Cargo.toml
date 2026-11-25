@@ -8,30 +8,11 @@ publish = false
 build = "../../packaging/windows/resources.rs"
 
 [dependencies]
-krill-ui = { workspace = true }
 krill-app-core = { workspace = true }
-sysinfo = { workspace = true }
-krill-hosts = { workspace = true }
-krill-link = { workspace = true }
-tokio = { workspace = true }
-krill-log = { workspace = true }
-tracing = { workspace = true }
+krill-bots-ui = { workspace = true }
+krill-app-shell = { workspace = true }
 krill-proto = { workspace = true }
 krill-version = { workspace = true }
-krill-term = { workspace = true }
-gpui-pre = { workspace = true }
-gpui-pre-platform = { workspace = true }
-gpui-component = { workspace = true, features = ["tree-sitter-rust"] }
-gpui-kit-assets = { workspace = true }
-image = { workspace = true }
-postcard = { workspace = true }
-regex = { workspace = true }
-rustix = { workspace = true }
-ring = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-toml = { workspace = true }
 
 [build-dependencies]
 embed-resource = { workspace = true }
@@ -40,10 +21,20 @@ embed-resource = { workspace = true }
 workspace = true
 
 [dev-dependencies]
-proptest = { workspace = true }
-gpui-pre-platform = { workspace = true, features = ["test-support"] }
-gpui-pre = { workspace = true, features = ["test-support"] }
+krill-hosts = { workspace = true }
+krill-link = { workspace = true }
+krill-term = { workspace = true }
 krilld = { workspace = true }
+gpui-pre = { workspace = true, features = ["test-support"] }
+gpui-pre-platform = { workspace = true, features = ["test-support"] }
+gpui-component = { workspace = true }
+gpui-kit-assets = { workspace = true }
+proptest = { workspace = true }
+ring = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix-openpty = { workspace = true }

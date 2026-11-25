@@ -279,7 +279,7 @@ jobs:
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::query_replies_never_block_the_engine_on_a_full_input_pipe'
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::halt_deadline_and_resume_run_in_an_isolated_process'
           Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'registry::schedule::windows_tests::precheck_passes_exit_zero_and_reports_status_output_and_timeout'
-          Test-KrillNative -Package krill-app -TargetArgs @('--bin', 'krill-app') -TestName 'shell::folder::tests::windows_project_commands_create_and_clone_with_literal_paths'
+          Test-KrillNative -Package krill-app-shell -TargetArgs @('--lib') -TestName 'shell::folder::tests::windows_project_commands_create_and_clone_with_literal_paths'
 
       # ConPTY B안 파일은 저장소에 없다. nupkg 해시를 확인하고, 안의 두 파일 해시는 bundle.ps1이 다시 확인한다.
       - name: Fetch pinned ConPTY package

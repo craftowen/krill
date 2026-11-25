@@ -4,7 +4,7 @@
 //! Keeping version and source-hash metadata in a tiny leaf crate ensures that bumping
 //! `[workspace.package].version` (or editing daemon sources) never invalidates compile caches for
 //! internal library crates (`krill-proto`, `krill-term`, `krill-hosts`, `krill-log`, `krill-ui`,
-//! `krill-app-core`).
+//! `krill-app-core`, `krill-bots-ui`, `krill-app-shell`).
 
 /// Workspace semantic version (`Cargo.toml` `[workspace.package].version`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
