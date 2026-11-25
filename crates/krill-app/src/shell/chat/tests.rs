@@ -1980,3 +1980,598 @@ fn wave2b_context_cleared_cards_question_batch_and_bash_dedup() {
             .is_some_and(|h| !h.trim().is_empty())
     );
 }
+
+#[test]
+fn worker_dock_counts_only_actively_working_workers_and_maps_exited_to_stopped() {
+    use krill_proto::control::AgentState;
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, OrchestrationStore,
+        Run, RunStatus,
+    };
+    use std::collections::{BTreeSet, HashMap};
+
+    let now_ms = 1_800_000_000_000u64;
+    let mk_dispatch = |id: &str, name: &str, sid: u64, status: DispatchStatus| Dispatch {
+        id: id.into(),
+        run_id: "run-1".into(),
+        task_id: None,
+        worker_name: name.into(),
+        agent: "claude".into(),
+        session_id: Some(sid),
+        depth: 1,
+        cwd: "/tmp/repo".into(),
+        prompt: "work".into(),
+        status,
+        summary: None,
+        archived_output: None,
+        started_at_ms: now_ms - 60_000,
+        ended_at_ms: (status != DispatchStatus::Active).then_some(now_ms - 10_000),
+        release_state: DispatchReleaseState::Active,
+        session_origin: DispatchSessionOrigin::Created,
+        model: None,
+        effort: None,
+        retry_of: None,
+        request_id: None,
+    };
+    let store = OrchestrationStore {
+        runs: vec![Run {
+            id: "run-1".into(),
+            title: "Run 1".into(),
+            coordinator_session_id: Some(100),
+            status: RunStatus::Active,
+            created_at_ms: now_ms - 120_000,
+            updated_at_ms: now_ms - 10_000,
+        }],
+        dispatches: vec![
+            mk_dispatch("d-work-1", "w-work-1", 201, DispatchStatus::Active),
+            mk_dispatch("d-work-2", "w-work-2", 202, DispatchStatus::Active),
+            mk_dispatch("d-wait", "w-wait", 203, DispatchStatus::Active),
+            mk_dispatch("d-idle", "w-idle", 204, DispatchStatus::Active),
+            mk_dispatch("d-exited", "w-exited", 205, DispatchStatus::Active),
+            mk_dispatch("d-vanished", "w-vanished", 206, DispatchStatus::Active),
+            mk_dispatch("d-done", "w-done", 207, DispatchStatus::Succeeded),
+        ],
+        ..OrchestrationStore::default()
+    };
+    let mut sessions = HashMap::new();
+    sessions.insert(
+        SessionId(201),
+        worker_dock::SessionObservation {
+            state: AgentState::Working,
+            exited: false,
+            since_ms: now_ms - 5_000,
+        },
+    );
+    sessions.insert(
+        SessionId(202),
+        worker_dock::SessionObservation {
+            state: AgentState::Working,
+            exited: false,
+            since_ms: now_ms - 4_000,
+        },
+    );
+    sessions.insert(
+        SessionId(203),
+        worker_dock::SessionObservation {
+            state: AgentState::Waiting,
+            exited: false,
+            since_ms: now_ms - 3_000,
+        },
+    );
+    sessions.insert(
+        SessionId(204),
+        worker_dock::SessionObservation {
+            state: AgentState::Done,
+            exited: false,
+            since_ms: now_ms - 2_000,
+        },
+    );
+    sessions.insert(
+        SessionId(205),
+        worker_dock::SessionObservation {
+            state: AgentState::Exited,
+            exited: true,
+            since_ms: now_ms - 1_000,
+        },
+    );
+    // Session 206 intentionally absent (cut off / vanished).
+
+    let snap = worker_dock::build_worker_dock_snapshot(
+        &store,
+        SessionId(100),
+        &sessions,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        now_ms,
+    );
+    assert_eq!(
+        snap.active_count, 2,
+        "only actively Working workers count toward active_count"
+    );
+    assert_eq!(snap.needs_you_count, 1);
+    assert_eq!(snap.failed_count, 2);
+    assert_eq!(snap.rows.len(), 6, "Succeeded dispatch is omitted");
+    assert_eq!(snap.rows[0].dispatch_id, "d-wait", "NeedsYou leads");
+    let exited_row = snap
+        .rows
+        .iter()
+        .find(|r| r.dispatch_id == "d-exited")
+        .expect("exited worker present");
+    let vanished_row = snap
+        .rows
+        .iter()
+        .find(|r| r.dispatch_id == "d-vanished")
+        .expect("vanished worker present");
+    assert_eq!(exited_row.state, worker_dock::WorkerDockState::Stopped);
+    assert_eq!(vanished_row.state, worker_dock::WorkerDockState::Stopped);
+    assert!(exited_row.clearable);
+    assert!(
+        !exited_row
+            .state
+            .label()
+            .to_ascii_lowercase()
+            .contains("unavailable")
+    );
+}
+
+#[test]
+fn worker_dock_retains_at_most_four_recent_unacknowledged_failures_within_four_hours() {
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, MessageType,
+        OrchMessage, OrchestrationStore, Run, RunStatus,
+    };
+    use std::collections::{BTreeSet, HashMap};
+
+    let now_ms = 1_800_000_000_000u64;
+    let mk_fail = |id: &str, name: &str, ended_offset_ms: u64, status: DispatchStatus| Dispatch {
+        id: id.into(),
+        run_id: "run-f".into(),
+        task_id: None,
+        worker_name: name.into(),
+        agent: "codex".into(),
+        session_id: None,
+        depth: 1,
+        cwd: "/tmp/repo".into(),
+        prompt: "work".into(),
+        status,
+        summary: None,
+        archived_output: None,
+        started_at_ms: now_ms - ended_offset_ms - 10_000,
+        ended_at_ms: Some(now_ms - ended_offset_ms),
+        release_state: DispatchReleaseState::Active,
+        session_origin: DispatchSessionOrigin::Created,
+        model: None,
+        effort: None,
+        retry_of: None,
+        request_id: None,
+    };
+    let mut retried = mk_fail(
+        "f-retried-old",
+        "worker-retry",
+        15_000,
+        DispatchStatus::Failed,
+    );
+    retried.task_id = Some("task-r".into());
+    let mut retry_attempt = mk_fail(
+        "f-retry-new",
+        "worker-retry",
+        5_000,
+        DispatchStatus::Succeeded,
+    );
+    retry_attempt.task_id = Some("task-r".into());
+    retry_attempt.retry_of = Some("f-retried-old".into());
+
+    let store = OrchestrationStore {
+        runs: vec![Run {
+            id: "run-f".into(),
+            title: "Failures".into(),
+            coordinator_session_id: Some(50),
+            status: RunStatus::Active,
+            created_at_ms: now_ms - 20_000_000,
+            updated_at_ms: now_ms,
+        }],
+        dispatches: vec![
+            mk_fail("f-1", "w1", 60_000, DispatchStatus::Failed),
+            mk_fail("f-2", "w2", 50_000, DispatchStatus::Stopped),
+            mk_fail("f-3", "w3", 40_000, DispatchStatus::Failed),
+            mk_fail("f-4", "w4", 30_000, DispatchStatus::Abandoned),
+            mk_fail("f-5", "w5", 20_000, DispatchStatus::Failed),
+            mk_fail(
+                "f-expired",
+                "w-old",
+                worker_dock::FAILURE_RETENTION_MS + 1_000,
+                DispatchStatus::Failed,
+            ),
+            mk_fail("f-owner-stop", "w-owner", 10_000, DispatchStatus::Stopped),
+            mk_fail("f-acked", "w-acked", 10_000, DispatchStatus::Failed),
+            retried,
+            retry_attempt,
+        ],
+        messages: vec![OrchMessage {
+            id: "m-ack".into(),
+            run_id: Some("run-f".into()),
+            task_id: None,
+            dispatch_id: Some("f-acked".into()),
+            from: "w-acked".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "failed".into(),
+            body: String::new(),
+            reply_to: None,
+            acked: true,
+            created_at_ms: now_ms - 5_000,
+        }],
+        ..OrchestrationStore::default()
+    };
+    let mut owner_stopped = BTreeSet::new();
+    owner_stopped.insert("f-owner-stop".to_owned());
+
+    let snap = worker_dock::build_worker_dock_snapshot(
+        &store,
+        SessionId(50),
+        &HashMap::new(),
+        &BTreeSet::new(),
+        &owner_stopped,
+        now_ms,
+    );
+    assert_eq!(snap.active_count, 0);
+    assert_eq!(
+        snap.rows.len(),
+        worker_dock::MAX_RECENT_FAILURES,
+        "capped at 4 newest failures"
+    );
+    let ids: Vec<&str> = snap.rows.iter().map(|r| r.dispatch_id.as_str()).collect();
+    assert_eq!(ids, vec!["f-5", "f-4", "f-3", "f-2"]);
+
+    // Clearing one removes it and lets the 5th eligible failure surface only if not cleared.
+    let mut cleared = BTreeSet::new();
+    cleared.insert("f-5".to_owned());
+    let after_clear = worker_dock::build_worker_dock_snapshot(
+        &store,
+        SessionId(50),
+        &HashMap::new(),
+        &cleared,
+        &owner_stopped,
+        now_ms,
+    );
+    let after_ids: Vec<&str> = after_clear
+        .rows
+        .iter()
+        .map(|r| r.dispatch_id.as_str())
+        .collect();
+    assert_eq!(after_ids, vec!["f-4", "f-3", "f-2", "f-1"]);
+}
+
+#[test]
+fn temporary_worker_banner_and_bot_chat_lineage_rules() {
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, OrchestrationStore,
+        Run, RunStatus,
+    };
+    use std::collections::BTreeSet;
+
+    let now_ms = 1_800_000_000_000u64;
+    let store = OrchestrationStore {
+        runs: vec![
+            Run {
+                id: "run-bot".into(),
+                title: "Bot run".into(),
+                coordinator_session_id: Some(10),
+                status: RunStatus::Active,
+                created_at_ms: now_ms - 100_000,
+                updated_at_ms: now_ms,
+            },
+            Run {
+                id: "run-sub".into(),
+                title: "Sub run".into(),
+                coordinator_session_id: Some(20),
+                status: RunStatus::Active,
+                created_at_ms: now_ms - 50_000,
+                updated_at_ms: now_ms,
+            },
+            Run {
+                id: "run-plain".into(),
+                title: "Plain run".into(),
+                coordinator_session_id: Some(99),
+                status: RunStatus::Active,
+                created_at_ms: now_ms - 50_000,
+                updated_at_ms: now_ms,
+            },
+        ],
+        dispatches: vec![
+            Dispatch {
+                id: "d-running".into(),
+                run_id: "run-bot".into(),
+                task_id: None,
+                worker_name: "w-1".into(),
+                agent: "claude".into(),
+                session_id: Some(20),
+                depth: 1,
+                cwd: "/tmp".into(),
+                prompt: "p".into(),
+                status: DispatchStatus::Active,
+                summary: None,
+                archived_output: None,
+                started_at_ms: now_ms - 40_000,
+                ended_at_ms: None,
+                release_state: DispatchReleaseState::Active,
+                session_origin: DispatchSessionOrigin::Created,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            },
+            Dispatch {
+                id: "d-settled".into(),
+                run_id: "run-sub".into(),
+                task_id: None,
+                worker_name: "w-sub".into(),
+                agent: "codex".into(),
+                session_id: Some(30),
+                depth: 2,
+                cwd: "/tmp".into(),
+                prompt: "p".into(),
+                status: DispatchStatus::Succeeded,
+                summary: None,
+                archived_output: None,
+                started_at_ms: now_ms - 40_000,
+                ended_at_ms: Some(now_ms - 25_000),
+                release_state: DispatchReleaseState::Active,
+                session_origin: DispatchSessionOrigin::Created,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            },
+            Dispatch {
+                id: "d-borrowed".into(),
+                run_id: "run-bot".into(),
+                task_id: None,
+                worker_name: "w-borrowed".into(),
+                agent: "claude".into(),
+                session_id: Some(40),
+                depth: 1,
+                cwd: "/tmp".into(),
+                prompt: "p".into(),
+                status: DispatchStatus::Active,
+                summary: None,
+                archived_output: None,
+                started_at_ms: now_ms - 40_000,
+                ended_at_ms: None,
+                release_state: DispatchReleaseState::Active,
+                session_origin: DispatchSessionOrigin::Borrowed,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            },
+            Dispatch {
+                id: "d-plain".into(),
+                run_id: "run-plain".into(),
+                task_id: None,
+                worker_name: "w-plain".into(),
+                agent: "claude".into(),
+                session_id: Some(50),
+                depth: 1,
+                cwd: "/tmp".into(),
+                prompt: "p".into(),
+                status: DispatchStatus::Active,
+                summary: None,
+                archived_output: None,
+                started_at_ms: now_ms - 40_000,
+                ended_at_ms: None,
+                release_state: DispatchReleaseState::Active,
+                session_origin: DispatchSessionOrigin::Created,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            },
+        ],
+        ..OrchestrationStore::default()
+    };
+
+    let kept = BTreeSet::new();
+    let running =
+        worker_dock::temporary_worker_banner_for_session(&store, SessionId(20), &kept, now_ms)
+            .expect("running created worker shows banner");
+    assert_eq!(running.phase, worker_dock::TemporaryWorkerPhase::Running);
+
+    let settled =
+        worker_dock::temporary_worker_banner_for_session(&store, SessionId(30), &kept, now_ms)
+            .expect("settled created worker shows countdown banner");
+    assert_eq!(
+        settled.phase,
+        worker_dock::TemporaryWorkerPhase::Settled {
+            remaining_ms: 95_000
+        }
+    );
+    assert_eq!(worker_dock::format_worker_countdown(95_000), "1:35");
+    assert_eq!(worker_dock::format_worker_countdown(0), "0:00");
+
+    assert!(
+        worker_dock::temporary_worker_banner_for_session(&store, SessionId(40), &kept, now_ms)
+            .is_none(),
+        "borrowed sessions never show temporary worker banner"
+    );
+
+    let mut kept_after = BTreeSet::new();
+    kept_after.insert("d-settled".to_owned());
+    assert!(
+        worker_dock::temporary_worker_banner_for_session(
+            &store,
+            SessionId(30),
+            &kept_after,
+            now_ms
+        )
+        .is_none(),
+        "Keep open hides the banner"
+    );
+
+    // Lineage: session 10 is a bot chat -> both direct worker (20) and nested sub-worker (30)
+    // default to chat view; borrowed (40) and non-bot worker (50) do not.
+    let is_bot = |sid: SessionId| sid == SessionId(10);
+    assert!(worker_dock::is_bot_chat_worker_lineage(
+        &store,
+        SessionId(20),
+        is_bot
+    ));
+    assert!(worker_dock::is_bot_chat_worker_lineage(
+        &store,
+        SessionId(30),
+        is_bot
+    ));
+    assert!(!worker_dock::is_bot_chat_worker_lineage(
+        &store,
+        SessionId(40),
+        is_bot
+    ));
+    assert!(!worker_dock::is_bot_chat_worker_lineage(
+        &store,
+        SessionId(50),
+        is_bot
+    ));
+}
+
+#[test]
+fn side_chat_pill_parsing_and_support_rules() {
+    let btw = side_chat::parse_leading_side_chat_command("/btw what does the fork keep?")
+        .expect("parses /btw");
+    assert_eq!(btw.prefix, side_chat::SideChatPrefix::btw());
+    assert_eq!(btw.rest, "what does the fork keep?");
+    assert_eq!(
+        btw.prefix.compose(btw.rest),
+        "/btw what does the fork keep?"
+    );
+
+    let side = side_chat::parse_leading_side_chat_command("/SIDE quick check")
+        .expect("case-insensitive /side");
+    assert_eq!(side.prefix.command, "/SIDE");
+    assert_eq!(side.rest, "quick check");
+    assert_eq!(side.prefix.compose(side.rest), "/SIDE quick check");
+
+    assert!(side_chat::parse_leading_side_chat_command("/btw").is_none());
+    assert!(side_chat::parse_leading_side_chat_command("/side").is_none());
+    assert!(side_chat::parse_leading_side_chat_command("hello /btw world").is_none());
+    assert!(side_chat::supports_side_chat("claude", false));
+    assert!(side_chat::supports_side_chat("codex", false));
+    assert!(!side_chat::supports_side_chat("claude", true));
+    assert!(!side_chat::supports_side_chat("zsh", false));
+}
+
+#[test]
+fn cross_message_lightbox_collection_and_bounds_stepping() {
+    #[cfg(windows)]
+    let (a, b, diag, c) = (
+        r"C:\tmp\a.png",
+        r"C:\tmp\b.png",
+        r"C:\tmp\diag.png",
+        r"C:\tmp\c.png",
+    );
+    #[cfg(not(windows))]
+    let (a, b, diag, c) = ("/tmp/a.png", "/tmp/b.png", "/tmp/diag.png", "/tmp/c.png");
+    let items = vec![
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: "[Image #1] [Image #2] first".into(),
+            file_path: format!("{a}\n{b}"),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: format!(
+                "Local ![diag]({diag}) and remote ![gh](https://github.com/user-attachments/assets/1234)"
+            ),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: "second".into(),
+            file_path: c.into(),
+            ..Default::default()
+        }),
+    ];
+    let gallery = images::collect_chat_lightbox_images(10, &items, false, |_| None);
+    let paths: Vec<&std::path::Path> = gallery.iter().map(|g| g.path.as_path()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            std::path::Path::new(a),
+            std::path::Path::new(b),
+            std::path::Path::new(diag),
+            std::path::Path::new(c),
+        ]
+    );
+    assert_eq!(images::step_image_index(0, 4, -1), None);
+    assert_eq!(images::step_image_index(0, 4, 1), Some(1));
+    assert_eq!(images::step_image_index(2, 4, 1), Some(3));
+    assert_eq!(images::step_image_index(3, 4, 1), None);
+    assert_eq!(images::step_image_index(0, 1, 1), None);
+}
+
+#[test]
+fn selection_quote_formatting_and_reusable_composer_hook() {
+    struct MockCommentBox {
+        draft: String,
+        focused: bool,
+        accepts: bool,
+    }
+    impl selection_quote::SelectionQuoteTarget for MockCommentBox {
+        fn accepts_quote(&self) -> bool {
+            self.accepts
+        }
+        fn current_draft(&self) -> String {
+            self.draft.clone()
+        }
+        fn set_draft_and_focus(&mut self, next: String) {
+            self.draft = next;
+            self.focused = true;
+        }
+    }
+
+    assert_eq!(
+        selection_quote::format_selection_quote("first line\n\nsecond line"),
+        Some("> first line\n>\n> second line\n\n".to_owned())
+    );
+    assert_eq!(selection_quote::format_selection_quote("   \n  "), None);
+    assert_eq!(
+        selection_quote::append_selection_quote("", "hello"),
+        Some("> hello\n\n".to_owned())
+    );
+    assert_eq!(
+        selection_quote::append_selection_quote("already typed", "hello\nworld"),
+        Some("already typed\n\n> hello\n> world\n\n".to_owned())
+    );
+    assert_eq!(
+        selection_quote::append_selection_quote("already typed\n", "hello"),
+        Some("already typed\n\n> hello\n\n".to_owned())
+    );
+    assert_eq!(
+        selection_quote::append_selection_quote("already typed\n\n", "hello"),
+        Some("already typed\n\n> hello\n\n".to_owned())
+    );
+
+    let mut box_ok = MockCommentBox {
+        draft: "Context:".into(),
+        focused: false,
+        accepts: true,
+    };
+    assert!(selection_quote::quote_selection_for_composer(
+        &mut box_ok,
+        "Run checks\nThen rebase."
+    ));
+    assert!(box_ok.focused);
+    assert_eq!(box_ok.draft, "Context:\n\n> Run checks\n> Then rebase.\n\n");
+
+    let mut box_closed = MockCommentBox {
+        draft: "Keep me".into(),
+        focused: false,
+        accepts: false,
+    };
+    assert!(!selection_quote::quote_selection_for_composer(
+        &mut box_closed,
+        "Ignored"
+    ));
+    assert_eq!(box_closed.draft, "Keep me");
+    assert!(!box_closed.focused);
+}

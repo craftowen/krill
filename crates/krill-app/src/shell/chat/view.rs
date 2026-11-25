@@ -1170,14 +1170,12 @@ impl Shell {
                         }
                     })
                     .collect();
-                let gallery = (!resolved_paths.is_empty())
-                    .then(|| self.collect_chat_gallery_images(&key, is_remote));
                 let images = self
-                    .chat_message_images(
+                    .chat_message_images_for_item(
                         &format!("chat-item-{}-{abs_idx}", pane.get()),
+                        Some((&key, abs_idx)),
                         &resolved_paths,
                         &image_numbers,
-                        gallery.as_ref(),
                         cx,
                     )
                     .map(gpui::Styled::mb_0p5);
@@ -4094,7 +4092,24 @@ impl Shell {
             .when(home_pill, |d| d.pt(gpui::px(48.)))
             .flex()
             .flex_col()
-            .gap_2();
+            .gap_2()
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener({
+                    let sel_key = key.clone();
+                    move |_, e: &gpui::MouseUpEvent, window, cx| {
+                        let sel_key = sel_key.clone();
+                        let pos = e.position;
+                        let weak = cx.weak_entity();
+                        window.defer(cx, move |window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.sync_chat_selection_quote(&sel_key, Some(pos), window, cx);
+                            })
+                            .ok();
+                        });
+                    }
+                }),
+            );
 
         let pending_slice = self
             .chat
@@ -4547,15 +4562,50 @@ impl Shell {
 
         // Orca's `BotServerOutageCard` stands where the composer was while its server is down.
         self.sync_chat_image_tokens(&key, &input_state, window, cx);
+        self.sync_side_chat_pill(&key, window, cx);
         self.ensure_agy_version(cx);
         let composer = match self.render_bot_outage_card(&key, cx) {
             Some(card) => card,
             None => self.render_chat_composer(pane, key.clone(), &input_state, cx),
         };
         let paused_banner = self.render_bot_paused_banner(&key, cx);
-        let worker_auto_close_banner = self.render_worker_auto_close_banner(&key, cx);
+        let worker_auto_close_banner = self.render_worker_auto_close_banner(pane, &key, cx);
         let resume_toast = self.render_resume_toast(&key, cx);
         let home_banner = self.render_bot_home_banner(pane, &key, cx);
+
+        // Orca #47157: floating `Add to chat` pill when text is selected in chat replies.
+        let selection_quote_btn = if self.layout.focused() == Some(pane)
+            && !self.chat_pane_has_focus(pane, window, cx)
+            && !self.chat_find_is_open(cx)
+        {
+            let live_selected = gpui_component::TextSelection::selected_text(window, cx);
+            let active_text = if live_selected.trim().is_empty() {
+                self.chat.selection_quote_dismissed = None;
+                self.chat
+                    .selection_quote
+                    .as_ref()
+                    .filter(|sq| sq.key == key && !sq.text.trim().is_empty())
+                    .map(|sq| sq.text.clone())
+            } else if self.chat.selection_quote_dismissed.as_deref() == Some(live_selected.as_str())
+            {
+                None
+            } else {
+                Some(live_selected)
+            };
+            active_text.map(|selected| {
+                super::selection_quote::render_add_to_chat_floating_button(
+                    pane,
+                    key.clone(),
+                    selected,
+                    cx,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(btn) = selection_quote_btn {
+            feed = feed.child(btn);
+        }
 
         let live_line = (agent_state == krill_proto::control::AgentState::Working)
             .then(|| self.pane_live_status_line(pane))
@@ -4792,6 +4842,17 @@ impl Shell {
                     this.attach_dropped_paths_to_chat(&drop_key, paths, window, cx);
                 }
             }))
+            .on_key_down(cx.listener({
+                let esc_key = key.clone();
+                move |this, e: &gpui::KeyDownEvent, window, cx| {
+                    if e.keystroke.key == "escape"
+                        && !e.keystroke.modifiers.modified()
+                        && this.dismiss_chat_selection_quote(&esc_key, window, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .context_menu(move |menu, _, cx| {
                 super::super::terminal_menu::build_chat_overlay(menu, &overlay_weak, pane, cx)
             })
@@ -4963,80 +5024,6 @@ impl Shell {
                             .child(ctext::BOT_FIRST_STEP_REPLY.get()),
                     ),
             )
-    }
-
-    /// Orca `NativeChatWorkerAutoCloseBanner` (`#43521`): in-flow top banner for temporary
-    /// orchestration workers with a `Keep open` action.
-    fn render_worker_auto_close_banner(
-        &self,
-        key: &ChatKey,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.chat.worker_keep_open.contains(&key.1) {
-            return None;
-        }
-        let store = self.orch_snapshot_for(&key.0)?;
-        let dispatch = store.dispatches.iter().find(|d| {
-            d.session_id == Some(key.1.0)
-                && matches!(
-                    d.status,
-                    krill_proto::orchestration::DispatchStatus::Active
-                        | krill_proto::orchestration::DispatchStatus::Succeeded
-                        | krill_proto::orchestration::DispatchStatus::Failed
-                        | krill_proto::orchestration::DispatchStatus::Stopped
-                )
-        })?;
-        let palette = ui::palette(cx);
-        let label = if dispatch.ended_at_ms.is_some() {
-            ctext::WORKER_AUTO_CLOSE_DONE.get().to_owned()
-        } else {
-            ctext::WORKER_AUTO_CLOSE_TITLE.format(&[("time", "5m")])
-        };
-        let session = key.1;
-        Some(
-            div()
-                .id("chat-worker-auto-close-banner")
-                .debug_selector(|| "chat-worker-auto-close-banner".into())
-                .role(gpui::Role::Status)
-                .flex_none()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_2p5()
-                .border_b_1()
-                .border_color(palette.border)
-                .bg(palette.muted.opacity(0.45))
-                .py_1p5()
-                .pr_2()
-                .pl_3()
-                .text_size(ui::TEXT_SM)
-                .child(
-                    gpui_component::Icon::new(IconName::Timer)
-                        .with_size(ui::ICON_MD)
-                        .text_color(palette.muted_foreground),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(palette.foreground)
-                        .child(label),
-                )
-                .child(
-                    Button::new("chat-worker-keep-open")
-                        .debug_selector(|| "chat-worker-keep-open".into())
-                        .label(ctext::WORKER_KEEP_OPEN.get())
-                        .outline()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat.worker_keep_open.insert(session);
-                            cx.notify();
-                        })),
-                )
-                .into_any_element(),
-        )
     }
 
     /// Orca `#47859`: resume toast whose primary Resume button is filled with `theme_accent`.

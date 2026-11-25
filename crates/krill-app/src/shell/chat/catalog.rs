@@ -619,6 +619,8 @@ fn builtin_slash_commands(family: &str) -> Vec<(&'static str, &'static str)> {
     use krill_app::i18n::catalog::chat as ctext;
     let mut base = vec![
         ("model", ctext::SLASH_MODEL_DESC.get()),
+        ("btw", ctext::SLASH_BTW_DESC.get()),
+        ("side", ctext::SLASH_SIDE_DESC.get()),
         ("compact", ctext::SLASH_COMPACT_DESC.get()),
         ("clear", ctext::SLASH_CLEAR_DESC.get()),
         ("review", ctext::SLASH_REVIEW_DESC.get()),

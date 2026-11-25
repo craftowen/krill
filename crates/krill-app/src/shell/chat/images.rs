@@ -140,6 +140,131 @@ impl ChatImages {
     }
 }
 
+/// One previewable image discovered across messages in a chat view (Orca #47457).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ChatLightboxImage {
+    pub abs_idx: usize,
+    pub slot_idx: usize,
+    pub path: PathBuf,
+    pub number: usize,
+}
+
+/// Pure bounded index step for lightbox navigation (returns `None` at bounds).
+pub(super) fn step_image_index(current: usize, count: usize, by: isize) -> Option<usize> {
+    if count <= 1 {
+        return None;
+    }
+    current.checked_add_signed(by).filter(|&to| to < count)
+}
+
+/// Extracts local previewable Markdown image paths (`![alt](path)`), excluding remote URLs and
+/// GitHub user-attachment links (Orca #47457).
+pub(super) fn markdown_local_image_paths(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(bang) = rest.find("![") {
+        let after_bang = rest.get(bang + 2..).unwrap_or("");
+        let Some(close_bracket) = after_bang.find("](") else {
+            rest = after_bang;
+            continue;
+        };
+        let after_paren = after_bang.get(close_bracket + 2..).unwrap_or("");
+        let Some(close_paren) = after_paren.find(')') else {
+            break;
+        };
+        let target = after_paren
+            .get(..close_paren)
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''));
+        let lower = target.to_ascii_lowercase();
+        let is_remote_url = lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("data:")
+            || lower.contains("github.com/user-attachments/");
+        if !target.is_empty() && !is_remote_url {
+            let local_str = match target.strip_prefix("file://") {
+                Some(rest)
+                    if cfg!(windows)
+                        && rest.starts_with('/')
+                        && rest
+                            .as_bytes()
+                            .get(1..3)
+                            .is_some_and(|b| b[0].is_ascii_alphabetic() && b[1] == b':') =>
+                {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                }
+                Some(rest) => rest,
+                None => target,
+            };
+            let path = PathBuf::from(local_str);
+            if path.is_absolute()
+                && !path
+                    .as_os_str()
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control)
+            {
+                out.push(path);
+            }
+        }
+        rest = after_paren.get(close_paren + 1..).unwrap_or("");
+    }
+    out
+}
+
+/// Collects all previewable images currently present across messages in a chat log in order.
+pub(super) fn collect_chat_lightbox_images(
+    base_index: usize,
+    items: &[Arc<ChatItem>],
+    is_remote: bool,
+    mut resolve_remote: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Vec<ChatLightboxImage> {
+    let mut gallery = Vec::new();
+    for (rel_idx, item) in items.iter().enumerate() {
+        let abs_idx = base_index.saturating_add(rel_idx);
+        match item.kind {
+            ChatItemKind::User => {
+                let raw_paths = item_image_paths(item);
+                let nums = image_numbers(&item.text, raw_paths.len());
+                for (slot_idx, raw_path) in raw_paths.into_iter().enumerate() {
+                    let resolved = if is_remote {
+                        resolve_remote(&raw_path)
+                    } else {
+                        Some(raw_path)
+                    };
+                    if let Some(path) = resolved {
+                        let number = nums.get(slot_idx).copied().unwrap_or(slot_idx + 1);
+                        gallery.push(ChatLightboxImage {
+                            abs_idx,
+                            slot_idx,
+                            path,
+                            number,
+                        });
+                    }
+                }
+            }
+            ChatItemKind::Assistant if !is_remote => {
+                for (slot_idx, path) in markdown_local_image_paths(&item.text)
+                    .into_iter()
+                    .enumerate()
+                {
+                    gallery.push(ChatLightboxImage {
+                        abs_idx,
+                        slot_idx,
+                        path,
+                        number: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    gallery
+}
+
 /// Image paths krilld attached to a user prompt (one per line of `file_path`).
 pub(super) fn item_image_paths(item: &ChatItem) -> Vec<PathBuf> {
     if item.kind != ChatItemKind::User {
@@ -321,6 +446,32 @@ impl Shell {
         gallery: Option<&(Vec<PathBuf>, Vec<usize>)>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
+        self.chat_message_images_inner(id_prefix, None, paths, numbers, gallery, cx)
+    }
+
+    /// Same as [`Self::chat_message_images`], tied to a rendered message `(key, abs_idx)` so
+    /// opening the lightbox positions accurately by `(abs_idx, slot_idx)` even if duplicate image
+    /// paths appear across messages (Orca #47457).
+    pub(super) fn chat_message_images_for_item(
+        &mut self,
+        id_prefix: &str,
+        gallery_source: Option<(&super::ChatKey, usize)>,
+        paths: &[Option<PathBuf>],
+        numbers: &[usize],
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        self.chat_message_images_inner(id_prefix, gallery_source, paths, numbers, None, cx)
+    }
+
+    fn chat_message_images_inner(
+        &mut self,
+        id_prefix: &str,
+        gallery_source: Option<(&super::ChatKey, usize)>,
+        paths: &[Option<PathBuf>],
+        numbers: &[usize],
+        gallery: Option<&(Vec<PathBuf>, Vec<usize>)>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
         if paths.is_empty() {
             return None;
         }
@@ -339,6 +490,7 @@ impl Shell {
                 viewer_indices.push(None);
             }
         }
+        let gallery_origin = gallery_source.map(|(k, abs_idx)| (k.clone(), abs_idx));
         let mut row = div().flex().flex_wrap().gap_1p5();
         for (index, path) in paths.iter().enumerate() {
             let loaded = match path {
@@ -369,6 +521,7 @@ impl Shell {
                     }
                     _ => (viewer_paths.clone(), viewer_numbers.clone(), None),
                 };
+            let origin = gallery_origin.clone();
             let tile = image_tile(
                 SharedString::from(format!("{id_prefix}-image-{index}")),
                 &loaded,
@@ -383,18 +536,82 @@ impl Shell {
             .when_some(open_index, |tile, viewer_idx| {
                 tile.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_chat_image_viewer(
-                            open_paths.clone(),
-                            open_numbers.clone(),
-                            viewer_idx,
-                            window,
-                            cx,
-                        );
+                        if let Some((chat_key, abs_idx)) = origin.as_ref() {
+                            this.open_chat_message_image_viewer(
+                                chat_key,
+                                *abs_idx,
+                                index,
+                                open_paths.clone(),
+                                open_numbers.clone(),
+                                viewer_idx,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            this.open_chat_image_viewer(
+                                open_paths.clone(),
+                                open_numbers.clone(),
+                                viewer_idx,
+                                window,
+                                cx,
+                            );
+                        }
                     }))
             });
             row = row.child(tile);
         }
         Some(row)
+    }
+
+    /// Captures all previewable images currently rendered across messages in `key` and opens
+    /// the lightbox positioned at `(abs_idx, slot_idx)` (Orca #47457).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "needs chat key, clicked slot coordinates, fallback single-message list, and GPUI handles"
+    )]
+    pub(super) fn open_chat_message_image_viewer(
+        &mut self,
+        key: &super::ChatKey,
+        abs_idx: usize,
+        slot_idx: usize,
+        fallback_paths: Vec<PathBuf>,
+        fallback_numbers: Vec<usize>,
+        fallback_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_remote = key.0.is_remote();
+        let gallery = self.chat.logs.get(key).map(|log| {
+            collect_chat_lightbox_images(log.base_index, &log.items, is_remote, |remote| {
+                self.chat
+                    .images
+                    .resolve_remote_preview(remote)
+                    .map(Path::to_path_buf)
+            })
+        });
+        if let Some(gallery) = gallery
+            && let Some(pos) = gallery
+                .iter()
+                .position(|entry| entry.abs_idx == abs_idx && entry.slot_idx == slot_idx)
+        {
+            let mut paths: Vec<PathBuf> = gallery.iter().map(|e| e.path.clone()).collect();
+            let mut numbers: Vec<usize> = gallery.iter().map(|e| e.number).collect();
+            if let Some(pending) = self.chat.pending_prompts.get(key) {
+                for entry in pending {
+                    let mut n = 0usize;
+                    for att in &entry.attachments {
+                        if att.is_image {
+                            n += 1;
+                            paths.push(att.preview_path().to_path_buf());
+                            numbers.push(n);
+                        }
+                    }
+                }
+            }
+            self.open_chat_image_viewer(paths, numbers, pos, window, cx);
+            return;
+        }
+        self.open_chat_image_viewer(fallback_paths, fallback_numbers, fallback_index, window, cx);
     }
 
     pub(super) fn open_chat_image_viewer(
@@ -456,7 +673,7 @@ impl Shell {
         .detach();
     }
 
-    /// Previous (`-1`) or next (`1`) image of the message the viewer shows.
+    /// Previous (`-1`) or next (`1`) image in the viewer's captured gallery.
     pub(super) fn step_chat_image_viewer(
         &mut self,
         by: isize,
@@ -466,11 +683,7 @@ impl Shell {
         let Some(viewer) = self.chat.images.viewer.as_mut() else {
             return;
         };
-        let Some(to) = viewer
-            .index
-            .checked_add_signed(by)
-            .filter(|to| *to < viewer.paths.len())
-        else {
+        let Some(to) = step_image_index(viewer.index, viewer.paths.len(), by) else {
             return;
         };
         if let Loaded::Ready(image) = std::mem::replace(&mut viewer.image, Loaded::Loading) {
@@ -569,15 +782,24 @@ impl Shell {
         let p = ui::palette(cx);
         let count = viewer.paths.len();
         let index = viewer.index;
-        let title = viewer.numbers.get(index).map_or_else(
-            || {
-                viewer
-                    .paths
-                    .get(index)
-                    .and_then(|path| path.file_name())
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-            },
-            |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
+        let file_name = viewer
+            .paths
+            .get(index)
+            .and_then(|path| path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty());
+        let title = viewer
+            .numbers
+            .get(index)
+            .copied()
+            .filter(|&n| n > 0)
+            .map_or_else(
+                || file_name.clone().unwrap_or_default(),
+                |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
+            );
+        let failed_label = file_name.as_deref().map_or_else(
+            || ctext::IMAGE_PREVIEW_UNAVAILABLE.get().to_owned(),
+            |name| ctext::IMAGE_LOAD_FAILED_NAMED.format(&[("name", name)]),
         );
         let viewport = window.viewport_size();
         // The picture fits 96px clear of the edges; zoomed, it is sized and placed by hand.
@@ -639,7 +861,7 @@ impl Shell {
                         .data(ui::icons::IMAGE_SVG)
                         .size(px(ui::ICON_MD)),
                 )
-                .child(ctext::IMAGE_PREVIEW_UNAVAILABLE.get())
+                .child(failed_label)
                 .into_any_element(),
         };
         let tool = |id: &'static str, icon: IconName, label: &'static str| {
@@ -706,6 +928,17 @@ impl Shell {
                             .on_click(cx.listener(
                                 |this, _, window, cx| this.step_chat_image_viewer(-1, window, cx),
                             )),
+                        )
+                        .child(
+                            div()
+                                .id("chat-image-viewer-counter")
+                                .debug_selector(|| "chat-image-viewer-counter".into())
+                                .flex_none()
+                                .px_1()
+                                .font_family(ui::FONT_MONO)
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(format!("{} / {}", index + 1, count)),
                         )
                         .child(
                             tool(
