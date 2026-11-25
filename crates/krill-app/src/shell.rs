@@ -4643,6 +4643,7 @@ impl Shell {
             for session in &mut bot.sessions {
                 if session.session_id == from {
                     session.session_id = to;
+                    session.live = true;
                     touched = true;
                 }
             }
@@ -4652,6 +4653,7 @@ impl Shell {
                 for session in &mut bot.sessions {
                     if session.session_id == from {
                         session.session_id = to;
+                        session.live = true;
                         touched = true;
                     }
                 }
@@ -5571,6 +5573,7 @@ impl Shell {
                 .get(&pane)
                 .and_then(|l| l.pane.session())
                 .is_some();
+            let prior_cold_id = prior_cold.as_ref().map(|(id, _)| *id);
             if let Some((cold_session, cold)) = prior_cold {
                 self.bind_paste_queue_first_session(pane, had_session, cold_session);
                 if let Some(l) = self.live.get_mut(&pane)
@@ -5581,12 +5584,24 @@ impl Shell {
             } else {
                 self.bind_paste_queue_first_session(pane, had_session, session);
             }
-            let fresh = self.layout.session(pane) != Some(session);
+            let prev_session = self.layout.session(pane);
+            let fresh = prev_session != Some(session);
             if fresh {
-                if self.layout.host(pane).is_local() {
+                let host = self.layout.host(pane).clone();
+                if host.is_local() {
                     self.layout.clear_session(pane);
                 }
                 self.layout.set_session(pane, session);
+                if let Some(old) = prior_cold_id.or(prev_session).filter(|&id| id != session) {
+                    let bot_sidebar_rebound = self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.rebind_bot_session(&host, old, session, cx)
+                    });
+                    let bot_ui_rebound = self.rebind_bot_session_ui(&host, old, session);
+                    if bot_sidebar_rebound || bot_ui_rebound {
+                        self.rebind_chat_session(&host, old, session, &[pane]);
+                        self.refresh_bots_for_host(&host, true, cx);
+                    }
+                }
                 self.sync_sidebar_tab_state(cx);
                 self.sync_focused_session(cx);
                 self.record_workspace_nav(cx);

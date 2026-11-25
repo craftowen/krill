@@ -647,11 +647,10 @@ pub fn sidebar_snapshot_on(
         bots: bots
             .iter()
             .map(|bot| {
-                let mut live: Vec<BotSessionSummary> = sessions
+                let mut chats: Vec<BotSessionSummary> = sessions
                     .iter()
                     .filter(|s| {
                         s.bot_id == bot.id
-                            && s.live
                             && krill_proto::bots::session_belongs_to_bot(
                                 bot.created_at_ms,
                                 s.created_at_ms,
@@ -659,7 +658,13 @@ pub fn sidebar_snapshot_on(
                     })
                     .cloned()
                     .collect();
-                live.sort_by_key(|s| (s.link_id.is_some(), std::cmp::Reverse(s.created_at_ms)));
+                chats.sort_by_key(|s| {
+                    (
+                        s.link_id.is_some(),
+                        !s.live,
+                        std::cmp::Reverse(s.created_at_ms),
+                    )
+                });
                 SidebarBot {
                     host: host.clone(),
                     id: bot.id.clone(),
@@ -696,7 +701,7 @@ pub fn sidebar_snapshot_on(
                             }
                         })
                         .collect(),
-                    sessions: live,
+                    sessions: chats,
                     updated_at_ms: bot.updated_at_ms,
                     schedules: bot
                         .schedules
@@ -1474,5 +1479,52 @@ mod tests {
 
         let eof = map_socket_io_error(io::Error::from(io::ErrorKind::UnexpectedEof));
         assert_eq!(eof.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn sidebar_snapshot_keeps_dormant_post_reboot_sessions_and_sorts_live_first() {
+        let bot = BotConfig::new(
+            BotId::new("bot-reboot").unwrap(),
+            "크릴",
+            "agy",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let dormant_home = BotSessionSummary {
+            session_id: SessionId(41_800),
+            bot_id: bot.id.clone(),
+            link_id: None,
+            pid: 0,
+            live: false,
+            working: false,
+            label: "크릴".to_owned(),
+            created_at_ms: 1_700_000_001_000,
+        };
+        let live_other = BotSessionSummary {
+            session_id: SessionId(41_900),
+            bot_id: bot.id.clone(),
+            link_id: Some("slack-1".to_owned()),
+            pid: 5002,
+            live: true,
+            working: false,
+            label: "Slack".to_owned(),
+            created_at_ms: 1_700_000_002_000,
+        };
+
+        let snap = sidebar_snapshot(&[bot], &[], &[], &[live_other, dormant_home]);
+        assert_eq!(snap.bots.len(), 1);
+        let row = &snap.bots[0];
+        assert_eq!(
+            row.sessions.len(),
+            2,
+            "dormant post-reboot chat must stay visible in sidebar instead of disappearing"
+        );
+        assert_eq!(
+            row.home_session().map(|s| s.session_id),
+            Some(SessionId(41_800)),
+            "dormant Home Chat must be found by home_session() so clicking resumes it"
+        );
+        assert_eq!(row.sessions[0].session_id, SessionId(41_800));
+        assert_eq!(row.sessions[1].session_id, SessionId(41_900));
     }
 }

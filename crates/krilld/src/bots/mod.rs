@@ -81,6 +81,7 @@ pub struct BotsManager {
     active_cron_sessions: Mutex<HashMap<(BotId, String), SessionId>>,
     in_flight_composio: Mutex<HashSet<BotId>>,
     in_flight_schedules: Mutex<HashSet<(BotId, String)>>,
+    runtime_rehydrated: OnceLock<()>,
     boot_reconciled: OnceLock<()>,
     google_endpoints: GoogleEndpoints,
     tracker_endpoints: TrackerEndpoints,
@@ -152,6 +153,7 @@ impl BotsManager {
             active_cron_sessions: Mutex::new(HashMap::new()),
             in_flight_composio: Mutex::new(HashSet::new()),
             in_flight_schedules: Mutex::new(HashSet::new()),
+            runtime_rehydrated: OnceLock::new(),
             boot_reconciled: OnceLock::new(),
             google_endpoints,
             tracker_endpoints,
@@ -174,12 +176,20 @@ impl BotsManager {
         manager
     }
 
+    /// Rehydrates persisted bot session bindings once before any bot RPC or session resume runs.
+    /// Uses `OnceLock::get_or_init` so concurrent callers block until rehydration finishes.
+    pub fn ensure_runtime_rehydrated(&self, registry: &Registry) {
+        self.runtime_rehydrated.get_or_init(|| {
+            self.runtime.rehydrate_from_disk(&self.store, registry);
+        });
+    }
+
     /// Rehydrates kept bot session bindings and starts any configured connectors/pollers once on boot.
     pub fn boot_recover(&self, registry: &Registry) {
         if self.boot_reconciled.set(()).is_err() {
             return;
         }
-        self.runtime.rehydrate_from_disk(&self.store, registry);
+        self.ensure_runtime_rehydrated(registry);
         self.reconcile_enabled_workers();
     }
 
@@ -384,8 +394,30 @@ impl BotsManager {
         )
     }
 
-    /// Rebinds a bot session across runtime bindings, active group turns, and cron tracking.
-    /// Returns `Some(ReboundBotSession)` if `old` was bound to a bot.
+    /// Prepares bot launch inputs when `old` is a cold/exited bot session resuming into `new`.
+    pub(crate) fn prepare_resume_launch(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+        stored_instructions: Option<&str>,
+        stored_launched_at_ms: u64,
+    ) -> Result<Option<runtime::BotAccountSwitchLaunch>, String> {
+        self.runtime.prepare_resume_launch(
+            &self.store,
+            &self.secrets,
+            &self.tool_relay,
+            &self.composio_base_url,
+            old,
+            new,
+            launch_cwd,
+            stored_instructions,
+            stored_launched_at_ms,
+        )
+    }
+
+    /// Rebinds a bot session across runtime bindings, active group turns, external links, and
+    /// cron tracking. Returns `Some(ReboundBotSession)` if `old` was bound to a bot.
     pub(crate) fn rebind_session(
         &self,
         old: SessionId,
@@ -394,6 +426,9 @@ impl BotsManager {
         new_token: Option<zeroize::Zeroizing<String>>,
     ) -> Option<runtime::ReboundBotSession> {
         let rebound = self.runtime.rebind_session(old, new, new_pid, new_token)?;
+        if let Some(ref link_id) = rebound.link_id {
+            self.store.bind_link_session(link_id, new, now_ms()).ok();
+        }
         self.groups.rebind_session(old, new);
         for sid in lock(&self.active_cron_sessions).values_mut() {
             if *sid == old {
@@ -401,6 +436,25 @@ impl BotsManager {
             }
         }
         Some(rebound)
+    }
+
+    /// Registers a resumed bot session whose prior binding was missing from disk.
+    pub(crate) fn adopt_resumed_session(
+        &self,
+        bot_id: BotId,
+        session_id: SessionId,
+        pid: u32,
+        launch_token: Option<zeroize::Zeroizing<String>>,
+        created_at_ms: u64,
+    ) {
+        self.runtime.adopt_resumed_session(
+            &self.store,
+            bot_id,
+            session_id,
+            pid,
+            launch_token,
+            created_at_ms,
+        );
     }
 
     /// Revokes an ephemeral bot tool relay launch token.
@@ -805,6 +859,7 @@ impl BotsManager {
         if is_observer && !req.is_read_only() {
             return BotRpcResponse::Error("permission denied".to_owned());
         }
+        self.ensure_runtime_rehydrated(registry);
 
         let caller_bot = peer_session.and_then(|sid| {
             self.runtime

@@ -1927,51 +1927,151 @@ impl Registry {
         let session = self
             .reserve_session_id(Some(old))
             .map_err(|error| os(&error))?;
-        let Launch { argv, env } = match stored {
+        let cwd_path = {
+            use krill_proto::os::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(&c.cwd))
+        };
+        let bots_mgr = if let Some(existing) = self.bots_if_initialized() {
+            Some(Arc::clone(existing))
+        } else if stored
+            .as_ref()
+            .is_some_and(|s| s.bot_instructions.is_some())
+            || state
+                .as_deref()
+                .is_some_and(|d| d.join("bots").join("runtime-bindings.json").is_file())
+        {
+            self.bots().ok().cloned()
+        } else {
+            None
+        };
+        let mut bot_launch = if let Some(ref bots) = bots_mgr {
+            bots.ensure_runtime_rehydrated(self);
+            match bots.prepare_resume_launch(
+                old,
+                session,
+                &cwd_path,
+                stored.as_ref().and_then(|s| s.bot_instructions.as_deref()),
+                stored
+                    .as_ref()
+                    .and_then(|s| s.launched_at)
+                    .unwrap_or(0)
+                    .saturating_mul(1000),
+            ) {
+                Ok(bl) => bl,
+                Err(err) => {
+                    tracing::warn!(
+                        session = old.0,
+                        error = %err,
+                        "bot resume launch preparation failed; falling back to stored instructions"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let revoke_bot_grant = |bl: &mut Option<crate::bots::runtime::BotAccountSwitchLaunch>| {
+            if let (Some(bots), Some(launch)) = (bots_mgr.as_ref(), bl.take()) {
+                bots.revoke_launch_token(launch.grant_token.as_ref());
+            }
+        };
+        let Launch { argv, mut env } = match stored {
             Some(s) => {
-                let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
-                let (canonical, profile) =
-                    agents.resolve(&s.profile).ok_or(Failure::UnknownAgent)?;
+                let Ok(agents) = self.agents.agents() else {
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(Failure::UnknownAgent);
+                };
+                let Some((canonical, profile)) = agents.resolve(&s.profile) else {
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(Failure::UnknownAgent);
+                };
                 let resume_id = s.session_id.or(fallback_sid);
                 // 실행 당시 계정으로 이어 간다(OWE-698). 휴면 깨우기도 이 경로다.
                 // 요청이 계정을 지정하면 그 계정으로 이어 간다(OWE-699, 다른 계정으로 이어가기).
-                let account = crate::agent::resume_target(
+                let account = match crate::agent::resume_target(
                     profile,
                     state.as_deref(),
                     c.account.as_deref(),
                     s.account.as_ref(),
                     resume_id.as_deref(),
-                )
-                .map_err(|e| os(&e))?;
-                crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
-                let (launch, session_id, account) = crate::agent::resume_in_with_bot_instructions(
-                    profile,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
+                };
+                let mut effective_profile = profile.clone();
+                if let Some(ref bl) = bot_launch {
+                    let mut overrides = krill_proto::agent::LaunchOverrides {
+                        model: bl.model.clone(),
+                        effort: bl.effort.clone(),
+                    };
+                    if canonical == "agy"
+                        && let Some(ref m) = overrides.model
+                        && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                            None,
+                            m,
+                            overrides.effort.as_deref(),
+                        )
+                    {
+                        overrides.model = Some(family);
+                        overrides.effort = Some(eff);
+                    }
+                    if !overrides.is_empty()
+                        && let Err(err) = krill_proto::agent::apply_launch_overrides(
+                            canonical,
+                            &mut effective_profile,
+                            &overrides,
+                        )
+                    {
+                        tracing::warn!(
+                            session = old.0,
+                            error = %err,
+                            "ignoring invalid bot launch override during resume"
+                        );
+                    }
+                }
+                crate::agent::pre_trust_workspace(&effective_profile, &c.cwd, account.as_ref());
+                let instructions = bot_launch
+                    .as_ref()
+                    .map(|bl| bl.instructions.as_str())
+                    .or(s.bot_instructions.as_deref());
+                let (launch, session_id, account) = match crate::agent::resume_in_with_bot_mcp(
+                    &effective_profile,
                     s.permission,
                     session,
                     state.as_deref(),
                     resume_id.as_deref(),
                     account.as_ref(),
-                    s.bot_instructions.as_deref(),
-                )
-                .map_err(|e| {
-                    self.discard_settings(session);
-                    os(&e)
-                })?;
+                    bot_launch.as_ref().map(|_| cwd_path.as_path()),
+                    bot_launch.as_ref().map(|bl| &bl.mcp_cfg),
+                    instructions,
+                ) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        self.discard_settings(session);
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
+                };
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: s.permission,
                 };
-                self.agents
+                if let Err(e) = self
+                    .agents
                     .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
-                    .and_then(|()| match s.bot_instructions.as_deref() {
+                    .and_then(|()| match instructions {
                         Some(text) => self.agents.remember_bot_instructions(session, text),
                         None => Ok(()),
                     })
-                    .map_err(|e| {
-                        self.discard_settings(session);
-                        self.agents.forget(session);
-                        os(&e)
-                    })?;
+                {
+                    self.discard_settings(session);
+                    self.agents.forget(session);
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(os(&e));
+                }
                 launch
             }
             None => match c.program {
@@ -1979,49 +2079,78 @@ impl Registry {
                 Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
                 Program::Agent { id } => {
                     let (canonical, profile, permission) =
-                        self.resolve_agent_profile_with_overrides(&id)?;
-                    let account = crate::agent::resume_target(
+                        match self.resolve_agent_profile_with_overrides(&id) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                revoke_bot_grant(&mut bot_launch);
+                                return Err(e);
+                            }
+                        };
+                    let account = match crate::agent::resume_target(
                         &profile,
                         state.as_deref(),
                         c.account.as_deref(),
                         None,
                         fallback_sid.as_deref(),
-                    )
-                    .map_err(|e| os(&e))?;
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            revoke_bot_grant(&mut bot_launch);
+                            return Err(os(&e));
+                        }
+                    };
                     crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
-                    let (launch, session_id, account) = crate::agent::resume_in(
+                    let (launch, session_id, account) = match crate::agent::resume_in_with_bot_mcp(
                         &profile,
                         permission,
                         session,
                         state.as_deref(),
                         fallback_sid.as_deref(),
                         account.as_ref(),
-                    )
-                    .map_err(|e| {
-                        self.discard_settings(session);
-                        os(&e)
-                    })?;
+                        bot_launch.as_ref().map(|_| cwd_path.as_path()),
+                        bot_launch.as_ref().map(|bl| &bl.mcp_cfg),
+                        bot_launch.as_ref().map(|bl| bl.instructions.as_str()),
+                    ) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            self.discard_settings(session);
+                            revoke_bot_grant(&mut bot_launch);
+                            return Err(os(&e));
+                        }
+                    };
                     let metadata = control::AgentLaunch {
                         profile: canonical,
                         permission,
                     };
-                    self.agents
+                    if let Err(e) = self
+                        .agents
                         .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
-                        .map_err(|e| {
-                            self.discard_settings(session);
-                            os(&e)
-                        })?;
+                        .and_then(|()| match bot_launch.as_ref() {
+                            Some(bl) => self
+                                .agents
+                                .remember_bot_instructions(session, &bl.instructions),
+                            None => Ok(()),
+                        })
+                    {
+                        self.discard_settings(session);
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
                     launch
                 }
             },
         };
+        if let Some(ref bl) = bot_launch {
+            env.extend(bl.extra_env.clone());
+        }
         if let Some(store) = &self.store {
             // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
-            store.inherit_history(session, old).map_err(|e| {
+            if let Err(e) = store.inherit_history(session, old) {
                 self.discard_settings(session);
                 self.agents.forget(session);
-                os(&e)
-            })?;
+                revoke_bot_grant(&mut bot_launch);
+                return Err(os(&e));
+            }
         }
         let (session, pid) =
             match self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows) {
@@ -2030,9 +2159,25 @@ impl Registry {
                     if let Some(store) = &self.store {
                         store.discard_inherited_history(session);
                     }
+                    revoke_bot_grant(&mut bot_launch);
                     return Err(e);
                 }
             };
+        // Rebind bot ownership BEFORE `self.remove(old)` so old's removal never drops the
+        // resurrected session from `runtime-bindings.json`.
+        if let (Some(bots), Some(bl)) = (bots_mgr.as_ref(), bot_launch.take()) {
+            if let Some(rebound) = bots.rebind_session(old, session, pid, bl.grant_token.clone()) {
+                bots.revoke_launch_token(rebound.previous_token.as_ref());
+            } else {
+                bots.adopt_resumed_session(
+                    bl.bot_id,
+                    session,
+                    pid,
+                    bl.grant_token,
+                    bl.created_at_ms,
+                );
+            }
+        }
         let (has_old, exited_old) = {
             let mut st = lock(&self.state);
             st.resumed.insert(old);
@@ -4142,15 +4287,99 @@ impl Registry {
         lock(&self.state).sessions.get(&id).map(|e| e.pid)
     }
 
-    /// Closes/terminates a bot-managed PTY session cleanly.
+    /// Closes/terminates a bot-managed PTY session cleanly, or permanently marks a dormant
+    /// post-reboot bot session closed so it cannot be resurrected on a later restart.
     pub(crate) fn kill_bot_session(&self, id: SessionId) -> io::Result<()> {
+        if !lock(&self.state).sessions.contains_key(&id) {
+            self.close_dormant_bot_session(id);
+            return Ok(());
+        }
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
         };
-        self.close(&peer, id)
-            .map(|_| ())
-            .map_err(|fail| io::Error::other(format!("failed to close bot session: {fail:?}")))
+        match self.close(&peer, id) {
+            Ok(_) => Ok(()),
+            Err(Failure::NoSession) => {
+                self.close_dormant_bot_session(id);
+                Ok(())
+            }
+            Err(fail) => Err(io::Error::other(format!(
+                "failed to close bot session: {fail:?}"
+            ))),
+        }
+    }
+
+    fn close_dormant_bot_session(&self, id: SessionId) {
+        self.closed_ledger.record_closed(id);
+        if let Some(store) = &self.store {
+            store.mark_closed(id);
+        }
+        self.discard_settings(id);
+        self.agents.forget(id);
+        self.clear_sleeping(id);
+    }
+
+    /// Returns `true` if `id` is recorded as explicitly closed.
+    pub(crate) fn is_session_closed(&self, id: SessionId) -> bool {
+        self.is_closed(id)
+    }
+
+    /// Returns `true` if `id` is not closed/resumed and still has durable launch metadata or
+    /// cold terminal history on disk that `Request::Resume` can resurrect after a reboot.
+    pub(crate) fn is_session_resumable(&self, id: SessionId) -> bool {
+        if self.is_closed(id) || lock(&self.state).resumed.contains(&id) {
+            return false;
+        }
+        if self.agents.stored(id).ok().flatten().is_some() {
+            return true;
+        }
+        if let Some(store) = &self.store
+            && store.session_dir(id).is_dir()
+        {
+            return true;
+        }
+        self.dir.as_ref().is_some_and(|d| {
+            d.join("sessions")
+                .join(format!("{}.noindex", id.0))
+                .is_dir()
+        })
+    }
+
+    /// Returns live non-exited sessions whose stored launch still carries `bot_instructions`,
+    /// enabling self-healing adoption when `runtime-bindings.json` lost their entry.
+    pub(crate) fn live_bot_launch_candidates(&self) -> Vec<(SessionId, u32, PathBuf, String, u64)> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let live: Vec<(SessionId, u32, PathBuf)> = {
+            let st = lock(&self.state);
+            st.sessions
+                .iter()
+                .filter(|(id, entry)| !st.exited.contains_key(id) && !entry.session.is_closed())
+                .map(|(&id, entry)| (id, entry.pid, entry.cwd.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (sid, pid, live_cwd) in live {
+            let Ok(Some(stored)) = self.agents.stored(sid) else {
+                continue;
+            };
+            let Some(instructions) = stored.bot_instructions else {
+                continue;
+            };
+            let cwd = if stored.cwd.is_empty() {
+                live_cwd
+            } else {
+                PathBuf::from(std::ffi::OsStr::from_bytes(&stored.cwd))
+            };
+            out.push((
+                sid,
+                pid,
+                cwd,
+                instructions,
+                stored.launched_at.unwrap_or(0).saturating_mul(1000),
+            ));
+        }
+        out
     }
 
     /// Returns `true` if `id` is a live, non-exited session.

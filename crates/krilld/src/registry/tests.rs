@@ -4122,3 +4122,186 @@ fn bots_watcher_mask_observer_audit_oversized_and_auto_boot() {
     }
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn resuming_dormant_bot_session_after_reboot_rebinds_and_preserves_bot_identity() {
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse, CreateBotParams, ExternalSource};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("bot-reboot-resume-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let bots_root = dir.join("bots");
+    fs::create_dir_all(&bots_root).unwrap();
+    fs::create_dir_all(dir.join("agent-launches")).unwrap();
+
+    // 1. Create a bot and persist a pre-reboot runtime binding + external link + launch file.
+    let store = crate::bots::store::BotStore::new(bots_root.clone());
+    let bot = store
+        .create_bot(
+            CreateBotParams {
+                name: "크릴".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: "Reboot test bot".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let bot_home = store.bot_home(&bot);
+    fs::create_dir_all(&bot_home).unwrap();
+    let old_sid = SessionId(41_800);
+    let link = store
+        .lookup_or_create_link(
+            &bot.id,
+            ExternalSource::Slack,
+            Some("T1"),
+            "C1",
+            Some("ts1"),
+            krill_proto::bots::ActsFor::Owner,
+            1_700_000_000_500,
+        )
+        .unwrap();
+    store
+        .bind_link_session(&link.id, old_sid, 1_700_000_000_600)
+        .unwrap();
+
+    fs::write(
+        dir.join(format!("agent-launches/{}.json", old_sid.0)),
+        serde_json::json!({
+            "profile": "claude",
+            "permission": "yolo",
+            "session_id": "22222222-2222-2222-2222-222222222222",
+            "cwd": bot_home.as_os_str().as_bytes(),
+            "hibernation_blocked": false,
+            "bot_instructions": "You are 크릴, a bot that runs in Krill.",
+            "launched_at": 1_700_000_001_u64
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    fs::write(
+        bots_root.join("runtime-bindings.json"),
+        serde_json::json!([{
+            "session_id": old_sid.0,
+            "bot_id": bot.id.as_str(),
+            "link_id": link.id,
+            "chat_offset": 7,
+            "pid": 54321,
+            "label": "크릴",
+            "created_at_ms": 1_700_000_001_000_u64,
+            "owner_turn_pending": true,
+            "last_prompt": "before reboot",
+            "group_key": null,
+            "turn_seq": 3,
+            "active_turn_seq": 3
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    // 2. Cold post-reboot Registry with fake holder (0 kept live PTYs).
+    let (reg, _, _guard) = fake_holder_registry(Some(&dir));
+    reg.bind_self_arc();
+
+    // Even before Request::Resume runs, ListBotSessions must preserve the dormant session.
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let listed = reg.handle(
+        &full,
+        Request::Bot(BotRpcRequest::ListBotSessions {
+            bot_id: Some(bot.id.clone()),
+        }),
+        &mut HashMap::new(),
+    );
+    let Reply::Bot(BotRpcResponse::BotSessions(before_sessions)) = listed else {
+        panic!("expected BotSessions before resume, got {listed:?}");
+    };
+    assert_eq!(before_sessions.len(), 1);
+    assert_eq!(before_sessions[0].session_id, old_sid);
+    assert!(!before_sessions[0].live);
+    assert!(!before_sessions[0].working);
+
+    // 3. Desktop app resumes the cold pane via Request::Resume.
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: bot_home.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    let resumed = reg.handle(
+        &full,
+        Request::Resume {
+            session: old_sid,
+            create,
+        },
+        &mut HashMap::new(),
+    );
+    let Reply::Resumed {
+        session: new_sid, ..
+    } = resumed
+    else {
+        panic!("expected Resumed reply, got {resumed:?}");
+    };
+    assert_ne!(new_sid, old_sid);
+
+    // 4. BotRuntime & runtime-bindings.json must now point to new_sid (live: true), and the
+    //    external conversation link must be updated to new_sid.
+    let listed_after = reg.handle(
+        &full,
+        Request::Bot(BotRpcRequest::ListBotSessions {
+            bot_id: Some(bot.id.clone()),
+        }),
+        &mut HashMap::new(),
+    );
+    let Reply::Bot(BotRpcResponse::BotSessions(after_sessions)) = listed_after else {
+        panic!("expected BotSessions after resume, got {listed_after:?}");
+    };
+    assert_eq!(after_sessions.len(), 1);
+    assert_eq!(after_sessions[0].session_id, new_sid);
+    assert!(after_sessions[0].live);
+    assert_eq!(
+        after_sessions[0].link_id.as_deref(),
+        Some(link.id.as_str()),
+        "external link_id must survive reboot resume"
+    );
+
+    let bindings_raw = fs::read_to_string(bots_root.join("runtime-bindings.json")).unwrap();
+    assert!(
+        bindings_raw.contains(&new_sid.0.to_string()),
+        "runtime-bindings.json must persist rebound new_sid: {bindings_raw}"
+    );
+    assert!(
+        !bindings_raw.contains(&old_sid.0.to_string()),
+        "runtime-bindings.json must retire old_sid after rebind: {bindings_raw}"
+    );
+
+    let updated_link = store.get_link(&link.id).unwrap().unwrap();
+    assert_eq!(updated_link.session_id, Some(new_sid));
+
+    // 5. Verify self-healing adoption: wipe runtime-bindings.json and simulate krilld restart
+    //    where the live session's agent-launch still carries bot_instructions.
+    fs::write(bots_root.join("runtime-bindings.json"), b"[]").unwrap();
+    let fresh_rt = crate::bots::runtime::BotRuntime::with_root(bots_root.clone());
+    let adopted = fresh_rt.rehydrate_from_disk(&store, &reg);
+    assert_eq!(
+        adopted, 1,
+        "orphaned live bot session must self-heal on rehydrate"
+    );
+    assert_eq!(fresh_rt.bot_for_session(new_sid), Some(bot.id.clone()));
+
+    if let Some(b) = reg.bots_if_initialized() {
+        b.shutdown();
+    }
+    fs::remove_dir_all(&dir).ok();
+}
