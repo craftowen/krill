@@ -47,12 +47,15 @@ mod prompt;
 #[cfg(test)]
 mod prompt_tests;
 mod rate_limit;
+pub(crate) mod selection_quote;
+mod side_chat;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod ui_tests;
 mod view;
 mod work_run;
+mod worker_dock;
 use actions::{RequestIdentity, Submission};
 #[cfg(test)]
 mod action_tests;
@@ -674,8 +677,19 @@ pub(crate) struct ChatState {
     /// Combined worker dock above composer: expanded state and acknowledged failed dispatch IDs.
     pub(super) worker_dock_expanded: BTreeSet<ChatKey>,
     pub(super) worker_dock_cleared: BTreeSet<String>,
+    worker_dock_owner_stopped: BTreeSet<String>,
     /// Temporary orchestration worker sessions pinned open via `#43521` `Keep open`.
     pub(super) worker_keep_open: BTreeSet<SessionId>,
+    worker_banner_kept: BTreeSet<String>,
+    worker_banner_timer: Option<Task<()>>,
+    /// Leading `/btw ` or `/side ` side-chat pill state (`#42129`).
+    side_chat_mode: BTreeMap<ChatKey, side_chat::SideChatPrefix>,
+    editing_queued: BTreeSet<ChatKey>,
+    /// Keyboard-focused queued message row (`#47346`).
+    queued_focused: BTreeMap<ChatKey, u64>,
+    /// Active floating `Add to chat` text selection quote state (`#47157`).
+    selection_quote: Option<selection_quote::ActiveSelectionQuote>,
+    selection_quote_dismissed: Option<String>,
     /// Multi-question batch navigation & preserved step answers (`#46963`, `#47959`, `#42789`).
     pub(super) question_batch_step: BTreeMap<(ChatKey, usize), usize>,
     pub(super) question_batch_answers: BTreeMap<(ChatKey, usize), BTreeMap<usize, Vec<usize>>>,
@@ -1363,11 +1377,16 @@ impl Shell {
     }
 
     pub(super) fn is_pane_chat_view(&self, pane: PaneId, cx: &gpui::App) -> bool {
-        if self.layout.session(pane).is_none() {
+        let Some(session) = self.layout.session(pane) else {
             return false;
-        }
+        };
         if let Some(chat) = self.layout.chat_view(pane) {
             return chat;
+        }
+        // Orca #47363: workers spawned from a bot chat (and their sub-workers) default to Chat view
+        // unless explicitly switched to Terminal (`Some(false)`).
+        if self.is_bot_chat_worker_session(self.layout.host(pane), session, cx) {
+            return true;
         }
         krill_app::settings::default_view_mode(cx) == krill_app::settings::DefaultViewMode::Chat
     }
@@ -1768,7 +1787,18 @@ impl Shell {
         .detach();
     }
 
-    /// Loads a queued message back into the composer for editing (`#47346`).
+    pub(super) fn focus_queued_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        queued_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.queued_focused.insert(key.clone(), queued_id) != Some(queued_id) {
+            cx.notify();
+        }
+    }
+
+    /// Loads an editable queued message back into the composer for editing (`#47346`).
     pub(super) fn edit_queued_chat_prompt(
         &mut self,
         key: &ChatKey,
@@ -1776,27 +1806,42 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(log) = self.chat.logs.get_mut(key) else {
+        let Some(queued) = self.chat.logs.get_mut(key).and_then(|log| {
+            let pos = log.queued_prompts.iter().position(|q| q.id == queued_id)?;
+            if log
+                .queued_prompts
+                .get(pos)
+                .is_none_or(|q| q.display_text.trim().is_empty())
+            {
+                return None;
+            }
+            log.queued_prompts.remove(pos)
+        }) else {
             return;
         };
-        let Some(pos) = log.queued_prompts.iter().position(|q| q.id == queued_id) else {
-            return;
-        };
-        let Some(queued) = log.queued_prompts.remove(pos) else {
-            return;
-        };
-        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
-        let input = self.ensure_chat_input(key.clone(), window, cx);
-        let text = queued.display_text;
-        input.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
-            state.focus(window, cx);
-        });
-        if !queued.attachments.is_empty() {
+        if self.chat.queued_focused.get(key) == Some(&queued_id) {
+            self.chat.queued_focused.remove(key);
+        }
+        self.chat.side_chat_mode.remove(key);
+        self.chat.editing_queued.insert(key.clone());
+        if queued.attachments.is_empty() {
+            self.chat.draft_attachments.remove(key);
+        } else {
             self.chat
                 .draft_attachments
                 .insert(key.clone(), queued.attachments);
         }
+        self.chat.image_tokens.remove(key);
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        let text = queued.display_text;
+        input.update(cx, |state, cx| {
+            state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        self.chat.history_cursor.remove(key);
+        self.chat.history_saved_draft.remove(key);
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
         cx.notify();
     }
 
@@ -1808,9 +1853,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.chat.prompt_tasks.contains_key(key) || self.chat.prompt_review.contains(key) {
+            return;
+        }
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
+        if self.paste_queue.has_pending_for(pane) {
+            return;
+        }
         let Some((pos, submitted_payload)) = self.chat.logs.get(key).and_then(|log| {
             log.queued_prompts
                 .iter()
@@ -1839,6 +1890,10 @@ impl Shell {
         else {
             return;
         };
+        if self.chat.queued_focused.get(key) == Some(&queued_id) {
+            self.chat.queued_focused.remove(key);
+        }
+        self.chat.multiline_blocked.remove(key);
         self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
         let (origin_epoch, origin_item, opens_terminal, local_slash) = self.pending_prompt_meta(
             key,
@@ -1863,6 +1918,9 @@ impl Shell {
         self.chat
             .pending_epochs
             .insert((key.clone(), queued.id), origin_epoch);
+        if let Some(list) = self.chat.lists.get_mut(&(pane, session)) {
+            list.state.set_follow_mode(gpui::FollowMode::Tail);
+        }
         self.dispatch_pending_chat_prompt(
             PendingDispatch {
                 key: key.clone(),
@@ -1917,26 +1975,19 @@ impl Shell {
         let mut paths = Vec::new();
         let mut numbers = Vec::new();
         if let Some(log) = self.chat.logs.get(key) {
-            for item in &log.items {
-                if item.kind != ChatItemKind::User {
-                    continue;
-                }
-                let item_paths = images::item_image_paths(item);
-                let item_nums = images::image_numbers(&item.text, item_paths.len());
-                for (path, num) in item_paths.into_iter().zip(item_nums) {
-                    let resolved = if is_remote {
-                        self.chat
-                            .images
-                            .resolve_remote_preview(&path)
-                            .map(std::path::Path::to_path_buf)
-                    } else {
-                        Some(path)
-                    };
-                    if let Some(local) = resolved {
-                        paths.push(local);
-                        numbers.push(num);
-                    }
-                }
+            for entry in images::collect_chat_lightbox_images(
+                log.base_index,
+                &log.items,
+                is_remote,
+                |path| {
+                    self.chat
+                        .images
+                        .resolve_remote_preview(path)
+                        .map(std::path::Path::to_path_buf)
+                },
+            ) {
+                paths.push(entry.path);
+                numbers.push(entry.number);
             }
         }
         if let Some(pending) = self.chat.pending_prompts.get(key) {
@@ -2116,6 +2167,22 @@ impl Shell {
         if chat.worker_keep_open.remove(&from) {
             chat.worker_keep_open.insert(to);
         }
+        if let Some(prefix) = chat.side_chat_mode.remove(&old_key) {
+            chat.side_chat_mode.entry(new_key.clone()).or_insert(prefix);
+        }
+        if chat.editing_queued.remove(&old_key) {
+            chat.editing_queued.insert(new_key.clone());
+        }
+        if let Some(focused_id) = chat.queued_focused.remove(&old_key) {
+            chat.queued_focused
+                .entry(new_key.clone())
+                .or_insert(focused_id);
+        }
+        if let Some(sq) = &mut chat.selection_quote
+            && sq.key == old_key
+        {
+            sq.key = new_key.clone();
+        }
         if let Some(query) = chat.resume_search.remove(&old_key) {
             chat.resume_search.entry(new_key.clone()).or_insert(query);
         }
@@ -2260,8 +2327,23 @@ impl Shell {
         chat.worker_dock_expanded.retain(keep);
         chat.worker_dock_cleared
             .retain(|id| orch.dispatches.iter().any(|d| &d.id == id));
+        chat.worker_dock_owner_stopped
+            .retain(|id| orch.dispatches.iter().any(|d| &d.id == id));
         chat.worker_keep_open
             .retain(|sid| shown_sessions.contains(sid));
+        chat.worker_banner_kept
+            .retain(|id| orch.dispatches.iter().any(|d| &d.id == id));
+        chat.side_chat_mode.retain(|key, _| keep(key));
+        chat.editing_queued.retain(keep);
+        chat.queued_focused.retain(|key, _| keep(key));
+        if chat
+            .selection_quote
+            .as_ref()
+            .is_some_and(|sq| !keep(&sq.key))
+        {
+            chat.selection_quote = None;
+            chat.selection_quote_dismissed = None;
+        }
         chat.question_batch_step.retain(|(key, _), _| keep(key));
         chat.question_batch_answers.retain(|(key, _), _| keep(key));
         chat.approval_focus.retain(|(key, _), _| keep(key));
@@ -3440,9 +3522,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Entity<TextareaState> {
+        let placeholder = if self.chat.side_chat_mode.contains_key(&key) {
+            ctext::SIDE_CHAT_PLACEHOLDER.get()
+        } else {
+            ctext::PROMPT_PLACEHOLDER.get()
+        };
         if let Some((input, _)) = self.chat.inputs.get(&key) {
             let input = input.clone();
-            let placeholder = ctext::PROMPT_PLACEHOLDER.get();
             if input.read(cx).presentation().placeholder().as_ref() != placeholder {
                 input.update(cx, |state, cx| {
                     state.set_placeholder(placeholder, window, cx);
@@ -3454,7 +3540,7 @@ impl Shell {
             TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .submit_on_enter(true)
-                .placeholder(ctext::PROMPT_PLACEHOLDER.get())
+                .placeholder(placeholder)
         });
         let input_id = input.entity_id();
         let sub = cx.subscribe_in(
@@ -3471,6 +3557,7 @@ impl Shell {
                 };
                 match ev {
                     InputEvent::Focus => {
+                        this.chat.queued_focused.remove(&focus_key);
                         if let Some(pane) = this.chat_pane(&focus_key)
                             && this.layout.focused() != Some(pane)
                         {
@@ -3484,6 +3571,7 @@ impl Shell {
                         this.chat.prompt_review.remove(&focus_key);
                         this.chat.prompt_failed.remove(&focus_key);
                         this.chat.multiline_blocked.remove(&focus_key);
+                        this.sync_side_chat_pill(&focus_key, window, cx);
                         this.sync_chat_autocomplete(&focus_key, window, cx);
                         cx.notify();
                     }
@@ -3501,6 +3589,116 @@ impl Shell {
             input.update(cx, |state, cx| state.focus(window, cx));
         }
         input
+    }
+
+    pub(super) fn sync_side_chat_pill(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((input, _)) = self.chat.inputs.get(key) else {
+            return;
+        };
+        let input = input.clone();
+        if Self::chat_input_is_composing(&input, window, cx) {
+            return;
+        }
+        let supported = side_chat::supports_side_chat(
+            self.chat_agent_id(key),
+            self.chat.editing_queued.contains(key),
+        );
+        if !supported {
+            if let Some(prefix) = self.chat.side_chat_mode.remove(key) {
+                let current = input.read(cx).value().to_string();
+                let restored = prefix.compose(&current);
+                input.update(cx, |state, cx| {
+                    state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+                    state.set_value(restored, window, cx);
+                });
+            }
+            return;
+        }
+        if self.chat.side_chat_mode.contains_key(key) {
+            return;
+        }
+        let value = input.read(cx).value().to_string();
+        if let Some(parsed) = side_chat::parse_leading_side_chat_command(&value) {
+            let prefix = parsed.prefix;
+            let rest = parsed.rest.to_owned();
+            self.chat.side_chat_mode.insert(key.clone(), prefix);
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.close();
+                ac.dismissed = None;
+            }
+            input.update(cx, |state, cx| {
+                state.set_placeholder(ctext::SIDE_CHAT_PLACEHOLDER.get(), window, cx);
+                state.set_value(rest, window, cx);
+            });
+        }
+    }
+
+    pub(super) fn dismiss_side_chat_pill(
+        &mut self,
+        key: &ChatKey,
+        restore_command: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prefix) = self.chat.side_chat_mode.remove(key) else {
+            return;
+        };
+        if let Some((input, _)) = self.chat.inputs.get(key) {
+            let input = input.clone();
+            let next_val = if restore_command {
+                let current = input.read(cx).value().to_string();
+                if current.is_empty() {
+                    prefix.command.clone()
+                } else {
+                    format!("{}{current}", prefix.command)
+                }
+            } else {
+                input.read(cx).value().to_string()
+            };
+            input.update(cx, |state, cx| {
+                state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+                if restore_command {
+                    state.set_value(next_val, window, cx);
+                    let col = u32::try_from(prefix.command.len()).unwrap_or(0);
+                    state.set_cursor_position(
+                        gpui_component::input::Position::new(0, col),
+                        window,
+                        cx,
+                    );
+                } else {
+                    state.focus(window, cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn side_chat_backspace(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.chat.side_chat_mode.contains_key(key) {
+            return false;
+        }
+        let Some((input, _)) = self.chat.inputs.get(key) else {
+            return false;
+        };
+        let (cursor, has_selection) = {
+            let state = input.read(cx);
+            (state.cursor(), !state.selected_range().is_empty())
+        };
+        if cursor != 0 || has_selection {
+            return false;
+        }
+        self.dismiss_side_chat_pill(key, true, window, cx);
+        true
     }
 
     pub(super) fn chat_pane_has_focus(
@@ -3617,10 +3815,15 @@ impl Shell {
                     .map(str::trim)
                     .filter(|q| !q.is_empty())
                 {
+                    self.chat.side_chat_mode.remove(key);
+                    self.chat.editing_queued.remove(key);
                     self.chat
                         .resume_search
                         .insert(key.clone(), query.to_owned());
-                    input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+                    input.update(cx, |state, cx| {
+                        state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+                        state.set_value(String::new(), window, cx);
+                    });
                     if let Some(ac) = self.chat.autocomplete.get_mut(key) {
                         ac.close();
                         ac.dismissed = None;
@@ -3650,12 +3853,24 @@ impl Shell {
                 .get(key)
                 .cloned()
                 .unwrap_or_default();
-            let Some(submitted_payload) =
+            let Some(base_payload) =
                 build_chat_payload_with_tokens(&raw_text, &tokens, &attachments)
             else {
                 return;
             };
-            let display_text = strip_image_token_spans(&raw_text, &tokens);
+            let base_display = strip_image_token_spans(&raw_text, &tokens);
+            let side_prefix = self.chat.side_chat_mode.remove(key);
+            if side_prefix.is_some() && base_display.trim().is_empty() {
+                if let Some(prefix) = side_prefix {
+                    self.chat.side_chat_mode.insert(key.clone(), prefix);
+                }
+                return;
+            }
+            let (display_text, submitted_payload) = match side_prefix {
+                Some(prefix) => (prefix.compose(&base_display), prefix.compose(&base_payload)),
+                None => (base_display, base_payload),
+            };
+            self.chat.editing_queued.remove(key);
             self.cancel_auto_continue(key, cx);
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
@@ -3665,7 +3880,10 @@ impl Shell {
                 &display_text,
                 cx,
             );
-            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            input.update(cx, |state, cx| {
+                state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+                state.set_value(String::new(), window, cx);
+            });
             self.chat.draft_attachments.remove(key);
             self.chat.image_tokens.remove(key);
             if let Some(ac) = self.chat.autocomplete.get_mut(key) {
@@ -3713,12 +3931,19 @@ impl Shell {
             .get(key)
             .cloned()
             .unwrap_or_default();
-        let Some(submitted_payload) =
-            build_chat_payload_with_tokens(&raw_text, &tokens, &attachments)
+        let Some(base_payload) = build_chat_payload_with_tokens(&raw_text, &tokens, &attachments)
         else {
             return;
         };
-        let display_text = strip_image_token_spans(&raw_text, &tokens);
+        let base_display = strip_image_token_spans(&raw_text, &tokens);
+        let side_prefix = self.chat.side_chat_mode.get(key).cloned();
+        if side_prefix.is_some() && base_display.trim().is_empty() {
+            return;
+        }
+        let (display_text, submitted_payload) = match &side_prefix {
+            Some(prefix) => (prefix.compose(&base_display), prefix.compose(&base_payload)),
+            None => (base_display, base_payload),
+        };
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
@@ -3737,6 +3962,8 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(key);
+        self.chat.side_chat_mode.remove(key);
+        self.chat.editing_queued.remove(key);
         let (origin_epoch, origin_item, opens_terminal, local_slash) =
             self.pending_prompt_meta(key, &submitted_payload, attachments.is_empty());
         self.cancel_auto_continue(key, cx);
@@ -3748,7 +3975,10 @@ impl Shell {
             &display_text,
             cx,
         );
-        input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        input.update(cx, |state, cx| {
+            state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+            state.set_value(String::new(), window, cx);
+        });
         self.chat.draft_attachments.remove(key);
         self.chat.image_tokens.remove(key);
         if let Some(ac) = self.chat.autocomplete.get_mut(key) {
@@ -3906,6 +4136,9 @@ impl Shell {
             let before = log.queued_prompts.len();
             log.queued_prompts.retain(|q| q.id != queued_id);
             if log.queued_prompts.len() != before {
+                if self.chat.queued_focused.get(key) == Some(&queued_id) {
+                    self.chat.queued_focused.remove(key);
+                }
                 self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
                 cx.notify();
             }
@@ -4491,25 +4724,9 @@ pub(super) struct PendingReview<'a> {
     pub immediate_send_failure: bool,
 }
 
+#[cfg(test)]
 fn format_chat_quote(text: &str) -> Option<String> {
-    let stripped = krill_app::pull_request::checks::strip_ansi_codes(text);
-    let cleaned = krill_term::select::clean_text(&stripped);
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut quoted = String::new();
-    for line in trimmed.lines() {
-        if line.is_empty() {
-            quoted.push_str(">\n");
-        } else {
-            quoted.push_str("> ");
-            quoted.push_str(line);
-            quoted.push('\n');
-        }
-    }
-    quoted.push('\n');
-    Some(quoted)
+    selection_quote::format_selection_quote(text)
 }
 
 struct PendingDispatch {
@@ -4646,30 +4863,85 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(quoted) = format_chat_quote(text) else {
-            return;
-        };
-        let input = self.ensure_chat_input(key.clone(), window, cx);
-        input.update(cx, |state, cx| {
-            let current = state.value().to_string();
-            let mut next = String::new();
-            if !current.is_empty() {
-                next.push_str(&current);
-                if !current.ends_with("\n\n") {
-                    if current.ends_with('\n') {
-                        next.push('\n');
-                    } else {
-                        next.push_str("\n\n");
-                    }
-                }
+        struct ComposerTarget<'a, 'b> {
+            state: &'a mut TextareaState,
+            window: &'a mut Window,
+            cx: &'a mut Context<'b, TextareaState>,
+        }
+        impl selection_quote::SelectionQuoteTarget for ComposerTarget<'_, '_> {
+            fn current_draft(&self) -> String {
+                self.state.value().to_string()
             }
-            next.push_str(&quoted);
-            state.set_value(next, window, cx);
-            state.focus(window, cx);
+            fn set_draft_and_focus(&mut self, next: String) {
+                self.state.set_value(next, self.window, self.cx);
+                self.state.focus(self.window, self.cx);
+            }
+        }
+        if selection_quote::format_selection_quote(text).is_none() {
+            return;
+        }
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        let applied = input.update(cx, |state, cx| {
+            let mut target = ComposerTarget { state, window, cx };
+            selection_quote::quote_selection_for_composer(&mut target, text)
         });
-        self.chat.history_cursor.remove(key);
-        self.chat.history_saved_draft.remove(key);
+        if applied {
+            self.chat.history_cursor.remove(key);
+            self.chat.history_saved_draft.remove(key);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn sync_chat_selection_quote(
+        &mut self,
+        key: &ChatKey,
+        anchor: Option<gpui::Point<gpui::Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = gpui_component::TextSelection::selected_text(window, cx);
+        if selected.trim().is_empty() {
+            let cleared = self.chat.selection_quote.take().is_some();
+            self.chat.selection_quote_dismissed = None;
+            if cleared {
+                cx.notify();
+            }
+            return;
+        }
+        if self.chat.selection_quote_dismissed.as_deref() == Some(selected.as_str()) {
+            return;
+        }
+        self.chat.selection_quote = Some(selection_quote::ActiveSelectionQuote {
+            key: key.clone(),
+            text: selected,
+            _anchor: anchor,
+        });
         cx.notify();
+    }
+
+    pub(super) fn dismiss_chat_selection_quote(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let live = gpui_component::TextSelection::selected_text(window, cx);
+        let had_active = self
+            .chat
+            .selection_quote
+            .as_ref()
+            .is_some_and(|sq| &sq.key == key)
+            || !live.trim().is_empty();
+        if !had_active {
+            return false;
+        }
+        if !live.trim().is_empty() {
+            self.chat.selection_quote_dismissed = Some(live);
+        }
+        self.chat.selection_quote = None;
+        gpui_component::TextSelection::clear(window, cx);
+        cx.notify();
+        true
     }
 
     pub(super) fn quote_chat_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5220,7 +5492,7 @@ impl Shell {
             reason = "test builds read self.chat.now_override"
         )
     )]
-    fn chat_now_epoch_ms(&self) -> u64 {
+    pub(super) fn chat_now_epoch_ms(&self) -> u64 {
         let system_now_ms = || {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -6088,6 +6360,7 @@ impl Shell {
         if let Some(ac) = self.chat.autocomplete.get_mut(key) {
             ac.close();
         }
+        self.sync_side_chat_pill(key, window, cx);
         cx.notify();
         true
     }

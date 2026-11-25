@@ -4464,14 +4464,17 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
 
         // Inject orchestration snapshot with 1 Active + 1 Stopped worker for this chat,
         // and also mark SESSION as a worker dispatch for `#43521` auto-close banner test.
+        let now_secs = 1_800_000_000u64;
+        let now_ms = now_secs * 1_000;
+        s.chat.now_override = Some(now_secs);
         let mut orch = krill_proto::orchestration::OrchestrationStore::default();
         orch.runs.push(krill_proto::orchestration::Run {
             id: "run-1".into(),
             title: "Wave 2B".into(),
             coordinator_session_id: Some(SESSION.0),
             status: krill_proto::orchestration::RunStatus::Active,
-            created_at_ms: 1,
-            updated_at_ms: 1,
+            created_at_ms: now_ms - 60_000,
+            updated_at_ms: now_ms,
         });
         orch.dispatches.push(krill_proto::orchestration::Dispatch {
             id: "disp-active".into(),
@@ -4479,7 +4482,7 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
             task_id: None,
             worker_name: "researcher".into(),
             agent: "agy".into(),
-            session_id: Some(901),
+            session_id: None,
             depth: 1,
             cwd: "/tmp".into(),
             prompt: "Investigate long background task description wrapping cleanly across lines"
@@ -4487,7 +4490,7 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
             status: krill_proto::orchestration::DispatchStatus::Active,
             summary: None,
             archived_output: None,
-            started_at_ms: 10,
+            started_at_ms: now_ms - 30_000,
             ended_at_ms: None,
             release_state: krill_proto::orchestration::DispatchReleaseState::Active,
             session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
@@ -4509,9 +4512,9 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
             status: krill_proto::orchestration::DispatchStatus::Stopped,
             summary: Some("Stopped by user".into()),
             archived_output: None,
-            started_at_ms: 10,
-            ended_at_ms: Some(20),
-            release_state: krill_proto::orchestration::DispatchReleaseState::Released,
+            started_at_ms: now_ms - 30_000,
+            ended_at_ms: Some(now_ms - 5_000),
+            release_state: krill_proto::orchestration::DispatchReleaseState::Active,
             session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
             model: None,
             effort: None,
@@ -4531,7 +4534,7 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
             status: krill_proto::orchestration::DispatchStatus::Active,
             summary: None,
             archived_output: None,
-            started_at_ms: 10,
+            started_at_ms: now_ms - 30_000,
             ended_at_ms: None,
             release_state: krill_proto::orchestration::DispatchReleaseState::Active,
             session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
@@ -4900,6 +4903,16 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
                 .insert((key.clone(), "req:1".into()));
             s.chat.resume_toast = Some((key.clone(), "ready".into()));
             s.chat.resume_search.insert(key.clone(), "triage".into());
+            s.chat
+                .side_chat_mode
+                .insert(key.clone(), super::side_chat::SideChatPrefix::btw());
+            s.chat.editing_queued.insert(key.clone());
+            s.chat.queued_focused.insert(key.clone(), 42);
+            s.chat.selection_quote = Some(super::selection_quote::ActiveSelectionQuote {
+                key: key.clone(),
+                text: "quoted".into(),
+                _anchor: None,
+            });
 
             s.rebind_chat_session(&HostId::Local, SESSION, rebind_to, &[pane]);
             let new_key = local_key(rebind_to);
@@ -4910,6 +4923,16 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             assert!(s.chat.agy_auth_picker.contains(&new_key));
             assert!(s.chat.worker_dock_expanded.contains(&new_key));
             assert!(s.chat.worker_keep_open.contains(&rebind_to));
+            assert_eq!(
+                s.chat.side_chat_mode.get(&new_key),
+                Some(&super::side_chat::SideChatPrefix::btw())
+            );
+            assert!(s.chat.editing_queued.contains(&new_key));
+            assert_eq!(s.chat.queued_focused.get(&new_key), Some(&42));
+            assert_eq!(
+                s.chat.selection_quote.as_ref().map(|sq| &sq.key),
+                Some(&new_key)
+            );
             assert_eq!(
                 s.chat.question_batch_step.get(&(new_key.clone(), 0)),
                 Some(&1)
@@ -4948,7 +4971,22 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             s.chat.agy_auth_picker.insert(stale_key.clone());
             s.chat.worker_dock_expanded.insert(stale_key.clone());
             s.chat.worker_dock_cleared.insert("gone-dispatch".into());
+            s.chat
+                .worker_dock_owner_stopped
+                .insert("gone-owner-stop".into());
             s.chat.worker_keep_open.insert(SessionId(8888));
+            s.chat.worker_banner_kept.insert("gone-banner".into());
+            s.chat
+                .side_chat_mode
+                .insert(stale_key.clone(), super::side_chat::SideChatPrefix::btw());
+            s.chat.editing_queued.insert(stale_key.clone());
+            s.chat.queued_focused.insert(stale_key.clone(), 99);
+            s.chat.selection_quote = Some(super::selection_quote::ActiveSelectionQuote {
+                key: stale_key.clone(),
+                text: "stale".into(),
+                _anchor: None,
+            });
+            s.chat.selection_quote_dismissed = Some("stale".into());
             s.chat.question_batch_step.insert((stale_key.clone(), 0), 1);
             s.chat
                 .question_batch_answers
@@ -4971,7 +5009,14 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             assert!(!s.chat.agy_auth_picker.contains(&stale_key));
             assert!(!s.chat.worker_dock_expanded.contains(&stale_key));
             assert!(!s.chat.worker_dock_cleared.contains("gone-dispatch"));
+            assert!(!s.chat.worker_dock_owner_stopped.contains("gone-owner-stop"));
             assert!(!s.chat.worker_keep_open.contains(&SessionId(8888)));
+            assert!(!s.chat.worker_banner_kept.contains("gone-banner"));
+            assert!(!s.chat.side_chat_mode.contains_key(&stale_key));
+            assert!(!s.chat.editing_queued.contains(&stale_key));
+            assert!(!s.chat.queued_focused.contains_key(&stale_key));
+            assert!(s.chat.selection_quote.is_none());
+            assert!(s.chat.selection_quote_dismissed.is_none());
             assert!(
                 !s.chat
                     .question_batch_step
@@ -5165,4 +5210,719 @@ fn s2_17_question_batch_cleans_empty_multi_submits_all_steps_and_guards_stale(
         shell.read_with(cx, |s, _| s.chat.question_batch_answers.is_empty()),
         "S2-17: non-current question batch must not accept option clicks"
     );
+}
+
+#[gpui::test]
+fn chat_worker_dock_renders_above_composer_counts_active_only_and_clears_failures(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::control::AgentState;
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, OrchestrationStore,
+        Run, RunStatus,
+    };
+
+    struct MultiSessionSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for MultiSessionSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = fixture(cx, "chat-worker-dock-ui", vec![]);
+    let now_secs = 1_800_000_000u64;
+    let now_ms = now_secs * 1000;
+    let worker_working = SessionId(901);
+    let worker_waiting = SessionId(902);
+    let worker_exited = SessionId(903);
+
+    shell.update(cx, |s, cx| {
+        s.chat.now_override = Some(now_secs);
+        s.sidebar_bots = vec![bot_for(SESSION, false)];
+        let snap = krill_app::sidebar::Snapshot {
+            sessions: vec![
+                krill_app::sidebar::Session {
+                    id: SESSION,
+                    status: krill_proto::control::AgentStatus {
+                        state: AgentState::Done,
+                        agent: "claude".into(),
+                        since_unix_ns: now_secs * 1_000_000_000,
+                        ..krill_proto::control::AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                },
+                krill_app::sidebar::Session {
+                    id: worker_working,
+                    status: krill_proto::control::AgentStatus {
+                        state: AgentState::Working,
+                        agent: "claude".into(),
+                        since_unix_ns: now_secs * 1_000_000_000,
+                        ..krill_proto::control::AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                },
+                krill_app::sidebar::Session {
+                    id: worker_waiting,
+                    status: krill_proto::control::AgentStatus {
+                        state: AgentState::Waiting,
+                        agent: "codex".into(),
+                        since_unix_ns: now_secs * 1_000_000_000,
+                        ..krill_proto::control::AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                },
+                krill_app::sidebar::Session {
+                    id: worker_exited,
+                    status: krill_proto::control::AgentStatus {
+                        state: AgentState::Exited,
+                        agent: "claude".into(),
+                        since_unix_ns: now_secs * 1_000_000_000,
+                        ..krill_proto::control::AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                },
+            ],
+            trees: std::collections::BTreeMap::new(),
+        };
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(MultiSessionSource(snap)), cx);
+        });
+        let mk = |id: &str, name: &str, sid: Option<u64>, status: DispatchStatus| Dispatch {
+            id: id.into(),
+            run_id: "run-dock".into(),
+            task_id: None,
+            worker_name: name.into(),
+            agent: "claude".into(),
+            session_id: sid,
+            depth: 1,
+            cwd: "/tmp/repo".into(),
+            prompt: "task".into(),
+            status,
+            summary: None,
+            archived_output: None,
+            started_at_ms: now_ms - 60_000,
+            ended_at_ms: (status != DispatchStatus::Active).then_some(now_ms - 5_000),
+            release_state: DispatchReleaseState::Active,
+            session_origin: DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        };
+        s.orch_snapshot = Arc::new(OrchestrationStore {
+            runs: vec![Run {
+                id: "run-dock".into(),
+                title: "Dock".into(),
+                coordinator_session_id: Some(SESSION.0),
+                status: RunStatus::Active,
+                created_at_ms: now_ms - 120_000,
+                updated_at_ms: now_ms,
+            }],
+            dispatches: vec![
+                mk(
+                    "d-w1",
+                    "worker-1",
+                    Some(worker_working.0),
+                    DispatchStatus::Active,
+                ),
+                mk(
+                    "d-w2",
+                    "worker-2",
+                    Some(worker_waiting.0),
+                    DispatchStatus::Active,
+                ),
+                mk(
+                    "d-ex",
+                    "worker-cut",
+                    Some(worker_exited.0),
+                    DispatchStatus::Active,
+                ),
+                mk("d-f1", "worker-f1", None, DispatchStatus::Failed),
+                mk("d-f2", "worker-f2", None, DispatchStatus::Failed),
+            ],
+            ..OrchestrationStore::default()
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let dock = cx
+        .debug_bounds("chat-worker-dock")
+        .expect("worker dock renders above composer");
+    let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
+    assert!(
+        dock.bottom() <= composer.top(),
+        "worker dock {dock:?} must sit above composer {composer:?}"
+    );
+    assert!(cx.debug_bounds("chat-worker-dock-list").is_none());
+
+    // Active-only count is 1 (only worker-1 is actively Working).
+    shell.read_with(cx, |s, cx| {
+        let snap = s.worker_dock_snapshot(&local_key(SESSION), cx);
+        assert_eq!(snap.active_count, 1);
+        assert_eq!(snap.needs_you_count, 1);
+        assert_eq!(snap.failed_count, 3);
+    });
+
+    // Expand dock and verify rows, per-row Clear, and Clear all.
+    let toggle = cx.debug_bounds("chat-worker-dock-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-dock-list").is_some());
+    assert!(cx.debug_bounds("chat-worker-dock-clear").is_some());
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-w1").is_some());
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-ex").is_some());
+
+    let clear_f1 = cx.debug_bounds("chat-worker-dock-clear-d-f1").unwrap();
+    cx.simulate_click(clear_f1.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-f1").is_none());
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-f2").is_some());
+
+    let clear_all = cx.debug_bounds("chat-worker-dock-clear").unwrap();
+    cx.simulate_click(clear_all.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-f2").is_none());
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-ex").is_none());
+    assert!(cx.debug_bounds("chat-worker-dock-clear").is_none());
+    assert!(cx.debug_bounds("chat-worker-dock-row-d-w1").is_some());
+
+    // Clicking a bot-spawned worker opens it and defaults to Chat view.
+    let row_w1 = cx.debug_bounds("chat-worker-dock-row-d-w1").unwrap();
+    cx.simulate_click(row_w1.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        assert_eq!(s.layout.session(pane), Some(worker_working));
+        assert_eq!(s.layout.chat_view(pane), None);
+        assert!(
+            s.is_pane_chat_view(pane, cx),
+            "bot-spawned worker defaults to Chat view"
+        );
+    });
+
+    // Explicitly switching to Terminal overrides the bot-spawned worker Chat default.
+    let term_btn = cx.debug_bounds("chat-switch-terminal").unwrap();
+    cx.simulate_click(term_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        assert_eq!(s.layout.chat_view(pane), Some(false));
+        assert!(!s.is_pane_chat_view(pane, cx));
+    });
+}
+
+#[gpui::test]
+fn temporary_chat_worker_banner_renders_countdown_and_keep_open_removes_it(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, OrchestrationStore,
+        Run, RunStatus,
+    };
+
+    let (shell, cx) = fixture(cx, "chat-temp-worker-banner-ui", vec![]);
+    let now_secs = 1_800_000_000u64;
+    let now_ms = now_secs * 1000;
+    let make_store = |status: DispatchStatus, ended_at_ms: Option<u64>| {
+        Arc::new(OrchestrationStore {
+            runs: vec![Run {
+                id: "run-temp".into(),
+                title: "Temp".into(),
+                coordinator_session_id: Some(500),
+                status: RunStatus::Active,
+                created_at_ms: now_ms - 60_000,
+                updated_at_ms: now_ms,
+            }],
+            dispatches: vec![Dispatch {
+                id: "disp-temp".into(),
+                run_id: "run-temp".into(),
+                task_id: None,
+                worker_name: "worker-alpha".into(),
+                agent: "claude".into(),
+                session_id: Some(SESSION.0),
+                depth: 1,
+                cwd: "/tmp/repo".into(),
+                prompt: "work".into(),
+                status,
+                summary: None,
+                archived_output: None,
+                started_at_ms: now_ms - 60_000,
+                ended_at_ms,
+                release_state: DispatchReleaseState::Active,
+                session_origin: DispatchSessionOrigin::Created,
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            }],
+            ..OrchestrationStore::default()
+        })
+    };
+
+    // Active temporary worker renders banner above feed.
+    shell.update(cx, |s, cx| {
+        s.chat.now_override = Some(now_secs);
+        s.orch_snapshot = make_store(DispatchStatus::Active, None);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let banner = cx
+        .debug_bounds("chat-worker-auto-close-banner")
+        .expect("running temp worker banner visible");
+    let feed = cx.debug_bounds("desktop-chat-feed").unwrap();
+    assert!(banner.bottom() <= feed.top());
+    assert!(cx.debug_bounds("chat-worker-keep-open").is_some());
+
+    // Settled worker shows live 2-minute countdown banner.
+    shell.update(cx, |s, cx| {
+        s.orch_snapshot = make_store(DispatchStatus::Succeeded, Some(now_ms - 30_000));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-auto-close-banner").is_some());
+    shell.read_with(cx, |s, _| {
+        let state = worker_dock::temporary_worker_banner_for_session(
+            &s.orch_snapshot,
+            SESSION,
+            &s.chat.worker_banner_kept,
+            s.chat_now_epoch_ms(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.phase,
+            worker_dock::TemporaryWorkerPhase::Settled {
+                remaining_ms: 90_000
+            }
+        );
+    });
+
+    // Clicking `Keep open` hides the banner immediately and retains the dispatch.
+    let keep = cx.debug_bounds("chat-worker-keep-open").unwrap();
+    cx.simulate_click(keep.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-auto-close-banner").is_none());
+    shell.read_with(cx, |s, _| {
+        assert!(s.chat.worker_keep_open.contains(&SESSION));
+        assert!(s.chat.worker_banner_kept.contains("disp-temp"));
+        assert_eq!(
+            s.orch_snapshot.dispatches[0].release_state,
+            DispatchReleaseState::Retained
+        );
+    });
+}
+
+#[gpui::test]
+fn side_chat_pill_activates_dismisses_and_preserves_command_on_submit(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(cx, "chat-side-pill-ui", vec![]);
+    let key = local_key(SESSION);
+    let sent: SentBytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sent_clone = sent.clone();
+
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            attach_live_test_pane(s, pane, SESSION, cx);
+            s.chat.send_input = Some(Box::new(move |bytes| {
+                sent_clone.lock().unwrap().push(bytes);
+                true
+            }));
+            s.ensure_chat_input(key.clone(), window, cx)
+        })
+    });
+    cx.run_until_parked();
+
+    // Typing `/btw ` via text input activates the muted Side chat pill and empties input.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            gpui::EntityInputHandler::replace_text_in_range(state, None, "/btw ", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_some());
+    assert_eq!(input.read_with(cx, |s, _| s.value().to_string()), "");
+
+    // Pressing Backspace at offset 0 turns the pill back into `/btw`.
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_none());
+    assert_eq!(input.read_with(cx, |s, _| s.value().to_string()), "/btw");
+
+    // Typing `/side keep this` activates the pill; clicking it dismisses back to normal draft.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            gpui::EntityInputHandler::replace_text_in_range(
+                state,
+                None,
+                "/side keep this",
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_some());
+    assert_eq!(
+        input.read_with(cx, |s, _| s.value().to_string()),
+        "keep this"
+    );
+    let pill = cx.debug_bounds("chat-side-chat-pill").unwrap();
+    cx.simulate_click(pill.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_none());
+    assert_eq!(
+        input.read_with(cx, |s, _| s.value().to_string()),
+        "keep this"
+    );
+
+    // Submitting with active `/btw ` pill preserves `/btw <question>` in the wire payload.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            gpui::EntityInputHandler::replace_text_in_range(
+                state,
+                None,
+                "/btw what does the fork keep?",
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_none());
+    let payload = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect::<String>();
+    assert!(
+        payload.contains("/btw what does the fork keep?"),
+        "expected /btw prefix preserved in sent payload, got {payload:?}"
+    );
+}
+
+#[gpui::test]
+fn queued_messages_keep_steer_visible_and_support_edit_delete_and_steer(cx: &mut TestAppContext) {
+    use krill_proto::control::AgentState;
+
+    let (shell, cx) = fixture(cx, "chat-queued-actions-ui", vec![]);
+    let key = local_key(SESSION);
+    let sent: SentBytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sent_clone = sent.clone();
+
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            attach_live_test_pane(s, pane, SESSION, cx);
+            s.chat.send_input = Some(Box::new(move |bytes| {
+                sent_clone.lock().unwrap().push(bytes);
+                true
+            }));
+            s.ensure_chat_input(key.clone(), window, cx)
+        })
+    });
+    set_phase2b_session_state(&shell, cx, AgentState::Working, 100);
+
+    // Queue two editable prompts + one attachment-only prompt while Working.
+    for text in ["first queued task", "second queued task"] {
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+            shell.update(cx, |s, cx| s.submit_chat_prompt(&key, window, cx));
+        });
+        cx.run_until_parked();
+    }
+    shell.update(cx, |s, cx| {
+        s.chat
+            .logs
+            .entry(key.clone())
+            .or_default()
+            .queued_prompts
+            .push_back(QueuedChatPrompt {
+                id: 9999,
+                display_text: String::new(),
+                submitted_payload: "/tmp/only.png".into(),
+                attachments: vec![DraftAttachment {
+                    path: std::path::PathBuf::from("/tmp/only.png"),
+                    preview_path: None,
+                    display_name: "only.png".into(),
+                    byte_len: 12,
+                    is_image: true,
+                }],
+            });
+        s.chat.pending_revision = s.chat.pending_revision.wrapping_add(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let (id1, id2, id3) = shell.read_with(cx, |s, _| {
+        let q = &s.chat.logs[&key].queued_prompts;
+        assert_eq!(q.len(), 3);
+        (q[0].id, q[1].id, q[2].id)
+    });
+
+    // Steer is visible on queued rows at rest; focusing row 2 does not shift Steer bounds.
+    let steer_before = cx
+        .debug_bounds("chat-queued-steer")
+        .expect("Steer visible at rest");
+    shell.update(cx, |s, cx| s.focus_queued_chat_prompt(&key, id2, cx));
+    cx.run_until_parked();
+    let steer_after = cx.debug_bounds("chat-queued-steer").unwrap();
+    assert_eq!(
+        steer_before, steer_after,
+        "revealing Edit/Delete on focus must not shift Steer"
+    );
+
+    // Edit loads the second queued prompt back into the composer and removes it from the queue.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| s.edit_queued_chat_prompt(&key, id2, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        input.read_with(cx, |s, _| s.value().to_string()),
+        "second queued task"
+    );
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.logs[&key].queued_prompts.len(), 2);
+        assert_eq!(s.chat.logs[&key].queued_prompts[0].id, id1);
+        assert_eq!(s.chat.logs[&key].queued_prompts[1].id, id3);
+    });
+
+    // Attachment-only queued prompt cannot be edited into text, and Delete removes it cleanly.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| s.edit_queued_chat_prompt(&key, id3, window, cx));
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.logs[&key].queued_prompts.len(), 2);
+    });
+    shell.update(cx, |s, cx| s.remove_queued_chat_prompt(&key, id3, cx));
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.logs[&key].queued_prompts.len(), 1);
+    });
+
+    // Steer on the remaining queued row sends it immediately and clears the queue.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.steer_queued_chat_prompt(&key, id1, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(s.chat.logs[&key].queued_prompts.is_empty());
+    });
+    let all_sent: String = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect();
+    assert!(
+        all_sent.contains("first queued task"),
+        "expected steered queued prompt in sent bytes, got {all_sent:?}"
+    );
+}
+
+#[gpui::test]
+fn cross_message_image_lightbox_steps_across_messages_with_counter(cx: &mut TestAppContext) {
+    let dir = state_path("chat-cross-msg-lightbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png_a = dir.join("a.png");
+    let png_b = dir.join("b.png");
+    let png_c = dir.join("c.png");
+    for (p, color) in [
+        (&png_a, [20, 40, 60, 255]),
+        (&png_b, [60, 80, 100, 255]),
+        (&png_c, [100, 120, 140, 255]),
+    ] {
+        image::RgbaImage::from_pixel(16, 16, image::Rgba(color))
+            .save(p)
+            .unwrap();
+    }
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-cross-msg-lightbox-ui",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "[Image #1] [Image #2] first".into(),
+                file_path: format!("{}\n{}", png_a.display(), png_b.display()),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Looks good.".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "[Image #1] second".into(),
+                file_path: png_c.display().to_string(),
+                ..Default::default()
+            },
+        ],
+    );
+
+    // Click image 0 in message 0 (first image overall) -> captures all 3 images across messages.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let base = s.chat.logs[&local_key(SESSION)].base_index;
+            s.open_chat_message_image_viewer(
+                &local_key(SESSION),
+                base,
+                0,
+                vec![png_a.clone(), png_b.clone()],
+                vec![1, 2],
+                0,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_some());
+    assert!(cx.debug_bounds("chat-image-viewer-counter").is_some());
+    shell.read_with(cx, |s, _| {
+        let v = s.chat.images.viewer.as_ref().unwrap();
+        assert_eq!(v.paths, vec![png_a.clone(), png_b.clone(), png_c.clone()]);
+        assert_eq!(v.index, 0);
+    });
+
+    // Step across message boundary via Right arrow and Next button; bounds clamp cleanly.
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.images.viewer.as_ref().unwrap().index, 1);
+    });
+    let next = cx.debug_bounds("chat-image-viewer-next").unwrap();
+    cx.simulate_click(next.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.images.viewer.as_ref().unwrap().index, 2);
+    });
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.chat.images.viewer.as_ref().unwrap().index,
+            2,
+            "clamped at last image"
+        );
+    });
+    cx.simulate_keystrokes("left");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.images.viewer.as_ref().unwrap().index, 1);
+    });
+    let prev = cx.debug_bounds("chat-image-viewer-previous").unwrap();
+    cx.simulate_click(prev.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.images.viewer.as_ref().unwrap().index, 0);
+    });
+    cx.simulate_keystrokes("left");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.chat.images.viewer.as_ref().unwrap().index,
+            0,
+            "clamped at first image"
+        );
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn selection_quote_floating_add_to_chat_appends_after_existing_draft(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-selection-add-to-chat-ui",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "First reply line\nSecond reply line".into(),
+            ..Default::default()
+        }],
+    );
+    let key = local_key(SESSION);
+
+    // Pre-fill composer draft and move focus out of composer so reply selection is active.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("Existing note", window, cx);
+            });
+            window.focus(&s.focus, cx);
+            s.chat.selection_quote = Some(selection_quote::ActiveSelectionQuote {
+                key: key.clone(),
+                text: "First reply line\nSecond reply line".into(),
+                _anchor: None,
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    let add_btn = cx
+        .debug_bounds("chat-selection-add-to-chat")
+        .expect("floating Add to chat button visible on selection");
+    cx.simulate_click(add_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-selection-add-to-chat").is_none());
+    shell.read_with(cx, |s, cx| {
+        let val = s.chat.inputs[&key].0.read(cx).value().to_string();
+        assert_eq!(
+            val,
+            "Existing note\n\n> First reply line\n> Second reply line\n\n"
+        );
+    });
+
+    // Dismissing selection quote clears the floating button without modifying the draft.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            window.focus(&s.focus, cx);
+            s.chat.selection_quote = Some(selection_quote::ActiveSelectionQuote {
+                key: key.clone(),
+                text: "Dismiss me".into(),
+                _anchor: None,
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-selection-add-to-chat").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            assert!(s.dismiss_chat_selection_quote(&key, window, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-selection-add-to-chat").is_none());
+    shell.read_with(cx, |s, cx| {
+        let val = s.chat.inputs[&key].0.read(cx).value().to_string();
+        assert_eq!(
+            val,
+            "Existing note\n\n> First reply line\n> Second reply line\n\n"
+        );
+    });
 }

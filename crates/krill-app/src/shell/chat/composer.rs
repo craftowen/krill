@@ -875,7 +875,9 @@ impl Shell {
             .map(|log| log.queued_prompts.iter().cloned().collect())
             .unwrap_or_default();
         let is_working_now = agent_state == krill_proto::control::AgentState::Working;
-        // Orca `#47346`: queued rows keep Steer always visible and reveal Edit & Delete on hover.
+        let focused_queued = self.chat.queued_focused.get(&key).copied();
+        // Orca `#47346`: queued rows keep Steer always visible and reveal Edit & Delete on hover
+        // or keyboard focus without layout shift.
         let queued_strip = (!queued_prompts.is_empty()).then(|| {
             let q_key = key.clone();
             div()
@@ -899,7 +901,10 @@ impl Shell {
                     let cancel_key = q_key.clone();
                     let edit_key = q_key.clone();
                     let steer_key = q_key.clone();
+                    let focus_key = q_key.clone();
                     let q_id = queued.id;
+                    let editable = !queued.display_text.trim().is_empty();
+                    let row_focused = focused_queued == Some(q_id);
                     let row_group = SharedString::from(format!("chat-queued-row-{q_id}"));
                     let preview: String = queued.display_text.trim().chars().take(96).collect();
                     let label = if preview.is_empty() {
@@ -917,9 +922,19 @@ impl Shell {
                         .id(SharedString::from(format!("chat-queued-{q_id}")))
                         .debug_selector(|| "chat-queued-item".into())
                         .group(row_group.clone())
+                        .tab_index(0)
+                        .focus_visible(|d| d.border_color(palette.ring))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.focus_queued_chat_prompt(&focus_key, q_id, cx);
+                            }),
+                        )
                         .w_full()
                         .min_w_0()
                         .when(idx > 0, |d| d.border_t_1().border_color(palette.border))
+                        .when(row_focused, |d| d.bg(palette.muted))
                         .px_2p5()
                         .py_1p5()
                         .flex()
@@ -954,29 +969,51 @@ impl Shell {
                                 .flex()
                                 .items_center()
                                 .gap_0p5()
-                                // Edit & Delete reveal on hover (`#47346`).
+                                // Edit & Delete reveal on hover/focus without shifting Steer (`#47346`).
+                                .when(editable, |d| {
+                                    d.child(
+                                        div()
+                                            .flex_none()
+                                            .when(!row_focused, |d| {
+                                                d.invisible().group_hover(
+                                                    row_group.clone(),
+                                                    gpui::Styled::visible,
+                                                )
+                                            })
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "chat-queued-edit-{q_id}"
+                                                )))
+                                                .debug_selector(|| "chat-queued-edit".into())
+                                                .icon(gpui_kit_assets::IconName::Pencil)
+                                                .tooltip(ctext::EDIT_QUEUED.get())
+                                                .accessibility_label(ctext::EDIT_QUEUED.get())
+                                                .xsmall()
+                                                .ghost()
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    |_, _, cx| cx.stop_propagation(),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.edit_queued_chat_prompt(
+                                                            &edit_key, q_id, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                            ),
+                                    )
+                                })
                                 .child(
                                     div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_0p5()
-                                        .opacity(0.)
-                                        .group_hover(row_group.clone(), |s| s.opacity(1.))
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "chat-queued-edit-{q_id}"
-                                            )))
-                                            .debug_selector(|| "chat-queued-edit".into())
-                                            .icon(gpui_kit_assets::IconName::Pencil)
-                                            .tooltip(ctext::EDIT_QUEUED.get())
-                                            .xsmall()
-                                            .ghost()
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.edit_queued_chat_prompt(
-                                                    &edit_key, q_id, window, cx,
-                                                );
-                                            })),
-                                        )
+                                        .flex_none()
+                                        .when(!row_focused, |d| {
+                                            d.invisible().group_hover(
+                                                row_group.clone(),
+                                                gpui::Styled::visible,
+                                            )
+                                        })
                                         .child(
                                             Button::new(SharedString::from(format!(
                                                 "chat-queued-cancel-{q_id}"
@@ -984,9 +1021,14 @@ impl Shell {
                                             .debug_selector(|| "chat-queued-cancel".into())
                                             .icon(gpui_kit_assets::IconName::Trash)
                                             .tooltip(ctext::REMOVE_QUEUED.get())
+                                            .accessibility_label(ctext::REMOVE_QUEUED.get())
                                             .xsmall()
                                             .ghost()
+                                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
                                             .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
                                                 this.remove_queued_chat_prompt(
                                                     &cancel_key,
                                                     q_id,
@@ -1013,7 +1055,11 @@ impl Shell {
                                     })
                                     .xsmall()
                                     .ghost()
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
                                         this.steer_queued_chat_prompt(&steer_key, q_id, window, cx);
                                     })),
                                 ),
@@ -1535,43 +1581,31 @@ impl Shell {
                 }))
         });
 
-        // Orca `#42129`: typing `/btw` or `/side` shows a gray `Side chat` pill in the composer.
-        let draft_val = input_state.read(cx).value();
-        let is_side_chat = {
-            let t = draft_val.trim_start();
-            t == "/btw" || t.starts_with("/btw ") || t == "/side" || t.starts_with("/side ")
-        };
-        let side_chat_pill = is_side_chat.then(|| {
-            div()
-                .id(SharedString::from(format!(
-                    "chat-side-chat-pill-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-side-chat-pill".into())
-                .flex_none()
-                .self_start()
-                .mx_2()
-                .mt_1()
-                .px_1p5()
-                .py_0p5()
-                .rounded(ui::RADIUS_SM)
-                .border_1()
-                .border_color(palette.border)
-                .bg(palette.muted)
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_size(ui::TEXT_XS)
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(muted_fg)
-                .child(Icon::new(gpui_kit_assets::IconName::GitFork).size(px(ui::ICON_XS)))
-                .child(ctext::SIDE_CHAT_PILL.get())
-        });
+        // Orca `#42129`: leading `/btw ` or `/side ` shows a muted dismissible `Side chat` pill.
+        let side_chat_pill = self
+            .chat
+            .side_chat_mode
+            .get(&key)
+            .cloned()
+            .map(|prefix| super::side_chat::render_side_chat_pill(pane, &key, &prefix, cx));
 
         let worker_dock = self.render_chat_worker_dock(pane, &key, cx);
         let inner_card = div()
             .id("desktop-chat-composer")
             .debug_selector(|| "desktop-chat-composer".into())
+            .capture_action(cx.listener({
+                let bs_key = key.clone();
+                let bs_input = input_state.clone();
+                move |this, _: &gpui_component::input::Backspace, window, cx| {
+                    if bs_input.read(cx).focus_handle(cx).is_focused(window)
+                        && !super::Shell::chat_input_is_composing(&bs_input, window, cx)
+                        && this.side_chat_backspace(&bs_key, window, cx)
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .capture_action(cx.listener({
                 let up_key = key.clone();
                 let up_input = input_state.clone();
@@ -2243,284 +2277,6 @@ impl Shell {
 }
 
 impl Shell {
-    /// Orca `#47149` + `#47432` + `#47774` + `#47359`: combined worker dock directly above
-    /// the composer. Counts only active workers, shows `Stopped` on stopped workers, shares
-    /// one working spinner, uses full-width row hover, and wraps long task summaries.
-    fn render_chat_worker_dock(
-        &self,
-        pane: PaneId,
-        key: &ChatKey,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        use krill_proto::orchestration::DispatchStatus;
-        let orch = self.orch_snapshot_for(&key.0)?;
-        let run_ids: BTreeSet<&str> = orch
-            .runs
-            .iter()
-            .filter(|r| r.coordinator_session_id == Some(key.1.0))
-            .map(|r| r.id.as_str())
-            .collect();
-        if run_ids.is_empty() {
-            return None;
-        }
-        let dispatches: Vec<&krill_proto::orchestration::Dispatch> = orch
-            .dispatches
-            .iter()
-            .filter(|d| {
-                run_ids.contains(d.run_id.as_str())
-                    && !self.chat.worker_dock_cleared.contains(&d.id)
-            })
-            .collect();
-        if dispatches.is_empty() {
-            return None;
-        }
-        let palette = ui::palette(cx);
-        let active_count = dispatches
-            .iter()
-            .filter(|d| d.status == DispatchStatus::Active)
-            .count();
-        let has_settled = dispatches
-            .iter()
-            .any(|d| d.status != DispatchStatus::Active);
-        let expanded = self.chat.worker_dock_expanded.contains(key);
-        let heading = match active_count {
-            0 => ctext::WORKER_DOCK_EMPTY.get().to_owned(),
-            1 => ctext::WORKER_DOCK_COUNT_ONE.get().to_owned(),
-            n => ctext::WORKER_DOCK_COUNT_MANY.format(&[("n", &n.to_string())]),
-        };
-        let settled_ids: Vec<String> = dispatches
-            .iter()
-            .filter(|d| d.status != DispatchStatus::Active)
-            .map(|d| d.id.clone())
-            .collect();
-        let toggle_key = key.clone();
-        let host = key.0.clone();
-
-        let header = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "chat-worker-dock-toggle-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-worker-dock-toggle".into())
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .rounded(ui::RADIUS_SM)
-                    .px_1()
-                    .py_0p5()
-                    .hover(|s| s.bg(palette.secondary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.chat.worker_dock_expanded.remove(&toggle_key) {
-                            this.chat.worker_dock_expanded.insert(toggle_key.clone());
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(px(ui::ICON_XS))
-                        .text_color(palette.muted_foreground),
-                    )
-                    .when(active_count > 0, |d| {
-                        // Orca `#47774`: shared working spinner in the dock header.
-                        d.child(
-                            div()
-                                .debug_selector(|| "chat-worker-dock-spinner".into())
-                                .size(px(8.))
-                                .rounded_full()
-                                .bg(palette.agent_working()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .debug_selector(|| "chat-worker-dock-count".into())
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(palette.foreground)
-                            .child(heading),
-                    ),
-            )
-            .when(has_settled, |d| {
-                d.child(
-                    Button::new(SharedString::from(format!(
-                        "chat-worker-dock-clear-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-worker-dock-clear".into())
-                    .label(ctext::WORKER_DOCK_CLEAR_ALL.get())
-                    .ghost()
-                    .xsmall()
-                    .text_color(palette.muted_foreground)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        for id in &settled_ids {
-                            this.chat.worker_dock_cleared.insert(id.clone());
-                        }
-                        cx.notify();
-                    })),
-                )
-            });
-
-        let rows = expanded.then(|| {
-            div()
-                .id(SharedString::from(format!(
-                    "chat-worker-dock-list-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-worker-dock-list".into())
-                .w_full()
-                .min_w_0()
-                .border_t_1()
-                .border_color(palette.border.opacity(0.6))
-                .py_1()
-                .flex()
-                .flex_col()
-                .children(dispatches.iter().enumerate().map(|(ix, d)| {
-                    let (state_label, state_color) = match d.status {
-                        DispatchStatus::Active => {
-                            (ctext::WORKER_STATE_RUNNING.get(), palette.agent_working())
-                        }
-                        DispatchStatus::Stopped | DispatchStatus::Abandoned => {
-                            // Orca `#47432`: explicitly show Stopped for stopped workers.
-                            (ctext::WORKER_STATE_STOPPED.get(), palette.muted_foreground)
-                        }
-                        DispatchStatus::Failed => {
-                            (ctext::WORKER_STATE_FAILED.get(), palette.destructive)
-                        }
-                        DispatchStatus::Succeeded
-                        | DispatchStatus::Released
-                        | DispatchStatus::Retained => {
-                            (ctext::WORKER_STATE_DONE.get(), palette.success)
-                        }
-                    };
-                    let title = if d.worker_name.trim().is_empty() {
-                        d.agent.clone()
-                    } else {
-                        d.worker_name.clone()
-                    };
-                    let detail = d
-                        .summary
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or(d.prompt.as_str())
-                        .trim()
-                        .to_owned();
-                    let wsid = d.session_id.map(SessionId);
-                    let row_host = host.clone();
-                    div()
-                        .id(SharedString::from(format!(
-                            "chat-worker-dock-row-{ix}-{}",
-                            pane.get()
-                        )))
-                        .debug_selector(move || format!("chat-worker-dock-row-{ix}"))
-                        .w_full()
-                        .min_w_0()
-                        .px_3()
-                        .py_1()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .hover(|s| s.bg(palette.secondary))
-                        .when_some(wsid, |el, sid| {
-                            el.cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_worker_session_from_dock(row_host.clone(), sid, cx);
-                                }))
-                        })
-                        .child(
-                            div()
-                                .mt(px(5.))
-                                .flex_none()
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(state_color),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(ui::TEXT_XS)
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .text_color(palette.foreground)
-                                                .child(title),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .text_size(ui::TEXT_XS)
-                                                .text_color(state_color)
-                                                .child(state_label),
-                                        ),
-                                )
-                                .when(!detail.is_empty(), |el| {
-                                    // Orca `#47359`: long background task descriptions wrap cleanly.
-                                    el.child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_size(ui::TEXT_XS)
-                                            .text_color(palette.muted_foreground)
-                                            .child(detail),
-                                    )
-                                }),
-                        )
-                }))
-        });
-
-        Some(
-            div()
-                .id(SharedString::from(format!(
-                    "chat-worker-dock-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-worker-dock".into())
-                .w_full()
-                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                .min_w_0()
-                .mb_1()
-                .rounded(ui::RADIUS_MD)
-                .border_1()
-                .border_color(palette.border)
-                .bg(palette.muted.opacity(0.28))
-                .flex()
-                .flex_col()
-                .child(header)
-                .children(rows)
-                .into_any_element(),
-        )
-    }
-
     /// Orca's `NativeChatUsageLimitRow` (`#47079`): the gauge, "{agent} 사용량 한도에 도달했습니다"
     /// with when it can continue, Switch account, Continue after switch even when reset time is
     /// unknown, auto-continue clock, and more-options dropdown.
