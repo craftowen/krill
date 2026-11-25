@@ -2461,22 +2461,33 @@ fn side_chat_pill_parsing_and_support_rules() {
 
 #[test]
 fn cross_message_lightbox_collection_and_bounds_stepping() {
+    #[cfg(windows)]
+    let (a, b, diag, c) = (
+        r"C:\tmp\a.png",
+        r"C:\tmp\b.png",
+        r"C:\tmp\diag.png",
+        r"C:\tmp\c.png",
+    );
+    #[cfg(not(windows))]
+    let (a, b, diag, c) = ("/tmp/a.png", "/tmp/b.png", "/tmp/diag.png", "/tmp/c.png");
     let items = vec![
         Arc::new(ChatItem {
             kind: ChatItemKind::User,
             text: "[Image #1] [Image #2] first".into(),
-            file_path: "/tmp/a.png\n/tmp/b.png".into(),
+            file_path: format!("{a}\n{b}"),
             ..Default::default()
         }),
         Arc::new(ChatItem {
             kind: ChatItemKind::Assistant,
-            text: "Local ![diag](/tmp/diag.png) and remote ![gh](https://github.com/user-attachments/assets/1234)".into(),
+            text: format!(
+                "Local ![diag]({diag}) and remote ![gh](https://github.com/user-attachments/assets/1234)"
+            ),
             ..Default::default()
         }),
         Arc::new(ChatItem {
             kind: ChatItemKind::User,
             text: "second".into(),
-            file_path: "/tmp/c.png".into(),
+            file_path: c.into(),
             ..Default::default()
         }),
     ];
@@ -2485,10 +2496,10 @@ fn cross_message_lightbox_collection_and_bounds_stepping() {
     assert_eq!(
         paths,
         vec![
-            std::path::Path::new("/tmp/a.png"),
-            std::path::Path::new("/tmp/b.png"),
-            std::path::Path::new("/tmp/diag.png"),
-            std::path::Path::new("/tmp/c.png"),
+            std::path::Path::new(a),
+            std::path::Path::new(b),
+            std::path::Path::new(diag),
+            std::path::Path::new(c),
         ]
     );
     assert_eq!(images::step_image_index(0, 4, -1), None);

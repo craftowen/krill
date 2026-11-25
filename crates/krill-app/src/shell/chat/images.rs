@@ -185,7 +185,20 @@ pub(super) fn markdown_local_image_paths(text: &str) -> Vec<PathBuf> {
             || lower.starts_with("data:")
             || lower.contains("github.com/user-attachments/");
         if !target.is_empty() && !is_remote_url {
-            let local_str = target.strip_prefix("file://").unwrap_or(target);
+            let local_str = match target.strip_prefix("file://") {
+                Some(rest)
+                    if cfg!(windows)
+                        && rest.starts_with('/')
+                        && rest
+                            .as_bytes()
+                            .get(1..3)
+                            .is_some_and(|b| b[0].is_ascii_alphabetic() && b[1] == b':') =>
+                {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                }
+                Some(rest) => rest,
+                None => target,
+            };
             let path = PathBuf::from(local_str);
             if path.is_absolute()
                 && !path
