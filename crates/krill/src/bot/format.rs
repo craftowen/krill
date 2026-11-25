@@ -639,9 +639,14 @@ pub(crate) fn format_items(items: &[BotItem], json: bool) -> Result<String, CliE
         } else {
             ""
         };
+        let wait_suffix = item
+            .waiting_reason
+            .as_deref()
+            .filter(|_| item.status == krill_proto::bots::BotItemStatus::Waiting)
+            .map_or_else(String::new, |reason| format!(" (waiting: {reason})"));
         writeln!(
             out,
-            "#{:<7} {:<16} {:<10} {}{snooze}",
+            "#{:<7} {:<16} {:<10} {}{wait_suffix}{snooze}",
             item.number,
             item.owner_bot_id,
             item.status.as_str(),
@@ -683,6 +688,9 @@ pub(crate) fn format_item_detail(item: &BotItem, json: bool) -> Result<String, C
     }
     if let Some(ref done) = item.done_means {
         writeln!(out, "  done_means:  {done}").ok();
+    }
+    if let Some(ref reason) = item.waiting_reason {
+        writeln!(out, "  waiting_on:  {reason}").ok();
     }
     if let Some(until) = item.snoozed_until_ms {
         writeln!(out, "  snoozed_ms:  {until}").ok();

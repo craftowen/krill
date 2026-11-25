@@ -1680,6 +1680,8 @@ mod tests {
             created_at_ms: 100,
             updated_at_ms: 100,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         assert_eq!(
             super::super::home_item::waiting_question(&item).map(|e| e.id),
@@ -1794,6 +1796,8 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
 
         let state = Arc::new(Mutex::new(State {
@@ -1979,6 +1983,8 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         let answers = Arc::new(Mutex::new(Vec::<String>::new()));
         let comments = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2106,6 +2112,8 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         assert_eq!(super::super::home::waiting_note(&item), Some("CI build"));
 
@@ -2189,6 +2197,8 @@ mod tests {
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_005_000,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         let bot_rpc = bot.clone();
         let item_rpc = item.clone();
@@ -2380,6 +2390,8 @@ mod tests {
             created_at_ms: now,
             updated_at_ms: now,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         let bot_rpc = bot.clone();
         let item_rpc = item.clone();
@@ -2487,6 +2499,8 @@ mod tests {
             created_at_ms: now - n * 1_000,
             updated_at_ms: now - n * 1_000,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         let items = vec![
             mk(&b1, "u-work", 1, BotItemStatus::Working, "grp-1"),

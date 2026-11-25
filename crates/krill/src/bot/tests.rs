@@ -81,6 +81,8 @@ fn sample_item() -> BotItem {
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     }
 }
 
@@ -2630,4 +2632,121 @@ fn groups_send_defaults_sender_to_env_bot_id_and_avatar_rpc_fits_frame() {
         encoded.len(),
         krill_proto::ipc::MAX_FRAME + 4
     );
+}
+
+#[test]
+fn parses_and_executes_waiting_status_with_note_and_help_guidance() {
+    assert_eq!(
+        super::parse::parse_item_status("waiting").unwrap(),
+        BotItemStatus::Waiting
+    );
+    assert_eq!(
+        super::parse::parse_item_status("needs-you").unwrap(),
+        BotItemStatus::NeedsYou
+    );
+    assert!(
+        parse_command(
+            &s(&["items", "mybot", "update", "42", "--status", "waiting"]),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        parse_command(
+            &s(&[
+                "items", "mybot", "update", "42", "--status", "waiting", "--note", "   "
+            ]),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        parse_command(
+            &s(&[
+                "items",
+                "mybot",
+                "update",
+                "42",
+                "--status",
+                "waiting",
+                "--note",
+                "line1\nline2"
+            ]),
+            None
+        )
+        .is_err()
+    );
+
+    let cmd = parse_command(
+        &s(&[
+            "items",
+            "mybot",
+            "update",
+            "42",
+            "--status",
+            "waiting",
+            "--note",
+            "CI on PR #42",
+        ]),
+        None,
+    )
+    .unwrap();
+    let BotCommand::ItemsUpdate(upd) = cmd.clone() else {
+        panic!("expected ItemsUpdate");
+    };
+    assert_eq!(upd.status, Some(BotItemStatus::Waiting));
+    assert_eq!(upd.waiting_reason.as_deref(), Some("CI on PR #42"));
+
+    let list_cmd =
+        parse_command(&s(&["items", "mybot", "ls", "--status", "waiting"]), None).unwrap();
+    assert!(matches!(
+        list_cmd,
+        BotCommand::ItemsList {
+            status: Some(BotItemStatus::Waiting),
+            ..
+        }
+    ));
+
+    let help = super::parse::help_text(Some("items"));
+    assert!(help.contains("waiting"));
+    assert!(help.contains("running worker counts as working"));
+
+    let mut waiting_item = sample_item();
+    waiting_item.status = BotItemStatus::Waiting;
+    waiting_item.waiting_reason = Some("CI on PR #42".to_owned());
+    waiting_item.waiting_since_ms = Some(1_700_000_000_000);
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(sample_bot())),
+        BotRpcResponse::Item(Box::new(waiting_item)),
+    ]);
+    let mut empty = std::io::empty();
+    let rendered = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "pr-reviewer",
+                "update",
+                "1",
+                "--status",
+                "waiting",
+                "--note",
+                "CI on PR #42",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    assert!(rendered.contains("[waiting]"));
+    assert!(rendered.contains("waiting_on:  CI on PR #42"));
+    assert!(matches!(
+        client.recorded.last(),
+        Some(BotRpcRequest::UpdateItem(p))
+            if p.status == Some(BotItemStatus::Waiting)
+                && p.waiting_reason.as_deref() == Some("CI on PR #42")
+    ));
 }

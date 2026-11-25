@@ -46,6 +46,13 @@ pub(super) const WAITING_NOTE_PREFIX: &str = "waiting:";
 
 /// What an open `Waiting` item is waiting on, if any.
 pub(super) fn waiting_note(item: &BotItem) -> Option<&str> {
+    if item.status == BotItemStatus::Waiting {
+        return item
+            .waiting_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+    }
     if !item.status.is_open() {
         return None;
     }
@@ -56,6 +63,7 @@ pub(super) fn waiting_note(item: &BotItem) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(test)]
 pub(super) fn encode_waiting_note(note: &str) -> String {
     format!("{WAITING_NOTE_PREFIX}{}", note.trim())
 }
@@ -306,7 +314,8 @@ impl HomeBucket {
         match self {
             Self::NeedsYou => Group::NeedsYou,
             Self::Working => Group::Working,
-            Self::Waiting | Self::Planned => Group::Planned,
+            Self::Waiting => Group::Waiting,
+            Self::Planned => Group::Planned,
             Self::Snoozed => Group::Snoozed,
             Self::Stale => Group::Stale,
             Self::Closed => Group::Closed,
@@ -320,6 +329,7 @@ fn home_bucket_of(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64)
         _ if is_snoozed(item, now) => HomeBucket::Snoozed,
         _ if is_stale(item, live, stale_days, now) => HomeBucket::Stale,
         BotItemStatus::NeedsYou => HomeBucket::NeedsYou,
+        BotItemStatus::Waiting => HomeBucket::Waiting,
         _ if waiting_note(item).is_some() => HomeBucket::Waiting,
         BotItemStatus::Working => HomeBucket::Working,
         BotItemStatus::Planned => HomeBucket::Planned,
@@ -331,6 +341,7 @@ fn home_bucket_of(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64)
 pub(super) enum Group {
     NeedsYou,
     Working,
+    Waiting,
     Planned,
     Snoozed,
     Stale,
@@ -338,9 +349,10 @@ pub(super) enum Group {
 }
 
 impl Group {
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::NeedsYou,
         Self::Working,
+        Self::Waiting,
         Self::Planned,
         Self::Snoozed,
         Self::Stale,
@@ -351,6 +363,7 @@ impl Group {
         match self {
             Self::NeedsYou => "needs-you",
             Self::Working => "working",
+            Self::Waiting => "waiting",
             Self::Planned => "planned",
             Self::Snoozed => "snoozed",
             Self::Stale => "stale",
@@ -371,6 +384,7 @@ pub(super) fn status_name(status: BotItemStatus) -> &'static str {
     match status {
         BotItemStatus::Planned => text::HM_STATUS_PLANNED.get(),
         BotItemStatus::Working => text::HM_STATUS_WORKING.get(),
+        BotItemStatus::Waiting => text::HM_STATUS_WAITING.get(),
         BotItemStatus::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
         BotItemStatus::Done => text::HM_STATUS_DONE.get(),
         BotItemStatus::Canceled => text::HM_STATUS_CANCELED.get(),
@@ -414,7 +428,7 @@ fn is_stale(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64) -> bo
     let idle = now.saturating_sub(activity_at(item, now));
     match item.status {
         BotItemStatus::NeedsYou => idle >= days * DAY_MS,
-        BotItemStatus::Working => !live && idle >= days * DAY_MS,
+        BotItemStatus::Working | BotItemStatus::Waiting => !live && idle >= days * DAY_MS,
         BotItemStatus::Planned => idle >= 3 * days * DAY_MS,
         BotItemStatus::Done | BotItemStatus::Canceled => false,
     }
@@ -427,6 +441,7 @@ pub(super) fn group_of(item: &BotItem, live: bool, stale_days: Option<u64>, now:
         _ if is_stale(item, live, stale_days, now) => Group::Stale,
         BotItemStatus::NeedsYou => Group::NeedsYou,
         BotItemStatus::Working => Group::Working,
+        BotItemStatus::Waiting => Group::Waiting,
         BotItemStatus::Planned => Group::Planned,
     }
 }
@@ -438,8 +453,8 @@ pub(super) fn grouped<'a>(
     live: impl Fn(&BotItem) -> bool,
     stale_days: Option<u64>,
     now: u64,
-) -> [Vec<&'a BotItem>; 6] {
-    let mut groups: [Vec<&BotItem>; 6] = Default::default();
+) -> [Vec<&'a BotItem>; 7] {
+    let mut groups: [Vec<&BotItem>; 7] = Default::default();
     for item in items {
         groups[group_of(item, live(item), stale_days, now) as usize].push(item);
     }
@@ -541,12 +556,10 @@ pub(super) fn snooze_presets(now_ms: u64, offset_secs: i64) -> [(String, u64); 3
 // Lucide `circle-check` / `circle-slash` at Orca's `absoluteStrokeWidth` 2 px in a 10 px box (4.8 of 24).
 const CIRCLE_CHECK_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="m8 12 3 3 5-6"/></svg>"#;
 const CIRCLE_SLASH_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="M8.5 15.5 15.5 8.5"/></svg>"#;
-// Orca `BotItemStatusIcon` Waiting: 10 px grey ring with its lower half filled.
-const WAITING_HALF_CIRCLE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/><path d="M4.4 12a7.6 7.6 0 0 0 15.2 0z" fill="currentColor" stroke="none"/></svg>"#;
 
 pub(super) fn waiting_icon(p: &ui::Palette) -> AnyElement {
     Icon::default()
-        .data(WAITING_HALF_CIRCLE_SVG)
+        .data(ui::status::BOT_ITEM_WAITING_SVG)
         .size(px(10.))
         .text_color(p.muted_foreground)
         .into_any_element()
@@ -559,8 +572,10 @@ pub(super) fn item_status_icon(
     p: &ui::Palette,
     cx: &gpui::App,
 ) -> AnyElement {
-    if item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some() {
-        waiting_icon(p)
+    if item.status == BotItemStatus::Waiting
+        || (item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some())
+    {
+        status_icon(BotItemStatus::Waiting, live, quiet, p, cx)
     } else {
         status_icon(item.status, live, quiet, p, cx)
     }
@@ -596,6 +611,15 @@ pub(super) fn status_icon(
         )
         .into_any_element(),
         BotItemStatus::Working => ring().border_color(p.warning).into_any_element(),
+        BotItemStatus::Waiting => Icon::default()
+            .data(ui::status::BOT_ITEM_WAITING_SVG)
+            .size(px(10.))
+            .text_color(if quiet {
+                p.muted_foreground.opacity(0.6)
+            } else {
+                p.muted_foreground
+            })
+            .into_any_element(),
         BotItemStatus::Planned => ring()
             .border_dashed()
             .border_color(p.muted_foreground)
@@ -951,7 +975,8 @@ impl View {
             && !bot.paused
             && needs.is_empty()
             && grouped_indices[HomeBucket::NeedsYou as usize].is_empty()
-            && grouped_indices[HomeBucket::Working as usize].is_empty();
+            && grouped_indices[HomeBucket::Working as usize].is_empty()
+            && grouped_indices[HomeBucket::Waiting as usize].is_empty();
         if all_clear {
             rows.push(HomeRow::AllClear);
             row_keys.push(RowAnchor::AllClear);
@@ -2243,6 +2268,8 @@ mod tests {
                     created_at_ms: ts,
                     updated_at_ms: ts,
                     closed_at_ms: None,
+                    waiting_reason: None,
+                    waiting_since_ms: None,
                 }
             })
             .collect()
@@ -2615,5 +2642,154 @@ mod tests {
                 "clicking row Done must stop propagation and not open the item pane"
             );
         });
+    }
+
+    #[gpui::test]
+    fn waiting_group_hover_reason_wait_card_and_desktop_capability(cx: &mut gpui::TestAppContext) {
+        use krill_proto::bots::{BotItemEvent, BotItemEventKind};
+
+        // Desktop client advertises bots.item-waiting.v1 so Waiting is never downgraded (#47429).
+        let caps: Vec<String> = super::super::rpc::DESKTOP_BOT_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(krill_proto::bots::client_supports_item_waiting(&caps));
+
+        // Waiting group starts open and renders localized EN/KO labels.
+        assert!(!Group::Waiting.folded_by_default());
+        assert_eq!(
+            text::HM_STATUS_WAITING.in_language(crate::i18n::Language::En),
+            "Waiting"
+        );
+        assert_eq!(
+            text::HM_STATUS_WAITING.in_language(crate::i18n::Language::Ko),
+            "대기 중"
+        );
+
+        let now = now_unix_ms();
+        let bot_id = BotId::new("wait-bot").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Release Bot", "agy", now).unwrap();
+        let wait_item = BotItem {
+            uid: "wait-1".to_owned(),
+            number: 11,
+            owner_bot_id: bot_id.clone(),
+            title: "Ship v0.4".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::Waiting,
+            close_note: None,
+            links: Vec::new(),
+            events: vec![
+                BotItemEvent {
+                    id: 1,
+                    item_uid: "wait-1".to_owned(),
+                    kind: BotItemEventKind::Made,
+                    actor: BotItemActor::Bot {
+                        bot_id: bot_id.clone(),
+                        session_id: None,
+                    },
+                    text: "Ship v0.4".to_owned(),
+                    decisions: Vec::new(),
+                    created_at_ms: now.saturating_sub(60_000),
+                },
+                BotItemEvent {
+                    id: 2,
+                    item_uid: "wait-1".to_owned(),
+                    kind: BotItemEventKind::Status,
+                    actor: BotItemActor::Bot {
+                        bot_id: bot_id.clone(),
+                        session_id: None,
+                    },
+                    text: "status -> waiting: CI on PR #42".to_owned(),
+                    decisions: Vec::new(),
+                    created_at_ms: now.saturating_sub(30_000),
+                },
+            ],
+            snoozed_until_ms: None,
+            version: 2,
+            last_activity_at_ms: now.saturating_sub(30_000),
+            created_at_ms: now.saturating_sub(60_000),
+            updated_at_ms: now.saturating_sub(30_000),
+            closed_at_ms: None,
+            waiting_reason: Some("CI on PR #42".to_owned()),
+            waiting_since_ms: Some(now.saturating_sub(30_000)),
+        };
+
+        // Grouping places the item in Group::Waiting (open) and suppresses duplicate status event.
+        assert_eq!(group_of(&wait_item, false, Some(5), now), Group::Waiting);
+        assert_eq!(
+            super::super::home_item::active_wait_event_id(&wait_item),
+            Some(2)
+        );
+
+        let items = Arc::new(Mutex::new(vec![wait_item.clone()]));
+        let bot_rpc = bot.clone();
+        let items_rpc = items.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => {
+                Ok(BotRpcResponse::Items(items_rpc.lock().unwrap().clone()))
+            }
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(360.), px(520.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Waiting group header and item row are visible by default (not folded, no AllClear).
+        assert!(vcx.debug_bounds("bot-home-group-waiting").is_some());
+        let row = vcx
+            .debug_bounds("bot-home-item-wait-1")
+            .expect("waiting item row visible");
+        assert!(vcx.debug_bounds("bot-home-all-clear").is_none());
+
+        // Clicking the Waiting row opens item detail with the "Waiting on" card in Activity.
+        vcx.simulate_click(row.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("bot-item-wait-card").is_some(),
+            "Waiting on card must render at the end of Activity while Waiting"
+        );
+
+        // Once the item moves on to Working, the Waiting on card disappears and the past wait
+        // event is no longer suppressed.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let mut moved = wait_item.clone();
+                moved.status = BotItemStatus::Working;
+                moved.waiting_reason = None;
+                moved.waiting_since_ms = None;
+                assert_eq!(super::super::home_item::active_wait_event_id(&moved), None);
+                v.upsert_item(moved, &bot_id);
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("bot-item-wait-card").is_none(),
+            "Waiting on card must disappear once item leaves Waiting"
+        );
     }
 }

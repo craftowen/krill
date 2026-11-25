@@ -569,6 +569,31 @@ pub fn run_look_around_tracked(
                     now_ms,
                 ));
             }
+            BotItemStatus::Waiting
+                if now_ms.saturating_sub(item.last_activity_at_ms) >= STALE_WORKING_MS =>
+            {
+                let why = match item.waiting_reason.as_deref() {
+                    Some(reason) => {
+                        format!("Waiting on: {reason} (no activity for over 24 hours).")
+                    }
+                    None => {
+                        "This item has been marked Waiting with no recorded activity for over 24 hours."
+                            .to_owned()
+                    }
+                };
+                candidates.push(make_suggestion(
+                    bot_id,
+                    format!("Check waiting item #{}: {}", item.number, item.title),
+                    why,
+                    format!(
+                        "Check whether item #{} is unblocked and update its status or note.",
+                        item.number
+                    ),
+                    url_link,
+                    pr_link.map(|_| ExternalSource::GitHub),
+                    now_ms,
+                ));
+            }
             BotItemStatus::Planned => {
                 let why = if let Some(ref pr) = pr_link {
                     format!("Linked pull request ({pr}) is still queued in Planned.")
@@ -1943,6 +1968,7 @@ mod tests {
                     links: vec![BotItemLink::Pr(
                         "https://github.com/craftowen/krill/pull/99".to_owned(),
                     )],
+                    waiting_reason: None,
                 },
                 &actor,
                 1_500,
@@ -2002,6 +2028,59 @@ mod tests {
     }
 
     #[test]
+    fn look_around_scans_stale_waiting_items_with_reason() {
+        let root = temp_dir("waiting-scan");
+        let store = BotStore::new(root.clone());
+        let items = BotItemsStore::new(root.join("bot-items.db"));
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Release Scout".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: Some(
+                        "# Release Scout\n\nTracks release pipelines and external CI waits.\n"
+                            .to_owned(),
+                    ),
+                },
+                1_000,
+            )
+            .unwrap();
+        let actor = BotItemActor::Owner { device: None };
+        items
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot.id.clone(),
+                    title: "Ship v2".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Waiting),
+                    links: Vec::new(),
+                    waiting_reason: Some("CI on PR #42".to_owned()),
+                },
+                &actor,
+                1_000,
+            )
+            .unwrap();
+
+        let fresh = run_look_around(&store, &items, &bot.id, 1_000 + 60_000).unwrap();
+        assert!(fresh.is_empty());
+
+        let stale = run_look_around(&store, &items, &bot.id, 1_000 + STALE_WORKING_MS + 1).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].title.contains("Ship v2"));
+        assert!(stale[0].why.contains("CI on PR #42"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn cron_calendar_respects_offsets_and_iana_timezones() {
         // 2026-11-20 00:15:00 UTC -> Asia/Seoul is 09:15 on 2026-11-20.
         let utc_secs = 1_795_133_700;
@@ -2049,6 +2128,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &BotItemActor::Owner { device: None },
                 1_500,
@@ -2241,6 +2321,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &BotItemActor::Owner { device: None },
                 1_500,

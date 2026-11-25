@@ -30,6 +30,9 @@ const RING_SVG: &[u8] = br##"<svg viewBox="0 0 24 24" fill="none" xmlns="http://
 const RING_FULL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8.6"/></svg>"#;
 /// Lucide `bell`(ISC License)을 채운 모양. 미확인 완료 표시.
 const BELL_FILLED_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>"#;
+/// Bot item `Waiting` glyph: ring with lower half filled (Orca `BotItemStatusIcon`,
+/// 2 px stroke in a 10 px box = 4.8 in 24×24 coordinates).
+pub const BOT_ITEM_WAITING_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="M4.4 12a7.6 7.6 0 0 0 15.2 0z" fill="currentColor" stroke="none"/></svg>"#;
 
 /// 1초에 한 바퀴, 30fps 연속 회전. 모든 스피너가 앱 공용 시계(`repeat_synced`)로 같은 위상을 공유하고
 /// 비활성 창에서는 0fps 정적 링으로 멈춰 GPU·배터리 부하를 억제한다.

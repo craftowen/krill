@@ -6040,6 +6040,7 @@ fn import_orca_bot_items(
             .unwrap_or("planned")
         {
             "working" => BotItemStatus::Working.as_str(),
+            "waiting" => BotItemStatus::Waiting.as_str(),
             "needs_you" => BotItemStatus::NeedsYou.as_str(),
             "done" => BotItemStatus::Done.as_str(),
             "canceled" => BotItemStatus::Canceled.as_str(),

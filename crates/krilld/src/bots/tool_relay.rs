@@ -1140,21 +1140,23 @@ fn builtin_tools_schema() -> Value {
         },
         {
             "name": "items_create",
-            "description": "Create a tracked deliverable/work item for this bot.",
+            "description": "Create a tracked deliverable/work item for this bot. Use status 'waiting' with waiting_reason only for external waits (CI, review, deploy, external reply, usage-limit reset); your own running worker counts as 'working'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string" },
                     "description": { "type": "string" },
                     "done_means": { "type": "string" },
-                    "status": { "type": "string", "enum": ["planned", "working", "needs_you", "done", "canceled"] }
+                    "status": { "type": "string", "enum": ["planned", "working", "waiting", "needs_you", "done", "canceled"] },
+                    "waiting_reason": { "type": "string", "description": "Required single-line reason (max 200 chars) when status is 'waiting'." },
+                    "note": { "type": "string", "description": "Alias for waiting_reason when status is 'waiting'." }
                 },
                 "required": ["title"]
             }
         },
         {
             "name": "items_update",
-            "description": "Update an existing tracked item (status, comment, title, description, done_means, close_note).",
+            "description": "Update an existing tracked item (status, waiting_reason/note, comment, title, description, done_means, close_note). Use 'waiting' with waiting_reason only for external waits (CI, review, deploy, external reply, usage-limit reset); your own running worker counts as 'working'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1162,7 +1164,9 @@ fn builtin_tools_schema() -> Value {
                     "title": { "type": "string" },
                     "description": { "type": "string" },
                     "done_means": { "type": "string" },
-                    "status": { "type": "string", "enum": ["planned", "working", "needs_you", "done", "canceled"] },
+                    "status": { "type": "string", "enum": ["planned", "working", "waiting", "needs_you", "done", "canceled"] },
+                    "waiting_reason": { "type": "string", "description": "Required single-line reason (max 200 chars) when status is 'waiting'." },
+                    "note": { "type": "string", "description": "Alias for waiting_reason when status is 'waiting'." },
                     "comment": { "type": "string" },
                     "close_note": { "type": "string" }
                 },
