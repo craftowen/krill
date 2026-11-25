@@ -362,7 +362,9 @@ impl Shell {
         BotFacts {
             unread: chats.iter().any(|c| c.unread),
             active: chats.iter().any(|c| c.active),
-            needs_you: chats.iter().any(|c| c.needs_you) || waiting_workers > 0,
+            needs_you: chats.iter().any(|c| c.needs_you)
+                || waiting_workers > 0
+                || bot.attention > 0,
             status,
             line,
             limit,
@@ -568,11 +570,35 @@ impl Shell {
 
         // Orca BotSidebarRow title: `text-[13px] leading-5`; unread is semibold, read is 80%.
         let name: AnyElement = match renaming {
-            Some(input) => div()
-                .flex_1()
-                .min_w_0()
-                .child(Input::new(&input).xsmall().appearance(false))
-                .into_any_element(),
+            Some(input) => {
+                let esc_input = input.clone();
+                let rename_sel = format!("bot-row-rename-{}", bot.id.as_str());
+                div()
+                    .id(SharedString::from(rename_sel.clone()))
+                    .debug_selector(move || rename_sel.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .capture_key_down(cx.listener(
+                        move |this, e: &gpui::KeyDownEvent, window, cx| {
+                            if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                                let composing = esc_input.update(cx, |s, cx| {
+                                    gpui::EntityInputHandler::marked_text_range(s, window, cx)
+                                        .is_some()
+                                });
+                                if !composing {
+                                    cx.stop_propagation();
+                                    window.prevent_default();
+                                    this.bot_ui.renaming = None;
+                                    cx.notify();
+                                }
+                            }
+                        },
+                    ))
+                    .child(Input::new(&input).xsmall().appearance(false))
+                    .into_any_element()
+            }
             None => div()
                 .flex_1()
                 .min_w_0()
@@ -640,6 +666,14 @@ impl Shell {
                     .hover(|d| d.bg(p.worktree_sidebar_accent))
             })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                if this
+                    .bot_ui
+                    .renaming
+                    .as_ref()
+                    .is_some_and(|(h, id, _, _)| *h == open_host && *id == open_id)
+                {
+                    return;
+                }
                 // A double click's second click renames, as Orca's.
                 if e.click_count() > 1 {
                     this.start_bot_rename_on(&open_host, &open_id, window, cx);
@@ -1150,7 +1184,10 @@ impl Shell {
             &input,
             window,
             move |this, input, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => {
                     let composing = input.update(cx, |s, cx| {
                         gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
                     });

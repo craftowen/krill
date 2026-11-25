@@ -51,6 +51,9 @@ impl View {
             {
                 self.reload(cx);
             }
+            if tab == DetailTab::Items {
+                self.items.clear_seen_for(bot_id);
+            }
         }
         if self.detail_tab != tab {
             // Settings opens on Orca's list, not on the page it was last left at; a row that
@@ -61,8 +64,7 @@ impl View {
             self.set_detail_tab(tab, cx);
             if tab == DetailTab::Items {
                 // A fresh opening: rows and suggestions changed since get their dots again.
-                self.items.seen_at_open.remove(bot_id);
-                self.items.up_next_seen_at_open.remove(bot_id);
+                self.items.clear_seen_for(bot_id);
             }
         }
         if tab == DetailTab::Items {

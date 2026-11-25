@@ -1723,7 +1723,9 @@ impl Panel {
                     let val = state.read(cx).value().to_string();
                     this.schedule_explorer_filter(val, cx);
                 }
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter {
+                    secondary: false, ..
+                } => {
                     // Enter는 디바운스 없이 즉시 백그라운드 스캔으로 반영한다.
                     let val = state.read(cx).value().to_string();
                     this.apply_explorer_filter_now(val, cx);
@@ -1759,11 +1761,22 @@ impl Panel {
                 .default_value(default_val)
         });
         input.update(cx, |s, cx| s.focus(window, cx));
-        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.submit_explorer_edit(cx);
-            }
-        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        ..
+                    }
+                ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    this.submit_explorer_edit(cx);
+                }
+            },
+        );
         self.explorer.editing = Some((kind, input, Some(sub)));
         self.explorer.error = None;
         cx.notify();
@@ -1965,6 +1978,12 @@ impl Panel {
                     .id("explorer-tree-container")
                     .track_focus(&tree_focus)
                     .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                        if this.explorer.editing.is_some() {
+                            if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                                this.on_explorer_tree_key("escape", cx);
+                            }
+                            return;
+                        }
                         if ev.keystroke.modifiers.shift
                             && matches!(ev.keystroke.key.as_str(), "up" | "down")
                         {
@@ -2028,6 +2047,9 @@ impl Panel {
 
     /// 트리 화살표 키 탐색(OWE-849): `↑/↓` 이동, `→` 펼치기, `←` 접기/부모로, `Enter` 고정 열기.
     fn on_explorer_tree_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.explorer.editing.is_some() && key != "escape" {
+            return;
+        }
         match key {
             "up" => {
                 cx.stop_propagation();
@@ -2834,6 +2856,29 @@ mod selection_tests {
 #[cfg(test)]
 mod external_open_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mk-explorer-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
     #[gpui::test]
     fn external_open_reports_async_errors_and_guards_remote_paths(cx: &mut gpui::TestAppContext) {
         let panel = cx.new(|cx| Panel::unconnected(PathBuf::from("/repo"), cx));
@@ -2934,6 +2979,156 @@ mod external_open_tests {
             assert!(
                 panel.explorer.error.is_some(),
                 "failed remote reveal must surface an error on the panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn explorer_inline_edit_left_and_right_do_not_collapse_or_reselect_tree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = TempDir::new("inline-arrows");
+        let root = dir.0.clone();
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let target = sub.join("alpha.rs");
+        fs::write(&target, "fn a() {}\n").unwrap();
+
+        let panel_root = root.clone();
+        let sub_init = sub.clone();
+        let target_init = target.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = Panel::unconnected(panel_root, cx);
+            panel.tab = super::super::PanelTab::Files;
+            panel.explorer.ensure_loaded();
+            panel.toggle_explorer_dir(&sub_init, cx);
+            panel.explorer.selected = Some(target_init.clone());
+            panel.start_explorer_edit(
+                EditKind::Rename {
+                    target: target_init,
+                },
+                window,
+                cx,
+            );
+            panel
+        });
+        cx.run_until_parked();
+
+        // Press Left many times (hitting offset 0) and Right many times (hitting text end).
+        for key in [
+            "left", "left", "left", "left", "left", "left", "left", "left", "left", "left",
+        ] {
+            cx.simulate_keystrokes(key);
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.explorer.editing.is_some());
+            assert!(
+                panel.explorer.expanded.contains(&sub),
+                "Left at offset 0 during inline edit must not collapse parent dir"
+            );
+            assert_eq!(
+                panel.explorer.selected.as_ref(),
+                Some(&target),
+                "Left at offset 0 during inline edit must not reselect parent dir"
+            );
+        });
+
+        // Secondary+Shift+Enter must not submit explorer inline edit (R2A-15).
+        cx.simulate_keystrokes("cmd-shift-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.editing.is_some(),
+                "secondary-shift-enter must not commit explorer inline edit"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn explorer_filter_ime_escape_preserves_text_and_secondary_enter_does_not_apply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::EntityInputHandler as _;
+
+        cx.update(gpui_component::init);
+        let dir = TempDir::new("filter-ime-enter");
+        let root = dir.0.clone();
+        fs::write(root.join("alpha.txt"), "ok\n").unwrap();
+
+        let panel_root = root.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = Panel::unconnected(panel_root, cx);
+            panel.tab = super::super::PanelTab::Files;
+            panel.explorer.ensure_loaded();
+            let input = panel.ensure_explorer_filter_input(window, cx);
+            input.update(cx, |st, cx| {
+                st.focus(window, cx);
+                st.set_value("alpha".to_owned(), window, cx);
+            });
+            panel
+        });
+        cx.run_until_parked();
+
+        // Start IME preedit on the clean_on_escape filter input.
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| {
+                let input = panel.explorer.filter_input.as_ref().unwrap().clone();
+                input.update(cx, |st, cx| {
+                    st.focus(window, cx);
+                    st.replace_and_mark_text_in_range(None, "한", None, window, cx);
+                });
+                assert!(crate::jump::entity_input_is_composing(&input, window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        // First Escape must only cancel IME preedit, NOT wipe text via clean_on_escape (R3A-02).
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let input = view
+                .read(cx)
+                .explorer
+                .filter_input
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert!(!crate::jump::entity_input_is_composing(&input, window, cx));
+            assert_eq!(
+                input.read(cx).value(),
+                "alpha한",
+                "Escape during IME composition must not clear clean_on_escape filter input"
+            );
+        });
+
+        // Second Escape (no active preedit) clears the input via clean_on_escape.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, cx| {
+            let input = panel.explorer.filter_input.as_ref().unwrap();
+            assert_eq!(input.read(cx).value(), "");
+        });
+
+        // Cmd+Shift+Enter must not trigger immediate filter scan (R3A-05).
+        let gen_before = view.read_with(cx, |panel, _| panel.explorer.filter_generation);
+        cx.simulate_keystrokes("secondary-shift-enter");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.explorer.filter_generation, gen_before,
+                "secondary-shift-enter must not trigger apply_explorer_filter_now"
+            );
+        });
+
+        // Plain Enter still triggers immediate filter scan.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.filter_generation > gen_before,
+                "plain enter should still trigger apply_explorer_filter_now"
             );
         });
     }

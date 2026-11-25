@@ -407,6 +407,8 @@ impl Shell {
                         })
                     })
                     .when_some(rename_input, |t, input| {
+                        let escape_capture_input = input.clone();
+                        let escape_keydown_input = input.clone();
                         t.child(
                             div()
                                 .id("tab-rename-input")
@@ -414,6 +416,40 @@ impl Shell {
                                 .w(px(140.))
                                 .min_w_0()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .capture_action(cx.listener(
+                                    move |_, _: &gpui_component::input::Escape, window, cx| {
+                                        let composing = escape_capture_input.update(cx, |s, cx| {
+                                            gpui::EntityInputHandler::marked_text_range(
+                                                s, window, cx,
+                                            )
+                                            .is_some()
+                                        });
+                                        if composing {
+                                            window.prevent_default();
+                                        }
+                                    },
+                                ))
+                                .on_key_down(cx.listener(
+                                    move |this, ev: &KeyDownEvent, window, cx| {
+                                        if ev.keystroke.key == "escape"
+                                            && !ev.keystroke.modifiers.modified()
+                                        {
+                                            let composing =
+                                                escape_keydown_input.update(cx, |s, cx| {
+                                                    gpui::EntityInputHandler::marked_text_range(
+                                                        s, window, cx,
+                                                    )
+                                                    .is_some()
+                                                });
+                                            if window.default_prevented() || composing {
+                                                return;
+                                            }
+                                            this.cancel_tab_rename(cx);
+                                            this.focus.focus(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .child(Input::new(&input).small()),
                         )
                     })
@@ -1176,7 +1212,10 @@ impl Shell {
                 if this.tab_rename.as_ref().is_none_or(|r| r.input != *input) {
                     return;
                 }
-                if let InputEvent::PressEnter { .. } = event {
+                if let InputEvent::PressEnter {
+                    secondary: false, ..
+                } = event
+                {
                     let composing = input.update(cx, |s, cx| {
                         gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
                     });

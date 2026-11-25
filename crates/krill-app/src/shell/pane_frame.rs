@@ -227,6 +227,7 @@ impl Shell {
             || self.confirm_close_tab.is_some()
             || self.pending_running_close.is_some()
             || self.tab_context_menu.is_some()
+            || self.has_dialog_or_viewer_overlay()
     }
 
     #[must_use]

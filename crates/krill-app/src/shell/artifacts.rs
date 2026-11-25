@@ -324,6 +324,9 @@ impl Shell {
             if ev.host != this.launch_host {
                 this.set_launch_host(ev.host.clone(), cx);
             }
+            if let Some(err) = &ev.warning {
+                this.notice = Some(err.clone());
+            }
             this.refresh_bots_for_host(&ev.host, true, cx);
             this.open_bot_home_on(&ev.host, ev.bot_id.clone(), ev.kickoff.clone(), cx);
         })

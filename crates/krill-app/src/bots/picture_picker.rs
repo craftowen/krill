@@ -111,6 +111,7 @@ pub struct PictureState {
     gen_input: Option<Entity<TextareaState>>,
     gen_sub: Option<Subscription>,
     gen_task: Option<Task<()>>,
+    gen_seq: u64,
 }
 
 impl Drop for PictureState {
@@ -177,6 +178,7 @@ impl PictureState {
             gen_input: None,
             gen_sub: None,
             gen_task: None,
+            gen_seq: 0,
         }
     }
 
@@ -332,6 +334,7 @@ impl PictureState {
     }
 
     pub fn cancel_running_generation(&mut self) {
+        self.gen_seq = self.gen_seq.wrapping_add(1);
         if let GenRunState::Running { ref cancel, .. } = self.gen_run {
             cancel.cancel();
             self.gen_run = GenRunState::Idle;
@@ -416,6 +419,10 @@ impl PictureState {
         if selects_picture {
             self.intake_seq += 1;
             self.reading = false;
+            self.cancel_running_generation();
+            if matches!(self.gen_run, GenRunState::Error { .. }) {
+                self.gen_run = GenRunState::Idle;
+            }
         }
         match face {
             PictureFace::Mascot(id) => {
@@ -679,6 +686,8 @@ impl PictureState {
 
         self.intake_seq += 1;
         let turn = self.intake_seq;
+        self.gen_seq = self.gen_seq.wrapping_add(1);
+        let gen_turn = self.gen_seq;
         let cancel = AvatarCancelHandle::new();
         let cancel_bg = cancel.clone();
         self.gen_editing = false;
@@ -693,44 +702,65 @@ impl PictureState {
                 .await;
             this.update(cx, |this, cx| {
                 let state = lens(this);
-                match outcome {
-                    AvatarRunResult::Ok { agent, image } => {
-                        state.gen_run = GenRunState::Idle;
-                        let own_turn = state.intake_seq == turn;
-                        if own_turn {
-                            let gpui_img = Arc::new(Image::from_bytes(
-                                gpui::ImageFormat::Png,
-                                image.png_bytes.clone(),
-                            ));
-                            let tint = avatar::picture_tint(&image.png_bytes);
-                            let entry = (image.png_bytes, gpui_img, tint, description.clone());
-                            state.gen_made = Some(entry.clone());
-                            state.custom = Some(entry);
-                            state.custom_after = state.mascot_idx;
-                            if state.on_generate {
-                                state.showing_custom = true;
-                            }
-                        }
-                        let _ = agent;
-                    }
-                    AvatarRunResult::Err { error, agent } => {
-                        if error == AvatarGenerationFailure::Canceled {
-                            state.gen_run = GenRunState::Idle;
-                        } else {
-                            state.gen_run = GenRunState::Error {
-                                failure: error,
-                                agent,
-                            };
-                        }
-                        if error == AvatarGenerationFailure::SignedOut {
-                            state.refresh_capability(lens, cx);
-                        }
-                    }
+                let should_refresh =
+                    state.apply_generation_result(gen_turn, turn, &description, outcome);
+                if should_refresh {
+                    state.refresh_capability(lens, cx);
                 }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// Applies an avatar generation completion if its generation turn is still current.
+    /// Returns `true` when the caller should refresh generation capability (signed-out error).
+    fn apply_generation_result(
+        &mut self,
+        gen_turn: u64,
+        intake_turn: u64,
+        description: &str,
+        outcome: AvatarRunResult,
+    ) -> bool {
+        if self.gen_seq != gen_turn {
+            return false;
+        }
+        self.gen_task = None;
+        let own_turn = self.intake_seq == intake_turn;
+        match outcome {
+            AvatarRunResult::Ok { agent, image } => {
+                self.gen_run = GenRunState::Idle;
+                if own_turn {
+                    let gpui_img = Arc::new(Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        image.png_bytes.clone(),
+                    ));
+                    let tint = avatar::picture_tint(&image.png_bytes);
+                    let entry = (image.png_bytes, gpui_img, tint, description.to_owned());
+                    self.gen_made = Some(entry.clone());
+                    self.custom = Some(entry);
+                    self.custom_after = self.mascot_idx;
+                    if self.on_generate {
+                        self.showing_custom = true;
+                    }
+                }
+                let _ = agent;
+                false
+            }
+            AvatarRunResult::Err { error, agent } => {
+                if !own_turn || error == AvatarGenerationFailure::Canceled {
+                    self.gen_run = GenRunState::Idle;
+                    false
+                } else {
+                    let signed_out = error == AvatarGenerationFailure::SignedOut;
+                    self.gen_run = GenRunState::Error {
+                        failure: error,
+                        agent,
+                    };
+                    signed_out
+                }
+            }
+        }
     }
 
     fn ensure_hex_input<E: 'static>(
@@ -789,6 +819,7 @@ impl PictureState {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 6)
+                .submit_on_enter(true)
                 .placeholder(text::AVATAR_GEN_PLACEHOLDER.get())
         });
         let sub = cx.subscribe_in(
@@ -810,9 +841,10 @@ impl PictureState {
                     }
                     cx.notify();
                 }
-                InputEvent::PressEnter { .. }
-                    if !super::opt_textarea_composing(Some(inp), window, cx) =>
-                {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } if !super::opt_textarea_composing(Some(inp), window, cx) => {
                     lens(this).start_generation(lens, cx);
                 }
                 _ => {}
@@ -821,6 +853,26 @@ impl PictureState {
         self.gen_input = Some(input.clone());
         self.gen_sub = Some(sub);
         input
+    }
+
+    fn render_gen_textarea<E: 'static>(
+        input: &Entity<TextareaState>,
+        running: bool,
+        cx: &mut Context<E>,
+    ) -> gpui::Div {
+        div()
+            .px_1p5()
+            .pt_1p5()
+            .on_action(
+                cx.listener(|_, action: &gpui_component::input::Enter, _, cx| {
+                    // Consume plain Enter so GPUI does not fall through to text-input `\n`,
+                    // while letting Shift+Enter and Secondary+Shift+Enter propagate.
+                    if action.secondary || action.shift {
+                        cx.propagate();
+                    }
+                }),
+            )
+            .child(Textarea::new(input).appearance(false).disabled(running))
     }
 
     /// 64×64 rounded-[18px] tile + 22px bottom-right Pencil badge opening `BotPicturePicker` popover.
@@ -1602,12 +1654,7 @@ impl PictureState {
                     .bg(p.background)
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .px_1p5()
-                            .pt_1p5()
-                            .child(Textarea::new(&input).appearance(false).disabled(running)),
-                    )
+                    .child(Self::render_gen_textarea(&input, running, cx))
                     .child(
                         div()
                             .px_1p5()
@@ -1758,5 +1805,153 @@ impl std::fmt::Debug for PictureState {
             .field("background", &self.background)
             .field("popover_open", &self.popover_open)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyHost {
+        picture: PictureState,
+    }
+
+    #[gpui::test]
+    fn select_face_cancels_generation_and_ignores_stale_errors(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+            crate::settings::init(cx);
+        });
+        let host = cx.new(|cx| DummyHost {
+            picture: PictureState::new("test", Some("A1"), cx),
+        });
+        cx.update(|cx| {
+            host.update(cx, |h, cx| {
+                let cancel = AvatarCancelHandle::new();
+                h.picture.intake_seq += 1;
+                let intake_turn = h.picture.intake_seq;
+                h.picture.gen_seq = h.picture.gen_seq.wrapping_add(1);
+                let gen_turn = h.picture.gen_seq;
+                h.picture.gen_run = GenRunState::Running {
+                    agent: AvatarImageAgent::Codex,
+                    cancel,
+                };
+                h.picture.gen_task = Some(cx.spawn(async move |_, _| {}));
+
+                // Switching to a mascot cancels gen_task and resets gen_run to Idle.
+                h.picture.select_face_value(PictureFace::Mascot("B1"), cx);
+                assert!(h.picture.gen_task.is_none());
+                assert!(matches!(h.picture.gen_run, GenRunState::Idle));
+
+                // A stale Err from the superseded generation must NOT overwrite gen_run.
+                let refresh = h.picture.apply_generation_result(
+                    gen_turn,
+                    intake_turn,
+                    "a blue crab",
+                    AvatarRunResult::Err {
+                        error: AvatarGenerationFailure::SignedOut,
+                        agent: Some(AvatarImageAgent::Codex),
+                    },
+                );
+                assert!(!refresh);
+                assert!(matches!(h.picture.gen_run, GenRunState::Idle));
+
+                // Even if gen_seq matches, a stale intake_seq (e.g. concurrent upload) drops Err.
+                let cur_gen = h.picture.gen_seq;
+                let old_intake = h.picture.intake_seq;
+                h.picture.intake_seq += 1;
+                let refresh_stale_intake = h.picture.apply_generation_result(
+                    cur_gen,
+                    old_intake,
+                    "a blue crab",
+                    AvatarRunResult::Err {
+                        error: AvatarGenerationFailure::SignedOut,
+                        agent: Some(AvatarImageAgent::Codex),
+                    },
+                );
+                assert!(!refresh_stale_intake);
+                assert!(matches!(h.picture.gen_run, GenRunState::Idle));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn gen_input_submits_only_on_plain_enter_and_inserts_newline_on_shift_enter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct TestView {
+            picture: PictureState,
+        }
+        impl gpui::Render for TestView {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let inp = self
+                    .picture
+                    .ensure_gen_input(|v| &mut v.picture, window, cx);
+                PictureState::render_gen_textarea(&inp, false, cx)
+            }
+        }
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+            crate::settings::init(cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| TestView {
+            picture: PictureState::new("test-gen", Some("A1"), cx),
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let inp = v.picture.ensure_gen_input(|s| &mut s.picture, window, cx);
+                inp.update(cx, |s, cx| {
+                    s.set_value("blue crab".to_owned(), window, cx);
+                    s.focus(window, cx);
+                });
+            });
+        });
+        vcx.run_until_parked();
+
+        // Shift+Enter inserts a newline without starting generation.
+        vcx.simulate_keystrokes("shift-enter");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let val = v.picture.gen_input.as_ref().unwrap().read(cx).value();
+            assert!(
+                val.contains('\n'),
+                "Shift+Enter must insert a newline in gen_input, got {val:?}"
+            );
+            assert_eq!(
+                v.picture.gen_seq, 0,
+                "Shift+Enter must not start avatar generation"
+            );
+        });
+
+        // Plain Enter starts generation without inserting another newline.
+        let before = vcx.update(|_, cx| {
+            view.read(cx)
+                .picture
+                .gen_input
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let after = v.picture.gen_input.as_ref().unwrap().read(cx).value();
+            assert_eq!(
+                after.as_ref(),
+                before.as_str(),
+                "plain Enter with submit_on_enter must not append a newline"
+            );
+            assert!(
+                !matches!(v.picture.gen_run, GenRunState::Idle),
+                "plain Enter must trigger avatar generation"
+            );
+        });
     }
 }

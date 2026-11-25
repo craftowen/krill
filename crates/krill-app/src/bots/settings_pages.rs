@@ -129,7 +129,7 @@ impl View {
             SettingsPage::Schedules => self.render_schedules_page(bot, p, window, cx),
             SettingsPage::Soul => self.render_soul_page(bot, p, window, cx),
             SettingsPage::Memory => self.render_memory_page(bot, p, window, cx),
-            SettingsPage::WhoCanAsk => self.render_who_can_ask_page(bot, p, cx),
+            SettingsPage::WhoCanAsk => self.render_who_can_ask_page(bot, p, window, cx),
             SettingsPage::Tools => self.render_tools_page(bot, p, window, cx),
             SettingsPage::Skills => Self::render_skills_page(bot, p, cx),
             SettingsPage::Sharing => self.render_sharing_page(bot, p, cx),
@@ -221,8 +221,9 @@ impl View {
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_agent_models(&bot.agent_id, cx);
         let runtime = bot.agent_id.clone();
+        let menu_runtime = runtime.clone();
         let this = cx.weak_entity();
-        let switch_bot = bot.clone();
+        let bot_id_rt = bot.id.clone();
         let enabled_runtimes = super::pickers::available_runtimes(self.host.is_local(), cx);
         let runtime_button = Button::new("bot-settings-agent-runtime")
             .debug_selector(|| "bot-settings-agent-runtime".into())
@@ -245,7 +246,7 @@ impl View {
                     .child(div().truncate().child(runtime_display_label(&runtime))),
             )
             .dropdown_menu(move |mut menu, _, _| {
-                let current_canon = krill_proto::agent::canonical_id(&switch_bot.agent_id);
+                let current_canon = krill_proto::agent::canonical_id(&menu_runtime);
                 for rt in BOT_RUNTIMES {
                     let is_current = current_canon == rt.id;
                     // Orca #47382: show only enabled/installed agents (always keep the bot's current agent).
@@ -256,23 +257,34 @@ impl View {
                         continue;
                     }
                     let this = this.clone();
-                    let bot = switch_bot.clone();
+                    let bot_id = bot_id_rt.clone();
                     menu = menu.item(
                         PopupMenuItem::new(rt.label())
                             .icon(ui::icons::agent_menu_icon(rt.id))
                             .checked(is_current)
                             .on_click(move |_, _, cx| {
-                                if is_current {
-                                    return;
-                                }
-                                // A new agent starts on its own default model and effort.
-                                let params = UpdateBotParams {
-                                    agent_id: Some(rt.id.to_owned()),
-                                    model: krill_proto::bots::FieldPatch::Clear,
-                                    effort: krill_proto::bots::FieldPatch::Clear,
-                                    ..patch(&bot)
-                                };
-                                this.update(cx, |v, cx| v.patch_bot(params, cx)).ok();
+                                this.update(cx, |v, cx| {
+                                    let Some(params) = v
+                                        .bots
+                                        .iter()
+                                        .find(|b| {
+                                            b.id == bot_id
+                                                && krill_proto::agent::canonical_id(&b.agent_id)
+                                                    != rt.id
+                                        })
+                                        .map(|current| UpdateBotParams {
+                                            // A new agent starts on its own default model and effort.
+                                            agent_id: Some(rt.id.to_owned()),
+                                            model: krill_proto::bots::FieldPatch::Clear,
+                                            effort: krill_proto::bots::FieldPatch::Clear,
+                                            ..patch(current)
+                                        })
+                                    else {
+                                        return;
+                                    };
+                                    v.patch_bot(params, cx);
+                                })
+                                .ok();
                             }),
                     );
                 }
@@ -302,7 +314,7 @@ impl View {
             },
         );
         let this = cx.weak_entity();
-        let model_bot = bot.clone();
+        let bot_id_model = bot.id.clone();
         let model_button = Button::new("bot-settings-agent-model")
             .debug_selector(|| "bot-settings-agent-model".into())
             .outline()
@@ -313,28 +325,41 @@ impl View {
             .dropdown_menu(move |mut menu, _, _| {
                 let pick = |choice: Option<String>| {
                     let this = this.clone();
-                    let bot = model_bot.clone();
+                    let bot_id = bot_id_model.clone();
                     move |_: &ClickEvent, _: &mut Window, cx: &mut gpui::App| {
-                        // Antigravity launch model IDs encode effort (e.g. `gemini-4-neon-high`);
-                        // clear any separate effort override so they stay consistent.
-                        let clear_effort = krill_proto::agent::canonical_id(&bot.agent_id) == "agy"
-                            && choice.as_deref().is_some_and(|m| {
-                                krill_proto::agent::strip_agy_effort_suffix(m).1.is_some()
-                            });
-                        let params = UpdateBotParams {
-                            model: choice
-                                .clone()
-                                .map_or(krill_proto::bots::FieldPatch::Clear, |m| {
-                                    krill_proto::bots::FieldPatch::Set(m)
-                                }),
-                            effort: if clear_effort {
-                                krill_proto::bots::FieldPatch::Clear
-                            } else {
-                                krill_proto::bots::FieldPatch::Unchanged
-                            },
-                            ..patch(&bot)
-                        };
-                        this.update(cx, |v, cx| v.patch_bot(params, cx)).ok();
+                        let choice = choice.clone();
+                        this.update(cx, |v, cx| {
+                            let Some(params) =
+                                v.bots.iter().find(|b| b.id == bot_id).map(|current| {
+                                    // Antigravity launch model IDs encode effort (e.g. `gemini-4-neon-high`);
+                                    // clear any separate effort override so they stay consistent.
+                                    let clear_effort =
+                                        krill_proto::agent::canonical_id(&current.agent_id)
+                                            == "agy"
+                                            && choice.as_deref().is_some_and(|m| {
+                                                krill_proto::agent::strip_agy_effort_suffix(m)
+                                                    .1
+                                                    .is_some()
+                                            });
+                                    UpdateBotParams {
+                                        model: choice.clone().map_or(
+                                            krill_proto::bots::FieldPatch::Clear,
+                                            krill_proto::bots::FieldPatch::Set,
+                                        ),
+                                        effort: if clear_effort {
+                                            krill_proto::bots::FieldPatch::Clear
+                                        } else {
+                                            krill_proto::bots::FieldPatch::Unchanged
+                                        },
+                                        ..patch(current)
+                                    }
+                                })
+                            else {
+                                return;
+                            };
+                            v.patch_bot(params, cx);
+                        })
+                        .ok();
                     }
                 };
                 menu = menu.max_h(px(360.)).scrollable(true).item(
@@ -353,7 +378,7 @@ impl View {
             });
         let effort_options = effort_options_for_runtime(runtime_canon);
         let effort = bot.effort.clone().unwrap_or_default();
-        let effort_bot = bot.clone();
+        let bot_id_effort = bot.id.clone();
         let ent = cx.entity();
         let effort_select = row_select(
             "bot-settings-agent-effort",
@@ -369,18 +394,27 @@ impl View {
                 .collect(),
             |b| b.small().w_full(),
             move |i, _, cx| {
-                let Some(eff) = effort_options.get(i) else {
+                let Some(eff) = effort_options.get(i).copied() else {
                     return;
                 };
-                let params = UpdateBotParams {
-                    effort: if eff.is_empty() {
-                        krill_proto::bots::FieldPatch::Clear
-                    } else {
-                        krill_proto::bots::FieldPatch::Set((*eff).to_owned())
-                    },
-                    ..patch(&effort_bot)
-                };
-                ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                ent.update(cx, |this, cx| {
+                    let Some(params) =
+                        this.bots
+                            .iter()
+                            .find(|b| b.id == bot_id_effort)
+                            .map(|current| UpdateBotParams {
+                                effort: if eff.is_empty() {
+                                    krill_proto::bots::FieldPatch::Clear
+                                } else {
+                                    krill_proto::bots::FieldPatch::Set(eff.to_owned())
+                                },
+                                ..patch(current)
+                            })
+                    else {
+                        return;
+                    };
+                    this.patch_bot(params, cx);
+                });
             },
         );
 
@@ -468,6 +502,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let agent = canon.to_owned();
         self.settings.models_loading_for = Some(agent.clone());
         self.settings.models_task = Some(cx.spawn(async move |this, cx| {
@@ -479,7 +514,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.settings.models_loading_for.as_deref() != Some(agent.as_str()) {
+                if this.host != req_host
+                    || this.settings.models_loading_for.as_deref() != Some(agent.as_str())
+                {
                     return;
                 }
                 this.settings.models_loading_for = None;
@@ -517,7 +554,7 @@ impl View {
         .into_iter()
         .map(|(mode, id, icon, desc)| {
             let on = bot.permission_mode == mode;
-            let bot = bot.clone();
+            let bot_id = bot.id.clone();
             Row::new(id, Some(icon), Self::permission_label(mode))
                 .detail(desc)
                 .wrap_detail()
@@ -529,14 +566,15 @@ impl View {
                     )
                 }))
                 .opens(Open::run(move |this, _, cx| {
-                    if this
-                        .selected_bot()
-                        .is_some_and(|b| b.permission_mode != mode)
-                    {
-                        let params = UpdateBotParams {
+                    if let Some(params) = this
+                        .bots
+                        .iter()
+                        .find(|b| b.id == bot_id && b.permission_mode != mode)
+                        .map(|current| UpdateBotParams {
                             permission_mode: Some(mode),
-                            ..patch(&bot)
-                        };
+                            ..patch(current)
+                        })
+                    {
                         this.patch_bot(params, cx);
                     }
                 }))
@@ -656,9 +694,23 @@ impl View {
                 window,
                 cx,
             );
+            let next = bot.look_around.focus.as_str();
+            let last_synced = self.settings.look_focus_synced.as_deref();
+            if last_synced != Some(next) {
+                let dirty =
+                    last_synced.is_some_and(|prev| input.read(cx).value().trim() != prev.trim());
+                if !dirty {
+                    let next_owned = next.to_owned();
+                    input.update(cx, |st, cx| {
+                        st.set_value(next_owned.clone(), window, cx);
+                    });
+                    self.settings.look_focus_synced = Some(next_owned);
+                }
+            }
             return;
         }
         let focus = bot.look_around.focus.clone();
+        self.settings.look_focus_synced = Some(focus.clone());
         let input = cx.new(|cx| {
             let mut st =
                 InputState::new(window, cx).placeholder(text::SV_LOOK_FOCUS_PLACEHOLDER.get());
@@ -669,15 +721,25 @@ impl View {
         });
         self.settings.look_focus_sub =
             Some(
-                cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, _, cx| {
-                    if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                        return;
+                cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, window, cx| {
+                    match ev {
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        } => {
+                            if crate::jump::entity_input_is_composing(ent, window, cx) {
+                                return;
+                            }
+                        }
+                        InputEvent::Blur => {}
+                        _ => return,
                     }
                     let typed = ent.read(cx).value().trim().to_owned();
                     let Some(bot) = this.selected_bot().cloned() else {
                         return;
                     };
                     if typed != bot.look_around.focus {
+                        this.settings.look_focus_synced = Some(typed.clone());
                         let mut look = bot.look_around.clone();
                         look.focus = typed;
                         this.patch_bot(
@@ -703,7 +765,7 @@ impl View {
         self.ensure_look_focus_input(bot, window, cx);
         let look = bot.look_around.clone();
         let ent = cx.entity();
-        let switch_bot = bot.clone();
+        let switch_bot_id = bot.id.clone();
         let header = Self::subsection_header(
             text::SV_LOOK_AROUND.get(),
             Some(if look.enabled {
@@ -717,14 +779,26 @@ impl View {
                     "bot-look-around-switch",
                     text::SV_LOOK_AROUND.get(),
                     look.enabled,
+                    false,
                     move |on, _, cx| {
-                        let mut look = switch_bot.look_around.clone();
-                        look.enabled = on;
-                        let params = UpdateBotParams {
-                            look_around: Some(look),
-                            ..patch(&switch_bot)
-                        };
-                        ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                        ent.update(cx, |this, cx| {
+                            let Some(params) = this
+                                .bots
+                                .iter()
+                                .find(|b| b.id == switch_bot_id)
+                                .map(|current| {
+                                    let mut look = current.look_around.clone();
+                                    look.enabled = on;
+                                    UpdateBotParams {
+                                        look_around: Some(look),
+                                        ..patch(current)
+                                    }
+                                })
+                            else {
+                                return;
+                            };
+                            this.patch_bot(params, cx);
+                        });
                     },
                 )
                 .into_any_element(),
@@ -742,7 +816,7 @@ impl View {
             return Self::settings_screen("bot-settings-look-around-page").child(section);
         }
         let ent = cx.entity();
-        let every_bot = bot.clone();
+        let every_bot_id = bot.id.clone();
         let every = row_select(
             "bot-look-around-every",
             text::SV_HOW_OFTEN.get(),
@@ -755,7 +829,7 @@ impl View {
             move |every, _, cx| {
                 ent.update(cx, |this, cx| {
                     this.update_settings_extras(
-                        every_bot.id.clone(),
+                        every_bot_id.clone(),
                         Extras {
                             look_around_every: Some(every),
                             ..Extras::default()
@@ -766,23 +840,35 @@ impl View {
             },
         );
         let ent = cx.entity();
-        let weekdays_bot = bot.clone();
+        let weekdays_bot_id = bot.id.clone();
         let weekdays = row_switch(
             p,
             "bot-look-around-weekdays",
             text::SV_WEEKDAYS.get(),
             look.weekdays_only,
+            false,
             move |on, _, cx| {
-                let mut look = weekdays_bot.look_around.clone();
-                look.weekdays_only = on;
-                let params = UpdateBotParams {
-                    look_around: Some(look),
-                    ..patch(&weekdays_bot)
-                };
-                ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                ent.update(cx, |this, cx| {
+                    let Some(params) =
+                        this.bots
+                            .iter()
+                            .find(|b| b.id == weekdays_bot_id)
+                            .map(|current| {
+                                let mut look = current.look_around.clone();
+                                look.weekdays_only = on;
+                                UpdateBotParams {
+                                    look_around: Some(look),
+                                    ..patch(current)
+                                }
+                            })
+                    else {
+                        return;
+                    };
+                    this.patch_bot(params, cx);
+                });
             },
         );
-        let running = self.soul_memory.look_around_running;
+        let running = self.soul_memory.is_looking_around(&bot.id);
         let latest = self
             .soul_memory
             .suggestions
@@ -907,7 +993,7 @@ impl View {
             text::SV_OFF.get().to_owned()
         };
         let ent = cx.entity();
-        let switch_bot = bot.clone();
+        let switch_bot_id = bot.id.clone();
         let header = Self::subsection_header(
             text::SV_MEMORY_UPKEEP.get(),
             Some(line.into()),
@@ -917,14 +1003,26 @@ impl View {
                     "bot-tidy-up-switch",
                     text::SV_MEMORY_UPKEEP.get(),
                     tidy.enabled,
+                    false,
                     move |on, _, cx| {
-                        let mut tidy = switch_bot.memory_tidy;
-                        tidy.enabled = on;
-                        let params = UpdateBotParams {
-                            memory_tidy: Some(tidy),
-                            ..patch(&switch_bot)
-                        };
-                        ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                        ent.update(cx, |this, cx| {
+                            let Some(params) = this
+                                .bots
+                                .iter()
+                                .find(|b| b.id == switch_bot_id)
+                                .map(|current| {
+                                    let mut tidy = current.memory_tidy;
+                                    tidy.enabled = on;
+                                    UpdateBotParams {
+                                        memory_tidy: Some(tidy),
+                                        ..patch(current)
+                                    }
+                                })
+                            else {
+                                return;
+                            };
+                            this.patch_bot(params, cx);
+                        });
                     },
                 )
                 .into_any_element(),
@@ -988,8 +1086,9 @@ impl View {
                             .cursor_pointer()
                             .hover(|d| d.text_color(p.foreground))
                             .child(text::SV_TIDY_REVIEW.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.settings.tidy_review = true;
+                                this.focus.focus(window, cx);
                                 cx.notify();
                             })),
                     )
@@ -1233,11 +1332,13 @@ impl View {
     }
 
     fn render_who_can_ask_page(
-        &self,
+        &mut self,
         bot: &BotConfig,
         p: &ui::Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        self.ensure_connector_inputs(bot, window, cx);
         let mut screen = Self::settings_screen("bot-settings-who-can-ask-page");
         if self.connectors.bot_access_requests.iter().any(|r| {
             r.bot_id == bot.id && r.status == krill_proto::bots::BotAccessRequestStatus::Pending
@@ -1284,6 +1385,7 @@ impl View {
                 cx,
             ));
         }
+        let busy = self.patch_task.is_some();
         for (place_idx, (source, workspace)) in places.into_iter().enumerate() {
             let people: Vec<&BotMember> = bot
                 .members
@@ -1294,7 +1396,7 @@ impl View {
                 || source_label(source).to_owned(),
                 |w| format!("{} · {w}", source_label(source)),
             );
-            let list = Self::who_can_ask_card(bot, place_idx, &people, p, cx);
+            let list = Self::who_can_ask_card(bot, place_idx, &people, busy, p, cx);
             screen = screen.child(
                 div()
                     .min_w_0()
@@ -1335,6 +1437,7 @@ impl View {
         bot: &BotConfig,
         place_idx: usize,
         people: &[&BotMember],
+        busy: bool,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1439,6 +1542,7 @@ impl View {
                     .icon(IconName::Close)
                     .tooltip(text::SV_REMOVE.get())
                     .accessibility_label(text::SV_REMOVE.get())
+                    .disabled(busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_bot_members(bot_id.clone(), vec![member.clone()], cx);
                     })),
@@ -1490,6 +1594,7 @@ impl View {
                     text::SV_WHO_FIX_ONLY_ME_ACTION.get(),
                 )
                 .small()
+                .disabled(busy)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.remove_bot_members(bot_id.clone(), all.clone(), cx);
                 }))
@@ -1497,7 +1602,7 @@ impl View {
             ));
         }
         if !people.is_empty() && bot.permission_mode == Permission::Yolo {
-            let ask_bot = bot.clone();
+            let ask_bot_id = bot.id.clone();
             advice.push(fix(
                 ui::icons::HAND_SVG,
                 text::SV_WHO_FIX_ASK.get().to_owned(),
@@ -1507,12 +1612,19 @@ impl View {
                     text::SV_WHO_FIX_ASK_ACTION.get(),
                 )
                 .small()
+                .disabled(busy)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let params = UpdateBotParams {
-                        permission_mode: Some(Permission::Manual),
-                        ..patch(&ask_bot)
-                    };
-                    this.patch_bot(params, cx);
+                    if let Some(params) =
+                        this.bots
+                            .iter()
+                            .find(|b| b.id == ask_bot_id)
+                            .map(|current| UpdateBotParams {
+                                permission_mode: Some(Permission::Manual),
+                                ..patch(current)
+                            })
+                    {
+                        this.patch_bot(params, cx);
+                    }
                 }))
                 .into_any_element(),
             ));
@@ -1914,5 +2026,140 @@ fn source_label(source: ExternalSource) -> &'static str {
         ExternalSource::GitHub => "GitHub",
         ExternalSource::Google => "Google",
         ExternalSource::Composio => "Composio",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use krill_proto::bots::{BotAccessRequest, BotAccessRequestStatus, BotId};
+
+    use super::*;
+
+    #[gpui::test]
+    fn who_can_ask_page_initializes_pairing_input_directly_in_panel_mode(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_id = BotId::new("bot-ask").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Ops", "claude", 1_700_000_000_000).unwrap();
+        let reqs = vec![BotAccessRequest {
+            token: "tok-ask".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            sender_id: "u-1".to_owned(),
+            sender_name: "Alice".to_owned(),
+            channel_id: "c-1".to_owned(),
+            status: BotAccessRequestStatus::Pending,
+            created_at: 1_700_000_000_000,
+            decided_at: None,
+        }];
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot.clone()])),
+            BotRpcRequest::ListAccessRequests { .. } => {
+                Ok(BotRpcResponse::AccessRequests(reqs.clone()))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                // Open Settings > WhoCanAsk directly without ever visiting DetailTab::Connectors.
+                v.show_in_panel(&bot_id, super::super::DetailTab::Settings, cx);
+                v.open_settings_page(SettingsPage::WhoCanAsk, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        assert!(vcx.debug_bounds("bot-settings-who-can-ask-page").is_some());
+        vcx.update(|_, cx| {
+            assert!(
+                view.read(cx).connectors.pairing_code_input.is_some(),
+                "WhoCanAsk must initialize pairing_code_input via ensure_connector_inputs"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn look_focus_input_resyncs_when_clean_and_preserves_dirty_user_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_id = BotId::new("bot-look").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Scout", "claude", 1_700_000_000_000).unwrap();
+        bot.look_around.enabled = true;
+        bot.look_around.focus = "PRs".to_owned();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot.clone()])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Settings, cx);
+                v.open_settings_page(SettingsPage::LookAround, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let input = v.settings.look_focus_input.as_ref().unwrap();
+            assert_eq!(input.read(cx).value().as_str(), "PRs");
+            assert_eq!(v.settings.look_focus_synced.as_deref(), Some("PRs"));
+        });
+
+        // External bot update re-syncs clean input.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.bots[0].look_around.focus = "Issues".to_owned();
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            let input = view
+                .read(cx)
+                .settings
+                .look_focus_input
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert_eq!(input.read(cx).value().as_str(), "Issues");
+            assert_eq!(
+                view.read(cx).settings.look_focus_synced.as_deref(),
+                Some("Issues")
+            );
+            // User begins editing a local draft without committing yet.
+            input.update(cx, |s, cx| {
+                s.set_value("My draft".to_owned(), window, cx);
+            });
+            view.update(cx, |v, cx| {
+                v.bots[0].look_around.focus = "External update".to_owned();
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let input = view.read(cx).settings.look_focus_input.as_ref().unwrap();
+            assert_eq!(
+                input.read(cx).value().as_str(),
+                "My draft",
+                "external focus refresh must not overwrite a dirty user draft"
+            );
+        });
     }
 }

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -86,29 +87,105 @@ pub(super) fn local_source_for_slug(
     }
 }
 
-pub(super) fn fetch_remote_raw(share_url: &str) -> Option<(String, bool)> {
-    if !(share_url.starts_with("https://") || share_url.starts_with("http://")) {
+struct BoundedChild {
+    child: std::process::Child,
+    exited: bool,
+}
+
+impl Drop for BoundedChild {
+    fn drop(&mut self) {
+        if !self.exited {
+            krill_proto::os::kill_tree(&mut self.child);
+        }
+    }
+}
+
+pub(super) fn read_bounded_command_preview(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+) -> Option<(String, bool)> {
+    let mut child = BoundedChild {
+        child: cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?,
+        exited: false,
+    };
+    let stdout = child.child.stdout.take()?;
+    let deadline = Instant::now() + timeout;
+    let limit = (MAX_PREVIEW_BYTES + 1) as u64;
+    let reader = crate::process_io::read(stdout, limit, deadline).ok()?;
+    let mut captured_bytes: Option<Vec<u8>> = None;
+    let status = loop {
+        if captured_bytes.is_none()
+            && let Some(res) = reader.try_finish()
+        {
+            let captured = res.ok()?;
+            if captured.timed_out {
+                return None;
+            }
+            if captured.bytes.len() > MAX_PREVIEW_BYTES {
+                // We already received > MAX_PREVIEW_BYTES of a 2xx body (`curl --fail`
+                // suppresses error bodies); stop reading and reap curl on drop.
+                let (text, truncated) = truncate_utf8(&captured.bytes);
+                return (!text.is_empty()).then_some((text, truncated));
+            }
+            captured_bytes = Some(captured.bytes);
+        }
+        if let Some(status) = child.child.try_wait().ok()? {
+            child.exited = true;
+            break status;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let bytes = if let Some(bytes) = captured_bytes {
+        bytes
+    } else {
+        let captured = reader.finish(deadline + Duration::from_millis(50)).ok()?;
+        if captured.timed_out {
+            return None;
+        }
+        captured.bytes
+    };
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        // The child may have exited non-zero (SIGPIPE / curl exit 23) right after
+        // the bounded reader closed stdout upon hitting `limit`, before `try_finish()`
+        // was polled.
+        let (text, truncated) = truncate_utf8(&bytes);
+        return (!text.is_empty()).then_some((text, truncated));
+    }
+    if !status.success() {
         return None;
     }
-    let raw_url = format!("{}/raw", share_url.trim_end_matches('/'));
-    let output = crate::platform::background_command("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "8",
-            &raw_url,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let (text, truncated) = truncate_utf8(&output.stdout);
+    let (text, truncated) = truncate_utf8(&bytes);
     (!text.is_empty()).then_some((text, truncated))
+}
+
+pub(super) fn fetch_remote_raw(share_url: &str) -> Option<(String, bool)> {
+    let clean = crate::terminal::path_link::sanitize_http_url(share_url)?;
+    let raw_url = format!("{}/raw", clean.trim_end_matches('/'));
+    let raw_url = crate::terminal::path_link::sanitize_http_url(&raw_url)?;
+    let mut cmd = crate::platform::background_command("curl");
+    cmd.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--globoff",
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+        "--max-time",
+        "8",
+        &raw_url,
+    ]);
+    read_bounded_command_preview(&mut cmd, Duration::from_secs(10))
 }
 
 impl View {
@@ -291,7 +368,15 @@ impl View {
                                 ui::secondary("artifact-detail-open", text::OPEN_IN_BROWSER.get())
                                     .debug_selector(|| "artifact-detail-open".into())
                                     .disabled(!is_openable)
-                                    .on_click(move |_, _, cx| cx.open_url(&share_url_open)),
+                                    .on_click(move |_, _, cx| {
+                                        if let Some(clean) =
+                                            crate::terminal::path_link::sanitize_http_url(
+                                                &share_url_open,
+                                            )
+                                        {
+                                            cx.open_url(&clean);
+                                        }
+                                    }),
                             )
                             .children(local_path_for_open.map(|local_path| {
                                 ui::secondary("artifact-detail-open-local", text::OPEN_LOCAL.get())
@@ -502,7 +587,13 @@ impl View {
                     div().pt_1().child(
                         ui::secondary("artifact-preview-open-browser", text::OPEN_IN_BROWSER.get())
                             .disabled(!is_openable)
-                            .on_click(move |_, _, cx| cx.open_url(&share_url_fallback_open)),
+                            .on_click(move |_, _, cx| {
+                                if let Some(clean) = crate::terminal::path_link::sanitize_http_url(
+                                    &share_url_fallback_open,
+                                ) {
+                                    cx.open_url(&clean);
+                                }
+                            }),
                     ),
                 )
                 .into_any_element()

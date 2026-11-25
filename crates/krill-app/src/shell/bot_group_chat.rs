@@ -29,6 +29,7 @@ use super::Shell;
 
 const ROOM_PAGE_LIMIT: u32 = 80;
 const EVERYONE_HANDLE: &str = "@everyone";
+const TURN_COLLAPSE_LINE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct GroupRoomKey {
@@ -53,10 +54,16 @@ pub(super) enum ComposerFocus {
 }
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent in-flight request flags for room poll, repoll, earlier pagination, and send"
+)]
 pub(super) struct RoomState {
     pub room: Option<BotGroupRoomView>,
     pub reply_audience: BotGroupReplyAudience,
     pub loading: bool,
+    pub poll_gen: u64,
+    pub repoll_needed: bool,
     pub loading_earlier: bool,
     pub sending: bool,
     pub error: Option<String>,
@@ -194,6 +201,36 @@ fn same_group_thread(
     }
 }
 
+fn resolved_thread_id(key: &GroupRoomKey, state: Option<&RoomState>) -> Option<String> {
+    key.thread_id.clone().or_else(|| {
+        state
+            .and_then(|r| r.room.as_ref())
+            .and_then(|v| v.active_thread_id.clone())
+    })
+}
+
+/// Returns `(display_body, is_clamped)` for a finished group bot turn.
+/// When `expanded` is false and `body` has more than `TURN_COLLAPSE_LINE_LIMIT` lines,
+/// returns the first `TURN_COLLAPSE_LINE_LIMIT` lines followed by an ellipsis (closing any
+/// unclosed triple-backtick fence so markdown stays well-formed).
+fn group_turn_display_body(body: &str, expanded: bool) -> (String, bool) {
+    let mut lines = body.lines();
+    let head: Vec<&str> = lines.by_ref().take(TURN_COLLAPSE_LINE_LIMIT).collect();
+    if expanded || lines.next().is_none() {
+        return (body.to_owned(), false);
+    }
+    let mut preview = head.join("\n");
+    let open_fences = head
+        .iter()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    if !open_fences.is_multiple_of(2) {
+        preview.push_str("\n```");
+    }
+    preview.push_str("\n…");
+    (preview, true)
+}
+
 /// Merges a fresh latest-page poll into an existing room view so older messages previously
 /// fetched via "Load earlier" (and the corresponding `has_earlier` flag) are preserved.
 fn merge_polled_room(
@@ -248,6 +285,10 @@ fn invalidate_rooms_map(
             && targeted.is_none_or(|ids| ids.iter().any(|id| id == &k.group_id))
         {
             room.last_poll_ms = 0;
+            room.poll_gen = room.poll_gen.wrapping_add(1);
+            if room.loading {
+                room.repoll_needed = true;
+            }
         }
     }
 }
@@ -318,6 +359,10 @@ impl Shell {
         group_id: &str,
         cx: &mut Context<Self>,
     ) {
+        self.bot_ui
+            .group_chat
+            .rooms
+            .retain(|k, _| !(k.host == *host && k.group_id == group_id));
         let matching: Vec<PaneId> = self
             .layout
             .tabs()
@@ -339,15 +384,43 @@ impl Shell {
             return;
         }
         self.change(true, cx, |l| {
+            let prior_focused = l.focused();
+            let prior_tab_survivor = l.visible().into_iter().find(|p| !matching.contains(p));
+            let mut target_active_idx = l.active();
             for pane in matching {
                 if let Some(tab_idx) = l.tab_of_pane(pane) {
                     if l.tab_panes(tab_idx).len() <= 1 {
                         l.close_tab(tab_idx);
+                        if tab_idx < target_active_idx {
+                            target_active_idx -= 1;
+                        } else if tab_idx == target_active_idx && !l.tabs().is_empty() {
+                            target_active_idx = target_active_idx.min(l.tabs().len() - 1);
+                        }
                     } else {
+                        l.activate(tab_idx);
+                        let tab_prior_focus = l.focused();
                         l.focus(pane);
                         l.close_pane();
+                        if let Some(prev) = tab_prior_focus
+                            && prev != pane
+                            && l.tab_of_pane(prev) == Some(tab_idx)
+                        {
+                            l.focus(prev);
+                        }
                     }
                 }
+            }
+            if let Some(pane) = prior_focused
+                && let Some(tab_idx) = l.tab_of_pane(pane)
+            {
+                l.activate(tab_idx);
+                l.focus(pane);
+            } else if let Some(pane) = prior_tab_survivor
+                && let Some(tab_idx) = l.tab_of_pane(pane)
+            {
+                l.activate(tab_idx);
+            } else if !l.tabs().is_empty() {
+                l.activate(target_active_idx.min(l.tabs().len() - 1));
             }
         });
     }
@@ -629,17 +702,13 @@ impl Shell {
         let Some(rpc) = self.bot_rpc_on(&key.host) else {
             return;
         };
+        let target_for_sessions = self.resolved_target_for_host(&key.host);
         let gid = key.group_id.clone();
-        let tid = key.thread_id.clone();
-        let target = self.target_for_host(&key.host);
 
-        if self
-            .bot_ui
-            .group_chat
-            .rooms
-            .get(&key)
-            .is_some_and(|s| s.loading)
+        if let Some(state) = self.bot_ui.group_chat.rooms.get_mut(&key)
+            && state.loading
         {
+            state.repoll_needed = true;
             return;
         }
         // Identify live/waiting/active member sessions to inspect via ChatPoll for turns & ApprovalDock.
@@ -653,7 +722,10 @@ impl Shell {
             cx,
         );
         let state = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
+        let tid = resolved_thread_id(&key, Some(state));
         state.loading = true;
+        state.repoll_needed = false;
+        let poll_gen = state.poll_gen;
         state.last_poll_ms = now_unix_ms();
 
         cx.spawn(async move |this, cx| {
@@ -670,8 +742,15 @@ impl Shell {
                         },
                     );
                     let mut map: BTreeMap<SessionId, Vec<ChatItem>> = BTreeMap::new();
-                    if !sessions_to_poll.is_empty() {
-                        let call = krill_app::resources::daemon_call_for(target);
+                    if !sessions_to_poll.is_empty()
+                        && !matches!(
+                            target_for_sessions,
+                            super::bot_section::ResolvedHostTarget::Offline
+                        )
+                    {
+                        let call = krill_app::resources::daemon_call_for(
+                            target_for_sessions.into_target(),
+                        );
                         for sid in sessions_to_poll {
                             if let Ok(Reply::AgentHistory(Response::ChatPolled(snap))) =
                                 call(&Request::AgentHistory(Action::ChatPoll {
@@ -688,17 +767,26 @@ impl Shell {
                 .await;
 
             this.update(cx, |this, cx| {
-                let state = this.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
+                let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) else {
+                    return;
+                };
                 state.loading = false;
-                for (sid, items) in chat_items_map {
-                    state.member_items.insert(sid, items);
+                let repoll = std::mem::take(&mut state.repoll_needed);
+                if state.poll_gen != poll_gen {
+                    if repoll {
+                        this.poll_group_room(key, cx);
+                    }
+                    cx.notify();
+                    return;
                 }
+                let mut applied_snapshot = false;
                 match room_res {
                     Ok(BotRpcResponse::GroupRoom(view)) => {
                         state.reply_audience = view.reply_audience.clone();
                         state.error = None;
                         let merged = merge_polled_room(state.room.as_ref(), view);
                         state.room = Some(merged);
+                        applied_snapshot = true;
                     }
                     Ok(BotRpcResponse::GroupView(old)) => {
                         // Graceful fallback if daemon predates ReadGroupRoom.
@@ -715,28 +803,39 @@ impl Shell {
                         };
                         let merged = merge_polled_room(state.room.as_ref(), fallback);
                         state.room = Some(merged);
+                        applied_snapshot = true;
                     }
                     Ok(_) => {}
                     Err(err) => state.error = Some(err),
                 }
-                // Drop cached member items for sessions that are no longer active so the room
-                // returns to idle polling cadence (3s) and never surfaces stale prompts.
-                let active_sids: HashSet<SessionId> = this
-                    .active_group_member_sessions(
-                        &key,
-                        this.bot_ui
-                            .group_chat
-                            .rooms
-                            .get(&key)
-                            .and_then(|r| r.room.as_ref()),
-                        cx,
-                    )
-                    .into_iter()
-                    .collect();
-                if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
-                    state
-                        .member_items
-                        .retain(|sid, _| active_sids.contains(sid));
+                if applied_snapshot {
+                    // Drop cached member items for sessions that are no longer active so the room
+                    // returns to idle polling cadence (3s) and never surfaces stale prompts.
+                    let active_sids: HashSet<SessionId> = this
+                        .active_group_member_sessions(
+                            &key,
+                            this.bot_ui
+                                .group_chat
+                                .rooms
+                                .get(&key)
+                                .and_then(|r| r.room.as_ref()),
+                            cx,
+                        )
+                        .into_iter()
+                        .collect();
+                    if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                        for (sid, items) in chat_items_map {
+                            if active_sids.contains(&sid) {
+                                state.member_items.insert(sid, items);
+                            }
+                        }
+                        state
+                            .member_items
+                            .retain(|sid, _| active_sids.contains(sid));
+                    }
+                }
+                if repoll {
+                    this.poll_group_room(key, cx);
                 }
                 cx.notify();
             })
@@ -745,7 +844,11 @@ impl Shell {
         .detach();
     }
 
-    fn load_earlier_group_messages(&mut self, key: GroupRoomKey, cx: &mut Context<Self>) {
+    pub(super) fn load_earlier_group_messages(
+        &mut self,
+        key: GroupRoomKey,
+        cx: &mut Context<Self>,
+    ) {
         let Some(rpc) = self.bot_rpc_on(&key.host) else {
             return;
         };
@@ -766,7 +869,7 @@ impl Shell {
         state.loading_earlier = true;
         state.action_error = None;
         let gid = key.group_id.clone();
-        let tid = key.thread_id.clone();
+        let tid = resolved_thread_id(&key, Some(state));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -784,24 +887,33 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                let state = this.bot_ui.group_chat.rooms.entry(key).or_default();
+                let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) else {
+                    return;
+                };
                 state.loading_earlier = false;
                 match res {
                     Ok(BotRpcResponse::GroupRoom(earlier)) => {
                         if let Some(room) = &mut state.room {
-                            let existing_ids: HashSet<&str> = room
-                                .messages
-                                .iter()
-                                .map(|m| m.message_id.as_str())
-                                .collect();
-                            let mut merged: Vec<BotGroupMessage> = earlier
-                                .messages
-                                .into_iter()
-                                .filter(|m| !existing_ids.contains(m.message_id.as_str()))
-                                .collect();
-                            merged.append(&mut room.messages);
-                            room.messages = merged;
-                            room.has_earlier = earlier.has_earlier;
+                            let same_thread = room
+                                .active_thread_id
+                                .as_deref()
+                                .zip(earlier.active_thread_id.as_deref())
+                                .is_none_or(|(a, b)| a == b);
+                            if same_thread {
+                                let existing_ids: HashSet<&str> = room
+                                    .messages
+                                    .iter()
+                                    .map(|m| m.message_id.as_str())
+                                    .collect();
+                                let mut merged: Vec<BotGroupMessage> = earlier
+                                    .messages
+                                    .into_iter()
+                                    .filter(|m| !existing_ids.contains(m.message_id.as_str()))
+                                    .collect();
+                                merged.append(&mut room.messages);
+                                room.messages = merged;
+                                room.has_earlier = earlier.has_earlier;
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -816,7 +928,7 @@ impl Shell {
         .detach();
     }
 
-    fn ensure_group_composer(
+    pub(super) fn ensure_group_composer(
         &mut self,
         key: &GroupRoomKey,
         window: &mut Window,
@@ -855,7 +967,10 @@ impl Shell {
                     }
                     cx.notify();
                 }
-                InputEvent::PressEnter { secondary, .. } if !secondary => {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => {
                     if Self::chat_input_is_composing(state, window, cx) {
                         return;
                     }
@@ -900,7 +1015,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn set_group_reply_audience(
+    pub(super) fn set_group_reply_audience(
         &mut self,
         key: GroupRoomKey,
         audience: BotGroupReplyAudience,
@@ -912,6 +1027,7 @@ impl Shell {
         let state = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         state.reply_audience = audience.clone();
         state.action_error = None;
+        state.poll_gen = state.poll_gen.wrapping_add(1);
         if let Some(s) = self
             .sidebar_groups
             .iter_mut()
@@ -939,6 +1055,8 @@ impl Shell {
                     && let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key)
                 {
                     room.action_error = Some(err);
+                    room.poll_gen = room.poll_gen.wrapping_add(1);
+                    this.poll_group_room(key, cx);
                 }
                 cx.notify();
             })
@@ -947,7 +1065,7 @@ impl Shell {
         .detach();
     }
 
-    fn send_group_composer_message(
+    pub(super) fn send_group_composer_message(
         &mut self,
         key: GroupRoomKey,
         window: &mut Window,
@@ -969,7 +1087,7 @@ impl Shell {
         state.sending = true;
         state.action_error = None;
         let gid = key.group_id.clone();
-        let tid = key.thread_id.clone();
+        let tid = resolved_thread_id(&key, Some(state));
         let voice_text = text_body.clone();
         self.notify_voice_sent(
             &super::voice::VoiceComposerTarget::Group(key.clone()),
@@ -998,6 +1116,7 @@ impl Shell {
                 let mut clear_input = false;
                 if let Some(room_state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
                     room_state.sending = false;
+                    room_state.poll_gen = room_state.poll_gen.wrapping_add(1);
                     match res {
                         Ok(BotRpcResponse::GroupMessagePosted { message, .. }) => {
                             if room_state.draft == sent_draft {
@@ -1031,8 +1150,9 @@ impl Shell {
                 if clear_input && let Some(inp) = input {
                     inp.update(cx, |s, cx| s.set_value("", window, cx));
                 }
+                let host = key.host.clone();
                 this.poll_group_room(key, cx);
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host, true, cx);
                 cx.notify();
             })
             .ok();
@@ -1040,7 +1160,7 @@ impl Shell {
         .detach();
     }
 
-    fn stop_group_turn(
+    pub(super) fn stop_group_turn(
         &mut self,
         key: GroupRoomKey,
         bot_id: Option<BotId>,
@@ -1049,11 +1169,12 @@ impl Shell {
         let Some(rpc) = self.bot_rpc_on(&key.host) else {
             return;
         };
+        let tid = resolved_thread_id(&key, self.bot_ui.group_chat.rooms.get(&key));
         if let Some(room) = self.bot_ui.group_chat.rooms.get_mut(&key) {
             room.action_error = None;
+            room.poll_gen = room.poll_gen.wrapping_add(1);
         }
         let gid = key.group_id.clone();
-        let tid = key.thread_id.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1069,13 +1190,15 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if let Err(err) = res
-                    && let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key)
-                {
-                    room.action_error = Some(err);
+                if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                    room.poll_gen = room.poll_gen.wrapping_add(1);
+                    if let Err(err) = res {
+                        room.action_error = Some(err);
+                    }
                 }
+                let host = key.host.clone();
                 this.poll_group_room(key, cx);
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host, true, cx);
                 cx.notify();
             })
             .ok();
@@ -1083,7 +1206,7 @@ impl Shell {
         .detach();
     }
 
-    fn send_group_approval_input(
+    pub(super) fn send_group_approval_input(
         &mut self,
         key: GroupRoomKey,
         session: SessionId,
@@ -1093,7 +1216,19 @@ impl Shell {
         if let Some(state) = self.bot_ui.group_chat.rooms.get_mut(&key) {
             state.action_error = None;
         }
-        let target = self.target_for_host(&key.host);
+        let resolved = self.resolved_target_for_host(&key.host);
+        if matches!(resolved, super::bot_section::ResolvedHostTarget::Offline) {
+            if let Some(state) = self.bot_ui.group_chat.rooms.get_mut(&key) {
+                state.action_error = Some(
+                    krill_app::i18n::catalog::sidebar::HOST_DISCONNECTED
+                        .get()
+                        .to_owned(),
+                );
+            }
+            cx.notify();
+            return;
+        }
+        let target = resolved.into_target();
         let bytes = raw.as_bytes().to_vec();
         cx.spawn(async move |this, cx| {
             let err = cx
@@ -1113,13 +1248,15 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if let Some(err) = err
-                    && let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key)
-                {
-                    state.action_error = Some(err);
+                if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                    state.poll_gen = state.poll_gen.wrapping_add(1);
+                    if let Some(err) = err {
+                        state.action_error = Some(err);
+                    }
                 }
+                let host = key.host.clone();
                 this.poll_group_room(key, cx);
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host, true, cx);
                 cx.notify();
             })
             .ok();
@@ -1850,7 +1987,8 @@ impl Shell {
         let stop_bot_id = bot.map(|b| b.id.clone());
         let reply_handle = bot.map_or_else(|| msg.sender_id.clone(), |b| b.slug.clone());
 
-        let has_details = live_preview.is_some() || msg.body.lines().count() > 8;
+        let has_details =
+            live_preview.is_some() || msg.body.lines().count() > TURN_COLLAPSE_LINE_LIMIT;
         let show_body = if is_working {
             live_preview.is_some() || !msg.body.trim().is_empty()
         } else {
@@ -1990,12 +2128,37 @@ impl Shell {
             .child(header);
 
         if show_body {
-            let content = if is_working {
-                live_preview.unwrap_or(msg.body.trim()).to_owned()
+            let body_el = if is_working {
+                let content = live_preview.unwrap_or(msg.body.trim()).to_owned();
+                if expanded {
+                    div()
+                        .min_w_0()
+                        .text_size(ui::TEXT_MD)
+                        .text_color(p.foreground)
+                        .child(
+                            gpui_component::text::TextView::markdown(
+                                SharedString::from(format!("grp-md-{}", msg.message_id)),
+                                content,
+                            )
+                            .scrollable(false)
+                            .selectable(true)
+                            .on_link_click(|url, _, _, cx| {
+                                if let Some(clean) = krill_app::bots::sanitize_http_url(url) {
+                                    cx.open_url(&clean);
+                                }
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(p.muted_foreground)
+                        .line_clamp(3)
+                        .child(content)
+                        .into_any_element()
+                }
             } else {
-                msg.body.clone()
-            };
-            let body_el = if expanded || !is_working {
+                let (content, _clamped) = group_turn_display_body(&msg.body, expanded);
                 div()
                     .min_w_0()
                     .text_size(ui::TEXT_MD)
@@ -2006,15 +2169,13 @@ impl Shell {
                             content,
                         )
                         .scrollable(false)
-                        .selectable(true),
+                        .selectable(true)
+                        .on_link_click(|url, _, _, cx| {
+                            if let Some(clean) = krill_app::bots::sanitize_http_url(url) {
+                                cx.open_url(&clean);
+                            }
+                        }),
                     )
-                    .into_any_element()
-            } else {
-                div()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .line_clamp(3)
-                    .child(content)
                     .into_any_element()
             };
             card = card.child(div().pl(px(30.)).child(body_el));
@@ -2560,6 +2721,15 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_1p5()
+            .on_action(
+                cx.listener(|_, action: &gpui_component::input::Enter, _, cx| {
+                    // Consume plain Enter so GPUI does not fall through to text-input `\n`,
+                    // while letting Shift+Enter (newline) and Secondary+Shift+Enter (ToggleZoomPane) propagate.
+                    if action.secondary || action.shift {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, _| {
                 let _ = ev;
             }))
@@ -2875,5 +3045,65 @@ mod tests {
 
         invalidate_rooms_map(&mut rooms, None, None);
         assert_eq!(rooms[&k2].last_poll_ms, 0);
+    }
+
+    #[test]
+    fn resolved_thread_id_uses_loaded_active_thread_when_key_is_none() {
+        let key_none = GroupRoomKey {
+            host: HostId::Local,
+            group_id: "grp-1".to_owned(),
+            thread_id: None,
+        };
+        let state = RoomState {
+            room: Some(sample_room(Some("thr-main"), Vec::new(), false)),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_thread_id(&key_none, Some(&state)).as_deref(),
+            Some("thr-main")
+        );
+
+        let key_explicit = GroupRoomKey {
+            host: HostId::Local,
+            group_id: "grp-1".to_owned(),
+            thread_id: Some("thr-2".to_owned()),
+        };
+        assert_eq!(
+            resolved_thread_id(&key_explicit, Some(&state)).as_deref(),
+            Some("thr-2")
+        );
+    }
+
+    #[test]
+    fn group_turn_display_body_clamps_long_finished_messages_and_closes_fences() {
+        let short = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (out, clamped) = group_turn_display_body(&short, false);
+        assert!(!clamped);
+        assert_eq!(out, short);
+
+        let long = (1..=12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (collapsed, clamped) = group_turn_display_body(&long, false);
+        assert!(clamped);
+        assert!(collapsed.contains("line 8"));
+        assert!(!collapsed.contains("line 9"));
+        assert!(collapsed.ends_with("\n…"));
+
+        let (expanded, clamped_exp) = group_turn_display_body(&long, true);
+        assert!(!clamped_exp);
+        assert_eq!(expanded, long);
+
+        let fenced = "intro\n```rust\nfn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\nfn g() {}\n```";
+        let (fenced_collapsed, fenced_clamped) = group_turn_display_body(fenced, false);
+        assert!(fenced_clamped);
+        assert!(
+            fenced_collapsed.ends_with("\n```\n…"),
+            "clamped code fence should be closed before ellipsis, got {fenced_collapsed:?}"
+        );
     }
 }

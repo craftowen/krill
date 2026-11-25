@@ -176,6 +176,7 @@ fn chat_opens_on_the_newest_rows_and_adds_older_ones_above(cx: &mut gpui::TestAp
             krilld: "/unused".into(),
         });
         let recorded = polled_from.clone();
+        let wf_recorded = polled_from.clone();
         shell.chat.poll_call = Some(Arc::new(move |request| {
             let Request::AgentHistory(Action::ChatPoll { offset, .. }) = request else {
                 panic!("expected ChatPoll");
@@ -197,12 +198,16 @@ fn chat_opens_on_the_newest_rows_and_adds_older_ones_above(cx: &mut gpui::TestAp
             if request["action"] != "chat_poll" {
                 return Ok(r#"{"ok":true,"data":{}}"#.to_owned());
             }
-            assert_eq!(request["latest"], true);
-            Ok(match request["end_offset"].as_u64() {
-                None => page(&["newest"], 900, true, 1_000),
-                Some(900) => page(&["older"], 0, false, 900),
-                other => panic!("unexpected boundary {other:?}"),
-            })
+            if request["latest"] == true {
+                return Ok(match request["end_offset"].as_u64() {
+                    None => page(&["newest"], 900, true, 1_000),
+                    Some(900) => page(&["older"], 0, false, 900),
+                    other => panic!("unexpected boundary {other:?}"),
+                });
+            }
+            let offset = request["offset"].as_u64().unwrap();
+            wf_recorded.lock().unwrap().push(offset);
+            Ok(page(&[], offset, false, offset))
         }));
         shell.toggle_chat_view(cx);
     });
@@ -633,4 +638,187 @@ fn split_unfocused_chat_pane_keeps_polling_while_other_pane_focused(cx: &mut gpu
             >= 2,
         "unfocused split Chat pane must keep polling on timer ticks"
     );
+}
+
+#[gpui::test]
+fn incremental_chat_poll_uses_json_with_at_and_falls_back_to_postcard(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("chat-incremental-json-at"));
+    let fail_workflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_wf_ref = Arc::clone(&fail_workflow);
+    let postcard_calls = Arc::new(AtomicUsize::new(0));
+    let postcard_ref = Arc::clone(&postcard_calls);
+    let make_json = |text: &str, at: &str, start: u64, next_offset: u64, latest: bool| {
+        let mut data = serde_json::to_value(ChatPollSnapshot {
+            agent: "claude".into(),
+            session_id: "inc-session".into(),
+            transcript_path: "/external/inc.jsonl".into(),
+            bound: true,
+            next_offset,
+            items: vec![ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: text.to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        data["items"][0]["at"] = at.into();
+        if latest {
+            data["page_start"] = start.into();
+            data["has_earlier"] = false.into();
+        }
+        serde_json::json!({"ok":true,"data":data}).to_string()
+    };
+    view.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(998));
+        shell.paths = Some(krill_proto::daemon::Paths {
+            socket: "/unused".into(),
+            holder: "/unused".into(),
+            krilld: "/unused".into(),
+        });
+        shell.chat.poll_call = Some(Arc::new(move |request| {
+            let Request::AgentHistory(Action::ChatPoll { offset, .. }) = request else {
+                panic!("expected ChatPoll");
+            };
+            postcard_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(Reply::AgentHistory(Response::ChatPolled(
+                ChatPollSnapshot {
+                    agent: "claude".into(),
+                    session_id: "inc-session".into(),
+                    transcript_path: "/external/inc.jsonl".into(),
+                    bound: true,
+                    next_offset: *offset + 100,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "fallback postcard".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )))
+        }));
+        shell.chat.workflow_call = Some(Arc::new(move |raw| {
+            let req: serde_json::Value = serde_json::from_str(raw).unwrap();
+            if req["action"] != "chat_poll" {
+                return Ok(r#"{"ok":true,"data":{}}"#.to_owned());
+            }
+            if req["latest"] == true {
+                return Ok(make_json("seed", "2026-11-01T00:00:00Z", 0, 100, true));
+            }
+            if fail_wf_ref.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("workflow unavailable"));
+            }
+            let offset = req["offset"].as_u64().unwrap();
+            assert_eq!(offset, 100);
+            Ok(make_json(
+                "incremental json",
+                "2026-11-01T00:02:00Z",
+                100,
+                200,
+                false,
+            ))
+        }));
+        shell.toggle_chat_view(cx);
+    });
+    cx.run_until_parked();
+    // Seeded via JSON tail poll.
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(998))];
+        assert!(log.seeded);
+        assert_eq!(log.items.len(), 1);
+        assert_eq!(log.items[0].at, "2026-11-01T00:00:00Z");
+    });
+    assert_eq!(postcard_calls.load(Ordering::SeqCst), 0);
+
+    // Next incremental poll uses JSON chat_poll and preserves `at`.
+    cx.executor().advance_clock(Duration::from_millis(800));
+    cx.run_until_parked();
+    assert_eq!(
+        postcard_calls.load(Ordering::SeqCst),
+        0,
+        "seeded incremental poll should use JSON workflow chat_poll first"
+    );
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(998))];
+        assert_eq!(log.items.len(), 2);
+        assert_eq!(log.items[1].text, "incremental json");
+        assert_eq!(log.items[1].at, "2026-11-01T00:02:00Z");
+        assert_eq!(log.offset, 200);
+    });
+
+    // When workflow_call fails, incremental poll falls back to postcard Action::ChatPoll.
+    fail_workflow.store(true, Ordering::SeqCst);
+    cx.executor().advance_clock(Duration::from_millis(800));
+    cx.run_until_parked();
+    assert_eq!(postcard_calls.load(Ordering::SeqCst), 1);
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(998))];
+        assert_eq!(log.items.len(), 3);
+        assert_eq!(log.items[2].text, "fallback postcard");
+        assert_eq!(log.offset, 300);
+    });
+}
+
+#[gpui::test]
+fn apply_chat_tail_rebases_answered_and_submissions_to_chat_base_origin(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("chat-tail-rebase-answered"));
+    let sid = SessionId(999);
+    let key = local_key(sid);
+    view.update(cx, |shell, _| {
+        let page = ChatPage {
+            start: 500,
+            has_earlier: true,
+            snapshot: ChatPollSnapshot {
+                agent: "claude".into(),
+                session_id: "tail-ans".into(),
+                transcript_path: "/external/tail-ans.jsonl".into(),
+                bound: true,
+                next_offset: 900,
+                items: vec![
+                    ChatItem {
+                        kind: ChatItemKind::Question,
+                        tool_id: "tool-q1".into(),
+                        text: "Proceed?".into(),
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::ToolResult,
+                        tool_id: "tool-q1".into(),
+                        text: "Yes".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+        shell.apply_chat_tail(
+            sid,
+            krill_app::hosts::HostId::Local,
+            page,
+            None,
+            krill_proto::control::AgentState::Done,
+            std::time::Instant::now(),
+        );
+    });
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&key];
+        assert_eq!(log.base_index, CHAT_BASE_ORIGIN);
+        let expected_key = format!("tool-q1:{CHAT_BASE_ORIGIN}");
+        assert!(
+            log.answered.contains(&expected_key),
+            "answered must be rebased to CHAT_BASE_ORIGIN, got {:?}",
+            log.answered
+        );
+        assert!(!log.answered.contains("tool-q1:0"));
+        assert!(matches!(
+            log.submissions.get(&expected_key),
+            Some(Submission::Confirmed)
+        ));
+        assert!(!log.submissions.contains_key("tool-q1:0"));
+    });
 }

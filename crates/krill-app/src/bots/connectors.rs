@@ -41,6 +41,7 @@ pub(super) struct ConnectorsState {
     pub(super) show_all_access_requests: bool,
     pub(super) default_tracker_bots: DefaultTrackerBots,
     pub(super) composio_connections: Vec<ComposioConnectionInfo>,
+    pub(super) synced_bot_id: Option<BotId>,
     pub(super) needs_sync_from_bot: bool,
     pub(super) busy: bool,
     // Telegram
@@ -204,6 +205,33 @@ impl ConnectorsState {
     }
 }
 
+const MAX_GOOGLE_OAUTH_JSON_BYTES: usize = 1024 * 1024;
+
+fn read_google_oauth_json_bounded(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let max_u64 = u64::try_from(MAX_GOOGLE_OAUTH_JSON_BYTES).unwrap_or(u64::MAX);
+    let too_large = || {
+        format!(
+            "Google OAuth JSON file exceeds the {} KiB limit.",
+            MAX_GOOGLE_OAUTH_JSON_BYTES / 1024
+        )
+    };
+    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if len > max_u64 {
+        return Err(too_large());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(max_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_GOOGLE_OAUTH_JSON_BYTES {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
 fn parse_poll_secs(raw: &str) -> u64 {
     raw.trim()
         .parse::<u64>()
@@ -234,6 +262,23 @@ struct SecretRowSpec {
 type ClearSecretCallback = Box<dyn Fn(&mut View, &mut Context<View>) + 'static>;
 
 impl View {
+    pub(super) fn clear_connector_inputs_on_bot_switch(&mut self, cx: &mut Context<Self>) {
+        let handle = self.window_handle;
+        for slot in [
+            &mut self.connectors.tg_token,
+            &mut self.connectors.slack_app_token,
+            &mut self.connectors.slack_bot_token,
+            &mut self.connectors.discord_token,
+            &mut self.connectors.google_oauth_json,
+            &mut self.connectors.github_token,
+            &mut self.connectors.linear_api_key,
+            &mut self.connectors.composio_api_key,
+            &mut self.connectors.pairing_code_input,
+        ] {
+            clear_input_on_window(slot, handle, cx);
+        }
+    }
+
     pub(super) fn ensure_connector_inputs(
         &mut self,
         bot: &BotConfig,
@@ -307,8 +352,13 @@ impl View {
                 &pairing,
                 window,
                 |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
+                    if matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(inp, window, cx)
                     {
                         let code = inp.read(cx).value().to_string();
                         this.redeem_pairing_code(&code, Some(inp.clone()), cx);
@@ -316,6 +366,27 @@ impl View {
                 },
             ));
             self.connectors.pairing_code_input = Some(pairing);
+            self.connectors.needs_sync_from_bot = true;
+        }
+
+        if self.connectors.synced_bot_id.as_ref() != Some(&bot.id) {
+            for i in [
+                &self.connectors.tg_token,
+                &self.connectors.slack_app_token,
+                &self.connectors.slack_bot_token,
+                &self.connectors.discord_token,
+                &self.connectors.google_oauth_json,
+                &self.connectors.github_token,
+                &self.connectors.linear_api_key,
+                &self.connectors.composio_api_key,
+                &self.connectors.pairing_code_input,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                i.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+            }
+            self.connectors.synced_bot_id = Some(bot.id.clone());
             self.connectors.needs_sync_from_bot = true;
         }
 
@@ -826,8 +897,8 @@ impl View {
                 this.connectors.busy = false;
                 match res {
                     Ok(BotRpcResponse::GoogleOAuthStarted { auth_url, .. }) => {
-                        if auth_url.starts_with("https://") || auth_url.starts_with("http://") {
-                            cx.open_url(&auth_url);
+                        if let Some(clean) = super::sanitize_http_url(&auth_url) {
+                            cx.open_url(&clean);
                         }
                         this.notice = Some(SharedString::from(text::GOOGLE_OAUTH_OPENED.get()));
                     }
@@ -860,6 +931,7 @@ impl View {
             prompt: Some(text::GOOGLE_OAUTH_JSON_LABEL.get().into()),
         });
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let sref = next_c
             .google
             .oauth_client_secret_ref
@@ -879,7 +951,7 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    let content = read_google_oauth_json_bounded(&path)?;
                     call_checked(
                         &rpc,
                         &BotRpcRequest::SetSecret {
@@ -913,6 +985,9 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
                 match res {
                     Ok((BotRpcResponse::Bot(updated), statuses)) => {
                         this.upsert_bot_config(*updated);
@@ -1008,10 +1083,8 @@ impl View {
                 this.connectors.busy = false;
                 match res {
                     Ok(BotRpcResponse::ComposioConnectStarted { redirect_url, .. }) => {
-                        if redirect_url.starts_with("https://")
-                            || redirect_url.starts_with("http://")
-                        {
-                            cx.open_url(&redirect_url);
+                        if let Some(clean) = super::sanitize_http_url(&redirect_url) {
+                            cx.open_url(&clean);
                         }
                         this.notice = Some(SharedString::from(text::COMPOSIO_OAUTH_OPENED.get()));
                     }
@@ -1086,6 +1159,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         self.connectors.busy = true;
         self.error = None;
         self.notice = None;
@@ -1093,13 +1167,33 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    call_checked(&rpc, &BotRpcRequest::DecideAccessRequest { token, approve })
+                    let resp =
+                        call_checked(&rpc, &BotRpcRequest::DecideAccessRequest { token, approve })?;
+                    let updated_bot = if approve
+                        && let BotRpcResponse::AccessRequestDecided(ref decided) = resp
+                    {
+                        match call_checked(
+                            &rpc,
+                            &BotRpcRequest::GetBot {
+                                bot_id: decided.bot_id.clone(),
+                            },
+                        ) {
+                            Ok(BotRpcResponse::Bot(bot)) => Some(*bot),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Ok::<_, String>((resp, updated_bot))
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
                 this.connectors.busy = false;
                 match res {
-                    Ok(BotRpcResponse::AccessRequestDecided(decided)) => {
+                    Ok((BotRpcResponse::AccessRequestDecided(decided), updated_bot)) => {
                         for list in [
                             &mut this.connectors.bot_access_requests,
                             &mut this.all_access_requests,
@@ -1108,9 +1202,12 @@ impl View {
                                 *slot = decided.clone();
                             }
                         }
+                        if let Some(updated) = updated_bot {
+                            this.upsert_bot_config(updated);
+                        }
                         this.emit_badge(cx);
                     }
-                    Ok(other) => {
+                    Ok((other, _)) => {
                         this.error = Some(SharedString::from(format!(
                             "unexpected DecideAccessRequest response: {other:?}"
                         )));
@@ -1143,6 +1240,8 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
+        let fallback_bot_id = self.selected_bot_id.clone();
         self.connectors.busy = true;
         self.error = None;
         self.notice = None;
@@ -1152,6 +1251,20 @@ impl View {
                 .spawn(async move {
                     let resp =
                         call_checked(&rpc, &BotRpcRequest::RedeemPairingCode { code: trimmed })?;
+                    let target_bot_id = match &resp {
+                        BotRpcResponse::AccessRequestDecided(decided) => {
+                            Some(decided.bot_id.clone())
+                        }
+                        _ => fallback_bot_id,
+                    };
+                    let updated_bot = match target_bot_id {
+                        Some(bot_id) => match call_checked(&rpc, &BotRpcRequest::GetBot { bot_id })
+                        {
+                            Ok(BotRpcResponse::Bot(bot)) => Some(*bot),
+                            _ => None,
+                        },
+                        None => None,
+                    };
                     let all_req = match call_checked(
                         &rpc,
                         &BotRpcRequest::ListAccessRequests { bot_id: None },
@@ -1159,13 +1272,16 @@ impl View {
                         Ok(BotRpcResponse::AccessRequests(list)) => Some(list),
                         _ => None,
                     };
-                    Ok::<_, String>((resp, all_req))
+                    Ok::<_, String>((resp, updated_bot, all_req))
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
                 this.connectors.busy = false;
                 match res {
-                    Ok((resp, all_req)) => {
+                    Ok((resp, updated_bot, all_req)) => {
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
@@ -1199,6 +1315,9 @@ impl View {
                                 this.connectors.bot_access_requests =
                                     all.into_iter().filter(|r| &r.bot_id == bid).collect();
                             }
+                        }
+                        if let Some(updated) = updated_bot {
+                            this.upsert_bot_config(updated);
                         }
                         this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SAVED.get()));
@@ -3317,5 +3436,185 @@ impl View {
             }
         }
         access_card
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use krill_proto::bots::BotMember;
+
+    use super::*;
+
+    #[test]
+    fn read_google_oauth_json_bounded_rejects_oversized_file() {
+        let base = std::env::temp_dir().join(format!("krill-oauth-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let ok_path = base.join("oauth.json");
+        std::fs::write(&ok_path, r#"{"installed":{}}"#).unwrap();
+        assert_eq!(
+            read_google_oauth_json_bounded(&ok_path).unwrap(),
+            r#"{"installed":{}}"#
+        );
+
+        let big_path = base.join("huge.json");
+        let file = std::fs::File::create(&big_path).unwrap();
+        file.set_len(u64::try_from(MAX_GOOGLE_OAUTH_JSON_BYTES).unwrap() + 1)
+            .unwrap();
+        drop(file);
+        assert!(
+            read_google_oauth_json_bounded(&big_path).is_err(),
+            "oversized OAuth JSON must be rejected before reading"
+        );
+
+        std::fs::remove_file(&ok_path).ok();
+        std::fs::remove_file(&big_path).ok();
+        std::fs::remove_dir(&base).ok();
+    }
+
+    #[gpui::test]
+    fn decide_access_and_redeem_pairing_refresh_bot_members_and_bot_switch_clears_secrets(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_id = BotId::new("bot-1").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Ops", "claude", 1_700_000_000_000).unwrap();
+        let bot_state = Arc::new(Mutex::new(bot));
+        let req_state = Arc::new(Mutex::new(vec![BotAccessRequest {
+            token: "tok-1".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            sender_id: "u-1".to_owned(),
+            sender_name: "Alice".to_owned(),
+            channel_id: "c-1".to_owned(),
+            status: BotAccessRequestStatus::Pending,
+            created_at: 1_700_000_000_000,
+            decided_at: None,
+        }]));
+        let bs = bot_state.clone();
+        let rs = req_state.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bs.lock().unwrap().clone()])),
+            BotRpcRequest::GetBot { .. } => {
+                Ok(BotRpcResponse::Bot(Box::new(bs.lock().unwrap().clone())))
+            }
+            BotRpcRequest::ListAccessRequests { .. } => {
+                Ok(BotRpcResponse::AccessRequests(rs.lock().unwrap().clone()))
+            }
+            BotRpcRequest::DecideAccessRequest { token, approve } => {
+                let mut reqs = rs.lock().unwrap();
+                let r = reqs.iter_mut().find(|r| r.token == *token).unwrap();
+                r.status = if *approve {
+                    BotAccessRequestStatus::Approved
+                } else {
+                    BotAccessRequestStatus::Declined
+                };
+                if *approve {
+                    bs.lock().unwrap().members.push(BotMember {
+                        source: ExternalSource::Telegram,
+                        id: "u-1".to_owned(),
+                        name: "Alice".to_owned(),
+                        workspace_id: None,
+                    });
+                }
+                Ok(BotRpcResponse::AccessRequestDecided(r.clone()))
+            }
+            BotRpcRequest::RedeemPairingCode { .. } => {
+                bs.lock().unwrap().members.push(BotMember {
+                    source: ExternalSource::Slack,
+                    id: "u-2".to_owned(),
+                    name: "Bob".to_owned(),
+                    workspace_id: Some("T1".to_owned()),
+                });
+                Ok(BotRpcResponse::AccessRequestDecided(BotAccessRequest {
+                    token: "tok-pair".to_owned(),
+                    bot_id: BotId::new("bot-1").unwrap(),
+                    source: ExternalSource::Slack,
+                    sender_id: "u-2".to_owned(),
+                    sender_name: "Bob".to_owned(),
+                    channel_id: "D1".to_owned(),
+                    status: BotAccessRequestStatus::Approved,
+                    created_at: 1_700_000_000_002,
+                    decided_at: Some(1_700_000_000_002),
+                }))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.run_until_parked();
+
+        // Approve access request -> must re-fetch GetBot and refresh bot.members.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.decide_access_request("tok-1".to_owned(), true, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let members = &view.read(cx).selected_bot().unwrap().members;
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].id, "u-1");
+        });
+
+        // Redeem pairing code -> must re-fetch GetBot and refresh bot.members.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.redeem_pairing_code("PAIR-99", None, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let members = &view.read(cx).selected_bot().unwrap().members;
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[1].id, "u-2");
+        });
+
+        // Fill all 8 connector secrets + pairing_code_input, then clear on bot switch.
+        let sample = bot_state.lock().unwrap().clone();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.ensure_connector_inputs(&sample, window, cx);
+                for slot in [
+                    &v.connectors.tg_token,
+                    &v.connectors.slack_app_token,
+                    &v.connectors.slack_bot_token,
+                    &v.connectors.discord_token,
+                    &v.connectors.google_oauth_json,
+                    &v.connectors.github_token,
+                    &v.connectors.linear_api_key,
+                    &v.connectors.composio_api_key,
+                    &v.connectors.pairing_code_input,
+                ] {
+                    slot.as_ref()
+                        .unwrap()
+                        .update(cx, |s, cx| s.set_value("secret-val", window, cx));
+                }
+            });
+        });
+        cx.update(|cx| {
+            view.update(cx, View::clear_connector_inputs_on_bot_switch);
+            let v = view.read(cx);
+            for slot in [
+                &v.connectors.tg_token,
+                &v.connectors.slack_app_token,
+                &v.connectors.slack_bot_token,
+                &v.connectors.discord_token,
+                &v.connectors.google_oauth_json,
+                &v.connectors.github_token,
+                &v.connectors.linear_api_key,
+                &v.connectors.composio_api_key,
+                &v.connectors.pairing_code_input,
+            ] {
+                assert!(
+                    slot.as_ref().is_none_or(|i| i.read(cx).value().is_empty()),
+                    "secret/pairing input must be cleared on bot switch"
+                );
+            }
+        });
     }
 }

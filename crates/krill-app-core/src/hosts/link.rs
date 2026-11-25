@@ -549,8 +549,8 @@ impl Lease {
     }
 
     fn stop(self: &Arc<Self>) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        if self.stop_pending.swap(true, Ordering::AcqRel) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.stop_pending.swap(true, Ordering::SeqCst) {
             return;
         }
         let lease = Arc::clone(self);
@@ -558,11 +558,11 @@ impl Lease {
             .name("link-stop".into())
             .spawn(move || {
                 let child = lease.child.lock().ok().and_then(|mut guard| {
-                    lease.stop_pending.store(false, Ordering::Release);
+                    lease.stop_pending.store(false, Ordering::SeqCst);
                     // A reconnect may already have installed a new child. An old
                     // stop request must never reap that generation.
                     (lease.child_generation.load(Ordering::Acquire)
-                        != lease.generation.load(Ordering::Acquire))
+                        != lease.generation.load(Ordering::SeqCst))
                     .then(|| guard.take())
                     .flatten()
                 });
@@ -574,7 +574,7 @@ impl Lease {
             })
             .is_err()
         {
-            self.stop_pending.store(false, Ordering::Release);
+            self.stop_pending.store(false, Ordering::SeqCst);
             tracing::warn!("could not start link child cleanup");
         }
     }

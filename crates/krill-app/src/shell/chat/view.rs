@@ -136,6 +136,11 @@ impl Shell {
                                 .scrollable(false)
                                 .selectable(true)
                                 .stream_fade(style.stream_fade)
+                                .on_link_click(|url, _, _, cx| {
+                                    if let Some(clean) = krill_app::bots::sanitize_http_url(url) {
+                                        cx.open_url(&clean);
+                                    }
+                                })
                                 .into_any_element()
                             } else {
                                 gpui_component::SelectableText::new(
@@ -363,13 +368,13 @@ impl Shell {
         session: SessionId,
         row: &work_run::DisplayRow,
         row_ix: usize,
-        total_rows: usize,
+        row_count: usize,
         joins_activity_below: bool,
         list_state: &gpui::ListState,
         agent_state: krill_proto::control::AgentState,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_last_row = row_ix + 1 == total_rows;
+        let is_last_row = row_ix + 1 == row_count;
         let key = (self.layout.host(pane).clone(), session);
         let is_find_match = self.active_chat_find_row(&key) == Some(row_ix);
         let row_el = match row {
@@ -2579,7 +2584,10 @@ impl Shell {
                 ),
             )
             .child(div().min_w_0().truncate().child(note.title.clone()))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Focus this pane first so its bot panel opens even in split view.
+                this.change(false, cx, |l| l.focus(pane));
                 // The chip opens the bot's items (Orca opens the item in its Items tab).
                 if this.panel_collapsed {
                     this.toggle_panel(cx);
@@ -3440,13 +3448,16 @@ impl Shell {
                         })
                         .with_size(ui::ICON_MD),
                     )
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(log) = this
+                        let key = (this.layout.host(pane).clone(), session);
+                        if this
                             .chat
                             .logs
-                            .get_mut(&(this.layout.host(pane).clone(), session))
+                            .get_mut(&key)
+                            .is_some_and(|log| log.toggle_turn(user_abs_idx))
                         {
-                            log.toggle_turn(user_abs_idx);
+                            this.recompute_chat_find(&key);
                         }
                         cx.notify();
                     }))
@@ -3755,7 +3766,10 @@ impl Shell {
                         .underline()
                         .hover(|s| s.text_color(palette.foreground))
                         .child(ctext::MEMORY_OPEN.get())
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Focus this pane first so its bot panel opens even in split view.
+                            this.change(false, cx, |l| l.focus(pane));
                             // The chat is on its bot's page, so its panel shows this bot.
                             if this.panel_collapsed {
                                 this.toggle_panel(cx);
@@ -3999,11 +4013,12 @@ impl Shell {
             self.poll_session_chat(pane, session, cx);
         }
         let input_state = self.ensure_chat_input(key.clone(), window, cx);
-        if self.layout.focused() == Some(pane)
-            && matches!(&self.chat.focus_pending, Some(ChatFocus::Composer(id)) if *id == key)
-        {
-            input_state.update(cx, |state, cx| state.focus(window, cx));
-            self.chat.focus_pending = None;
+        if self.layout.focused() == Some(pane) {
+            self.apply_pending_draft(window, cx);
+            if matches!(&self.chat.focus_pending, Some(ChatFocus::Composer(id)) if *id == key) {
+                input_state.update(cx, |state, cx| state.focus(window, cx));
+                self.chat.focus_pending = None;
+            }
         }
         self.sync_bot_item_notes(&key, cx);
         let palette = ui::palette(cx);
@@ -4018,8 +4033,13 @@ impl Shell {
             .chat_bot(&key)
             .is_some()
             .then_some(agent_state == krill_proto::control::AgentState::Working);
-        if let Some(log) = self.chat.logs.get_mut(&key) {
-            log.set_turn_fold(fold);
+        if self
+            .chat
+            .logs
+            .get_mut(&key)
+            .is_some_and(|log| log.set_turn_fold(fold))
+        {
+            self.recompute_chat_find(&key);
         }
         let unread = host.is_local() && self.sidebar.read(cx).is_unread(session);
         let poll_failed = self.chat.poll_failed.contains(&key);
@@ -4333,7 +4353,7 @@ impl Shell {
             let owner = cx.weak_entity();
             let rows = Arc::clone(&display_feed);
             let pending_rows = Arc::clone(&pending_cards);
-            let total_rows = rows.len() + pending_len;
+            let row_count = rows.len();
             let list_state_for_rows = list_state.clone();
             let pending_key = key.clone();
             feed = feed.child(
@@ -4362,7 +4382,7 @@ impl Shell {
                                 session,
                                 row,
                                 row_ix,
-                                total_rows,
+                                row_count,
                                 joins_activity_below,
                                 &list_state_for_rows,
                                 agent_state,
@@ -4711,8 +4731,14 @@ impl Shell {
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .capture_action(cx.listener({
                     let key = find_key.clone();
-                    move |this, _: &gpui_component::input::Enter, window, cx| {
-                        let dir = if window.modifiers().shift {
+                    let find_input = find.input.clone();
+                    move |this, action: &gpui_component::input::Enter, window, cx| {
+                        if action.secondary
+                            || krill_app::jump::entity_input_is_composing(&find_input, window, cx)
+                        {
+                            return;
+                        }
+                        let dir = if action.shift || window.modifiers().shift {
                             krill_proto::search::Direction::Previous
                         } else {
                             krill_proto::search::Direction::Next
@@ -4723,7 +4749,11 @@ impl Shell {
                 }))
                 .capture_action(cx.listener({
                     let key = find_key.clone();
+                    let find_input = find.input.clone();
                     move |this, _: &gpui_component::input::Escape, window, cx| {
+                        if krill_app::jump::entity_input_is_composing(&find_input, window, cx) {
+                            return;
+                        }
                         cx.stop_propagation();
                         this.close_chat_find(&key, window, cx);
                     }

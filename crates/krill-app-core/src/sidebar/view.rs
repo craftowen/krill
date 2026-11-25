@@ -1701,8 +1701,34 @@ impl Sidebar {
                                 })),
                         ),
                 )
+                .capture_action(
+                    cx.listener(|s, _: &gpui_component::input::Escape, window, cx| {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if composing {
+                            window.prevent_default();
+                        }
+                    }),
+                )
+                .capture_action(
+                    cx.listener(|s, _: &gpui_component::input::Enter, window, cx| {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if composing {
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
                 .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
-                    if e.keystroke.key == "escape" {
+                    if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if window.default_prevented() || composing {
+                            return;
+                        }
                         cx.stop_propagation();
                         s.cancel_rename(Some(window), cx);
                     }
@@ -3040,8 +3066,34 @@ impl Sidebar {
                                 })),
                         ),
                 )
+                .capture_action(
+                    cx.listener(|s, _: &gpui_component::input::Escape, window, cx| {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if composing {
+                            window.prevent_default();
+                        }
+                    }),
+                )
+                .capture_action(
+                    cx.listener(|s, _: &gpui_component::input::Enter, window, cx| {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if composing {
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
                 .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
-                    if e.keystroke.key == "escape" {
+                    if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                        let composing = s.editing.as_ref().is_some_and(|(_, input)| {
+                            crate::jump::entity_input_is_composing(input, window, cx)
+                        });
+                        if window.default_prevented() || composing {
+                            return;
+                        }
                         cx.stop_propagation();
                         s.cancel_rename(Some(window), cx);
                     }

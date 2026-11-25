@@ -80,9 +80,47 @@ pub const UPLOAD_AVATAR: &str = "avatar.png";
 pub const PICTURE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const PICTURE_MIN_SIDE: u32 = 128;
 const PICTURE_SIDE: u32 = 512;
+const PICTURE_DOWNSCALE_SIDES: [u32; 4] = [PICTURE_SIDE, 384, 256, 192];
+/// Bound encoded PNG output to leave Store-ZIP and Mobile base64 headroom (R2A-07 + R2P-03).
+const MAX_PREPARED_PNG_BYTES: usize = 512 * 1024;
 /// Decode guard: a 10 MB JPEG can still unpack to gigabytes.
 const PICTURE_MAX_DECODE_SIDE: u32 = 8192;
 const PICTURE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn avatar_png_byte_limit() -> usize {
+    krill_proto::bots::MAX_AVATAR_PNG_BYTES.min(MAX_PREPARED_PNG_BYTES)
+}
+
+fn encode_optimized_png(img: &image::DynamicImage, opaque: bool) -> Result<Vec<u8>, PictureError> {
+    use image::ImageEncoder as _;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
+    let mut png = Vec::new();
+    let encoder =
+        PngEncoder::new_with_quality(&mut png, CompressionType::Best, FilterType::Adaptive);
+    if opaque {
+        let rgb = img.to_rgb8();
+        encoder
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|_| PictureError::Unreadable)?;
+    } else {
+        let rgba = img.to_rgba8();
+        encoder
+            .write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|_| PictureError::Unreadable)?;
+    }
+    Ok(png)
+}
 
 /// Why a picked picture was refused (Orca's three messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,12 +258,24 @@ pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
         );
     drop(picture);
     square.apply_orientation(orientation);
-    let mut png = Vec::new();
-    square
-        .to_rgba8()
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|_| PictureError::Unreadable)?;
-    Ok(png)
+    let opaque = square.to_rgba8().pixels().all(|p| p.0[3] == 255);
+    let max_bytes = avatar_png_byte_limit();
+    for &target_side in &PICTURE_DOWNSCALE_SIDES {
+        let png = if target_side == PICTURE_SIDE {
+            encode_optimized_png(&square, opaque)?
+        } else {
+            let shrunk = square.resize_exact(
+                target_side,
+                target_side,
+                image::imageops::FilterType::Lanczos3,
+            );
+            encode_optimized_png(&shrunk, opaque)?
+        };
+        if png.len() <= max_bytes {
+            return Ok(png);
+        }
+    }
+    Err(PictureError::TooBig)
 }
 
 /// Computes a toned-down background tint (`0x00RR_GGBB`) from the outer 10% ring of a 512px PNG,
@@ -479,13 +529,57 @@ pub fn mascot_image_grayscale(id: &'static str, background: u32) -> Option<Arc<I
     Some(image)
 }
 
+const GRAYSCALE_UPLOAD_CACHE_MAX: usize = 64;
+
+#[derive(Default)]
+struct GrayscaleUploadCache {
+    entries: HashMap<u64, Arc<Image>>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl GrayscaleUploadCache {
+    fn get(&self, id: u64) -> Option<Arc<Image>> {
+        self.entries.get(&id).cloned()
+    }
+
+    fn insert(&mut self, id: u64, image: Arc<Image>) -> Arc<Image> {
+        if let Some(existing) = self.entries.get(&id) {
+            return existing.clone();
+        }
+        while self.entries.len() >= GRAYSCALE_UPLOAD_CACHE_MAX {
+            if let Some(evict_id) = self.order.pop_front() {
+                self.entries.remove(&evict_id);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(id, image.clone());
+        self.order.push_back(id);
+        image
+    }
+}
+
 fn grayscale_upload_image(upload: &Arc<Image>) -> Option<Arc<Image>> {
+    static CACHE: OnceLock<Mutex<GrayscaleUploadCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(upload.id)
+    {
+        return Some(cached);
+    }
     let img = image::load_from_memory(upload.bytes()).ok()?.grayscale();
     let mut png = Vec::new();
     img.to_rgba8()
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .ok()?;
-    Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+    let gray = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+    let stored = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(upload.id, gray);
+    Some(stored)
 }
 
 /// What a bot's avatar shows.
@@ -839,5 +933,70 @@ mod tests {
         assert_eq!(avatar_png_from_icns(&icns_no_png), None);
         assert_eq!(prepare_picture(&icns_no_png), Err(PictureError::Unreadable));
         assert_eq!(avatar_png_from_icns(b"icns\x00\x00\x00\x04"), None);
+    }
+
+    #[test]
+    fn prepare_picture_bounds_high_entropy_image_to_512_kib_and_decode_matches() {
+        // Pseudo-random high-entropy 512x512 RGB image: naive RGBA8 PNG exceeds 768 KiB.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let img = image::RgbImage::from_fn(512, 512, |_, _| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let b = state.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes();
+            image::Rgb([b[0], b[1], b[2]])
+        });
+        let mut raw = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+            .unwrap();
+        let prepared = prepare_picture(&raw).expect("noisy photo should downscale under 512 KiB");
+        assert!(
+            prepared.len() <= 512 * 1024,
+            "prepared PNG must fit 512 KiB budget, got {} bytes",
+            prepared.len()
+        );
+        assert!(super::super::rpc::decode_png_avatar(&prepared).is_ok());
+
+        let mut oversize = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        oversize.resize(512 * 1024 + 1, 0);
+        let err = super::super::rpc::decode_png_avatar(&oversize).unwrap_err();
+        assert!(
+            err.contains("512 KiB"),
+            "expected 512 KiB message, got {err}"
+        );
+    }
+
+    #[test]
+    fn grayscale_upload_image_caches_by_image_id_and_bounds_entries() {
+        let rgb = image::RgbImage::from_fn(4, 4, |_, _| image::Rgb([220, 40, 20]));
+        let mut png = Vec::new();
+        rgb.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let src = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+
+        let first = grayscale_upload_image(&src).expect("grayscale png");
+        let second = grayscale_upload_image(&src).expect("cached grayscale png");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeated calls with the same source Image must reuse cached Arc"
+        );
+        assert_eq!(first.id, second.id);
+
+        let decoded = image::load_from_memory(first.bytes()).unwrap().to_rgba8();
+        let px = decoded.get_pixel(0, 0).0;
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+
+        let mut bounded = GrayscaleUploadCache::default();
+        for id in 0..=(GRAYSCALE_UPLOAD_CACHE_MAX as u64 + 5) {
+            let entry = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
+            bounded.insert(id, entry);
+        }
+        assert_eq!(bounded.entries.len(), GRAYSCALE_UPLOAD_CACHE_MAX);
+        assert!(bounded.get(0).is_none(), "oldest entries must be evicted");
+        assert!(
+            bounded.get(GRAYSCALE_UPLOAD_CACHE_MAX as u64 + 5).is_some(),
+            "newest entry must remain cached"
+        );
     }
 }

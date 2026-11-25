@@ -180,9 +180,8 @@ impl View {
                             ui::primary("bot-connectors-add-first", hm::ADD_CONNECTOR.get())
                                 .small()
                                 .icon(Icon::new(IconName::Plus))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.connectors.adding = Some(());
-                                    cx.notify();
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_connector_add_dialog(window, cx);
                                 })),
                         ),
                 )
@@ -225,15 +224,36 @@ impl View {
                             .xsmall()
                             .icon(Icon::new(IconName::Plus).size(px(14.)))
                             .label(hm::ADD.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.connectors.adding = Some(());
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_connector_add_dialog(window, cx);
                             })),
                     ),
             )
             .child(list)
             .child(webhooks)
             .children(add)
+    }
+
+    pub(super) fn open_connector_add_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connectors.adding = Some(());
+        let search = self
+            .connectors
+            .add_search
+            .get_or_insert_with(|| {
+                let input = cx.new(|cx| {
+                    gpui_component::input::InputState::new(window, cx)
+                        .placeholder(hm::SEARCH_APPS.get())
+                });
+                cx.observe(&input, |_, _, cx| cx.notify()).detach();
+                input
+            })
+            .clone();
+        search.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
     }
 
     /// Orca `BotConnectorsHostNotice`: explains when connectors run on a remote host.

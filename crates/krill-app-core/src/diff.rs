@@ -919,6 +919,12 @@ impl Panel {
             self.watch_gen = 0;
             self.refresh_branch_sync(cx);
             self.start_watch(cx);
+            if self.tab == PanelTab::Checks
+                && self.checks.inspection.is_none()
+                && !self.checks.loading
+            {
+                self.refresh_checks(cx);
+            }
         } else {
             self.watch_task = None;
             // 완료된 내용은 보존한다. 전환 중이면 새 선택과 이전 본문을 함께 해제한다.
@@ -938,9 +944,11 @@ impl Panel {
                 }
                 self.invalidate_patch();
             }
-            self.checks.generation = self.checks.generation.wrapping_add(1);
+            if !self.checks.merging {
+                self.checks.generation = self.checks.generation.wrapping_add(1);
+            }
             self.checks.task = None;
-            self.checks.loading = false;
+            self.checks.loading = self.checks.merging;
             if let Some(source) = self.source.clone() {
                 let req = GitWatchRequest {
                     repo: self.repo.as_os_str().as_bytes().to_vec(),

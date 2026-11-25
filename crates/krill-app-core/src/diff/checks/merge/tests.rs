@@ -75,6 +75,25 @@ impl Runner for Fake {
             .lock()
             .unwrap()
             .push((folder.to_owned(), target.to_owned(), method));
+        self.wait_on_mutation_gate();
+        if self.fail_merge {
+            Err(io::Error::other("fake: permission denied"))
+        } else {
+            Ok(())
+        }
+    }
+    fn set_pr_draft(&self, _: &Path, _: &str, _: bool) -> io::Result<()> {
+        self.wait_on_mutation_gate();
+        if self.fail_merge {
+            Err(io::Error::other("fake: permission denied"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Fake {
+    fn wait_on_mutation_gate(&self) {
         let gate = self.mutation_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.entered.send(()).unwrap();
@@ -87,11 +106,6 @@ impl Runner for Fake {
                 .scheduler_executor()
                 .scheduler()
                 .block(None, wait.as_mut(), None);
-        }
-        if self.fail_merge {
-            Err(io::Error::other("fake: permission denied"))
-        } else {
-            Ok(())
         }
     }
 }
@@ -643,4 +657,51 @@ fn short_merge_confirmation_keeps_decision_buttons_inside_viewport(cx: &mut gpui
         assert!(button.top() >= card.top());
         assert!(button.bottom() <= card.bottom());
     }
+}
+
+#[gpui::test]
+fn hiding_panel_or_refreshing_during_toggle_pr_draft_keeps_mutation_and_invalidates_inspection(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fake = Fake::new(false);
+    let (view, cx) = setup(cx, &fake);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    *fake.mutation_gate.lock().unwrap() = Some(MutationGate {
+        entered,
+        release: wait,
+        executor: cx.executor(),
+    });
+    let mut toggle_cx = cx.clone();
+    let toggle_view = view.clone();
+    let toggler = cx.spawn(async move |_| {
+        entry.await.unwrap();
+        toggle_cx.update(|_, cx| {
+            toggle_view.update(cx, |panel, cx| {
+                // Hiding panel and triggering refresh_checks while toggle_pr_draft is running
+                // must keep the mutation task alive and busy.
+                panel.set_visible(false, cx);
+                assert!(panel.checks.merging);
+                assert!(panel.checks.loading);
+                assert!(panel.checks.merge_task.is_some());
+                panel.refresh_checks(cx);
+                assert!(panel.checks.merging);
+            });
+        });
+        release.send(()).unwrap();
+    });
+    cx.update(|_, cx| {
+        view.update(cx, Panel::toggle_pr_draft);
+    });
+    cx.run_until_parked();
+    drop(toggler);
+    view.read_with(cx, |panel, _| {
+        assert!(!panel.checks.merging);
+        assert!(!panel.checks.loading);
+        assert_eq!(panel.checks.fix_status, Some(text::ACTION_SUCCESS));
+        assert!(
+            panel.checks.inspection.is_none(),
+            "completing toggle_pr_draft while hidden must invalidate stale inspection"
+        );
+    });
 }

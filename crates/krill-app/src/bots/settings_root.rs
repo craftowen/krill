@@ -179,9 +179,10 @@ pub(super) fn row_switch(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     on: bool,
+    disabled: bool,
     toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    ui::switch(p, id, on, false, toggle).aria_label(label.into())
+    ui::switch(p, id, on, disabled, toggle).aria_label(label.into())
 }
 
 /// A compact switch for Settings root rows (24×14px track, 10px thumb — Orca `BotSettingsSwitch`).
@@ -304,17 +305,148 @@ pub(super) fn computer_name(view: &View) -> String {
     }
 }
 
+/// A settings mutation queued behind an in-flight `patch_task` so rapid toggles serialize
+/// instead of overwriting and dropping the previous RPC.
+pub(super) enum PendingPatch {
+    UpdateBot {
+        req_host: crate::hosts::HostId,
+        params: Box<UpdateBotParams>,
+        prev_bot: Option<Box<BotConfig>>,
+    },
+    RemoveMembers {
+        req_host: crate::hosts::HostId,
+        bot_id: BotId,
+        members: Vec<BotMember>,
+        prev_bot: Option<Box<BotConfig>>,
+    },
+}
+
+fn apply_field_patch(slot: &mut Option<String>, patch: &FieldPatch<String>) {
+    match patch {
+        FieldPatch::Unchanged => {}
+        FieldPatch::Clear => *slot = None,
+        FieldPatch::Set(v) => *slot = Some(v.clone()),
+    }
+}
+
+fn apply_update_bot_params(bot: &mut BotConfig, params: &UpdateBotParams) {
+    if let Some(name) = &params.name {
+        bot.name.clone_from(name);
+    }
+    if let Some(description) = &params.description {
+        bot.description.clone_from(description);
+    }
+    apply_field_patch(&mut bot.emoji, &params.emoji);
+    apply_field_patch(&mut bot.avatar, &params.avatar);
+    if let Some(agent_id) = &params.agent_id {
+        bot.agent_id.clone_from(agent_id);
+    }
+    apply_field_patch(&mut bot.model, &params.model);
+    apply_field_patch(&mut bot.effort, &params.effort);
+    if let Some(permission_mode) = params.permission_mode {
+        bot.permission_mode = permission_mode;
+    }
+    apply_field_patch(&mut bot.workspace, &params.workspace);
+    if let Some(paused) = params.paused {
+        bot.paused = paused;
+    }
+    if let Some(first_run_completed) = params.first_run_completed {
+        bot.first_run_completed = first_run_completed;
+    }
+    if let Some(notifications) = params.notifications {
+        bot.notifications = notifications;
+    }
+    if let Some(schedules) = &params.schedules {
+        bot.schedules.clone_from(schedules);
+    }
+    if let Some(look_around) = &params.look_around {
+        bot.look_around.clone_from(look_around);
+    }
+    if let Some(memory_tidy) = params.memory_tidy {
+        bot.memory_tidy = memory_tidy;
+    }
+    if let Some(mcp_tools) = &params.mcp_tools {
+        bot.mcp_tools.clone_from(mcp_tools);
+    }
+}
+
+impl PendingPatch {
+    const fn req_host(&self) -> &crate::hosts::HostId {
+        match self {
+            Self::UpdateBot { req_host, .. } | Self::RemoveMembers { req_host, .. } => req_host,
+        }
+    }
+
+    fn bot_id(&self) -> &BotId {
+        match self {
+            Self::UpdateBot { params, .. } => &params.bot_id,
+            Self::RemoveMembers { bot_id, .. } => bot_id,
+        }
+    }
+
+    fn set_prev_bot(&mut self, bot: BotConfig) {
+        match self {
+            Self::UpdateBot { prev_bot, .. } | Self::RemoveMembers { prev_bot, .. } => {
+                *prev_bot = Some(Box::new(bot));
+            }
+        }
+    }
+
+    fn apply_to(&self, bot: &mut BotConfig) {
+        match self {
+            Self::UpdateBot { params, .. } => apply_update_bot_params(bot, params),
+            Self::RemoveMembers { members, .. } => {
+                bot.members.retain(|m| !members.contains(m));
+            }
+        }
+    }
+}
+
 impl View {
     /// Applies one change from a settings row and shows the bot as krilld returns it.
+    /// Rapid changes serialize through `settings.patch_queue` with optimistic updates and rollback.
     pub(super) fn patch_bot(&mut self, params: UpdateBotParams, cx: &mut Context<Self>) {
-        let rpc = self.rpc.clone();
-        let prev_agent = self
-            .bots
-            .iter()
-            .find(|b| b.id == params.bot_id)
-            .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
+        let req_host = self.host.clone();
+        self.settings
+            .patch_queue
+            .retain(|p| p.req_host() == &req_host);
+        let prev_bot = self.bots.iter().find(|b| b.id == params.bot_id).cloned();
+        if let Some(bot) = self.bots.iter_mut().find(|b| b.id == params.bot_id) {
+            apply_update_bot_params(bot, &params);
+            if self.selected_bot_id.as_ref() == Some(&params.bot_id) {
+                let snapshot = bot.clone();
+                self.settings.sync_from_bot(&snapshot);
+                self.soul_memory.sync_config_from_bot(&snapshot);
+            }
+        }
         self.error = None;
         self.notice = None;
+        if self.patch_task.is_some() {
+            self.settings
+                .patch_queue
+                .push_back(PendingPatch::UpdateBot {
+                    req_host,
+                    params: Box::new(params),
+                    prev_bot: prev_bot.map(Box::new),
+                });
+            cx.notify();
+            return;
+        }
+        self.start_patch_update(req_host, params, prev_bot, cx);
+    }
+
+    fn start_patch_update(
+        &mut self,
+        req_host: crate::hosts::HostId,
+        params: UpdateBotParams,
+        prev_bot: Option<BotConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        let rpc = self.rpc.clone();
+        let req_bot = params.bot_id.clone();
+        let prev_agent = prev_bot
+            .as_ref()
+            .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
         self.patch_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -323,36 +455,108 @@ impl View {
                 )
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
+                this.patch_task = None;
+                let same_bot = this.selected_bot_id.as_ref() == Some(&req_bot);
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
+                        let confirmed = *updated;
                         let next_agent =
-                            krill_proto::agent::canonical_id(&updated.agent_id).to_owned();
+                            krill_proto::agent::canonical_id(&confirmed.agent_id).to_owned();
                         let provider_changed = prev_agent
                             .as_deref()
                             .is_some_and(|prev| prev != next_agent.as_str());
-                        this.settings.sync_from_bot(&updated);
-                        this.soul_memory.sync_config_from_bot(&updated);
-                        if provider_changed {
-                            this.settings.agent_models = None;
-                            this.settings.models_loading_for = None;
-                            this.settings.models_task = None;
-                            this.bot_sessions.retain(|s| s.bot_id != updated.id);
+                        if let Some(next_for_bot) = this
+                            .settings
+                            .patch_queue
+                            .iter_mut()
+                            .find(|p| p.req_host() == &req_host && p.bot_id() == &confirmed.id)
+                        {
+                            next_for_bot.set_prev_bot(confirmed.clone());
                         }
-                        this.upsert_bot_config(*updated);
+                        let mut merged = confirmed;
+                        for queued in &this.settings.patch_queue {
+                            if queued.req_host() == &req_host && queued.bot_id() == &merged.id {
+                                queued.apply_to(&mut merged);
+                            }
+                        }
+                        if same_bot {
+                            this.settings.sync_from_bot(&merged);
+                            this.soul_memory.sync_config_from_bot(&merged);
+                        }
                         if provider_changed {
-                            this.ensure_agent_models(&next_agent, cx);
+                            if same_bot {
+                                this.settings.agent_models = None;
+                                this.settings.models_loading_for = None;
+                                this.settings.models_task = None;
+                            }
+                            this.bot_sessions.retain(|s| s.bot_id != merged.id);
+                        }
+                        this.upsert_bot_config(merged);
+                        if provider_changed {
+                            if same_bot {
+                                this.ensure_agent_models(&next_agent, cx);
+                            }
                             this.emit_sessions_changed(cx);
                         }
                         this.emit_badge(cx);
                     }
                     Ok(_) => {}
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                    Err(err) => {
+                        this.settings
+                            .patch_queue
+                            .retain(|p| !(p.req_host() == &req_host && p.bot_id() == &req_bot));
+                        if let Some(rollback) = prev_bot {
+                            if same_bot {
+                                this.settings.sync_from_bot(&rollback);
+                                this.soul_memory.sync_config_from_bot(&rollback);
+                            }
+                            this.upsert_bot_config(rollback);
+                            this.emit_badge(cx);
+                        }
+                        if same_bot {
+                            this.error = Some(SharedString::from(err));
+                        }
+                    }
                 }
+                this.drain_patch_queue(cx);
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    fn drain_patch_queue(&mut self, cx: &mut Context<Self>) {
+        if self.patch_task.is_some() {
+            return;
+        }
+        while let Some(next) = self.settings.patch_queue.pop_front() {
+            if next.req_host() != &self.host {
+                continue;
+            }
+            match next {
+                PendingPatch::UpdateBot {
+                    req_host,
+                    params,
+                    prev_bot,
+                } => {
+                    self.start_patch_update(req_host, *params, prev_bot.map(|b| *b), cx);
+                    return;
+                }
+                PendingPatch::RemoveMembers {
+                    req_host,
+                    bot_id,
+                    members,
+                    prev_bot,
+                } => {
+                    self.start_remove_members(req_host, bot_id, members, prev_bot.map(|b| *b), cx);
+                    return;
+                }
+            }
+        }
     }
 
     /// The bot's Items, Look around and Memory upkeep presets (defaults until krilld answers).
@@ -380,6 +584,7 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let rpc = self.rpc.clone();
+        let req_host = self.host.clone();
         let read_only = change == Extras::default();
         let req = if read_only {
             BotRpcRequest::GetBotSettingsExtras {
@@ -399,7 +604,11 @@ impl View {
                 .spawn(async move { call_checked(&rpc, &req) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host != req_host {
+                    return;
+                }
                 this.settings.extras_task = None;
+                let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id);
                 match res {
                     Ok(BotRpcResponse::BotSettingsExtras(extras)) => {
                         this.settings.extras.insert(bot_id, extras);
@@ -410,8 +619,8 @@ impl View {
                             .extras
                             .insert(bot_id, BotSettingsExtras::default());
                     }
-                    Ok(_) => {}
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                    Err(err) if same_bot => this.error = Some(SharedString::from(err)),
+                    Ok(_) | Err(_) => {}
                 }
                 cx.notify();
             })
@@ -426,39 +635,112 @@ impl View {
         members: Vec<BotMember>,
         cx: &mut Context<Self>,
     ) {
-        let rpc = self.rpc.clone();
+        if members.is_empty() {
+            return;
+        }
+        let req_host = self.host.clone();
+        self.settings
+            .patch_queue
+            .retain(|p| p.req_host() == &req_host);
+        let prev_bot = self.bots.iter().find(|b| b.id == bot_id).cloned();
+        if let Some(bot) = self.bots.iter_mut().find(|b| b.id == bot_id) {
+            bot.members.retain(|m| !members.contains(m));
+        }
         self.error = None;
         self.notice = None;
+        if self.patch_task.is_some() {
+            self.settings
+                .patch_queue
+                .push_back(PendingPatch::RemoveMembers {
+                    req_host,
+                    bot_id,
+                    members,
+                    prev_bot: prev_bot.map(Box::new),
+                });
+            cx.notify();
+            return;
+        }
+        self.start_remove_members(req_host, bot_id, members, prev_bot, cx);
+    }
+
+    fn start_remove_members(
+        &mut self,
+        req_host: crate::hosts::HostId,
+        bot_id: BotId,
+        members: Vec<BotMember>,
+        prev_bot: Option<BotConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        let rpc = self.rpc.clone();
+        let req_bot = bot_id.clone();
         self.patch_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut last = Ok(BotRpcResponse::Ok);
+                    let mut last_ok_bot: Option<BotConfig> = None;
                     for member in members {
-                        last = call_checked(
+                        match call_checked(
                             &rpc,
                             &BotRpcRequest::RemoveBotMember {
                                 bot_id: bot_id.clone(),
                                 member,
                             },
-                        );
-                        if last.is_err() {
-                            break;
+                        ) {
+                            Ok(BotRpcResponse::Bot(updated)) => {
+                                last_ok_bot = Some(*updated);
+                            }
+                            Ok(_) => {}
+                            Err(err) => return (last_ok_bot, Err(err)),
                         }
                     }
-                    last
+                    (last_ok_bot, Ok(()))
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match res {
-                    Ok(BotRpcResponse::Bot(updated)) => this.upsert_bot_config(*updated),
-                    Ok(_) => {}
-                    Err(err) => this.error = Some(SharedString::from(err)),
+                if this.host != req_host {
+                    return;
                 }
+                this.patch_task = None;
+                let same_bot = this.selected_bot_id.as_ref() == Some(&req_bot);
+                match res {
+                    (Some(confirmed), Ok(())) => {
+                        if let Some(next_for_bot) = this
+                            .settings
+                            .patch_queue
+                            .iter_mut()
+                            .find(|p| p.req_host() == &req_host && p.bot_id() == &confirmed.id)
+                        {
+                            next_for_bot.set_prev_bot(confirmed.clone());
+                        }
+                        let mut merged = confirmed;
+                        for queued in &this.settings.patch_queue {
+                            if queued.req_host() == &req_host && queued.bot_id() == &merged.id {
+                                queued.apply_to(&mut merged);
+                            }
+                        }
+                        this.upsert_bot_config(merged);
+                        this.emit_badge(cx);
+                    }
+                    (None, Ok(())) => {}
+                    (last_ok_bot, Err(err)) => {
+                        this.settings
+                            .patch_queue
+                            .retain(|p| !(p.req_host() == &req_host && p.bot_id() == &req_bot));
+                        if let Some(rollback) = last_ok_bot.or(prev_bot) {
+                            this.upsert_bot_config(rollback);
+                            this.emit_badge(cx);
+                        }
+                        if same_bot {
+                            this.error = Some(SharedString::from(err));
+                        }
+                    }
+                }
+                this.drain_patch_queue(cx);
                 cx.notify();
             })
             .ok();
         }));
+        cx.notify();
     }
 
     /// The subpage the Settings tab shows (the host's Back returns to the list first).
@@ -473,6 +755,9 @@ impl View {
     }
 
     pub(super) fn open_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if self.settings.page == SettingsPage::Soul && page != SettingsPage::Soul {
+            self.flush_unsaved_soul_edits(cx);
+        }
         self.settings.page = page;
         self.settings.memory_history_tab = false;
         self.settings.tidy_review = false;
@@ -748,15 +1033,19 @@ impl View {
         id: &'static str,
         label: &'static str,
         on: bool,
-        bot: &BotConfig,
+        bot_id: BotId,
         make: fn(&BotConfig, bool) -> UpdateBotParams,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let ent = cx.entity();
-        let bot = bot.clone();
         row_switch_compact(p, id, label, on, move |checked, _, cx| {
-            let params = make(&bot, checked);
-            ent.update(cx, |this, cx| this.patch_bot(params, cx));
+            ent.update(cx, |this, cx| {
+                let Some(current) = this.bots.iter().find(|b| b.id == bot_id) else {
+                    return;
+                };
+                let params = make(current, checked);
+                this.patch_bot(params, cx);
+            });
         })
     }
 
@@ -965,7 +1254,7 @@ impl View {
                 "bot-settings-active-switch",
                 text::SV_ACTIVE.get(),
                 !bot.paused,
-                bot,
+                bot.id.clone(),
                 |bot, on| UpdateBotParams {
                     paused: Some(!on),
                     ..patch(bot)
@@ -993,7 +1282,7 @@ impl View {
                 "bot-settings-look-around-switch",
                 text::SV_LOOK_AROUND.get(),
                 look.enabled,
-                bot,
+                bot.id.clone(),
                 |bot, on| {
                     let mut look = bot.look_around.clone();
                     look.enabled = on;
@@ -1016,7 +1305,7 @@ impl View {
                 "bot-settings-memory-upkeep-switch",
                 text::SV_MEMORY_UPKEEP.get(),
                 tidy.enabled,
-                bot,
+                bot.id.clone(),
                 |bot, on| {
                     let mut tidy = bot.memory_tidy;
                     tidy.enabled = on;
@@ -1132,7 +1421,15 @@ impl View {
                       on: bool,
                       make: fn(&BotConfig, bool) -> UpdateBotParams,
                       cx: &mut Context<Self>| {
-            Row::new(id, None, label).end(Self::switch_patch(p, id, label, on, bot, make, cx))
+            Row::new(id, None, label).end(Self::switch_patch(
+                p,
+                id,
+                label,
+                on,
+                bot.id.clone(),
+                make,
+                cx,
+            ))
         };
         let notifications = vec![
             notify(
@@ -1271,5 +1568,272 @@ impl View {
         } else {
             who
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use krill_proto::bots::BotNotifications;
+
+    use super::*;
+
+    #[gpui::test]
+    fn rapid_patch_bot_serializes_without_dropping_and_rolls_back_on_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_id = BotId::new("bot-1").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Alpha", "claude", 1_700_000_000_000).unwrap();
+        bot.notifications = BotNotifications {
+            needs_permission: false,
+            task_complete: false,
+            could_not_finish: false,
+        };
+        let state = Arc::new(Mutex::new(bot));
+        let calls = Arc::new(Mutex::new(Vec::<UpdateBotParams>::new()));
+        let fail_next = Arc::new(Mutex::new(false));
+        let st = state.clone();
+        let cl = calls.clone();
+        let fl = fail_next.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![st.lock().unwrap().clone()])),
+            BotRpcRequest::UpdateBot(params) => {
+                cl.lock().unwrap().push((**params).clone());
+                if *fl.lock().unwrap() {
+                    return Err("simulated patch failure".to_owned());
+                }
+                let mut cur = st.lock().unwrap();
+                apply_update_bot_params(&mut cur, params);
+                Ok(BotRpcResponse::Bot(Box::new(cur.clone())))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, DetailTab::Settings, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Two rapid toggles before the first RPC settles serialize through patch_queue.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let first = v.selected_bot().unwrap().clone();
+                let mut n1 = first.notifications;
+                n1.needs_permission = true;
+                v.patch_bot(
+                    UpdateBotParams {
+                        notifications: Some(n1),
+                        ..patch(&first)
+                    },
+                    cx,
+                );
+                assert!(v.selected_bot().unwrap().notifications.needs_permission);
+                assert!(v.patch_task.is_some());
+
+                // Second toggle reads live optimistically-updated bot and queues behind patch 1.
+                let second = v.selected_bot().unwrap().clone();
+                let mut n2 = second.notifications;
+                n2.task_complete = true;
+                v.patch_bot(
+                    UpdateBotParams {
+                        notifications: Some(n2),
+                        ..patch(&second)
+                    },
+                    cx,
+                );
+                assert!(v.selected_bot().unwrap().notifications.task_complete);
+                assert_eq!(v.settings.patch_queue.len(), 1);
+            });
+        });
+        vcx.run_until_parked();
+
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let updated = v.selected_bot().unwrap();
+            assert!(updated.notifications.needs_permission);
+            assert!(updated.notifications.task_complete);
+            assert!(v.settings.patch_queue.is_empty());
+            assert!(v.patch_task.is_none());
+            assert!(v.error.is_none());
+        });
+
+        // A failing patch rolls back optimistic state and drops queued follow-ups for that bot.
+        *fail_next.lock().unwrap() = true;
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let cur = v.selected_bot().unwrap().clone();
+                v.patch_bot(
+                    UpdateBotParams {
+                        paused: Some(true),
+                        ..patch(&cur)
+                    },
+                    cx,
+                );
+                let cur2 = v.selected_bot().unwrap().clone();
+                let mut n3 = cur2.notifications;
+                n3.could_not_finish = true;
+                v.patch_bot(
+                    UpdateBotParams {
+                        notifications: Some(n3),
+                        ..patch(&cur2)
+                    },
+                    cx,
+                );
+                assert!(v.selected_bot().unwrap().paused);
+                assert!(v.selected_bot().unwrap().notifications.could_not_finish);
+            });
+        });
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let rolled = v.selected_bot().unwrap();
+            assert!(!rolled.paused, "failed patch must roll back paused");
+            assert!(
+                !rolled.notifications.could_not_finish,
+                "queued follow-up for failed bot must be dropped"
+            );
+            assert!(v.error.is_some());
+            assert!(v.settings.patch_queue.is_empty());
+        });
+
+        // Stale host completion is ignored after switching hosts (UB-20).
+        *fail_next.lock().unwrap() = false;
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let cur = v.selected_bot().unwrap().clone();
+                v.patch_bot(
+                    UpdateBotParams {
+                        paused: Some(true),
+                        ..patch(&cur)
+                    },
+                    cx,
+                );
+                v.host = crate::hosts::HostId::Remote("iroh:other".into());
+                v.bots[0].paused = false;
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(!view.read(cx).bots[0].paused);
+        });
+    }
+
+    #[gpui::test]
+    fn switching_bots_keeps_patch_queue_draining_and_host_switch_resets_extras_models_and_scan(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use krill_proto::bots::BotAgentModels;
+        use std::sync::{Arc, Mutex};
+
+        let b1 = BotId::new("bot-switch-a").unwrap();
+        let b2 = BotId::new("bot-switch-b").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "claude", 1_700_000_000_000).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "claude", 1_700_000_000_000).unwrap();
+        let calls: Arc<Mutex<Vec<BotId>>> = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Mutex::new(cfg1.clone()));
+        let calls_rpc = calls.clone();
+        let state_rpc = state.clone();
+        let cfg2_rpc = cfg2.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![
+                state_rpc.lock().unwrap().clone(),
+                cfg2_rpc.clone(),
+            ])),
+            BotRpcRequest::UpdateBot(params) => {
+                calls_rpc.lock().unwrap().push(params.bot_id.clone());
+                let mut cur = state_rpc.lock().unwrap();
+                apply_update_bot_params(&mut cur, params);
+                Ok(BotRpcResponse::Bot(Box::new(cur.clone())))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+        vcx.run_until_parked();
+
+        // R2A-20: two rapid toggles on Bot A followed immediately by switching to Bot B must
+        // keep patch_task alive and drain patch_queue so both Bot A edits persist.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let first = v.bots.iter().find(|b| b.id == b1).unwrap().clone();
+                let mut n1 = first.notifications;
+                n1.needs_permission = true;
+                v.patch_bot(
+                    UpdateBotParams {
+                        notifications: Some(n1),
+                        ..patch(&first)
+                    },
+                    cx,
+                );
+                let second = v.bots.iter().find(|b| b.id == b1).unwrap().clone();
+                let mut n2 = second.notifications;
+                n2.task_complete = true;
+                v.patch_bot(
+                    UpdateBotParams {
+                        notifications: Some(n2),
+                        ..patch(&second)
+                    },
+                    cx,
+                );
+                assert_eq!(v.settings.patch_queue.len(), 1);
+                v.confirm_select_bot(b2.clone(), cx);
+                assert!(
+                    v.patch_task.is_some(),
+                    "confirm_select_bot must keep in-flight patch_task alive"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(calls.lock().unwrap().as_slice(), &[b1.clone(), b1.clone()]);
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let updated_a = v.bots.iter().find(|b| b.id == b1).unwrap();
+            assert!(updated_a.notifications.needs_permission);
+            assert!(updated_a.notifications.task_complete);
+            assert!(v.settings.patch_queue.is_empty());
+        });
+
+        // R2A-19: switching host resets extras_task, models_task, models_loading_for,
+        // agent_models, import_state.scanning, and patch_queue.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.settings.extras_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                v.settings.models_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                v.settings.models_loading_for = Some("claude".to_owned());
+                v.settings.agent_models = Some(("claude".to_owned(), BotAgentModels::default()));
+                v.import_state.scanning = true;
+                v.rpc_is_mock = false;
+                v.set_host_target(
+                    crate::hosts::HostId::Remote("host-b".into()),
+                    None,
+                    Vec::new(),
+                    cx,
+                );
+                assert!(v.settings.extras_task.is_none());
+                assert!(v.settings.models_task.is_none());
+                assert!(v.settings.models_loading_for.is_none());
+                assert!(v.settings.agent_models.is_none());
+                assert!(!v.import_state.scanning);
+                assert!(v.settings.patch_queue.is_empty());
+            });
+        });
     }
 }

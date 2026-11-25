@@ -409,7 +409,6 @@ impl Render for BotGroupMembersDialog {
             .debug_selector(|| "bot-group-members-dialog".into())
             .role(gpui::Role::Dialog)
             .aria_label(title)
-            .track_focus(&self.focus)
             .occlude()
             .w(px(460.))
             .max_w(ui::DIALOG_WIDTH)
@@ -432,12 +431,6 @@ impl Render for BotGroupMembersDialog {
                 if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
                     cx.stop_propagation();
                     cx.emit(Event::Close);
-                } else if ev.keystroke.key == "tab"
-                    && !ev.keystroke.modifiers.modified()
-                    && this.apply_suggested_name(window, cx)
-                {
-                    cx.stop_propagation();
-                    window.prevent_default();
                 }
             }))
             .child(
@@ -595,11 +588,21 @@ impl Render for BotGroupMembersDialog {
                 .flex()
                 .items_center()
                 .justify_center()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "tab"
+                        && !ev.keystroke.modifiers.modified()
+                        && !this.input_is_composing(window, cx)
+                        && this.apply_suggested_name(window, cx)
+                    {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
+                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_, _, _, cx| cx.emit(Event::Close)),
                 )
-                .child(card),
+                .child(ui::modal_focus_scope(card, &self.focus)),
         )
         .into_any_element()
     }
@@ -749,5 +752,42 @@ mod tests {
         let en = text::GRP_NAME_MANY
             .format_in(Language::En, &[("a", "Alice"), ("b", "Bob"), ("n", "2")]);
         assert_eq!(en, "Alice, Bob & 2 more");
+    }
+
+    #[gpui::test]
+    fn modal_focus_scope_traps_tab_within_group_dialog(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let bot_a = krill_proto::bots::BotConfig::new(
+            BotId::new("bot-a").unwrap(),
+            "Alice",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let bot_b = krill_proto::bots::BotConfig::new(
+            BotId::new("bot-b").unwrap(),
+            "Bob",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let bots = super::super::rpc::sidebar_snapshot(&[bot_a, bot_b], &[], &[], &[]).bots;
+        let (dialog, vcx) = cx.add_window_view(|window, cx| {
+            BotGroupMembersDialog::new_group(bots, HashMap::new(), window, cx)
+        });
+        vcx.run_until_parked();
+
+        // Tab cycles focus inside the modal focus scope without escaping the dialog.
+        vcx.simulate_keystrokes("tab");
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(
+                dialog.read(cx).focus.contains_focused(window, cx),
+                "Tab must keep focus inside BotGroupMembersDialog's modal_focus_scope"
+            );
+        });
     }
 }

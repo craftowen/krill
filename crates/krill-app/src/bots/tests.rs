@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px};
+use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext, px};
 use krill_proto::SessionId;
 use krill_proto::agent::Permission;
 use krill_proto::bots::{
@@ -3825,4 +3825,454 @@ fn s2_10_clear_bot_avatar_emits_badge_changed(cx: &mut gpui::TestAppContext) {
         *badges.lock().unwrap() >= 1,
         "clearing bot avatar must emit BadgeChanged immediately"
     );
+}
+
+#[gpui::test]
+fn ub10_group_panel_avoids_list_items_storm_and_retries_on_refresh(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot_a = sample_bot("alpha", "Alpha");
+    let bot_b = sample_bot("beta", "Beta");
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot_a.clone(), bot_b.clone()],
+        fail_list_items: Some("simulated daemon outage".to_owned()),
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+    state.lock().unwrap().requests.clear();
+
+    let members = vec![bot_a.id.clone(), bot_b.id.clone()];
+    let threads = vec!["thr-1".to_owned()];
+
+    // Calling show_group_in_panel repeatedly while in-flight must only dispatch one ListItems.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-1", &members, &threads, cx);
+            v.show_group_in_panel("grp-1", &members, &threads, cx);
+            v.show_group_in_panel("grp-1", &members, &threads, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let count_after_error = state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                BotRpcRequest::ListItems {
+                    bot_id: None,
+                    include_closed: true
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        count_after_error, 1,
+        "in-flight dedup must avoid spawning redundant ListItems RPCs"
+    );
+
+    // Subsequent renders after failure must not storm-retry until manual retry / stale refresh.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-1", &members, &threads, cx);
+            v.show_group_in_panel("grp-1", &members, &threads, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let count_still_failed = state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                BotRpcRequest::ListItems {
+                    bot_id: None,
+                    include_closed: true
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        count_still_failed, 1,
+        "failed group load must not re-fire ListItems on subsequent frames"
+    );
+
+    // Explicit retry refreshes items once daemon recovers.
+    {
+        let mut st = state.lock().unwrap();
+        st.fail_list_items = None;
+        st.items
+            .push(sample_item("alpha", "u-grp-1", 1, BotItemStatus::NeedsYou));
+    }
+    vcx.update(|_, cx| {
+        view.update(cx, View::retry_group_panel_items);
+    });
+    vcx.run_until_parked();
+    let loaded_uids: Vec<String> = vcx.update(|_, cx| {
+        view.read(cx)
+            .group_panel
+            .all_items
+            .iter()
+            .map(|i| i.uid.clone())
+            .collect()
+    });
+    assert_eq!(loaded_uids, vec!["u-grp-1".to_owned()]);
+}
+
+#[gpui::test]
+fn ub13_panel_show_in_panel_guards_unsaved_soul_and_respects_cancel(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot_a = sample_bot("alpha", "Alpha");
+    let bot_b = sample_bot("beta", "Beta");
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot_a.clone(), bot_b.clone()],
+        soul: "original soul".to_owned(),
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state);
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    // Open Bot A Settings > Soul, wait for initial GetSoul load, then introduce an unsaved edit.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.show_in_panel(&bot_a.id, DetailTab::Settings, cx));
+            v.settings.page = super::settings_root::SettingsPage::Soul;
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let input = cx.new(|cx| {
+                let mut s = gpui_component::input::TextareaState::new(window, cx);
+                s.set_value("unsaved soul edit", window, cx);
+                s
+            });
+            v.soul_memory.soul_input = Some(input);
+        });
+    });
+    vcx.run_until_parked();
+
+    // Attempting to switch panel to Bot B must NOT clobber detail_tab or settings.page.
+    let switched = vcx
+        .update(|_, cx| view.update(cx, |v, cx| v.show_in_panel(&bot_b.id, DetailTab::Items, cx)));
+    assert!(!switched);
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.selected_bot_id(), Some(&bot_a.id));
+        assert_eq!(v.detail_tab(), DetailTab::Settings);
+        assert_eq!(v.settings.page, super::settings_root::SettingsPage::Soul);
+        assert_eq!(v.pending_switch_bot, Some(bot_b.id.clone()));
+        assert!(v.is_panel_switch_blocked(&bot_b.id, cx));
+    });
+
+    // Clicking Cancel ("Stay") declines switching to Bot B without re-opening the banner.
+    vcx.update(|_, cx| {
+        view.update(cx, View::handle_escape);
+    });
+    let switched_again = vcx
+        .update(|_, cx| view.update(cx, |v, cx| v.show_in_panel(&bot_b.id, DetailTab::Items, cx)));
+    assert!(!switched_again);
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.pending_switch_bot, None);
+        assert!(v.is_panel_switch_blocked(&bot_b.id, cx));
+        assert_eq!(v.detail_tab(), DetailTab::Settings);
+        assert_eq!(v.settings.page, super::settings_root::SettingsPage::Soul);
+    });
+}
+
+#[gpui::test]
+fn ub28_confirm_select_bot_clears_stale_items_and_preserves_open_items_on_error(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot_a = sample_bot("alpha", "Alpha");
+    let bot_b = sample_bot("beta", "Beta");
+    let item_a = sample_item("alpha", "item-a", 1, BotItemStatus::NeedsYou);
+    let item_b = sample_item("beta", "item-b", 2, BotItemStatus::NeedsYou);
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot_a.clone(), bot_b.clone()],
+        items: vec![item_a.clone(), item_b.clone()],
+        suggestions: vec![BotSuggestion {
+            id: "sug-a".to_owned(),
+            bot_id: bot_a.id.clone(),
+            title: "Alpha suggestion".to_owned(),
+            why: "Reason".to_owned(),
+            ask: "Ask".to_owned(),
+            source: None,
+            link: None,
+            created_at_ms: 1_000,
+            dismissed: false,
+        }],
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.selected_bot_id(), Some(&bot_a.id));
+        assert_eq!(v.items.items.len(), 1);
+        assert_eq!(v.soul_memory.suggestions.len(), 1);
+        assert_eq!(v.all_open_items.len(), 2);
+    });
+
+    // Simulate ListItems failure when switching to Bot B.
+    state.lock().unwrap().fail_list_items = Some("temporary error".to_owned());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.confirm_select_bot(bot_b.id.clone(), cx));
+        // Immediately cleared before RPC finishes (no stale Bot A items/suggestions).
+        let v = view.read(cx);
+        assert!(v.items.items.is_empty());
+        assert!(v.soul_memory.suggestions.is_empty());
+    });
+    vcx.run_until_parked();
+
+    // After ListItems error, Bot B's open item in all_open_items must NOT be wiped.
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.all_open_items.iter().any(|i| i.owner_bot_id == bot_b.id),
+            "ListItems failure must not wipe Bot B from all_open_items"
+        );
+    });
+}
+
+#[gpui::test]
+fn ub35_returning_to_home_or_switching_bots_resets_seen_marks(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot_a = sample_bot("alpha", "Alpha");
+    let bot_b = sample_bot("beta", "Beta");
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot_a.clone(), bot_b.clone()],
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state);
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    // Seed seen marks on Bot A and switch to Settings then back to Items.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&bot_a.id, DetailTab::Items, cx);
+            v.items.seen_at_open.insert(bot_a.id.clone(), 500);
+            v.items.up_next_seen_at_open.insert(bot_a.id.clone(), 500);
+            v.show_in_panel(&bot_a.id, DetailTab::Settings, cx);
+            v.show_in_panel(&bot_a.id, DetailTab::Items, cx);
+            assert!(!v.items.seen_at_open.contains_key(&bot_a.id));
+            assert!(!v.items.up_next_seen_at_open.contains_key(&bot_a.id));
+
+            // Now seed Bot B seen marks while on Bot A Items and switch directly to Bot B Items.
+            v.items.seen_at_open.insert(bot_b.id.clone(), 700);
+            v.items.up_next_seen_at_open.insert(bot_b.id.clone(), 700);
+            v.show_in_panel(&bot_b.id, DetailTab::Items, cx);
+            assert!(!v.items.seen_at_open.contains_key(&bot_b.id));
+            assert!(!v.items.up_next_seen_at_open.contains_key(&bot_b.id));
+        });
+    });
+}
+
+#[test]
+fn rs02_sanitize_http_url_restricts_schemes_and_encodes_non_ascii() {
+    // Rejects dangerous/non-HTTP schemes (file, javascript, mailto, custom, http-prefixed).
+    assert_eq!(super::sanitize_http_url("file:///etc/passwd"), None);
+    assert_eq!(super::sanitize_http_url("javascript:alert(1)"), None);
+    assert_eq!(super::sanitize_http_url("mailto:user@example.com"), None);
+    assert_eq!(super::sanitize_http_url("http-evil:payload"), None);
+    assert_eq!(super::sanitize_http_url("https://example.com/a b"), None);
+
+    // Percent-encodes Korean/non-ASCII URLs so macOS NSURL::initWithString: accepts them.
+    let encoded = super::sanitize_http_url("https://example.com/문서/한글?q=테스트")
+        .expect("Korean HTTPS URL should sanitize cleanly");
+    assert!(encoded.starts_with("https://example.com/"));
+    assert!(
+        encoded.is_ascii(),
+        "sanitized URL must be pure ASCII for NSURL: {encoded}"
+    );
+    assert!(encoded.contains("%EB%AC%B8%EC%84%9C"));
+
+    // Preserves clean ASCII HTTP/HTTPS URLs.
+    assert_eq!(
+        super::sanitize_http_url("https://github.com/acme/repo/pull/42").as_deref(),
+        Some("https://github.com/acme/repo/pull/42")
+    );
+}
+
+#[gpui::test]
+fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot = sample_bot("alpha", "Alpha");
+    let mut item = sample_item("alpha", "item-1", 1, BotItemStatus::NeedsYou);
+    item.events.push(BotItemEvent {
+        id: 2,
+        item_uid: "item-1".to_owned(),
+        kind: BotItemEventKind::Status,
+        actor: BotItemActor::Bot {
+            bot_id: bot.id.clone(),
+            session_id: None,
+        },
+        text: "status -> needs_you".to_owned(),
+        decisions: vec![BotItemDecision {
+            question: "Target env?".to_owned(),
+            options: vec!["Staging".to_owned(), "Prod".to_owned()],
+            recommended: Some(0),
+            multi: false,
+        }],
+        created_at_ms: 1_700_000_001_000,
+    });
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot.clone()],
+        items: vec![item],
+        memory: "- 2026-11-23 Existing fact\n".to_owned(),
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&bot.id, DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    // Ensure all non-modal Bot Panel inputs exist by touching each section.
+    let (title_inp, desc_inp, comment_inp, link_inp, decision_inp, mem_add_inp, look_inp, pair_inp) =
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(!v.items.items.is_empty());
+                v.items.open_uid = Some("item-1".to_owned());
+                v.ensure_per_item_inputs("item-1", window, cx);
+                // Trigger Items composer + decision input + memory + look focus + pairing inputs.
+                let _ = v.render_items_tab(&bot, crate::ui::palette(cx), window, cx);
+                v.settings.page = super::settings_root::SettingsPage::Memory;
+                let _ = v.render_settings_tab(&bot, crate::ui::palette(cx), window, cx);
+                v.settings.page = super::settings_root::SettingsPage::LookAround;
+                let _ = v.render_settings_tab(&bot, crate::ui::palette(cx), window, cx);
+                v.settings.page = super::settings_root::SettingsPage::WhoCanAsk;
+                let _ = v.render_settings_tab(&bot, crate::ui::palette(cx), window, cx);
+
+                let title_inp = v.items.new_title_input.clone();
+                let desc_inp = v.items.new_desc_input.clone();
+                let comment_inp = v.items.comment_inputs.get("item-1").cloned();
+                let link_inp = v.items.link_inputs.get("item-1").cloned();
+                let decision_inp = v.items.decision_inputs.values().next().cloned();
+                let mem_add_inp = v.settings.memory_add_input.clone();
+                let look_inp = v.settings.look_focus_input.clone();
+                let pair_inp = v.connectors.pairing_code_input.clone();
+
+                for (inp, val) in [
+                    (&title_inp, "New Task"),
+                    (&desc_inp, "Task desc"),
+                    (&comment_inp, "Comment body"),
+                    (&link_inp, "https://example.com"),
+                    (&decision_inp, "Staging"),
+                    (&mem_add_inp, "New fact"),
+                    (&look_inp, "Watch CI"),
+                    (&pair_inp, "PAIR-1234"),
+                ] {
+                    if let Some(ent) = inp {
+                        let owned = val.to_owned();
+                        ent.update(cx, |s, cx| s.set_value(owned, window, cx));
+                    }
+                }
+                (
+                    title_inp,
+                    desc_inp,
+                    comment_inp,
+                    link_inp,
+                    decision_inp,
+                    mem_add_inp,
+                    look_inp,
+                    pair_inp,
+                )
+            })
+        });
+    vcx.run_until_parked();
+
+    // Verify we actually mounted every expected input.
+    assert!(title_inp.is_some());
+    assert!(desc_inp.is_some());
+    assert!(comment_inp.is_some());
+    assert!(link_inp.is_some());
+    assert!(decision_inp.is_some());
+    assert!(mem_add_inp.is_some());
+    assert!(look_inp.is_some());
+    assert!(pair_inp.is_some());
+
+    // Clear initial read RPCs, then fire PressEnter with secondary=true/shift=true on every mounted input.
+    state.lock().unwrap().requests.clear();
+    vcx.update(|_, cx| {
+        for inp in [
+            &title_inp,
+            &desc_inp,
+            &comment_inp,
+            &link_inp,
+            &decision_inp,
+            &mem_add_inp,
+            &look_inp,
+            &pair_inp,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+                inp.update(cx, |_, cx| {
+                    cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+                });
+            }
+        }
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        state.lock().unwrap().requests.is_empty(),
+        "modified PressEnter (Cmd+Shift+Enter / Cmd+Enter / Shift+Enter) must not trigger any mutating RPC: {:?}",
+        state.lock().unwrap().requests
+    );
+
+    // Plain PressEnter on look_focus_input still submits UpdateBot as expected.
+    if let Some(inp) = &look_inp {
+        vcx.update(|_, cx| {
+            inp.update(cx, |_, cx| {
+                cx.emit(gpui_component::input::InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                });
+            });
+        });
+        vcx.run_until_parked();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| matches!(r, BotRpcRequest::UpdateBot(_))),
+            "plain PressEnter on look_focus_input should submit UpdateBot"
+        );
+    }
 }

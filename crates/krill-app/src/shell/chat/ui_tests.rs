@@ -5926,3 +5926,369 @@ fn selection_quote_floating_add_to_chat_appends_after_existing_draft(cx: &mut Te
         );
     });
 }
+
+#[gpui::test]
+fn sync_chat_image_tokens_retries_after_ime_and_avoids_duplicate_pill_on_reattach(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(cx, "chat-ub06-image-tokens", vec![]);
+    let key = local_key(SESSION);
+    let img_path = std::path::PathBuf::from("/tmp/krill-ub06-shot.png");
+    let make_att = || DraftAttachment {
+        path: img_path.clone(),
+        preview_path: None,
+        display_name: "krill-ub06-shot.png".into(),
+        byte_len: 128,
+        is_image: true,
+    };
+
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let input = shell.ensure_chat_input(key.clone(), window, cx);
+            // Enter active IME composition (Korean syllable preedit).
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    state, None, "한", None, window, cx,
+                );
+            });
+            shell.stage_chat_attachments(&key, vec![make_att()], cx);
+            shell.sync_chat_image_tokens(&key, &input, window, cx);
+            assert!(
+                input.read(cx).tokens().is_empty(),
+                "token insert must fail cleanly while IME composition is active"
+            );
+            assert!(
+                shell
+                    .chat
+                    .image_tokens
+                    .get(&key)
+                    .is_none_or(|placed| !placed.contains(&img_path)),
+                "failed IME insert must not mark image as placed"
+            );
+
+            // End IME composition; next sync retries and places the pill once.
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::unmark_text(state, window, cx);
+            });
+            shell.sync_chat_image_tokens(&key, &input, window, cx);
+            assert_eq!(input.read(cx).tokens().len(), 1);
+            assert!(shell.chat.image_tokens[&key].contains(&img_path));
+
+            // Remove attachment (leaving stale token in TextareaState), then re-attach same path.
+            shell.remove_chat_attachment(&key, 0, cx);
+            shell.sync_chat_image_tokens(&key, &input, window, cx);
+            shell.stage_chat_attachments(&key, vec![make_att()], cx);
+            shell.sync_chat_image_tokens(&key, &input, window, cx);
+            input
+        })
+    });
+
+    shell.read_with(cx, |shell, app_cx| {
+        let state = input.read(app_cx);
+        assert_eq!(
+            state.tokens().len(),
+            1,
+            "re-attaching a removed image must update the existing token instead of duplicating pills"
+        );
+        let atts = &shell.chat.draft_attachments[&key];
+        let payload =
+            build_chat_payload_with_tokens(state.value().as_ref(), state.tokens(), atts).unwrap();
+        assert_eq!(
+            payload.matches("/tmp/krill-ub06-shot.png").count(),
+            1,
+            "re-attached image must expand once in submitted payload, got {payload:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn last_feed_row_stays_live_when_pending_prompt_is_queued(cx: &mut TestAppContext) {
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-ub07-last-row-pending",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Streaming answer...".into(),
+            ..Default::default()
+        }],
+    );
+    let key = local_key(SESSION);
+    let snap = krill_app::sidebar::Snapshot {
+        sessions: vec![krill_app::sidebar::Session {
+            id: SESSION,
+            status: krill_proto::control::AgentStatus {
+                state: krill_proto::control::AgentState::Working,
+                agent: "claude".into(),
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: std::collections::BTreeMap::new(),
+    };
+    shell.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(std::sync::Arc::new(StateSource(snap)), cx);
+        });
+        shell
+            .chat
+            .pending_prompts
+            .entry(key.clone())
+            .or_default()
+            .push(PendingChatPrompt {
+                id: 1,
+                origin_item: 1,
+                submitted_payload: "queued follow-up".into(),
+                display_text: "queued follow-up".into(),
+                attachments: Vec::new(),
+                status: PendingStatus::Queued,
+                submitted_at_ms: 0,
+            });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-scroll-top").is_none(),
+        "streaming last assistant row must remain is_last_row (footer suppressed) even with queued pending prompt"
+    );
+}
+
+#[gpui::test]
+fn cross_host_paused_resume_and_split_item_note_focus_behave_cleanly(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::{
+        BotItem, BotItemActor, BotItemEvent, BotItemEventKind, BotItemStatus, BotRpcRequest,
+        BotRpcResponse,
+    };
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-ub09-cross-host-and-split-focus",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "Track release".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Added item.".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.simulate_resize(size(px(1200.), px(800.)));
+
+    // Part 1: cross-host paused resume sends RPC to remote host and updates cached_bots.
+    let remote = HostId::Remote("iroh:studio".into());
+    let local_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let remote_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let local_hits_ref = std::sync::Arc::clone(&local_hits);
+    let remote_hits_ref = std::sync::Arc::clone(&remote_hits);
+    let remote_key = (remote.clone(), SessionId(888));
+    let mut paused_remote_bot = bot_for(SessionId(888), true);
+    paused_remote_bot.host = remote.clone();
+    let bot_id = paused_remote_bot.id.clone();
+
+    let item = BotItem {
+        uid: "item-split-1".into(),
+        number: 1,
+        owner_bot_id: bot_id.clone(),
+        title: "Ship release".into(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::NeedsYou,
+        close_note: None,
+        links: Vec::new(),
+        events: vec![BotItemEvent {
+            id: 1,
+            item_uid: "item-split-1".into(),
+            actor: BotItemActor::Bot {
+                bot_id: bot_id.clone(),
+                session_id: Some(SESSION),
+            },
+            kind: BotItemEventKind::Made,
+            text: "Made".into(),
+            decisions: Vec::new(),
+            created_at_ms: 1_700_000_000_500,
+        }],
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 1_700_000_000_500,
+        created_at_ms: 1_700_000_000_500,
+        updated_at_ms: 1_700_000_000_500,
+        closed_at_ms: None,
+    };
+    let items_for_rpc = vec![item];
+
+    let (bot_pane, other_pane) = shell.update(cx, |shell, cx| {
+        let bot_pane = shell.layout.focused().unwrap();
+        shell.bot_rpc_override = Some(std::sync::Arc::new(move |req| match req {
+            BotRpcRequest::UpdateBot(_) => {
+                local_hits_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items_for_rpc.clone())),
+            _ => Ok(BotRpcResponse::Ok),
+        }));
+        shell.bot_rpc_overrides.insert(
+            remote.clone(),
+            std::sync::Arc::new(move |req| {
+                if let BotRpcRequest::UpdateBot(params) = req
+                    && params.paused == Some(false)
+                {
+                    remote_hits_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(BotRpcResponse::Ok)
+            }),
+        );
+        shell
+            .chat
+            .cached_bots
+            .insert(remote_key.clone(), paused_remote_bot);
+        shell.set_bot_paused_on(&remote, bot_id.clone(), false, cx);
+
+        // Part 2: split view where bot pane is unfocused and right panel is collapsed.
+        shell.sidebar_bots = vec![bot_for(SESSION, false)];
+        shell.panel_collapsed = true;
+        shell.layout.split(krill_app::layout::Axis::Horizontal);
+        let other_pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(other_pane, SessionId(772));
+        shell.layout.set_chat_view(other_pane, false);
+        cx.notify();
+        (bot_pane, other_pane)
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        remote_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "resume on remote bot chat must target remote host RPC"
+    );
+    assert_eq!(
+        local_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "resume on remote bot chat must not target local host RPC"
+    );
+    shell.read_with(cx, |s, _| {
+        assert!(!s.chat.cached_bots[&remote_key].paused);
+        assert_eq!(s.layout.focused(), Some(other_pane));
+    });
+
+    let chip = cx
+        .debug_bounds("chat-item-note-chip")
+        .expect("item note chip in unfocused split bot pane");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.layout.focused(),
+            Some(bot_pane),
+            "clicking ItemNote chip in split view must focus its bot pane"
+        );
+        assert!(!s.panel_collapsed);
+    });
+}
+
+#[gpui::test]
+fn chat_find_recomputes_on_turn_fold_toggle_turn_and_item_notes_and_draft_applies_collapsed(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-ub37-ub42-find-and-draft",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "Run check".into(),
+                at: "2026-11-22T01:00:00Z".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::ToolCall,
+                title: "bash".into(),
+                text: "needle-tool-cmd".into(),
+                at: "2026-11-22T01:00:05Z".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "All green.".into(),
+                at: "2026-11-22T01:00:16Z".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    let key = local_key(SESSION);
+    let b = bot_for(SESSION, false);
+    let bot_id = b.id.clone();
+
+    // UB-42: pending draft inserts into composer even while right panel is collapsed.
+    shell.update(cx, |shell, cx| {
+        shell.panel_collapsed = true;
+        shell.sidebar_bots = vec![b];
+        shell.bot_ui.panel.pending_draft = Some((
+            krill_app::hosts::HostId::Local,
+            bot_id,
+            "Draft while collapsed".into(),
+        ));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, app_cx| {
+        assert!(shell.bot_ui.panel.pending_draft.is_none());
+        assert_eq!(
+            shell.chat.inputs[&key].0.read(app_cx).value().as_ref(),
+            "Draft while collapsed"
+        );
+    });
+
+    // UB-37: open chat find searching for the folded tool call; expanding the turn updates matches.
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let find_input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.toggle_chat_find(window, cx);
+            shell.chat.finds[&key].input.clone()
+        })
+    });
+    cx.update(|window, cx| {
+        find_input.update(cx, |s, cx| s.insert("needle-tool-cmd", window, cx));
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(shell.chat.finds[&key].query, "needle-tool-cmd");
+        assert!(
+            shell.chat.finds[&key].matches.is_empty(),
+            "folded turn hides tool call from display_feed"
+        );
+    });
+
+    let bar = cx
+        .debug_bounds("chat-turn-bar-0")
+        .expect("collapsed bot turn bar");
+    // Click the left side of the turn bar (clear of the top-right floating Find bar).
+    cx.simulate_click(
+        gpui::point(bar.origin.x + px(24.), bar.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-work-run-toggle").is_some(),
+        "clicking collapsed bot turn bar must expand the folded work run"
+    );
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.chat.finds[&key].matches.len(),
+            1,
+            "toggling turn expansion must recompute chat find matches"
+        );
+    });
+}
