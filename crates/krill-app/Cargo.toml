@@ -10,6 +10,7 @@ build = "../../packaging/windows/resources.rs"
 [dependencies]
 krill-ui = { workspace = true }
 krill-app-core = { workspace = true }
+krill-bots-ui = { workspace = true }
 sysinfo = { workspace = true }
 krill-hosts = { workspace = true }
 krill-link = { workspace = true }

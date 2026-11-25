@@ -1848,7 +1848,7 @@ mod tests {
         let terminal_rs = crates_dir.join("krill-app-core/src/terminal.rs");
         let terminal_tests_rs = crates_dir.join("krill-app-core/src/terminal/tests.rs");
         let mut violations = Vec::new();
-        for crate_name in ["krill-ui", "krill-app-core", "krill-app"] {
+        for crate_name in ["krill-ui", "krill-app-core", "krill-bots-ui", "krill-app"] {
             let src_dir = crates_dir.join(crate_name).join("src");
             let mut files = Vec::new();
             collect_rs_files(&src_dir, &mut files);

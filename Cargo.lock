@@ -3818,6 +3818,7 @@ dependencies = [
  "gpui-pre-platform",
  "image",
  "krill-app-core",
+ "krill-bots-ui",
  "krill-hosts",
  "krill-link",
  "krill-log",
@@ -3873,6 +3874,23 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "krill-bots-ui"
+version = "0.0.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "krill-app-core",
+ "krill-proto",
+ "krill-ui",
+ "regex",
+ "rustix",
+ "serde_json",
 ]
 
 [[package]]
