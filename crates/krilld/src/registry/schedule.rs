@@ -613,24 +613,41 @@ impl Registry {
                         .name(format!("sched-prompt-{}", session.0))
                         .spawn(move || {
                             let deadline = Instant::now() + Duration::from_secs(15);
+                            let mut ready_seen = false;
+                            let mut auth_blocked = false;
                             while Instant::now() < deadline {
                                 let p = tap.pulse();
                                 if p.closed {
                                     break;
                                 }
                                 if is_agy {
+                                    let screen = tap.capture().0;
+                                    if krill_proto::screen::agy::auth_login_screen(&screen) {
+                                        auth_blocked = true;
+                                        tracing::warn!(
+                                            session = session.0,
+                                            "aborted scheduled agy prompt delivery: Antigravity sign-in screen detected (auth_required)"
+                                        );
+                                        break;
+                                    }
                                     if p.end > 0
                                         && tap.quiet_ms() >= 150
-                                        && crate::mobile::agy_composer_ready(&tap.capture().0)
+                                        && crate::mobile::agy_composer_ready(&screen)
                                     {
+                                        ready_seen = true;
                                         break;
                                     }
                                 } else if p.end > 0 && tap.quiet_ms() >= 150 {
+                                    ready_seen = true;
                                     break;
                                 }
                                 std::thread::sleep(Duration::from_millis(50));
                             }
-                            if !tap.pulse().closed {
+                            if !tap.pulse().closed
+                                && !auth_blocked
+                                && (!is_agy || ready_seen)
+                                && !krill_proto::screen::agy::auth_login_screen(&tap.capture().0)
+                            {
                                 drop(Registry::deliver_input_to_tap(&tap, &prompt_bytes, true));
                             }
                         })
@@ -679,6 +696,12 @@ impl Registry {
                     self.discard_settings(session);
                     super::os(&e)
                 })?;
+                if canonical == "agy" && account.as_ref().is_none_or(|a| a.dir.is_empty()) {
+                    super::preflight_agy_background_launch(&launch.env).map_err(|e| {
+                        self.discard_settings(session);
+                        super::os(&e)
+                    })?;
+                }
                 crate::agent::pre_trust_workspace(&profile, &cwd, account.as_ref());
                 let agy_prewarm = if !cfg!(test) && canonical == "agy" {
                     Some(

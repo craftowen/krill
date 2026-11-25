@@ -1705,6 +1705,7 @@ impl Backend {
                     fs::remove_file(&path).ok();
                     return Err(invalid());
                 }
+                self.ensure_not_agy_auth_screen(session)?;
                 let send_result = if trimmed_prompt.is_some() {
                     self.input_paced(
                         session,
@@ -3217,7 +3218,21 @@ impl Backend {
             .upgrade()
             .is_some_and(|reg| reg.session_bracketed_paste(SessionId(session)))
     }
+    fn ensure_not_agy_auth_screen(&self, session: u64) -> io::Result<()> {
+        if let Some(reg) = self.registry.upgrade()
+            && let Some(screen) = reg.session_capture(SessionId(session))
+            && krill_proto::screen::agy::auth_login_screen(&screen)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Antigravity session requires sign-in (auth_required).",
+            ));
+        }
+        Ok(())
+    }
+
     fn send_prompt(&self, session: u64, text: &str) -> io::Result<()> {
+        self.ensure_not_agy_auth_screen(session)?;
         if text.is_empty() {
             return self.input(session, b"\r".to_vec());
         }
@@ -3254,19 +3269,22 @@ impl Backend {
         };
         let deadline = Instant::now() + Duration::from_millis(600);
         while Instant::now() < deadline {
-            if let Some(screen) = reg.session_capture(SessionId(session))
-                && let Some(qm) = krill_proto::screen::agy::queued_submission_confirmed(
-                    &screen, combined, baseline,
-                )
-            {
-                if qm.send_immediately_hint {
-                    self.input(
-                        session,
-                        krill_proto::screen::agy::SEND_IMMEDIATELY_KEY.to_vec(),
-                    )
-                    .ok();
+            if let Some(screen) = reg.session_capture(SessionId(session)) {
+                if krill_proto::screen::agy::auth_login_screen(&screen) {
+                    return;
                 }
-                return;
+                if let Some(qm) = krill_proto::screen::agy::queued_submission_confirmed(
+                    &screen, combined, baseline,
+                ) {
+                    if qm.send_immediately_hint {
+                        self.input(
+                            session,
+                            krill_proto::screen::agy::SEND_IMMEDIATELY_KEY.to_vec(),
+                        )
+                        .ok();
+                    }
+                    return;
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -3327,6 +3345,12 @@ impl Backend {
         let screen = registry
             .session_capture(id)
             .ok_or_else(|| io::Error::other("Live terminal screen is unavailable."))?;
+        if krill_proto::screen::agy::auth_login_screen(&screen) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Antigravity session requires sign-in (auth_required).",
+            ));
+        }
         let waiting_or_blocked = matches!(
             status.state,
             control::AgentState::Waiting | control::AgentState::Blocked

@@ -541,6 +541,14 @@ fn build_rows(rows: &[Vec<Cell>]) -> Vec<RowInfo> {
 
 fn detect_internal(rows: &[Vec<Cell>]) -> Option<DetectedMenu> {
     let built = build_rows(rows);
+    let plain_screen = built
+        .iter()
+        .map(|row| row.plain.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if super::agy::auth_login_text(&plain_screen) {
+        return None;
+    }
     if let Some(menu) = detect_numbered_menu(&built) {
         return Some(menu);
     }
@@ -990,5 +998,24 @@ Enter to select";
         let steps = verify_and_plan(&rows, "배포할까요?", &PromptReply::Choice(1), false)
             .expect("wide-char prompt should match without spurious spaces");
         assert_eq!(steps, vec![b"\x1b[B".to_vec(), b"\r".to_vec()]);
+    }
+
+    #[test]
+    fn ignores_agy_oauth_login_method_selector() {
+        let stage1 = rows_from_str(
+            "Welcome to the Antigravity CLI. You are currently not signed in.\n\
+             Select login method:\n\
+             > 1. Google OAuth\n\
+               2. Use a Google Cloud project\n\
+             ↑/↓ Navigate · enter Select",
+        );
+        assert!(detect(&stage1).is_none());
+
+        let stage2 = rows_from_str(
+            "Your browser should open automatically.\n\
+             → Click here to authenticate\n\
+             Paste authorization code here:",
+        );
+        assert!(detect(&stage2).is_none());
     }
 }

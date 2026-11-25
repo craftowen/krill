@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use krill_proto::usage::{
     AntigravityAccountOp, AntigravityStoredUsage, ProviderKind, Snapshot, Window,
@@ -779,4 +780,257 @@ fn keychain_command_timeout_kills_hanging_process() {
         started.elapsed() < Duration::from_secs(2),
         "hanging helper must be killed promptly on timeout"
     );
+}
+
+#[test]
+fn preflight_auth_backoff_handles_present_absent_and_transient_locked() {
+    use backend::{
+        AgyAuthPreflightError, AgyCredentialPresence, preflight_auth_with_backoff_using,
+    };
+
+    let delays = [Duration::from_millis(1), Duration::from_millis(1)];
+
+    // Immediate Present: single probe, succeeds.
+    let mut calls = 0;
+    let res = preflight_auth_with_backoff_using(&delays, || {
+        calls += 1;
+        AgyCredentialPresence::Present
+    });
+    assert_eq!(res, Ok(()));
+    assert_eq!(calls, 1);
+
+    // Immediate Absent: never waits or retries.
+    let mut calls = 0;
+    let res = preflight_auth_with_backoff_using(&delays, || {
+        calls += 1;
+        AgyCredentialPresence::Absent
+    });
+    assert_eq!(res, Err(AgyAuthPreflightError::Absent));
+    assert_eq!(calls, 1);
+
+    // Transient Locked after reboot -> Present on 3rd attempt.
+    let mut calls = 0;
+    let res = preflight_auth_with_backoff_using(&delays, || {
+        calls += 1;
+        if calls < 3 {
+            AgyCredentialPresence::Locked
+        } else {
+            AgyCredentialPresence::Present
+        }
+    });
+    assert_eq!(res, Ok(()));
+    assert_eq!(calls, 3);
+
+    // Persistent Locked -> exhausts backoff and fails with Locked.
+    let mut calls = 0;
+    let res = preflight_auth_with_backoff_using(&delays, || {
+        calls += 1;
+        AgyCredentialPresence::Locked
+    });
+    assert_eq!(res, Err(AgyAuthPreflightError::Locked));
+    assert_eq!(calls, 3);
+}
+
+#[test]
+fn update_snapshot_backfills_subject_for_migrated_account_without_validation_error() {
+    let root =
+        std::env::temp_dir().join(format!("krill-agy-subject-backfill-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // Seed host token WITHOUT id_token (just id_token_email, matching real agy 1.5.17 consumer OAuth).
+    let initial = serde_json::json!({
+        "auth_method": "consumer",
+        "id_token_email": "owner@example.test",
+        "token": {
+            "access_token": "tok-1",
+            "refresh_token": "ref-1",
+            "token_type": "Bearer"
+        }
+    })
+    .to_string();
+    let token_path = antigravity_token_file_path(&home);
+    write_atomic_0600(&token_path, initial.as_bytes()).unwrap();
+
+    let svc = AntigravityAccountService::for_host(&home, Some(&state));
+    // Simulate a legacy migrated snapshot whose stored credential lacked an OIDC id_token (`subject: None`).
+    svc.import_snapshots(
+        vec![StoredAntigravityAccount {
+            id: "agy-migrated-1".into(),
+            email: Some("owner@example.test".into()),
+            subject: None,
+            auth_method: "consumer".into(),
+            created_at: 1,
+            updated_at: 1,
+            credentials: Zeroizing::new(initial),
+            usage: None,
+        }],
+        Some("agy-migrated-1"),
+    )
+    .unwrap();
+    let before = svc.list_accounts().unwrap();
+    assert_eq!(before.accounts.len(), 1);
+    assert_eq!(before.accounts[0].subject, None);
+
+    // Now simulate agy refreshing the token with an OIDC id_token containing `sub`.
+    let id_token = codex_jwt(&serde_json::json!({
+        "sub": "google-sub-123",
+        "email": "owner@example.test",
+        "iss": "https://accounts.google.com"
+    }));
+    let refreshed = serde_json::json!({
+        "auth_method": "consumer",
+        "id_token_email": "owner@example.test",
+        "token": {
+            "access_token": "tok-2",
+            "refresh_token": "ref-1",
+            "id_token": id_token,
+            "token_type": "Bearer"
+        }
+    })
+    .to_string();
+    write_atomic_0600(&token_path, refreshed.as_bytes()).unwrap();
+
+    // Listing reconciles and writes the updated snapshot — must backfill `subject` instead of
+    // tripping `validate_vault`'s "inconsistent identity" error.
+    let listed = svc.list_accounts().unwrap();
+    assert_eq!(listed.accounts.len(), 1);
+    assert_eq!(
+        listed.accounts[0].subject.as_deref(),
+        Some("google-sub-123")
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn migrate_and_prune_removes_legacy_agy_rows_while_preserving_other_providers() {
+    let root = std::env::temp_dir().join(format!("krill-agy-legacy-prune-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let raw_toml = r#"# User comment must survive pruning
+[active]
+claude = "claude-work"
+agy = "agy-antigravity-profile-1"
+
+[[accounts]]
+id = "claude-work"
+provider = "claude"
+label = "Claude Work"
+email = "work@example.test"
+profile_dir = "/tmp/claude-work"
+
+[[accounts]]
+id = "codex-personal"
+provider = "codex"
+label = "Codex Personal"
+profile_dir = "/tmp/codex-personal"
+
+[[accounts]]
+id = "agy-antigravity-profile-1"
+provider = "agy"
+label = "Antigravity Profile #1"
+profile_dir = "/tmp/missing-agy-1"
+
+[[accounts]]
+id = "agy-antigravity-profile-2"
+provider = "agy"
+label = "Antigravity Profile #2"
+profile_dir = "/tmp/missing-agy-2"
+"#;
+    let config_path = crate::usage::accounts::config_path(&home, Some(&state));
+    std::fs::write(&config_path, raw_toml).unwrap();
+
+    service::migrate_and_prune_legacy_agy_profiles(&home, Some(&state), true);
+
+    let after = crate::usage::accounts::load_file(&home, Some(&state));
+    assert!(
+        after
+            .accounts
+            .iter()
+            .all(|a| ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity)),
+        "legacy agy rows must be pruned: {:?}",
+        after.accounts
+    );
+    assert_eq!(after.accounts.len(), 2);
+    assert!(after.accounts.iter().any(|a| a.id == "claude-work"));
+    assert!(after.accounts.iter().any(|a| a.id == "codex-personal"));
+    assert_eq!(
+        after.active.get("claude").map(String::as_str),
+        Some("claude-work")
+    );
+    assert!(!after.active.contains_key("agy"));
+    let saved_text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved_text.contains("# User comment must survive pruning"));
+    assert!(
+        vault_path(&home, Some(&state))
+            .parent()
+            .unwrap()
+            .join(".legacy-pruned-v2")
+            .is_file()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn refresh_accounts_with_native_login_hides_legacy_ghost_rows_without_vault() {
+    let root = std::env::temp_dir().join(format!("krill-agy-no-ghosts-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let host_token = serde_json::json!({
+        "auth_method": "consumer",
+        "id_token_email": "native@example.test",
+        "token": {
+            "access_token": "tok-native",
+            "refresh_token": "ref-native",
+            "token_type": "Bearer"
+        }
+    })
+    .to_string();
+    write_atomic_0600(&antigravity_token_file_path(&home), host_token.as_bytes()).unwrap();
+
+    let file = AccountsFile {
+        accounts: vec![StoredAccount {
+            id: "agy-antigravity-profile-1".into(),
+            provider: "agy".into(),
+            label: "Antigravity Profile #1".into(),
+            email: None,
+            profile_dir: root.join("missing-profile").display().to_string(),
+        }],
+        ..AccountsFile::default()
+    };
+    crate::usage::accounts::save_file(&home, Some(&state), &file).unwrap();
+    assert!(!vault_path(&home, Some(&state)).is_file());
+
+    let snap = crate::usage::accounts::refresh_accounts(&home, Some(&state));
+    let agy_rows: Vec<_> = snap
+        .accounts
+        .iter()
+        .filter(|a| a.provider == ProviderKind::Antigravity)
+        .collect();
+    assert_eq!(
+        agy_rows.len(),
+        1,
+        "ghost rows must not appear: {agy_rows:?}"
+    );
+    assert_eq!(agy_rows[0].id, "agy-host");
+    assert_eq!(agy_rows[0].email.as_deref(), Some("native@example.test"));
+    assert_eq!(
+        snap.connection_for("agy-host"),
+        krill_proto::usage::ConnectionStatus::Connected
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }

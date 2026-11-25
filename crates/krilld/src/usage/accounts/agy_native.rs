@@ -67,21 +67,46 @@ pub(crate) fn handle_op(
     }
 }
 
-/// Read-only projection of native Antigravity vault state for `AccountsSnapshot`.
-/// Returns `Ok(None)` if neither a vault nor a native login exists.
+/// Read-only projection of native Antigravity vault + host login state for `AccountsSnapshot`.
+/// Always queries the native credential service (even before the first saved vault account) so
+/// CLI, Desktop, and Mobile share a single native Antigravity source of truth.
 pub(crate) fn list_state_for_snapshot(
     home: &Path,
     state_dir: Option<&Path>,
 ) -> Option<AntigravityAccountState> {
     migrate_legacy_agy_profiles_once(home, state_dir);
-    let path = vault_path(home, state_dir);
-    let has_vault = path.is_file();
-    if !has_vault {
-        return None;
-    }
     AntigravityAccountService::for_host(home, state_dir)
         .list_accounts()
         .ok()
+}
+
+/// Fast active-account lookup for session launch paths (never spawns CLI probes or refreshes
+/// unrelated providers).
+pub(crate) fn active_account_for_launch(home: &Path, state_dir: Option<&Path>) -> Option<String> {
+    let path = vault_path(home, state_dir);
+    if !path.is_file() {
+        return None;
+    }
+    let vault = store::EncryptedAntigravityAccountStore::new(path)
+        .read()
+        .ok()?;
+    vault
+        .selected_account_id
+        .filter(|id| vault.accounts.iter().any(|a| a.id == *id))
+}
+
+/// Preflight native Antigravity credentials before spawning a background/bot/scheduled/resumed
+/// `agy` session. Uses a bounded backoff when the OS keyring is transiently locked after reboot.
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "called from non-test background launch paths")
+)]
+pub(crate) fn preflight_auth_for_background_launch(
+    home: &Path,
+    launch_env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    backend::preflight_auth_for_host(home, launch_env, backend::REBOOT_KEYCHAIN_BACKOFF)
+        .map_err(|err| err.message().to_owned())
 }
 
 /// Returns true if the native Antigravity vault currently has any saved account with `id`.
@@ -184,10 +209,16 @@ pub(crate) fn reconcile_host_to_profiles_then<T>(
     if home.as_os_str().is_empty() {
         return after();
     }
+    let has_legacy_agy = accounts.iter().any(|a| {
+        ProviderKind::parse(&a.provider) == Some(ProviderKind::Antigravity)
+            && !a.profile_dir.is_empty()
+    });
     let host_token_path = antigravity_token_file_path(home);
     crate::usage::direct::agy::run_account_op(|| {
         let _sync_guard = crate::session::lock(&SYNC_LOCK);
-        sync_account_gated(home, &host_token_path, accounts, None);
+        if has_legacy_agy {
+            sync_account_gated(home, &host_token_path, accounts, None);
+        }
         after()
     })
 }

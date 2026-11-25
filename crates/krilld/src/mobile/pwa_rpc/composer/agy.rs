@@ -323,6 +323,10 @@ fn fetch_gated(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, FetchE
             "--gemini_dir={}",
             gemini.to_str().ok_or(FetchError::Failed(LIST_FAILED))?
         ));
+    } else if home.is_absolute()
+        && let Some(gemini) = home.join(".gemini").to_str()
+    {
+        args.push(format!("--gemini_dir={gemini}"));
     }
     args.push("models".to_owned());
     let output = match direct::agy::run_agy_cancellable(

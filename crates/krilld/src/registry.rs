@@ -2082,6 +2082,14 @@ impl Registry {
                         return Err(os(&e));
                     }
                 };
+                if canonical == "agy"
+                    && account.as_ref().is_none_or(|a| a.dir.is_empty())
+                    && let Err(err) = preflight_agy_background_launch(&launch.env)
+                {
+                    self.discard_settings(session);
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(os(&err));
+                }
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: s.permission,
@@ -2145,6 +2153,14 @@ impl Registry {
                             return Err(os(&e));
                         }
                     };
+                    if canonical == "agy"
+                        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+                        && let Err(err) = preflight_agy_background_launch(&launch.env)
+                    {
+                        self.discard_settings(session);
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&err));
+                    }
                     let metadata = control::AgentLaunch {
                         profile: canonical,
                         permission,
@@ -3868,7 +3884,16 @@ impl Registry {
         submit: bool,
         expected_last_input_ns: Option<u64>,
     ) -> io::Result<bool> {
-        let (_, _, _, modes) = tap.capture_shared_with_modes();
+        let (screen, _, _, modes) = tap.capture_shared_with_modes();
+        if krill_proto::screen::agy::auth_login_screen(&screen) {
+            tracing::warn!(
+                "refused automated PTY input delivery while Antigravity sign-in/OAuth screen is active"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "antigravity session requires sign-in (auth_required)",
+            ));
+        }
         let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
         let payload = if submit {
             bytes
@@ -4599,6 +4624,10 @@ impl Registry {
             stored.bot_instructions.as_deref(),
         )
         .inspect_err(|_| self.discard_settings(session))?;
+        if canonical == "agy" && account.as_ref().is_none_or(|a| a.dir.is_empty()) {
+            preflight_agy_background_launch(&launch.env)
+                .inspect_err(|_| self.discard_settings(session))?;
+        }
         for (key, value) in [
             ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
             (
@@ -4728,7 +4757,7 @@ impl Registry {
                 ));
             };
             if canonical == "agy"
-                && let Some((installed, minimum)) = crate::mobile::agy_version_problem(&exe, true)
+                && let Some((installed, minimum)) = crate::mobile::agy_version_problem(&exe, false)
             {
                 return Err(BotStartError::Refused(BotSessionRefusal::cli_too_old(
                     canonical, installed, minimum,
@@ -4756,6 +4785,20 @@ impl Registry {
             BotStartError::Refused(BotSessionRefusal::spawn_failed(canonical, err.to_string()))
         })?;
         launch.env.extend(extra_env);
+        if canonical == "agy"
+            && account.as_ref().is_none_or(|a| a.dir.is_empty())
+            && let Err(err) = preflight_agy_background_launch(&launch.env)
+        {
+            self.discard_settings(session);
+            tracing::warn!(
+                agent = canonical,
+                error = %err,
+                "refused bot agy session launch before spawn: Antigravity credentials unavailable"
+            );
+            return Err(BotStartError::Refused(BotSessionRefusal::auth_required(
+                canonical,
+            )));
+        }
         crate::agent::pre_trust_workspace(&profile, &cwd_bytes, account.as_ref());
         let metadata = control::AgentLaunch {
             profile: canonical.to_owned(),
@@ -5962,6 +6005,66 @@ fn resolve_bot_cli_executable(
         .and_then(|home| krill_proto::agent::which(program, home.join(".local/bin").as_os_str()))
 }
 
+/// Preflights native Antigravity credentials before spawning a background/bot/scheduled/resumed
+/// `agy` session so unauthenticated or transiently locked reboot states never enter the OAuth TUI
+/// and launch a browser window.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "matches non-test Result signature"
+    )
+)]
+pub(super) fn preflight_agy_background_launch(env: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let _ = env;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let mut launch_env: std::collections::BTreeMap<String, String> = env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
+            "SSH_CONNECTION",
+            "SSH_TTY",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            if !launch_env.contains_key(key)
+                && let Ok(val) = std::env::var(key)
+            {
+                launch_env.insert(key.to_owned(), val);
+            }
+        }
+        let home = launch_env
+            .get("HOME")
+            .or_else(|| launch_env.get("USERPROFILE"))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(krill_proto::os::home_dir)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Antigravity is not signed in (auth_required).",
+                )
+            })?;
+        crate::usage::accounts::agy_native::preflight_auth_for_background_launch(&home, &launch_env)
+            .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
+    }
+}
+
 fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
     if let Ok(text) = std::str::from_utf8(cwd) {
         let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
@@ -6565,6 +6668,68 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_to_tap_refuses_agy_oauth_login_screen_with_zero_bytes_written()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+        for (idx, banner) in [
+            b"Welcome to the Antigravity CLI. You are currently not signed in.\r\n\
+              Select login method:\r\n\
+              > 1. Google OAuth\r\n\
+                2. Use a Google Cloud project\r\n"
+                .as_slice(),
+            b"Your browser should open automatically.\r\n\
+              -> Click here to authenticate\r\n\
+              Enter authorization code:\r\n"
+                .as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (master, mut terminal) = UnixStream::pair()?;
+            terminal.set_read_timeout(Some(Duration::from_millis(120)))?;
+            let session = Session::start(
+                SessionId(41_900 + idx as u64),
+                OwnedFd::from(master),
+                WinSize { cols: 80, rows: 24 },
+                Arc::clone(&look),
+                None,
+            )?;
+            let tap = session.tap();
+            terminal.write_all(banner)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !krill_proto::screen::agy::auth_login_screen(&tap.capture().0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for login banner on screen"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let err = Registry::deliver_input_to_tap(&tap, b"run bot task", true)
+                .expect_err("automated input must be refused on agy auth login screen");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("auth_required"), "err={err}");
+
+            let mut buf = [0_u8; 64];
+            let read_res = terminal.read(&mut buf);
+            assert!(
+                matches!(
+                    read_res,
+                    Err(ref e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                ),
+                "expected 0 bytes written to PTY, got {read_res:?}"
+            );
+            drop(session);
+        }
+        Ok(())
     }
 
     #[test]

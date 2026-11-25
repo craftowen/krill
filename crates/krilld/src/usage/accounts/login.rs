@@ -46,6 +46,9 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
         .into_iter()
         .filter_map(|a| {
             let provider = ProviderKind::parse(&a.provider)?;
+            if !cfg!(test) && provider == ProviderKind::Antigravity {
+                return None;
+            }
             let raw_dir = PathBuf::from(&a.profile_dir);
             let dir = if provider == ProviderKind::Codex {
                 super::resolve_codex_dir(home, &a.id, &raw_dir)
@@ -129,7 +132,14 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 status
             }
             _ if provider == ProviderKind::Antigravity => {
-                let status = super::super::direct::antigravity_auth_file(&dir, host);
+                let file_storage_host = super::agy_native::is_antigravity_file_storage_host(
+                    &super::agy_native::backend::current_process_env(),
+                );
+                let status = if !host || file_storage_host {
+                    super::super::direct::antigravity_auth_file(&dir, host)
+                } else {
+                    None
+                };
                 if !host || status.as_ref().is_some_and(|s| s.logged_in) {
                     lock(&STATES).insert(key.clone(), connection_from_auth(status.as_ref()));
                     lock(&CACHE).insert(key.clone(), (Instant::now(), stamp, status.clone()));

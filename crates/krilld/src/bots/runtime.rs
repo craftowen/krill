@@ -1165,6 +1165,7 @@ impl BotRuntime {
                         let _serial = lock(&ctrl_thread.delivery_lock);
                         let deadline = Instant::now() + PREAMBLE_READY_WAIT;
                         let mut ready_seen = false;
+                        let mut auth_blocked = false;
                         while Instant::now() < deadline {
                             let p = tap.pulse();
                             if p.closed {
@@ -1172,10 +1173,16 @@ impl BotRuntime {
                             }
                             if is_agy {
                                 // Antigravity CLI pauses >150ms during "Signing in..." before rendering
-                                // its interactive `> ` composer; wait for the composer to appear.
+                                // its interactive `> ` composer; wait for the composer to appear, and
+                                // abort immediately if it falls into the OAuth login screen.
+                                let screen = tap.capture().0;
+                                if krill_proto::screen::agy::auth_login_screen(&screen) {
+                                    auth_blocked = true;
+                                    break;
+                                }
                                 if p.end > 0
                                     && tap.quiet_ms() >= 150
-                                    && crate::mobile::agy_composer_ready(&tap.capture().0)
+                                    && crate::mobile::agy_composer_ready(&screen)
                                 {
                                     ready_seen = true;
                                     break;
@@ -1186,7 +1193,12 @@ impl BotRuntime {
                             }
                             std::thread::sleep(Duration::from_millis(50));
                         }
-                        if let Some(bytes) = bytes {
+                        if auth_blocked {
+                            Some(
+                                "auth_required: Antigravity session requires sign-in before accepting prompts"
+                                    .to_owned(),
+                            )
+                        } else if let Some(bytes) = bytes {
                             if tap.pulse().closed {
                                 Some("pty closed before initial prompt delivery".to_owned())
                             } else if is_agy && !ready_seen {
@@ -3139,6 +3151,14 @@ impl RuntimeInner {
         if let Some(ref c) = connectors {
             c.on_turn_complete_seq(bot_id, session_id, completed_seq, Some(fail_note.as_str()));
         }
+        if reason.contains("auth_required") {
+            tracing::warn!(
+                session = session_id.0,
+                bot_id = %bot_id,
+                "stopping queued bot turn drain because session requires sign-in (auth_required)"
+            );
+            return;
+        }
         if let (Some(reg), Some(store)) = (reg, store) {
             self.drain_next_queued_turn(
                 &reg,
@@ -3248,6 +3268,16 @@ impl RuntimeInner {
                             Some(next.turn_seq),
                             Some(fail_note.as_str()),
                         );
+                    }
+                    if err.kind() == io::ErrorKind::PermissionDenied
+                        || err.to_string().contains("auth_required")
+                    {
+                        tracing::warn!(
+                            session = session_id.0,
+                            bot_id = %bot_id,
+                            "halting queued bot turn drain on auth_required refusal"
+                        );
+                        return;
                     }
                 }
             }

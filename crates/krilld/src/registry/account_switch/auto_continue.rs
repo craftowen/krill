@@ -140,6 +140,16 @@ impl Registry {
                 if pulse.end > 0 && quiet_ms >= CONTINUE_COMPOSER_QUIET_MS {
                     let screen = plan.tap.capture().0;
                     let text = screen_plain_text(&screen);
+                    if plan.provider == ProviderKind::Antigravity
+                        && krill_proto::screen::agy::auth_login_text(&text)
+                    {
+                        tracing::warn!(
+                            session = plan.new.0,
+                            from = plan.old.0,
+                            "aborted automatic continuation: Antigravity session requires sign-in (auth_required)"
+                        );
+                        return;
+                    }
                     if !provider_blocking_or_loading_screen(plan.provider, &text) {
                         let composer_ready = provider_empty_composer_ready(plan.provider, &screen);
                         let fallback_ready = quiet_ms >= CONTINUE_FALLBACK_QUIET_MS
@@ -416,6 +426,9 @@ pub(super) fn provider_blocking_or_loading_screen(provider: ProviderKind, text: 
         "esc to cancel",
     ];
     let lower = text.to_ascii_lowercase();
+    if provider == ProviderKind::Antigravity && krill_proto::screen::agy::auth_login_text(text) {
+        return true;
+    }
     if provider == ProviderKind::Codex
         && (text.contains(CODEX_WRITER_LOCKED)
             || lower.contains("close it there and press r to continue here"))
