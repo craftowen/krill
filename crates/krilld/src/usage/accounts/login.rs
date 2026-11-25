@@ -135,7 +135,10 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 let file_storage_host = super::agy_native::is_antigravity_file_storage_host(
                     &super::agy_native::backend::current_process_env(),
                 );
-                let status = if !host || file_storage_host {
+                let status = if !host
+                    || file_storage_host
+                    || !super::agy_native::backend::is_real_home(home)
+                {
                     super::super::direct::antigravity_auth_file(&dir, host)
                 } else {
                     None
