@@ -202,13 +202,14 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             assert evaluate('[...document.querySelectorAll(".recent-session-row[data-session]")].some(b=>b.disabled)')
             evaluate("KrillMobile.store.preferences.language='ko';KrillMobile.i18n.configure('ko');KrillMobile.app.navigate('/accounts');true")
             wait('!!document.querySelector(".accounts")')
-            # Choose the remaining connected PC, then inspect Korean UI with English duration units.
+            # Choose the remaining connected PC, then inspect compact Korean UI with localized duration units.
             evaluate('KrillMobile.app.selectHost('+json.dumps(hosts[1]['id'])+",()=>KrillMobile.app.navigate('/accounts'));true")
             wait('!!document.querySelector(".account-row")')
             browser('set', 'viewport', '320', '740')
             evaluate("document.documentElement.style.setProperty('--ui-scale','1.5');true")
             assert evaluate('document.documentElement.scrollWidth<=innerWidth')
-            assert evaluate('[...document.querySelectorAll(".usage-reset")].every(n=>!/[가-힣]/.test(n.textContent))')
+            assert evaluate('[...document.querySelectorAll(".usage-label")].length>=2 && [...document.querySelectorAll(".usage-label")].every(n=>["5시간","7일"].includes(n.textContent))')
+            assert evaluate(r'(()=>{const resets=[...document.querySelectorAll(".usage-reset")].map(n=>n.textContent);return resets.some(t=>/^(?:지금|\d+(?:분|시간|일))$/.test(t))&&resets.every(t=>t==="—"||/^(?:지금|\d+(?:분|시간|일))$/.test(t));})()')
             browser('screenshot', str(shots / 'accounts-ko-320.png'))
             home()
             assert evaluate('document.documentElement.scrollWidth<=innerWidth')
