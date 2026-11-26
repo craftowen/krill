@@ -1002,21 +1002,22 @@ async fn abrupt_client_socket_drop_sends_reset_and_frees_server_slot_immediately
     assert_eq!(&got, b"halfway");
 
     // Drop client socket abruptly (simulating a timed-out/cancelled RPC client), then let
-    // upstream write a reply without shutting down; the client's local write EPIPE triggers
-    // Kind::Reset so the server closes the stream immediately instead of suspending.
+    // upstream write responses without shutting down; on Unix write #1 hits EPIPE immediately,
+    // while on Windows loopback TCP/AF_UNIX write #1 triggers RST and subsequent writes observe
+    // WSAECONNRESET, causing the client to send Kind::Reset so the server closes immediately.
     drop(app);
     let mut eof = [0u8; 1];
     let read_res = tokio::time::timeout(WAIT, upstream.read(&mut eof))
         .await
         .unwrap();
     assert!(matches!(read_res, Ok(0) | Err(_)));
-    upstream
-        .write_all(b"late response after client drop")
-        .await
-        .ok();
 
     let deadline = Instant::now() + WAIT;
     loop {
+        upstream
+            .write_all(b"late response after client drop")
+            .await
+            .ok();
         let statuses = f.server.stream_statuses();
         if !statuses.is_empty() && statuses.iter().all(|s| s.state == StreamPhase::Closed) {
             break;
@@ -1025,7 +1026,7 @@ async fn abrupt_client_socket_drop_sends_reset_and_frees_server_slot_immediately
             Instant::now() < deadline,
             "abruptly dropped client stream stayed stuck instead of closing: {statuses:?}"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     f.shutdown().await;
 }
