@@ -345,7 +345,7 @@ pub fn notify_on_stop_signal(done: std::sync::mpsc::Sender<()>) {
         }
         return;
     }
-    for sig in [libc::SIGTERM, libc::SIGINT] {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: `on_signal`은 원자 읽기와 write(2)만 수행하는 async-signal-safe 핸들러다.
         unsafe {
             libc::signal(sig, on_signal as *const () as libc::sighandler_t);

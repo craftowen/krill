@@ -132,6 +132,22 @@ fn retry_deadline_doubles_and_caps_until_reason_changes() {
 }
 
 #[test]
+fn transient_transport_error_does_not_reset_auth_failure_streak_or_rewarn() {
+    let now = Instant::now();
+    let mut retry = Retry::new();
+    assert!(retry.fail(Failure::Http(401), now));
+    assert!(!retry.fail(Failure::Http(401), now));
+    // A brief offline/wake transport error keeps the persistent 401 streak intact.
+    assert!(!retry.fail(Failure::Transport, now));
+    assert_eq!(retry.reason, Some(Failure::Http(401)));
+    assert_eq!(retry.failures, 3);
+    // Returning to 401 once back online must not re-warn or reset backoff to 30s.
+    assert!(!retry.fail(Failure::Http(401), now));
+    assert_eq!(retry.failures, 4);
+    assert_eq!(retry.until.duration_since(now), Duration::from_secs(240));
+}
+
+#[test]
 fn expired_selected_keychain_is_not_replaced_by_another_account_and_is_reread() {
     let expired = br#"{"claudeAiOauth":{"accessToken":"expired-fixture","refreshToken":"fixture-only","expiresAt":1000}}"#;
     let renewed = br#"{"claudeAiOauth":{"accessToken":"renewed-fixture","expiresAt":2000}}"#;

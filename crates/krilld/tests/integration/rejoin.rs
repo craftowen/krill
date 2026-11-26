@@ -891,3 +891,39 @@ fn empty_holder_gives_up_when_handover_keeps_failing() {
     drop(kids);
     fs::remove_dir_all(dir).ok();
 }
+
+/// holder가 띄운 krilld가 0700 권한 위반 등 재시도 불가능한 설정 오류를 만나면
+/// `KRILLD_FATAL_CONFIG`로 종료해 holder가 5회 재시도 루프를 돌지 않고 즉시 멈춘다.
+#[test]
+fn linked_fatal_listener_error_stops_holder_without_retry_storm() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tmp("fatal-listener-fastfail");
+    let run = dir.join("run");
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+    let sock = run.join("krilld.sock");
+    let mut kids = Kids::default();
+    kids.holders.push(holder(&dir, &sock));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = kids.holders[0].try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder kept retrying fatal listener config failure"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "holder exit status: {status}");
+    let log = fs::read_to_string(dir.join("logs/krilld.log")).unwrap();
+    let failures = log.matches("listener failed").count();
+    assert_eq!(
+        failures, 1,
+        "expected single failure without retries: {log}"
+    );
+    drop(kids);
+    fs::remove_dir_all(dir).ok();
+}

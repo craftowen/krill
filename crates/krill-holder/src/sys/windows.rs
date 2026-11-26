@@ -294,7 +294,7 @@ fn hr(code: i32) -> io::Result<()> {
     if (code.cast_unsigned() & 0xffff_0000) == 0x8007_0000 && (code & 0xffff) != 0 {
         return Err(io::Error::from_raw_os_error(code & 0xffff));
     }
-    Err(io::Error::other(format!("ConPTY HRESULT {code:#x}")))
+    Err(io::Error::from_raw_os_error(code))
 }
 fn coord(size: WinSize) -> io::Result<COORD> {
     let (Ok(x), Ok(y)) = (i16::try_from(size.cols), i16::try_from(size.rows)) else {
@@ -1222,7 +1222,7 @@ mod tests {
         let access_denied = hr(0x8007_0005_u32.cast_signed()).unwrap_err();
         assert_eq!(access_denied.raw_os_error(), Some(5));
         let generic = hr(0x8000_4005_u32.cast_signed()).unwrap_err();
-        assert_eq!(generic.kind(), io::ErrorKind::Other);
+        assert_eq!(generic.raw_os_error(), Some(0x8000_4005_u32.cast_signed()));
         assert_eq!(
             bundled_console_rel(Some(OsStr::new("arm64")), Some(OsStr::new("AMD64"))),
             "arm64/OpenConsole.exe"

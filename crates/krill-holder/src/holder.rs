@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::sys::kq::{Event, EventFilter, EventFlags, ProcessEvents};
 use krill_proto::SessionId;
-use krill_proto::daemon::{KRILLD_DUPLICATE, KRILLD_HANDOVER_FAILED};
+use krill_proto::daemon::{KRILLD_DUPLICATE, KRILLD_FATAL_CONFIG, KRILLD_HANDOVER_FAILED};
 use krill_proto::holder::Error::UnknownKind;
 use krill_proto::holder::{
     FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
@@ -28,17 +28,14 @@ use crate::link::{Link, Packet};
 use crate::sys;
 use crate::teardown::Teardown;
 
-/// krilld가 이만큼 살았으면 다음 크래시는 "첫 크래시"로 보고 즉시 재기동한다.
-/// ponytail: MK-005 스파이크 값(1s·250ms·30s). 상수 확정은 오웬 확인 대기(MK-005 보고서).
+/// krilld가 이만큼 살았으면 다음 크래시는 첫 크래시로 보고 즉시 재기동한다(MK-005).
 const STABLE: Duration = Duration::from_secs(1);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
-/// `RLIMIT_NOFILE` 목표. macOS는 `OPEN_MAX`(10240)보다 큰 소프트 한도를 거부한다.
 const NOFILE: u64 = 10_240;
-/// `UpgradeKrilld`로 바꾼 krilld가 뜨자마자 죽기를 이 횟수 연속으로 반복하면 바꾸기 전 경로로 되돌린다(OWE-589).
-/// 백오프 1번째(즉시)·2번째(즉시)·3번째(250ms) 뒤라 롤백까지 1초 안에 끝난다.
+/// `UpgradeKrilld` 뒤 연속 실패가 이 횟수에 닿으면 이전 경로로 되돌린다(OWE-589).
 const ROLLBACK_AFTER: u32 = 3;
-/// 세션 없는 holder의 krilld가 이만큼 연속으로 뜨자마자 끝나면(bind 권한 오류 등) 다시 띄우지 않고 끝낸다(약 2초).
+/// 살아있는 세션 없는 holder의 연속 실패 포기 한도.
 const GIVE_UP: u32 = 5;
 
 #[derive(Debug)]
@@ -47,14 +44,13 @@ pub(crate) struct Session {
     pub pid: Pid,
     pub master: OwnedFd,
     pub status: Option<i32>,
-    /// `Adopt`로 받은 세션: holder의 자식이 아니라 `NOTE_EXIT`로만 종료를 안다.
+    /// `Adopt` 세션: `NOTE_EXIT`로만 종료 감지.
     pub adopted: bool,
 }
 
 #[derive(Debug)]
 struct Krilld {
     pid: Pid,
-    /// 링크가 끊기면 `None`. 프로세스는 죽을 때까지 기다렸다 거둔다.
     link: Option<Link>,
     started: Instant,
 }
@@ -65,21 +61,14 @@ struct Holder {
     krilld_args: Vec<OsString>,
     sessions: Vec<Session>,
     listener: Option<OwnedFd>,
-    /// 맡은 listen 소켓의 소유 락([`own_socket`]).
     owner: Option<File>,
     krilld: Option<Krilld>,
     restart_at: Option<Instant>,
-    /// 짧게 살고 죽은 연속 횟수(첫 크래시 = 1).
     streak: u32,
-    /// `UpgradeKrilld`를 받았다 — 다음 종료는 크래시가 아니다.
     upgrading: bool,
-    /// `UpgradeKrilld`로 바꾸기 전 경로. 새 경로가 안정(1초 이상 생존)되기 전 연속 실패가
-    /// [`ROLLBACK_AFTER`]에 닿으면 되돌린다. exec 핸드오프를 거치면 잃는다(업그레이드 순서가 holder
-    /// exec → krilld 경로 변경이라 잃을 일이 없다).
+    /// `UpgradeKrilld` 직전 경로(안정 전 [`ROLLBACK_AFTER`]회 실패 시 복구).
     prev_krilld: Option<OsString>,
-    /// 현 krilld 경로가 뜨자마자 죽거나 뜨지 못한 연속 횟수(경로 변경·안정 생존 때 0).
     unstable: u32,
-    /// 진행 중인 `Terminate` 단계들.
     teardowns: Vec<Teardown>,
     kq: OwnedFd,
 }
@@ -369,11 +358,14 @@ impl Holder {
             let status = st.as_raw();
             if self.krilld.as_ref().is_some_and(|k| k.pid == pid) {
                 let code = st.exit_status().and_then(|c| u8::try_from(c).ok());
-                if code == Some(KRILLD_DUPLICATE) && self.owner.is_none() {
-                    // 다른 데몬이 소켓을 쥐어 다시 띄워도 같다(A-01). 소켓을 맡은 holder의 중복은 bind 탐침과 겹친 일시 충돌이고, 멈추면 owner 락 때문에 아무도 그 소켓을 받지 못해 백오프로 다시 띄운다.
-                    tracing::warn!(sessions = self.sessions.len(), "daemon duplicate");
-                    self.krilld = None;
-                    self.restart_at = None;
+                let idle = self.sessions.iter().all(|s| s.status.is_some());
+                if (code == Some(KRILLD_DUPLICATE)
+                    && (self.owner.is_none() || self.streak >= GIVE_UP))
+                    || (code == Some(KRILLD_FATAL_CONFIG) && idle)
+                {
+                    tracing::warn!(sessions = self.sessions.len(), ?code, "daemon duplicate");
+                    (self.owner, self.listener, self.krilld, self.restart_at) =
+                        (None, None, None, None);
                 } else {
                     self.on_krilld_exit(code == Some(KRILLD_HANDOVER_FAILED));
                 }
@@ -423,16 +415,13 @@ impl Holder {
     fn on_krilld_exit(&mut self, failed_handover: bool) {
         let k = self.krilld.take();
         let stable = k.is_some_and(|k| !failed_handover && k.started.elapsed() >= STABLE);
-        let handover = std::mem::take(&mut self.upgrading);
-        if handover {
+        if std::mem::take(&mut self.upgrading) {
             self.streak = 0;
             tracing::info!(streak = 0u32, give_up = false, "daemon restart scheduled");
             self.restart_at = Some(Instant::now());
         } else {
             if stable {
-                self.streak = 1;
-                self.prev_krilld = None; // 새 경로가 안정됐다: 롤백 대상을 버린다.
-                self.unstable = 0;
+                (self.streak, self.prev_krilld, self.unstable) = (1, None, 0);
             } else {
                 self.streak = self.streak.saturating_add(1);
                 self.note_unstable();
@@ -442,13 +431,14 @@ impl Holder {
     }
 
     fn schedule(&mut self) {
-        let give_up = self.sessions.is_empty() && self.streak >= GIVE_UP;
-        tracing::warn!(streak = self.streak, give_up, "daemon restart scheduled");
+        let give_up = self.sessions.iter().all(|s| s.status.is_some()) && self.streak >= GIVE_UP;
+        if self.streak <= GIVE_UP || self.streak.is_power_of_two() {
+            tracing::warn!(streak = self.streak, give_up, "daemon restart scheduled");
+        }
         self.restart_at = (!give_up).then(|| Instant::now() + backoff(self.streak));
     }
 
-    /// 현 krilld 경로가 한 번 실패했다(뜨자마자 죽거나 뜨지 못함). `UpgradeKrilld` 뒤 연속 실패가
-    /// [`ROLLBACK_AFTER`]에 닿으면 바꾸기 전 경로로 되돌리고 처음부터 다시 센다.
+    /// 현 krilld 경로가 연속 [`ROLLBACK_AFTER`]회 실패하면 바꾸기 전 경로로 되돌린다.
     fn note_unstable(&mut self) {
         if self.prev_krilld.is_none() {
             return;
@@ -459,18 +449,18 @@ impl Holder {
                 tracing::warn!("new krilld keeps failing, rolling back");
                 self.krilld_path = prev;
             }
-            self.unstable = 0;
-            self.streak = 0;
+            (self.unstable, self.streak) = (0, 0);
         }
     }
 
     /// krilld를 띄우고 보관 중인 fd를 모두 넘긴다. 실패는 크래시와 같게 백오프한다.
     fn spawn_krilld(&mut self) {
         let started = (|| {
+            // macOS에는 SOCK_CLOEXEC가 없다(holder는 단일 스레드).
             let (ours, theirs) = socketpair(
                 AddressFamily::UNIX,
                 SocketType::STREAM,
-                SocketFlags::empty(), // macOS에는 SOCK_CLOEXEC가 없다(holder는 단일 스레드)
+                SocketFlags::empty(),
                 None,
             )?;
             fcntl_setfd(&ours, FdFlags::CLOEXEC)?;
@@ -483,12 +473,17 @@ impl Holder {
                 .spawn()?;
             io::Result::Ok((child_pid(&child)?, ours))
         })();
-        let Ok((pid, sock)) = started else {
-            self.streak = self.streak.saturating_add(1);
-            // 뜨지 못한 것도 실패로 센다(업그레이드 preflight를 피한 교체 등).
-            self.note_unstable();
-            self.schedule();
-            return;
+        let (pid, sock) = match started {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.streak = self.streak.saturating_add(1);
+                if self.streak <= GIVE_UP || self.streak.is_power_of_two() {
+                    tracing::warn!(streak = self.streak, kind = ?e.kind(), errno = e.raw_os_error(), "krilld spawn failed");
+                }
+                self.note_unstable();
+                self.schedule();
+                return;
+            }
         };
         let link = Link::new(sock);
         let sessions = self.sessions.iter().map(|s| {

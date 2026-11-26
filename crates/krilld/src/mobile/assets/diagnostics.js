@@ -644,7 +644,8 @@
           const asset = assetFile(event.target.src || event.target.href),
             file = files.has(asset) ? asset : undefined;
           // Icons and the manifest are decorative: a failed logo breaks nothing.
-          if (file || asset === "app.css")
+          // Offline script/CSS failures are expected network loss, not broken assets.
+          if ((file || asset === "app.css") && globalThis.navigator?.onLine !== false)
             report("mobile_asset_failed", {
               phase: "resource",
               reason: "resource_error",

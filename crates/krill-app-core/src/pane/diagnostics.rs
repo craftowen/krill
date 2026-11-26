@@ -79,6 +79,10 @@ pub struct StartAttempt {
     pub remote: bool,
 }
 
+fn is_expected_stale_restore(operation: &str, code: &str) -> bool {
+    operation == "restore" && code == "no_session"
+}
+
 /// Correlate retries using internal numeric IDs; no paths, accounts or provider conversation IDs.
 pub fn record_start_failure(
     operation: &'static str,
@@ -86,6 +90,21 @@ pub fn record_start_failure(
     context: Option<StartAttempt>,
 ) {
     let info = details(error);
+    if is_expected_stale_restore(operation, info.code) {
+        tracing::debug!(
+            operation,
+            failure = info.code,
+            kind = ?error.kind(),
+            errno = ?info.errno,
+            outcome_unknown = super::is_unknown_outcome(error),
+            pane = context.map(|c| c.pane),
+            wanted_session = context.and_then(|c| c.wanted_session.map(|s| s.0)),
+            attempt = context.map(|c| c.attempt),
+            remote = context.map(|c| c.remote),
+            "terminal restore target session already gone"
+        );
+        return;
+    }
     tracing::warn!(
         operation,
         failure = info.code,
@@ -183,5 +202,15 @@ mod tests {
             details(&failure_error(io::ErrorKind::Other, Failure::Os(13))).errno,
             Some(13)
         );
+    }
+
+    #[test]
+    fn stale_restore_no_session_is_expected_only_for_restore() {
+        let gone = crate::pane::failure_to_io_error(Failure::NoSession);
+        assert!(is_expected_stale_restore("restore", details(&gone).code));
+        assert!(!is_expected_stale_restore("spawn", details(&gone).code));
+        assert!(!is_expected_stale_restore("attach", details(&gone).code));
+        let other = crate::pane::failure_to_io_error(Failure::NoHolder);
+        assert!(!is_expected_stale_restore("restore", details(&other).code));
     }
 }

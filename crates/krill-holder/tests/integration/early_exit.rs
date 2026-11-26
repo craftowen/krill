@@ -48,6 +48,44 @@ fn immediate_duplicate_krilld_exit_does_not_hang_holder() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Non-retryable listener/config failure (`KRILLD_FATAL_CONFIG` = 5) must stop an idle holder
+/// immediately without amplifying into 5 crash-restart attempts.
+#[test]
+fn immediate_fatal_config_krilld_exit_stops_without_retrying() {
+    let dir = std::env::temp_dir().join(format!("krill-fatal-cfg-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let count_file = dir.join("runs");
+    let script = format!("echo x >> '{}'; exit 5", count_file.display());
+    let mut child = Command::new(HOLDER)
+        .args(["/bin/sh", "-c", &script])
+        .env("KRILL_LOG_DIR", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let runs = fs::read_to_string(&count_file)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    fs::remove_dir_all(&dir).ok();
+    let status = status.expect("holder hung after KRILLD_FATAL_CONFIG exit");
+    assert!(status.success(), "{status}");
+    assert_eq!(runs, 1, "holder must not retry KRILLD_FATAL_CONFIG");
+}
+
 /// LL-01: repeated immediate crash exits (status 1) must hit `GIVE_UP` and exit cleanly.
 #[test]
 fn immediate_crashing_krilld_hits_give_up_instead_of_hanging() {

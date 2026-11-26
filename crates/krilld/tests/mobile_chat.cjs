@@ -6726,6 +6726,69 @@ async function unboundEmptyAndVisibilityTransitions() {
         process.off("unhandledRejection", onUnhandled);
       }
       console.log("PASS sweep R2 chat regressions: R2M-12, R2M-13, R2M-24");
+
+      // Regression: short assistant message followed by a long/multiline assistant message and a tool_call
+      // must not mark the earlier short assistant message as an orphaned foldable note that passes null to insertBefore.
+      let orphanUnhandled = 0;
+      const onOrphanUnhandled = () => { orphanUnhandled++; };
+      process.on("unhandledRejection", onOrphanUnhandled);
+      try {
+        const fOrphan = fixture({
+          capabilities: { chat_tail: true },
+          handler: async (req) => {
+            if (req.action === "chat_poll" && req.latest) {
+              return {
+                generation: "g-orphan",
+                agent: "claude",
+                bound: true,
+                page_start: 100,
+                next_offset: 200,
+                items: [
+                  { id: "a1", kind: "assistant", text: "Short intro." },
+                  { id: "a2", kind: "assistant", text: "Line one\nLine two with details." },
+                  { id: "t1", kind: "tool_call", tool_name: "Bash", text: "ls" },
+                  { id: "t2", kind: "tool_result", tool_name: "Bash", text: "ok" },
+                ],
+              };
+            }
+            if (req.action === "chat_poll") {
+              return {
+                generation: "g-orphan",
+                agent: "claude",
+                bound: true,
+                page_start: 0,
+                next_offset: 100,
+                items: [
+                  { id: "u0", kind: "user", text: "run check" },
+                ],
+              };
+            }
+            return {};
+          },
+        });
+        await flush();
+        await new Promise((r) => setTimeout(r, 20));
+        const feed = fOrphan.find("chat-feed");
+        assert(
+          feed.children.every((node) => node !== null && node !== undefined),
+          "feed never receives a null child when a short assistant precedes a non-foldable assistant and tool_call",
+        );
+        assert(
+          feed.children.some(
+            (n) =>
+              n.tag === "article" &&
+              [n, ...n.descendants()].some((d) =>
+                String(d.textContent || "").includes("Short intro."),
+              ),
+          ),
+          "short assistant message separated by a non-foldable assistant message renders as a normal card",
+        );
+        assert.equal(orphanUnhandled, 0, "fillHistory/loadEarlier must not emit unhandledRejection");
+        fOrphan.dispose();
+      } finally {
+        process.off("unhandledRejection", onOrphanUnhandled);
+      }
+      console.log("PASS regression: orphaned foldable note across non-foldable assistant and loadEarlier");
     }
   }
 }

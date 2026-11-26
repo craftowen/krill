@@ -784,12 +784,14 @@ for (let idx = items.length - 1; idx >= 0; idx--) {
 const kind = items[idx]?.kind || "assistant";
 if (isTurnBoundaryKind(kind)) seenToolInTurn = false;
 else if (isToolItemKind(kind)) seenToolInTurn = true;
-else if (
+else if (kind === "reasoning") {
+} else if (
 kind === "assistant" &&
 seenToolInTurn &&
 isFoldablePreamble(items[idx]?.text)
 )
 foldable[idx] = true;
+else seenToolInTurn = false;
 }
 return foldable;
 }
@@ -3954,8 +3956,11 @@ const item = entry.items[idx];
 if (item.kind && !KNOWN_CHAT_KINDS.has(item.kind)) continue;
 const key = itemKey(item, idx),
 isFoldedNote = Boolean(foldable[idx]);
+if (!run && idx >= runEnd)
+runEnd = workRunEnd(entry.items, idx, foldable);
+const inWorkRun = run ? isWorkItemKind(item.kind) || isFoldedNote : idx < runEnd;
 let card = null;
-if (!isFoldedNote) {
+if (!(isFoldedNote && inWorkRun)) {
 wanted.add(key);
 card = cards.get(key);
 if (!card) {
@@ -3970,9 +3975,7 @@ card._syncPermission = next._syncPermission;
 }
 card._item = item;
 }
-if (!run && idx >= runEnd)
-runEnd = workRunEnd(entry.items, idx, foldable);
-if (run ? isWorkItemKind(item.kind) || isFoldedNote : idx < runEnd) {
+if (inWorkRun) {
 if (!run) {
 let group = toolRuns.get(key);
 if (!group && !incremental) {
@@ -5563,7 +5566,7 @@ if (!earlierQueued || inFlight) return;
 earlierQueued = false;
 const short = capability("chat_tail") && feed.scrollHeight <= feed.clientHeight + 1;
 if (canReadEarlier() && (!following || short && fillPages < 4) && feed.scrollTop <= historyThreshold())
-loadEarlier(true, short && following);
+loadEarlier(true, short && following).catch(() => {});
 }
 async function loadEarlier(automatic = false, filling = false) {
 if (!canReadEarlier() || earlierPending || inFlight) return;
@@ -5584,11 +5587,11 @@ linkEpoch === state.connection?.generation;
 earlierQueued = false;
 earlierPending = true;
 failedEarlier = false;
+let loaded = false;
+try {
 if (!filling) following = false;
 if (feed.scrollHeight <= feed.clientHeight + 1) fillPages++;
 renderItems();
-let loaded = false;
-try {
 const res = await (prepared?.key === page.key ? prepared.promise : ctx.rpc({
 action: "chat_poll",
 session: sessionId,

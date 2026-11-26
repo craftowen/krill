@@ -3132,7 +3132,7 @@ fn quit_now(cx: &mut App) {
             }
             snapshots.push((window, layout));
         }
-        let link_services = cx.update(|cx| {
+        let shutdown = cx.update(|cx| {
             if !restart_quit_is_current(restart.as_ref(), cx) {
                 return None;
             }
@@ -3145,13 +3145,16 @@ fn quit_now(cx: &mut App) {
                         shell.quit_layout_ready.set(true);
                     }
                 }
-                Some(krill_app_core::hosts::link::begin_shutdown())
+                let link_services = krill_app_core::hosts::link::begin_shutdown();
+                let alert_stopped = krill_app_core::alert::shutdown(cx);
+                let run_finished = krill_app_core::errors::finish_run_async(cx);
+                Some((link_services, alert_stopped, run_finished))
             } else {
                 quit_app(cx);
                 None
             }
         });
-        let Some(link_services) = link_services else {
+        let Some((link_services, alert_stopped, run_finished)) = shutdown else {
             return;
         };
         if !link_services.is_empty() {
@@ -3161,6 +3164,8 @@ fn quit_now(cx: &mut App) {
                 })
                 .await;
         }
+        alert_stopped.await;
+        run_finished.await;
         cx.update(|cx| {
             #[cfg(test)]
             if let Some(observed) = cx.try_global::<QuitObserved>() {

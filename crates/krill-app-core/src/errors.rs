@@ -227,6 +227,19 @@ fn finish_run(slot: &Mutex<RunSlot>) {
     }
 }
 
+/// Close the active run marker off GPUI before `cx.quit()` so `on_app_quit` does
+/// not contend with an in-flight refresh inside GPUI's shutdown timeout.
+pub fn finish_run_async(cx: &mut App) -> Task<()> {
+    let slot = cx
+        .try_global::<Reporter>()
+        .map(|reporter| Arc::clone(&reporter.run));
+    cx.background_spawn(async move {
+        if let Some(run) = slot {
+            finish_run(&run);
+        }
+    })
+}
+
 /// Refresh the current process marker after a consent change, off the UI thread.
 pub(crate) fn refresh_run(cx: &mut App) {
     let Some(state) = crate::settings::state_dir(cx) else {

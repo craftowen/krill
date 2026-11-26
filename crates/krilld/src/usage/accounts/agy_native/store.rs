@@ -217,13 +217,30 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
             .parent()
             .ok_or_else(|| VaultError::Other(READ_ERR.to_owned()))?;
         let key = MasterKey::load_or_create(dir, false, true).map_err(|err| {
-            tracing::warn!(
-                reason = err.reason(),
-                status = ?err.os_status(),
-                "failed to load Antigravity vault master key"
-            );
+            if err.is_legacy_acl_locked() {
+                if mark_locked_warned(&self.path) {
+                    tracing::warn!(
+                        reason = err.reason(),
+                        status = ?err.os_status(),
+                        "failed to load Antigravity vault master key"
+                    );
+                } else {
+                    tracing::debug!(
+                        reason = err.reason(),
+                        status = ?err.os_status(),
+                        "Antigravity vault master key remains ACL-locked"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    reason = err.reason(),
+                    status = ?err.os_status(),
+                    "failed to load Antigravity vault master key"
+                );
+            }
             err.into_vault_error()
         })?;
+        clear_locked_warned(&self.path);
         let sealed = fs::read(&self.path).map_err(|_| VaultError::Other(READ_ERR.to_owned()))?;
         let plaintext = key
             .decrypt(&sealed)
@@ -292,6 +309,7 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
             );
         }
         write_atomic_0600(&self.path, &encrypted).map_err(|_| WRITE_ERR.to_owned())?;
+        clear_locked_warned(&self.path);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -305,6 +323,16 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
         }
         Ok(())
     }
+}
+
+static LOCKED_VAULT_WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn mark_locked_warned(path: &Path) -> bool {
+    lock(&LOCKED_VAULT_WARNED).insert(path.to_path_buf())
+}
+
+fn clear_locked_warned(path: &Path) {
+    lock(&LOCKED_VAULT_WARNED).remove(path);
 }
 
 fn unique_backup_path(dir: &Path, stem: &str) -> PathBuf {
@@ -389,6 +417,14 @@ enum MasterKeyError {
 impl MasterKeyError {
     const fn unavailable(reason: &'static str, status: Option<i32>) -> Self {
         Self::Unavailable { reason, status }
+    }
+
+    const fn is_legacy_acl_locked(&self) -> bool {
+        match self {
+            #[cfg(all(target_os = "macos", not(test)))]
+            Self::LegacyAclLocked(_) => true,
+            Self::Unavailable { .. } => false,
+        }
     }
 
     const fn reason(&self) -> &'static str {

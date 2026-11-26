@@ -428,8 +428,12 @@
               if (reply.credential && reply.credential !== auth2.credential)
                 throw Error("Desktop credential changed.");
               save({ ...manifestPatch(current() || source, reply, selectedRoute),
+                auth_blocked: false,
                 preferred_route: routeUrls(current() || source, hash).find((r) => r.url === selectedRoute)?.kind });
               return auth2;
+            },
+            setAuthBlocked(blocked) {
+              save({ auth_blocked: !!blocked });
             },
             describeHost(info) {
               const patch = {};
@@ -857,6 +861,7 @@
               fixed: destinationFixed,
               ...(pairingPending && pairingDirect && { preferred_route: "tailscale", routes: { ...patch.routes, tailscale: { origin: pairingDirect } } }),
               name: existing?.name || "Desktop",
+              auth_blocked: false,
             }),
             existing
               ? (hosts[hosts.indexOf(existing)] = active)
@@ -879,6 +884,17 @@
             (replacementId = null),
             credentials
           );
+        },
+        setAuthBlocked(blocked) {
+          if (!active) return;
+          active.auth_blocked = !!blocked;
+          saved = credentials = active;
+          persist();
+          try {
+            localStorage.setItem(STORE, JSON.stringify(active));
+          } catch {
+            storageFailed = !0;
+          }
         },
         fallback(attempted) {
           if (credentials?.routes?.tailscale && credentials?.routes?.relay) {
@@ -1273,7 +1289,21 @@
             "bots.memory.get",
             "voice.status",
             "voice.config_get",
-          ].includes(request?.action);
+          ].includes(request?.action),
+        LONG_RPC_ACTIONS = new Set([
+          "handoff",
+          "create_workspace",
+          "voice.transcribe",
+          "composer_models",
+          "set_model",
+          "bots.look_around",
+        ]),
+        rpcDeadline = (request, probe) =>
+          probe
+            ? PROBE_DEADLINE
+            : LONG_RPC_ACTIONS.has(request?.action)
+              ? 45e3
+              : 15e3;
       let credentials = options.credentials,
         pair = options.pair,
         socket,
@@ -1298,7 +1328,7 @@
         retryDelay = 1e3,
         last = null,
         retryNotBefore = 0,
-        authBlocked = !1,
+        authBlocked = !pair && !!credentials?.auth_blocked,
         retryCount = 0,
         nextRetryAt = 0,
         routeAlternative = false;
@@ -1563,12 +1593,21 @@
         const bytes = await plain();
         if (current !== generation)
           throw transportClosed("Disconnected. Pending actions were not resent.");
-        if (bytes[4] !== 101) throw Error("Unexpected daemon response");
+        if (bytes[4] !== 101) {
+          const error = Object.assign(Error("Unexpected daemon response"), {
+            diagnosticReason: "protocol_error",
+          });
+          disconnect(error);
+          throw error;
+        }
         const r = reader(bytes.slice(5)),
           kind = Number(r.u());
         if (kind === 4)
           throw Object.assign(Error(r.text()), { definitive: !0 });
-        if (kind !== 6) throw Error("Update the desktop for mobile workflows");
+        if (kind !== 6)
+          throw Object.assign(Error("Update the desktop for mobile workflows"), {
+            definitive: !0,
+          });
         const reply = JSON.parse(r.text());
         if (!reply.ok)
           throw Object.assign(Error(reply.error), {
@@ -1629,7 +1668,7 @@
           submitted = !0;
           return deadline(
             answer(current),
-            probe ? PROBE_DEADLINE : 15e3,
+            rpcDeadline(request, probe),
             mutation
               ? "Desktop response timed out. The result may be unknown; pending actions were not resent."
               : "Disconnected. Reconnecting\u2026",
@@ -1645,6 +1684,7 @@
                 !mutation &&
                 !retried &&
                 !error.definitive &&
+                error.diagnosticReason !== "protocol_error" &&
                 !stopped &&
                 (!connected || current !== generation)
               )
@@ -1819,6 +1859,13 @@
         );
       }
       async function connect() {
+        if (authBlocked && !connecting && !stopped && !connected) {
+          status(
+            "disconnected",
+            "Desktop rejected authentication. Access may have been revoked; scan a fresh QR code.",
+          );
+          return;
+        }
         if (
           connecting ||
           stopped ||
@@ -1932,9 +1979,11 @@
                   const diagnosticReason =
                       e?.code === 1008 || e?.code === 4009
                         ? "auth_rejected"
-                        : e?.code
-                          ? "websocket_closed"
-                          : "websocket_error",
+                        : globalThis.navigator?.onLine === false
+                          ? "network_offline"
+                          : e?.code
+                            ? "websocket_closed"
+                            : "websocket_error",
                     reportEnd = () =>
                       trace?.report(
                         diagnosticReason === "auth_rejected"
@@ -1982,6 +2031,8 @@
                   if (denied && !routeAlternative) {
                     authBlocked = true;
                     clearTimeout(retryTimer);
+                    if (!pair && !capacity)
+                      options.endpoint?.setAuthBlocked?.(true);
                   }
                   if (cooldown) retryNotBefore = Date.now() + 65000;
                   const error = Error(
@@ -2499,7 +2550,10 @@
         }
       }
       function reconnect(acknowledge = !0) {
-        if (authBlocked) last = null;
+        if (authBlocked) {
+          last = null;
+          options.endpoint?.setAuthBlocked?.(false);
+        }
         (acknowledge && (uncertainMutation = !1),
           connectController?.abort(),
           disconnect(

@@ -6,7 +6,7 @@ use crate::{
 };
 use krill_proto::{
     SessionId,
-    daemon::{KRILLD_DUPLICATE, KRILLD_HANDOVER_FAILED},
+    daemon::{KRILLD_DUPLICATE, KRILLD_FATAL_CONFIG, KRILLD_HANDOVER_FAILED},
     holder::{
         FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
         request_id,
@@ -298,8 +298,10 @@ impl Holder {
         self.parked && self.sessions.iter().all(|s| s.status.is_some())
     }
     fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
-        if status == i32::from(KRILLD_DUPLICATE) {
-            // Another daemon owns the socket; park and keep each session's console until exit (A-01).
+        let idle = self.sessions.iter().all(|s| s.status.is_some());
+        if status == i32::from(KRILLD_DUPLICATE)
+            || (status == i32::from(KRILLD_FATAL_CONFIG) && idle)
+        {
             self.daemon = None;
             self.parked = true;
             return self.idle();
@@ -309,15 +311,11 @@ impl Holder {
         let stable =
             uptime >= Duration::from_secs(1) && status != i32::from(KRILLD_HANDOVER_FAILED);
         if stable && !upgrading {
-            self.streak = 0;
-            self.previous = None;
+            (self.streak, self.previous) = (0, None);
         }
         self.daemon = None;
         if upgrading {
-            // The old daemon's deliberate exit is not a crash, nor proof that
-            // the new executable is stable. Retain rollback until it runs.
-            self.streak = 0;
-            self.restart = Instant::now();
+            (self.streak, self.restart) = (0, Instant::now());
         } else {
             self.failed();
         }
@@ -325,39 +323,36 @@ impl Holder {
     }
     fn failed(&mut self) {
         self.streak = self.streak.saturating_add(1);
-        // A daemon that keeps dying at start with no sessions (a bind permission error) never recovers.
-        self.parked |= self.sessions.is_empty() && self.streak >= 5;
+        self.parked |= self.sessions.iter().all(|s| s.status.is_some()) && self.streak >= 5;
         if self.streak >= 3
             && let Some(path) = self.previous.take()
         {
             self.path = path;
         }
-        self.restart = Instant::now()
-            + Duration::from_millis(if self.streak <= 1 {
-                0
-            } else {
-                250_u64
-                    .saturating_mul(
-                        1_u64
-                            .checked_shl(self.streak.saturating_sub(2))
-                            .unwrap_or(u64::MAX),
-                    )
-                    .min(30_000)
-            });
+        let wait = if self.streak <= 1 {
+            0
+        } else {
+            250_u64
+                .saturating_mul(
+                    1_u64
+                        .checked_shl(self.streak.saturating_sub(2))
+                        .unwrap_or(u64::MAX),
+                )
+                .min(30_000)
+        };
+        self.restart = Instant::now() + Duration::from_millis(wait);
     }
     fn request(&mut self, packet: Packet, handoff_allowed: bool) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
-        let decoded = ToHolder::decode(packet.frame());
-        let result = match decoded {
+        let result = match ToHolder::decode(packet.frame()) {
             Ok(ToHolder::UpgradeHolder { req, path }) => {
-                // Extracted packets are no longer visible to Link::has_pending(). A successful
-                // handoff here would discard them, so let the caller retry after they are served.
-                let result = if handoff_allowed {
+                // Reject handoff while extracted packets remain pending; caller retries after they are served.
+                let res = if handoff_allowed {
                     text(path).and_then(|path| self.upgrade(&path, req))
                 } else {
                     Err(io::Error::from_raw_os_error(16))
                 };
-                match result {
+                match res {
                     Ok(()) => return true,
                     Err(e) => Err(e),
                 }
@@ -366,11 +361,14 @@ impl Holder {
             Err(_) => Err(io::Error::from_raw_os_error(38)),
         };
         let reply = match result {
-            Ok(Some(m)) => Some(m),
-            Ok(None) => None,
+            Ok(m) => m,
             Err(e) => Some(FromHolder::Failed {
                 req,
-                errno: e.raw_os_error().unwrap_or(5),
+                errno: e.raw_os_error().unwrap_or(match e.kind() {
+                    io::ErrorKind::InvalidInput => 87,
+                    io::ErrorKind::InvalidData => 13,
+                    _ => 5,
+                }),
             }),
         };
         if reply.is_some_and(|m| self.send(&m, None).is_err()) {
