@@ -496,7 +496,7 @@ mod tests {
             r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":7,"limit_window_seconds":3600}},"credits":{"has_credits":true,"balance":"42"},"rate_limit_reset_credits":{"available_count":2}}"#,
         );
         assert_eq!(codex.plan.as_deref(), Some("pro"));
-        assert_eq!(codex.meters[0].label, "60m");
+        assert_eq!(codex.meters[0].label, "1h");
         assert_eq!(codex.meters[1].value.as_deref(), Some("42"));
         assert_eq!(codex.meters[2].value.as_deref(), Some("2"));
         let claude = parse(
