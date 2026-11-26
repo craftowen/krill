@@ -124,7 +124,7 @@ pub(crate) async fn build_iroh_endpoint(
         .default_path_keep_alive_interval(QUIC_KEEP_ALIVE)
         .default_path_max_idle_timeout(Duration::from_millis(u64::from(QUIC_IDLE_TIMEOUT_MS)))
         .max_idle_timeout(Some(VarInt::from_u32(QUIC_IDLE_TIMEOUT_MS).into()))
-        .max_concurrent_bidi_streams(VarInt::from_u32(32))
+        .max_concurrent_bidi_streams(VarInt::from_u32(64))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(VarInt::from_u32(32 * 1024))
         .receive_window(VarInt::from_u32(256 * 1024))
@@ -375,7 +375,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
         .default_path_keep_alive_interval(QUIC_KEEP_ALIVE)
         .default_path_max_idle_timeout(Duration::from_millis(u64::from(QUIC_IDLE_TIMEOUT_MS)))
         .max_idle_timeout(Some(VarInt::from_u32(QUIC_IDLE_TIMEOUT_MS).into()))
-        .max_concurrent_bidi_streams(VarInt::from_u32(32))
+        .max_concurrent_bidi_streams(VarInt::from_u32(64))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(VarInt::from_u32(32 * 1024))
         .receive_window(VarInt::from_u32(256 * 1024))
@@ -782,7 +782,7 @@ async fn handle_link_connection(
             });
     }
     let mut tasks = tokio::task::JoinSet::new();
-    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(32));
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
         tokio::select! {
             _=revoke_rx.changed()=> { conn.close(403u32.into(),b"device revoked"); break; }

@@ -1153,15 +1153,13 @@ impl Shell {
                 let (sender_tag, item_text) = super::bot_rows::parse_prompt_sender_tag(&item.text);
                 let image_paths = super::images::item_image_paths(item);
                 let image_numbers = super::images::image_numbers(&item.text, image_paths.len());
-                let is_remote = self.layout.host(pane).is_remote();
+                let host = self.layout.host(pane).clone();
+                let is_remote = host.is_remote();
                 let resolved_paths: Vec<Option<std::path::PathBuf>> = image_paths
                     .into_iter()
                     .map(|path| {
                         if is_remote {
-                            self.chat
-                                .images
-                                .resolve_remote_preview(&path)
-                                .map(std::path::Path::to_path_buf)
+                            self.resolve_or_fetch_remote_chat_image(&host, &path, cx)
                         } else {
                             Some(path)
                         }

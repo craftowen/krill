@@ -2700,6 +2700,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
         let exe_name = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
         let holder = helpers.join(exe_name("krill-holder"));
         let krilld = helpers.join(exe_name("krilld"));
+        let krill_link = helpers.join(exe_name("krill-link"));
         if socket.exists() && holder.is_file() && krilld.is_file() {
             let paths = krill_proto::daemon::Paths {
                 socket,
@@ -2711,6 +2712,12 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
                 "krill-update",
             );
             krill_proto::daemon::upgrade_as(&paths, &hello, &manifest.version).ok();
+        }
+        if krill_link.is_file() {
+            crate::hosts::link::stop_stale_connect_processes(&state_dir, &krill_link);
+            if krill_link_core::is_serve_running(&state_dir) {
+                krill_link_core::service::ensure_default_server(&krill_link, &state_dir).ok();
+            }
         }
     }
 

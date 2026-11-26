@@ -822,3 +822,125 @@ fn apply_chat_tail_rebases_answered_and_submissions_to_chat_base_origin(
         assert!(!log.submissions.contains_key("tool-q1:0"));
     });
 }
+
+#[gpui::test]
+fn poll_failure_records_reason_updates_on_change_and_clears_on_recovery(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("chat-poll-failure-diagnostics"));
+    let phase = Arc::new(AtomicUsize::new(0));
+    let wf_phase = Arc::clone(&phase);
+    let pc_phase = Arc::clone(&phase);
+    let sid = SessionId(991);
+    let key = local_key(sid);
+
+    let pane = view.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, sid);
+        shell.paths = Some(krill_proto::daemon::Paths {
+            socket: "/unused".into(),
+            holder: "/unused".into(),
+            krilld: "/unused".into(),
+        });
+        shell.chat.workflow_call = Some(Arc::new(move |_| match wf_phase.load(Ordering::SeqCst) {
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "tunnel closed",
+            )),
+            1 => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            )),
+            _ => Ok(serde_json::json!({
+                "ok": true,
+                "data": {
+                    "agent": "agy",
+                    "session_id": "rec-41932",
+                    "transcript_path": "/fake/41932.jsonl",
+                    "bound": true,
+                    "next_offset": 128,
+                    "page_start": 0,
+                    "has_earlier": false,
+                    "items": [{
+                        "kind": "assistant",
+                        "text": "recovered reply"
+                    }]
+                }
+            })
+            .to_string()),
+        }));
+        shell.chat.poll_call = Some(Arc::new(move |_| match pc_phase.load(Ordering::SeqCst) {
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "tunnel closed",
+            )),
+            1 => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            )),
+            _ => Ok(Reply::AgentHistory(Response::ChatPolled(
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "rec-41932".into(),
+                    transcript_path: "/fake/41932.jsonl".into(),
+                    bound: true,
+                    next_offset: 128,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "recovered reply".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))),
+        }));
+        shell.toggle_chat_view(cx);
+        pane
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |shell, _| {
+        assert!(shell.chat.poll_failed.contains(&key));
+        let reason = shell
+            .chat
+            .poll_failure_reasons
+            .get(&key)
+            .expect("poll_failure_reasons must record first failure reason");
+        assert!(
+            reason.contains("UnexpectedEof"),
+            "unexpected first reason: {reason}"
+        );
+    });
+
+    // Change error kind and re-poll -> recorded reason updates.
+    phase.store(1, Ordering::SeqCst);
+    view.update(cx, |shell, cx| {
+        shell.poll_session_chat(pane, sid, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(shell.chat.poll_failed.contains(&key));
+        let reason = shell
+            .chat
+            .poll_failure_reasons
+            .get(&key)
+            .expect("poll_failure_reasons must update on reason change");
+        assert!(
+            reason.contains("TimedOut"),
+            "unexpected updated reason: {reason}"
+        );
+    });
+
+    // Recover -> poll_failed and poll_failure_reasons both clear and items appear.
+    phase.store(2, Ordering::SeqCst);
+    view.update(cx, |shell, cx| {
+        shell.poll_session_chat(pane, sid, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.chat.poll_failed.contains(&key));
+        assert!(!shell.chat.poll_failure_reasons.contains_key(&key));
+        let log = &shell.chat.logs[&key];
+        assert_eq!(log.items.last().unwrap().text, "recovered reply");
+    });
+}

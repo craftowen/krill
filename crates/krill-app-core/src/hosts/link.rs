@@ -550,16 +550,35 @@ impl Lease {
         let status = krill_link_core::host_status(&self.slot.state_dir, &self.slot.host.id)
             .map_err(io::Error::other)?;
         let paired_at = self.slot.paired_at_ms.load(Ordering::Acquire);
-        // 이미 실행 중인 외부 CLI 연결은 빌려 쓰되 소유하거나 종료하지 않는다.
+        // 이미 실행 중인 외부 CLI 연결은 같은/신규 빌드일 때만 빌려 쓴다.
+        // 앱 업그레이드 뒤 고아로 남은 구버전(또는 build 필드가 없는 구버전) `krill-link connect`는
+        // 안전하게 종료한 뒤 현재 번들의 바이너리로 교체 재시작한다.
         let owned = status
             .pid
             .is_some_and(|pid| self.slot.owned.lock().is_ok_and(|pids| pids.contains(&pid)));
-        if child.is_none()
-            && status.pid.is_some()
-            && !owned
-            && (paired_at == 0 || status.updated_at_ms >= paired_at)
-        {
-            return Ok(socket);
+        if child.is_none() && !owned && (paired_at == 0 || status.updated_at_ms >= paired_at) {
+            if status.pid.is_some() {
+                if krill_link_core::service::is_stale_build(&status.build) {
+                    let _ = stop_stale_connect_process(
+                        &self.slot.state_dir,
+                        &self.slot.host.id,
+                        &self.slot.executable,
+                        &status,
+                    );
+                } else {
+                    return Ok(socket);
+                }
+            } else if let Some(raw) = read_raw_host_status(&self.slot.state_dir, &self.slot.host.id)
+                && raw.pid.is_some()
+                && krill_link_core::service::is_stale_build(&raw.build)
+            {
+                let _ = stop_stale_connect_process(
+                    &self.slot.state_dir,
+                    &self.slot.host.id,
+                    &self.slot.executable,
+                    &raw,
+                );
+            }
         }
         if restart {
             clear_status_file(&self.slot.state_dir, &self.slot.host.id);
@@ -793,6 +812,167 @@ fn clear_status_file(state_dir: &Path, id: &str) {
     if let Ok(path) = krill_link_core::host_status_path(state_dir, id) {
         std::fs::remove_file(path).ok();
     }
+}
+
+fn process_matches_krill_link_connect(
+    process: &sysinfo::Process,
+    host_id: &str,
+    expected_executable: &Path,
+) -> bool {
+    let cmd: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let has_connect_args =
+        cmd.iter().any(|arg| arg == "connect") && cmd.iter().any(|arg| arg == host_id);
+    if !has_connect_args {
+        return false;
+    }
+    let exe_stem = process
+        .exe()
+        .and_then(Path::file_stem)
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if exe_stem.eq_ignore_ascii_case("krill-link") {
+        return true;
+    }
+    let expected_stem = expected_executable
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !expected_stem.is_empty() && exe_stem.eq_ignore_ascii_case(expected_stem) {
+        return true;
+    }
+    let expected_name = expected_executable
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    !expected_name.is_empty()
+        && cmd.iter().any(|arg| {
+            Path::new(arg)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(expected_name))
+        })
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        sysinfo::ProcessRefreshKind::new(),
+    );
+    sys.process(spid).is_some()
+}
+
+/// 구버전(또는 `build` 필드가 없는) `krill-link connect <host_id>` 프로세스를
+/// 실행 파일·인자 일치 검증 후 안전하게 종료해 새 바이너리로 교체할 수 있게 한다.
+fn stop_stale_connect_process(
+    state_dir: &Path,
+    host_id: &str,
+    executable: &Path,
+    status: &krill_link_core::HostTunnelStatus,
+) -> bool {
+    let Some(pid) = status.pid else {
+        return false;
+    };
+    if pid == std::process::id() || !krill_link_core::service::is_stale_build(&status.build) {
+        return false;
+    }
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[spid]),
+        sysinfo::ProcessRefreshKind::new()
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let Some(process) = sys.process(spid) else {
+        clear_status_file(state_dir, host_id);
+        return false;
+    };
+    if !process_matches_krill_link_connect(process, host_id, executable) {
+        tracing::warn!(
+            host_id,
+            pid,
+            "skipping stale krill-link connect cleanup because PID identity did not match"
+        );
+        return false;
+    }
+    tracing::info!(
+        host_id,
+        pid,
+        running_build = %status.build,
+        current_build = krill_proto::build_id(),
+        "stopping stale krill-link connect process for upgrade replacement"
+    );
+    #[cfg(unix)]
+    {
+        crate::platform::background_command("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && is_pid_alive(pid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if is_pid_alive(pid) {
+            crate::platform::background_command("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok();
+            let kill_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < kill_deadline && is_pid_alive(pid) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && is_pid_alive(pid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    clear_status_file(state_dir, host_id);
+    true
+}
+
+fn read_raw_host_status(
+    state_dir: &Path,
+    host_id: &str,
+) -> Option<krill_link_core::HostTunnelStatus> {
+    let path = krill_link_core::host_status_path(state_dir, host_id).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 등록된 모든 원격 호스트에 대해 구버전 `krill-link connect` 백그라운드 프로세스를 정리한다.
+/// 앱 기동·업그레이드 직후 호출해 macOS/Windows 모두에서 구버전 바이너리 잔존 및 `.prev` 잠금을 막는다.
+pub fn stop_stale_connect_processes(state_dir: &Path, executable: &Path) -> usize {
+    let Ok(hosts) = krill_link_core::load_hosts(state_dir) else {
+        return 0;
+    };
+    let mut stopped = 0usize;
+    for host in hosts {
+        if let Some(status) = read_raw_host_status(state_dir, &host.id)
+            && status.pid.is_some()
+            && krill_link_core::service::is_stale_build(&status.build)
+            && stop_stale_connect_process(state_dir, &host.id, executable, &status)
+        {
+            stopped += 1;
+        }
+    }
+    stopped
 }
 
 /// 공개 상태의 선택적 오류 분류를 읽고, 없는 버전에서는 명시적인 거부 사유만 대체 판별한다.
@@ -1068,6 +1248,7 @@ mod tests {
                 reconnect_attempt: 1,
                 updated_at_ms,
                 pid: None,
+                build: String::new(),
                 last_error: Some("unauthorized device".into()),
                 last_error_kind: Some(krill_link_core::TunnelErrorKind::Unauthorized),
                 streams: Vec::new(),
@@ -1250,6 +1431,142 @@ mod tests {
         for lease in &leases {
             assert!(lease.child.lock().unwrap().is_none());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_stale_connect_processes_replaces_stale_and_preserves_current_and_unrelated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Use short `/tmp` base so `run/hosts/<id>.sock` stays well under macOS's 104-byte sun_path limit.
+        let dir = PathBuf::from(format!("/tmp/kl-sc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake_bin = dir.join("krill-link-test-helper");
+        std::fs::write(&fake_bin, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
+        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let node_id = krill_link_core::DeviceIdentity::load_or_create(&dir)
+            .unwrap()
+            .node_id()
+            .to_string();
+        let hosts = vec![
+            krill_link_core::RemoteHost {
+                id: "stale-host".into(),
+                name: "Stale".into(),
+                node_id: node_id.clone(),
+                relay_url: None,
+                addr_hints: Vec::new(),
+                added_at: 1,
+            },
+            krill_link_core::RemoteHost {
+                id: "current-host".into(),
+                name: "Current".into(),
+                node_id: node_id.clone(),
+                relay_url: None,
+                addr_hints: Vec::new(),
+                added_at: 2,
+            },
+            krill_link_core::RemoteHost {
+                id: "unrelated-host".into(),
+                name: "Unrelated".into(),
+                node_id,
+                relay_url: None,
+                addr_hints: Vec::new(),
+                added_at: 3,
+            },
+        ];
+        krill_link_core::save_hosts(&dir, &hosts).unwrap();
+
+        let mut stale_child = std::process::Command::new(&fake_bin)
+            .args(["connect", "stale-host", "--state-dir"])
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut current_child = std::process::Command::new(&fake_bin)
+            .args(["connect", "current-host", "--state-dir"])
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut unrelated_child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let write_status = |host: &krill_link_core::RemoteHost, pid: u32, build: &str| {
+            let status_path = krill_link_core::host_status_path(&dir, &host.id).unwrap();
+            let socket_path = krill_link_core::host_socket_path(&dir, &host.id).unwrap();
+            std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+            let status = krill_link_core::HostTunnelStatus {
+                host_id: host.id.clone(),
+                host_name: host.name.clone(),
+                node_id: host.node_id.clone(),
+                socket_path,
+                state: krill_link_core::TunnelState::Connected,
+                route: krill_link_core::RouteKind::Direct,
+                remote_addr: None,
+                rtt_ms: None,
+                reconnect_attempt: 0,
+                updated_at_ms: now_unix_ms(),
+                pid: Some(pid),
+                build: build.to_owned(),
+                last_error: None,
+                last_error_kind: None,
+                streams: Vec::new(),
+            };
+            std::fs::write(status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+        };
+
+        write_status(&hosts[0], stale_child.id(), "0.0.1");
+        write_status(&hosts[1], current_child.id(), krill_proto::build_id());
+        write_status(&hosts[2], unrelated_child.id(), "");
+
+        // Wait briefly so execve completes and sysinfo sees the script args.
+        std::thread::sleep(Duration::from_millis(80));
+
+        let stopped = stop_stale_connect_processes(&dir, &fake_bin);
+        assert_eq!(stopped, 1, "only stale krill-link connect must be stopped");
+
+        // Reap stale child and verify it exited.
+        let stale_exit = stale_child.wait().unwrap();
+        assert!(!stale_exit.success() || stale_exit.code().is_some());
+        assert!(
+            !krill_link_core::host_status_path(&dir, "stale-host")
+                .unwrap()
+                .exists(),
+            "stale host status file must be removed after stopping stale process"
+        );
+
+        // Current build child and unrelated PID must remain untouched.
+        assert!(
+            current_child.try_wait().unwrap().is_none(),
+            "up-to-date krill-link connect must not be killed"
+        );
+        assert!(
+            krill_link_core::host_status_path(&dir, "current-host")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            unrelated_child.try_wait().unwrap().is_none(),
+            "unrelated PID whose cmdline does not match must never be killed"
+        );
+
+        current_child.kill().ok();
+        current_child.wait().ok();
+        unrelated_child.kill().ok();
+        unrelated_child.wait().ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

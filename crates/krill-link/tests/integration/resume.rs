@@ -908,3 +908,191 @@ async fn half_closed_rpc_survives_outage_and_duplicate_fin_is_idempotent() {
     endpoint.close().await;
     f.shutdown().await;
 }
+
+/// Short-lived RPC bursts must finish cleanly without leaking `StreamPhase::Suspended` slots on
+/// the server (prevents `MAX_STREAMS` exhaustion and `ERR_UNAVAILABLE` loops).
+#[tokio::test]
+async fn short_lived_rpc_burst_completes_cleanly_without_suspended_stream_accumulation() {
+    let f = Fixture::new(120_000, 1024 * 1024).await;
+    // Two waves of 40 RPCs (= 80 total, exceeding both the old 32 and new 64 MAX_STREAMS limits)
+    // separated by >1s to stay under the per-second PEER_REQUESTS anti-DoS rate limit (64/s).
+    let waves = [0usize..40, 40usize..80];
+    let total_rpcs = 80usize;
+    let server_accept = tokio::spawn({
+        let listener = f.listener;
+        async move {
+            for idx in 0..total_rpcs {
+                let (mut upstream, _) = tokio::time::timeout(WAIT, listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut req = Vec::new();
+                tokio::time::timeout(WAIT, upstream.read_to_end(&mut req))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected = format!("req-{idx:03}");
+                assert_eq!(req, expected.as_bytes());
+                let resp = format!("resp-{idx:03}");
+                upstream.write_all(resp.as_bytes()).await.unwrap();
+                upstream.shutdown().await.unwrap();
+            }
+        }
+    });
+
+    for (wave_idx, range) in waves.into_iter().enumerate() {
+        if wave_idx > 0 {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+        }
+        for idx in range {
+            let mut app = UnixStream::connect(f.tunnel.socket_path()).await.unwrap();
+            app.write_all(format!("req-{idx:03}").as_bytes())
+                .await
+                .unwrap();
+            app.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            tokio::time::timeout(WAIT, app.read_to_end(&mut resp))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp, format!("resp-{idx:03}").as_bytes());
+        }
+    }
+    server_accept.await.unwrap();
+
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let statuses = f.server.stream_statuses();
+        let suspended = statuses
+            .iter()
+            .filter(|s| s.state == StreamPhase::Suspended)
+            .count();
+        let normal = statuses
+            .iter()
+            .filter(|s| s.state == StreamPhase::Normal)
+            .count();
+        if suspended == 0 && normal == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short-lived RPCs left active/suspended server streams: normal={normal}, suspended={suspended}, statuses={statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    f.tunnel.shutdown().await;
+    f.server.shutdown().await;
+    fs::remove_dir_all(f.base).ok();
+}
+
+/// When a client drops its local socket abruptly and the server writes a response to the dead
+/// socket, `krill-link` sends `Kind::Reset` so the server frees its stream slot immediately
+/// instead of holding it in `Suspended` for the full 120s grace window.
+#[tokio::test]
+async fn abrupt_client_socket_drop_sends_reset_and_frees_server_slot_immediately() {
+    let f = Fixture::new(120_000, 1024 * 1024).await;
+    let (mut app, mut upstream) = f.pair().await;
+    app.write_all(b"halfway").await.unwrap();
+    let mut got = [0u8; 7];
+    tokio::time::timeout(WAIT, upstream.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got, b"halfway");
+
+    // Drop client socket abruptly (simulating a timed-out/cancelled RPC client), then let
+    // upstream write responses without shutting down; on Unix write #1 hits EPIPE immediately,
+    // while on Windows loopback TCP/AF_UNIX write #1 triggers RST and subsequent writes observe
+    // WSAECONNRESET, causing the client to send Kind::Reset so the server closes immediately.
+    drop(app);
+    let mut eof = [0u8; 1];
+    let read_res = tokio::time::timeout(WAIT, upstream.read(&mut eof))
+        .await
+        .unwrap();
+    assert!(matches!(read_res, Ok(0) | Err(_)));
+
+    let deadline = Instant::now() + WAIT;
+    loop {
+        upstream
+            .write_all(b"late response after client drop")
+            .await
+            .ok();
+        let statuses = f.server.stream_statuses();
+        if !statuses.is_empty() && statuses.iter().all(|s| s.state == StreamPhase::Closed) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "abruptly dropped client stream stayed stuck instead of closing: {statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    f.shutdown().await;
+}
+
+/// Backward compatibility: if an older client resets the QUIC stream immediately after both sides
+/// exchanged FIN (before its final ACK arrives) on an otherwise healthy QUIC connection, the server
+/// treats the stream as complete instead of leaking a `Suspended` slot for 120s.
+#[tokio::test]
+async fn legacy_peer_reset_after_mutual_fin_completes_cleanly_without_suspended() {
+    let f = Fixture::new(120_000, 1024 * 1024).await;
+    let endpoint = raw_endpoint(&f.base.join("c")).await;
+    let conn = endpoint
+        .connect(f.server.endpoint_addr(), krill_link::ALPN_LINK)
+        .await
+        .unwrap();
+    let id = krill_link::StreamId([29; 16]);
+    let (mut send, mut recv, _) = open_raw(&conn, hello(id, 1, 0, false)).await;
+    let (mut upstream, _) = f.listener.accept().await.unwrap();
+
+    // Client sends 0-byte FIN, server responds "ok" + FIN.
+    let mut fin = [0u8; 14];
+    fin[0] = 3; // Kind::Fin at offset 0
+    send.write_all(&fin).await.unwrap();
+    let mut req = Vec::new();
+    tokio::time::timeout(WAIT, upstream.read_to_end(&mut req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(req.is_empty());
+
+    upstream.write_all(b"ok").await.unwrap();
+    upstream.shutdown().await.unwrap();
+
+    // Read server's Data("ok") and Fin frames, ACK the 2 data bytes (without fin=true), then
+    // immediately emit QUIC RESET_STREAM like pre-fix v0.3.29 did on network.abort().
+    let (offset, data) = raw_read_data(&mut recv).await;
+    assert_eq!((offset, data.as_slice()), (0, b"ok".as_slice()));
+    let mut fin_hdr = [0u8; 14];
+    tokio::time::timeout(WAIT, recv.read_exact(&mut fin_hdr))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fin_hdr[0], 3, "expected server Kind::Fin");
+    let mut ack = [0u8; 14];
+    ack[0] = 2; // Kind::Ack without fin flag
+    ack[2..10].copy_from_slice(&2u64.to_le_bytes());
+    send.write_all(&ack).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    send.reset(0u32.into()).ok();
+
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let statuses = f.server.stream_statuses();
+        if let Some(st) = statuses.iter().find(|s| s.id == id)
+            && st.state == StreamPhase::Closed
+        {
+            assert_eq!(st.close_reason.as_deref(), Some("complete"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legacy peer reset after mutual FIN leaked suspended stream: {statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    endpoint.close().await;
+    f.shutdown().await;
+}

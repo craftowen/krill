@@ -6464,3 +6464,110 @@ fn chat_find_recomputes_on_turn_fold_toggle_turn_and_item_notes_and_draft_applie
         );
     });
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn remote_chat_image_stages_via_remote_fs_and_recovers_after_transient_error(
+    cx: &mut TestAppContext,
+) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-remote-chat-img-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let staged_png = dir.join("staged-preview.png");
+    let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([0x22, 0x88, 0xee, 0xff]));
+    image::DynamicImage::ImageRgba8(img)
+        .save_with_format(&staged_png, image::ImageFormat::Png)
+        .unwrap();
+
+    let remote_host = krill_app_core::hosts::HostId::Remote("macmini-peer".into());
+    let remote_path = std::path::PathBuf::from("/remote/tmp/krill-paste/clipboard-test.png");
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_ref = Arc::clone(&attempts);
+    let staged_ref = staged_png.clone();
+
+    let (shell, cx) = open(cx, state_path("chat-remote-image-stage"));
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_host(pane, remote_host.clone());
+        shell.layout.set_session(pane, SESSION);
+        shell.host_targets.insert(
+            remote_host.clone(),
+            krill_app_core::hosts::HostTarget::local(krill_proto::daemon::Paths {
+                socket: "/unused/remote.sock".into(),
+                holder: "/unused/holder".into(),
+                krilld: "/unused/krilld".into(),
+            }),
+        );
+        shell.chat.images.remote_fetcher = Some(Arc::new(move |_target, host, path| {
+            assert_eq!(
+                *host,
+                krill_app_core::hosts::HostId::Remote("macmini-peer".into())
+            );
+            assert_eq!(
+                path,
+                std::path::Path::new("/remote/tmp/krill-paste/clipboard-test.png")
+            );
+            let n = attempts_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "transient tunnel reset",
+                ))
+            } else {
+                Ok(staged_ref.clone())
+            }
+        }));
+        shell.apply_chat_poll_for_host(
+            SESSION,
+            remote_host.clone(),
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::User,
+                text: "[Image #1] pi does not respond".into(),
+                file_path: remote_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }]),
+            None,
+        );
+        shell.toggle_chat_view(cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // First attempt failed transiently; clearing transient failures (e.g. on poll recovery)
+    // immediately retries staging and decodes the thumbnail into Loaded::Ready.
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    shell.update(cx, |shell, cx| {
+        shell
+            .chat
+            .images
+            .clear_transient_remote_failures(&remote_host);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.chat.images.resolve_remote_preview(&remote_path),
+            Some(staged_png.as_path())
+        );
+        assert!(
+            matches!(
+                shell.chat.images.thumbs_for_test(&staged_png),
+                Some(super::images::Loaded::Ready(_))
+            ),
+            "staged remote image thumbnail must decode to Loaded::Ready"
+        );
+    });
+    assert!(
+        cx.debug_bounds("chat-message-image-0").is_some(),
+        "#1 remote image tile must render in the message"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

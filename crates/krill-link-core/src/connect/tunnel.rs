@@ -89,6 +89,7 @@ pub fn host_status(state_dir: &Path, host_id: &str) -> Result<HostTunnelStatus, 
         reconnect_attempt: 0,
         updated_at_ms: now_unix_ms(),
         pid: None,
+        build: String::new(),
         last_error: None,
         last_error_kind: None,
         streams: Vec::new(),
@@ -303,6 +304,7 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
         reconnect_attempt: 0,
         updated_at_ms: now_unix_ms(),
         pid: Some(std::process::id()),
+        build: krill_proto::build_id().to_owned(),
         last_error: None,
         last_error_kind: None,
         streams: Vec::new(),
@@ -761,6 +763,16 @@ mod tests {
         let parsed: HostTunnelStatus = serde_json::from_value(old).unwrap();
         assert_eq!(parsed.last_error_kind, None);
         assert!(parsed.streams.is_empty());
+        assert!(
+            parsed.build.is_empty(),
+            "old status JSON without build field must default to empty string"
+        );
+        assert!(
+            crate::service::is_stale_build(&parsed.build),
+            "empty build must be treated as stale for upgrade replacement"
+        );
+        assert!(!crate::service::is_stale_build(krill_proto::build_id()));
+        assert!(crate::service::is_stale_build("0.0.1"));
         for (kind, text) in [
             (TunnelErrorKind::Unauthorized, "unauthorized"),
             (TunnelErrorKind::RateLimited, "rate_limited"),

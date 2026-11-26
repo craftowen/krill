@@ -206,7 +206,13 @@ fn workflow_call_with_timeouts(
                 }
                 Err(err) => {
                     drop(conn);
-                    if attempt == 0 && should_reconnect_ipc(&err) {
+                    let retryable = should_reconnect_ipc(&err)
+                        || (from_pool
+                            && matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ));
+                    if attempt == 0 && retryable {
                         continue;
                     }
                     return Err(err);
@@ -268,7 +274,13 @@ fn daemon_call_with_timeouts(
                 }
                 Err(err) => {
                     drop(conn);
-                    if attempt == 0 && should_reconnect_ipc(&err) {
+                    let retryable = should_reconnect_ipc(&err)
+                        || (from_pool
+                            && matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ));
+                    if attempt == 0 && retryable {
                         continue;
                     }
                     return Err(err);
