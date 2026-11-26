@@ -1439,8 +1439,8 @@ mod tests {
     fn stop_stale_connect_processes_replaces_stale_and_preserves_current_and_unrelated() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir =
-            std::env::temp_dir().join(format!("krill-link-stale-connect-{}", std::process::id()));
+        // Use short `/tmp` base so `run/hosts/<id>.sock` stays well under macOS's 104-byte sun_path limit.
+        let dir = PathBuf::from(format!("/tmp/kl-sc-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
