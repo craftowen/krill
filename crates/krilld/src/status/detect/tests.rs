@@ -583,3 +583,46 @@ fn agy_auth_login_screen_classifies_as_blocked_not_done() {
         (AgentState::Blocked, Source::Screen, Confidence::Low)
     );
 }
+
+#[test]
+fn agy_signed_in_boot_welcome_and_leftover_banner_do_not_classify_as_blocked() {
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let boot = "Welcome to the Antigravity CLI. You are currently not signed in.\n\n\
+                ⣷  Signing in...";
+    assert!(
+        detector
+            .observe("", boot, 1, &AgentStatus::UNKNOWN, now)
+            .is_none()
+    );
+    let after_quiet = detector.observe("", boot, 1, &AgentStatus::UNKNOWN, now + QUIET);
+    assert!(
+        after_quiet
+            .as_ref()
+            .is_none_or(|e| e.state != AgentState::Blocked),
+        "normal agy 1.5.17 signed-in boot must not classify as Blocked: {after_quiet:?}"
+    );
+
+    let ready_with_leftover = "Welcome to the Antigravity CLI. You are currently not signed in.\n\
+         Antigravity CLI 1.5.17\n\
+         ────────────────────────────────────────────────────────────────\n\
+         > Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\n\
+         ────────────────────────────────────────────────────────────────";
+    let _ = detector.observe(
+        "◇ Ready (krill)",
+        ready_with_leftover,
+        2,
+        &AgentStatus::UNKNOWN,
+        now + QUIET,
+    );
+    let settled = detector
+        .observe(
+            "◇ Ready (krill)",
+            ready_with_leftover,
+            2,
+            &AgentStatus::UNKNOWN,
+            now + QUIET * 2,
+        )
+        .unwrap();
+    assert_ne!(settled.state, AgentState::Blocked);
+}

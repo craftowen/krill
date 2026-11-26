@@ -69,16 +69,20 @@ impl Logger {
     }
 }
 
+fn is_krill_target(target: &str) -> bool {
+    let root = target.split("::").next().unwrap_or_default();
+    matches!(root, "krill" | "krilld") || root.starts_with("krill_")
+}
+
 impl Subscriber for Logger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        let target = metadata.target().split("::").next().unwrap_or_default();
         // `krill_log`: forwarded `log` warnings (gpui render path) keep their origin in a `source` field.
+        // Admit every internal `krill_*` workspace crate (`krill_app_shell`, `krill_app_core`,
+        // `krill_bots_ui`, `krill_ui`, `krill_hosts`, `krill_link_core`, `krill_holder`, ...) so
+        // splitting crates never silently silences process logs while third-party crates stay out.
         metadata.is_event()
             && *metadata.level() <= Level::INFO
-            && matches!(
-                target,
-                "krill_app" | "krilld" | "krill_holder" | "krill" | "krill_log"
-            )
+            && is_krill_target(metadata.target())
     }
 
     fn new_span(&self, _: &Attributes<'_>) -> Id {
@@ -229,5 +233,77 @@ mod tests {
         line.append_suppressed(338);
         assert!(line.0.len() < RECORD_BYTES);
         assert!(line.0.ends_with(" suppressed_repeats=338"));
+    }
+
+    #[test]
+    fn krill_workspace_targets_are_enabled_and_external_targets_are_filtered() {
+        for allowed in [
+            "krill",
+            "krill::cli",
+            "krilld",
+            "krilld::bots::runtime",
+            "krill_app",
+            "krill_app_shell::app_host",
+            "krill_app_core::pane",
+            "krill_bots_ui::bots",
+            "krill_ui::theme",
+            "krill_holder::session",
+            "krill_hosts::ssh",
+            "krill_link_core::service",
+            "krill_log",
+        ] {
+            assert!(
+                is_krill_target(allowed),
+                "expected Krill target to be enabled: {allowed}"
+            );
+        }
+        for denied in [
+            "",
+            "gpui::window",
+            "hyper::proto",
+            "tokio::runtime",
+            "krillish::foo",
+            "my_krill_app::bar",
+        ] {
+            assert!(
+                !is_krill_target(denied),
+                "expected external target to be filtered: {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscriber_writes_split_app_crate_events_to_rolling_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-log-split-targets-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let writer = RollingLog::open(dir.clone(), crate::Component::App).expect("open log");
+        let logger = Logger::new(writer);
+        tracing::subscriber::with_default(logger, || {
+            tracing::info!(target: "krill_app_shell::app_host", version = "0.3.29", "app starting");
+            tracing::warn!(target: "krill_app_core::pane", failure = "timeout", "session create failed");
+            tracing::info!(target: "krill_bots_ui::bots", "bot rpc ready");
+            tracing::warn!(target: "gpui::window", "external warning should be ignored");
+            tracing::debug!(target: "krill_app_shell::app_host", "debug event should be ignored");
+        });
+        let content = std::fs::read_to_string(dir.join("krill-app.log")).expect("read app log");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(content.contains("krill_app_shell::app_host"), "{content}");
+        assert!(content.contains("app starting"), "{content}");
+        assert!(content.contains("krill_app_core::pane"), "{content}");
+        assert!(content.contains("session create failed"), "{content}");
+        assert!(content.contains("krill_bots_ui::bots"), "{content}");
+        assert!(
+            !content.contains("external warning should be ignored"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("debug event should be ignored"),
+            "{content}"
+        );
     }
 }
