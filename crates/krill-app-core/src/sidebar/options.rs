@@ -584,6 +584,24 @@ pub(super) fn is_worktree_awake(
         })
 }
 
+pub(super) fn is_automation_worktree_path(path: &Path) -> bool {
+    let mut parts = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .flat_map(|s| s.split(['/', '\\']))
+        .filter(|s| !s.is_empty())
+        .peekable();
+    while let Some(part) = parts.next() {
+        if part.eq_ignore_ascii_case("automations") && parts.peek().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) fn is_worktree_visible(
     repo: &Path,
     path: &Path,
@@ -593,12 +611,10 @@ pub(super) fn is_worktree_visible(
     options: &WorkspaceOptions,
     ctx: &WorktreeContext<'_>,
 ) -> bool {
-    if options.filters.hide_automation && {
-        let lossy = path.to_string_lossy();
-        ctx.automation_worktrees.is_some_and(|s| s.contains(path))
-            || lossy.contains("/.orca/automations/")
-            || lossy.contains("/automations/")
-    } {
+    if options.filters.hide_automation
+        && (ctx.automation_worktrees.is_some_and(|s| s.contains(path))
+            || is_automation_worktree_path(path))
+    {
         return false;
     }
     if options.filters.hide_cli
@@ -753,10 +769,12 @@ pub(super) fn sort_worktrees(
             let recent_key = match sort_by {
                 SortBy::Smart | SortBy::Recent => {
                     let updated = ctx.updated_at.and_then(|u| u.get(a)).copied().unwrap_or(0);
+                    // `worktree_created_at` is stored in Unix milliseconds while `updated_at`
+                    // is Unix seconds; convert to seconds before applying the 5-minute grace.
                     let created_grace = ctx
                         .created_at
                         .and_then(|c| c.get(a))
-                        .map_or(0, |created| created.saturating_add(300));
+                        .map_or(0, |created| (created / 1000).saturating_add(300));
                     Reverse(updated.max(created_grace))
                 }
                 SortBy::Created => {
@@ -1341,7 +1359,9 @@ impl Sidebar {
             created_at: Some(&self.disk.worktree_created_at),
             unread: Some(&self.unread),
             unread_worktrees: Some(&derived.unread_worktrees),
-            focused: self.focused,
+            focused: self
+                .focused
+                .filter(|_| self.same_machine_host(&HostId::Local, &self.focused_host)),
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
@@ -1418,7 +1438,9 @@ impl Sidebar {
             prs: Some(&self.prs),
             statuses: Some(&self.worktree_statuses),
             updated_at: Some(&self.worktree_updated_at),
-            focused: self.focused,
+            focused: self
+                .focused
+                .filter(|_| self.same_machine_host(&host_id, &self.focused_host)),
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
@@ -1804,6 +1826,7 @@ fn host_status_label(status: HostStatus) -> &'static str {
         HostStatus::Connected => text::HOST_CONNECTED.get(),
         HostStatus::Connecting => text::HOST_CONNECTING.get(),
         HostStatus::Disconnected => text::HOST_DISCONNECTED.get(),
+        HostStatus::AuthFailed => text::HOST_NEEDS_LOGIN.get(),
     }
 }
 
@@ -2794,5 +2817,59 @@ mod projection_tests {
         assert_eq!(cache.updated_at[&path], 15);
         assert!(!cache.unread_worktrees.contains(&path));
         assert!(!cache.checkpoint_prs.contains(&path));
+    }
+
+    #[test]
+    fn sort_worktrees_converts_created_ms_to_seconds_against_updated_secs() {
+        let old_active = PathBuf::from("/repo/old-active");
+        let newer_idle = PathBuf::from("/repo/newer-idle");
+        let brand_new = PathBuf::from("/repo/brand-new");
+        let mut updated_at = BTreeMap::new();
+        updated_at.insert(old_active.clone(), 1_790_002_000_u64);
+        updated_at.insert(newer_idle.clone(), 1_790_000_500_u64);
+        let mut created_at = BTreeMap::new();
+        // Real epoch milliseconds (~1000x larger than updated_at seconds).
+        created_at.insert(old_active.clone(), 1_790_000_000_000_u64);
+        created_at.insert(newer_idle.clone(), 1_790_001_000_000_u64);
+        // Created 1_790_001_800s -> +300s grace = 1_790_002_100s > old_active's 1_790_002_000s.
+        created_at.insert(brand_new.clone(), 1_790_001_800_000_u64);
+
+        let snapshot = Snapshot::default();
+        let prefs = Preferences::default();
+        let ctx = WorktreeContext {
+            updated_at: Some(&updated_at),
+            created_at: Some(&created_at),
+            ..WorktreeContext::default()
+        };
+        let sessions = WorktreeSessions::from_snapshot(&snapshot);
+        for sort_by in [SortBy::Recent, SortBy::Smart] {
+            let mut trees = vec![&newer_idle, &old_active, &brand_new];
+            sort_worktrees(&mut trees, &snapshot, &sessions, &prefs, sort_by, &ctx);
+            assert_eq!(
+                trees,
+                vec![&brand_new, &old_active, &newer_idle],
+                "sort_by={sort_by:?} must compare updated_at secs with created_ms / 1000 + 300"
+            );
+        }
+    }
+
+    #[test]
+    fn is_automation_worktree_path_handles_posix_and_windows_separators() {
+        assert!(is_automation_worktree_path(Path::new(
+            "/Users/me/.orca/automations/job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            "/work/automations/nightly"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"C:\Users\me\.orca\automations\job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"D:\work\automations\nightly"
+        )));
+        assert!(!is_automation_worktree_path(Path::new(
+            "/work/my-automations/job-1"
+        )));
+        assert!(!is_automation_worktree_path(Path::new("/work/automations")));
     }
 }

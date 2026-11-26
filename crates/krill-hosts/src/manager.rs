@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use krill_proto::daemon::Paths;
 
+use crate::managed::LingerStatus;
 use crate::ssh::{self, SshOptions, Tunnel};
 use crate::{HostId, HostStatus, HostTarget, RemoteConnector};
 
@@ -24,8 +25,23 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const OFFLINE_AFTER_FAILURES: u32 = 10;
 /// 꺼진 기기 재시도 간격. 사이드바 '다시 연결'([`HostManager::reconnect_now`])은 이 대기를 바로 푼다.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
+/// SSH 인증 실패(잠긴 `ssh-agent`·키 미등록·암호 필요) 전용 느린 지수 백오프: 2분 → 5분 → 10분 상한.
+/// 원격 fail2ban/CrowdSec이 사용자 IP를 차단하지 않도록 빠른 네트워크 재시도와 분리한다.
+const AUTH_BACKOFF_SCHEDULE: [Duration; 3] = [
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+];
+/// `AuthFailed` 대기 중 `ssh-agent` 잠금 해제(`ssh-add -l`)를 다시 확인하는 최소 간격.
+const AGENT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 type AttemptToken = (Arc<()>, u64);
+
+enum OutcomeFence {
+    None,
+    Attempt(AttemptToken),
+    Epoch(u64),
+}
 
 /// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,6 +59,21 @@ struct OfflineKey {
 /// 값은 다음 재시도 시각과 마지막 오류.
 static OFFLINE: std::sync::LazyLock<Mutex<BTreeMap<OfflineKey, (Instant, String)>>> =
     std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// 창 간 공유되는 SSH 인증 실패 백오프 상태 `(다음 재시도 시각, 실패 횟수, 마지막 오류, 실패 시 에이전트 지문)`.
+type AuthBackoffEntry = (Instant, u32, String, Option<u64>);
+
+static AUTH_BACKOFF: std::sync::LazyLock<Mutex<BTreeMap<OfflineKey, AuthBackoffEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[derive(Clone)]
+struct AgentProbe(Arc<dyn Fn() -> Option<u64> + Send + Sync>);
+
+impl std::fmt::Debug for AgentProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentProbe(..)")
+    }
+}
 
 /// 백그라운드에서 수집한 전송 상태. UI에서는 이 스냅샷만 읽는다.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -134,8 +165,12 @@ struct RemoteSlot {
     tunnel: Option<Tunnel>,
     placeholder_socket: PathBuf,
     failures: u32,
+    auth_failures: u32,
     next_retry_at: Option<Instant>,
     last_error: Option<String>,
+    agent_fingerprint: Option<u64>,
+    last_agent_probe: Option<Instant>,
+    linger: LingerStatus,
     tunnel_starts: usize,
     generation: u64,
     transport_epoch: Arc<AtomicU64>,
@@ -156,14 +191,30 @@ impl RemoteSlot {
             tunnel: None,
             placeholder_socket,
             failures: 0,
+            auth_failures: 0,
             next_retry_at: None,
             last_error: None,
+            agent_fingerprint: None,
+            last_agent_probe: None,
+            linger: LingerStatus::NotApplicable,
             tunnel_starts: 0,
             generation: 0,
             transport_epoch: Arc::new(AtomicU64::new(0)),
             registration: Arc::new(()),
             suspended: false,
         }
+    }
+
+    fn reap_dead_tunnel(&mut self) -> bool {
+        if let Some(t) = &mut self.tunnel
+            && !t.is_alive()
+        {
+            self.tunnel = None;
+            self.generation = self.generation.wrapping_add(1);
+            self.transport_epoch.fetch_add(1, Ordering::Release);
+            return true;
+        }
+        false
     }
 }
 
@@ -177,6 +228,7 @@ pub struct HostManager {
     aliases: Arc<Mutex<BTreeMap<String, String>>>,
     local_dir: Option<PathBuf>,
     ssh_bin: Option<std::ffi::OsString>,
+    agent_probe: Option<AgentProbe>,
 }
 
 impl HostManager {
@@ -191,12 +243,66 @@ impl HostManager {
     }
 
     pub fn connection_info(&self, id: &str) -> Option<HostConnectionInfo> {
-        self.external
+        if let Some(info) = self
+            .external
             .lock()
-            .ok()?
-            .get(id)
-            .map(|host| host.info.clone())
+            .ok()
+            .and_then(|map| map.get(id).map(|host| host.info.clone()))
+        {
+            return Some(info);
+        }
+        let slot = self.slot(id)?;
+        let s = slot.lock().ok()?;
+        let linger_detail = s
+            .linger
+            .fix_command()
+            .map(|cmd| format!("Linux systemd linger is disabled — run: {cmd}"));
+        if s.status == HostStatus::AuthFailed || linger_detail.is_some() {
+            return Some(HostConnectionInfo {
+                status: s.status,
+                detail: linger_detail,
+                error: s.last_error.clone(),
+            });
+        }
+        None
     }
+
+    /// 원격 호스트에서 마지막으로 감지한 Linux systemd linger 상태.
+    pub fn linger_status(&self, id: &str) -> LingerStatus {
+        self.slot(id)
+            .and_then(|slot| slot.lock().ok().map(|s| s.linger.clone()))
+            .unwrap_or(LingerStatus::NotApplicable)
+    }
+
+    /// 등록된 원격 호스트 중 Linux systemd linger가 꺼져 있는 항목을 돌려준다.
+    pub fn linger_warnings(&self) -> Vec<(RemoteHostSpec, LingerStatus)> {
+        let Ok(map) = self.slots.lock() else {
+            return Vec::new();
+        };
+        let Ok(order) = self.order.lock() else {
+            return Vec::new();
+        };
+        order
+            .iter()
+            .filter_map(|id| map.get(id))
+            .filter_map(|slot| {
+                let s = slot.lock().ok()?;
+                s.linger
+                    .is_disabled()
+                    .then(|| (s.spec.clone(), s.linger.clone()))
+            })
+            .collect()
+    }
+
+    /// 원격 호스트가 백오프 대기 중이라면 다음 자동 재시도까지 남은 시간.
+    pub fn next_retry_in(&self, id: &str) -> Option<Duration> {
+        let slot = self.slot(id)?;
+        let s = slot.lock().ok()?;
+        s.next_retry_at?
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -210,6 +316,28 @@ impl HostManager {
         }
     }
 
+    /// 테스트용: `ssh` 실행 파일과 함께 `ssh-agent` 잠금 해제 감지기까지 주입한다.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_ssh_and_agent_probe(
+        local_dir: PathBuf,
+        ssh_bin: std::ffi::OsString,
+        probe: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            local_dir: Some(local_dir),
+            ssh_bin: Some(ssh_bin),
+            agent_probe: Some(AgentProbe(Arc::new(probe))),
+            ..Self::default()
+        }
+    }
+
+    fn probe_agent(&self) -> Option<u64> {
+        match &self.agent_probe {
+            Some(probe) => (probe.0)(),
+            None => ssh::ssh_agent_fingerprint(),
+        }
+    }
+
     /// 연속 실패 횟수에 따른 지수 백오프 지연(200ms → 400ms → 800ms → 1.6s → 3.2s → 최대 5s).
     /// [`OFFLINE_AFTER_FAILURES`]번을 넘기면 [`OFFLINE_BACKOFF`]로 늘려, 꺼진 기기에 ssh를 5초마다 띄우지 않는다.
     pub fn backoff_delay(failures: u32) -> Duration {
@@ -219,6 +347,18 @@ impl HostManager {
         let shift = failures.saturating_sub(1).min(5);
         let factor = 1u32.checked_shl(shift).unwrap_or(32);
         INITIAL_BACKOFF.saturating_mul(factor).min(MAX_BACKOFF)
+    }
+
+    /// SSH 인증 실패 전용 느린 백오프(1회 2분 → 2회 5분 → 3회 이상 10분 상한).
+    #[must_use]
+    pub fn auth_backoff_delay(auth_failures: u32) -> Duration {
+        let index = usize::try_from(auth_failures.saturating_sub(1))
+            .unwrap_or(AUTH_BACKOFF_SCHEDULE.len() - 1)
+            .min(AUTH_BACKOFF_SCHEDULE.len() - 1);
+        AUTH_BACKOFF_SCHEDULE
+            .get(index)
+            .copied()
+            .unwrap_or(Duration::from_secs(600))
     }
 
     /// 설정된 원격 호스트 목록을 동기화한다. 기존 호스트의 살아 있는 터널은 그대로 유지하고,
@@ -247,10 +387,20 @@ impl HostManager {
                     if transport_changed {
                         slot.registration = Arc::new(());
                         slot.generation = slot.generation.wrapping_add(1);
+                        slot.transport_epoch.fetch_add(1, Ordering::Release);
                         slot.tunnel = None;
                         slot.failures = 0;
+                        slot.auth_failures = 0;
                         slot.next_retry_at = None;
-                        slot.status = HostStatus::Connecting;
+                        slot.agent_fingerprint = None;
+                        slot.last_agent_probe = None;
+                        slot.linger = LingerStatus::NotApplicable;
+                        slot.last_error = None;
+                        slot.status = if slot.suspended {
+                            HostStatus::Disconnected
+                        } else {
+                            HostStatus::Connecting
+                        };
                     }
                 }
                 keep.insert(spec.id.clone(), existing);
@@ -295,10 +445,7 @@ impl HostManager {
             .filter_map(|id| map.get(id))
             .filter_map(|slot| {
                 let mut s = slot.lock().ok()?;
-                if let Some(t) = &mut s.tunnel
-                    && !t.is_alive()
-                {
-                    s.tunnel = None;
+                if s.reap_dead_tunnel() {
                     s.status = HostStatus::Disconnected;
                 }
                 Some((s.spec.clone(), s.status))
@@ -311,8 +458,13 @@ impl HostManager {
     }
 
     pub fn status(&self, id: &str) -> HostStatus {
-        if let Some(info) = self.connection_info(id) {
-            return info.status;
+        if let Some(status) = self
+            .external
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).map(|host| host.info.status))
+        {
+            return status;
         }
         let Some(slot) = self.slot(id) else {
             return HostStatus::Disconnected;
@@ -320,10 +472,7 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return HostStatus::Disconnected;
         };
-        if let Some(t) = &mut s.tunnel
-            && !t.is_alive()
-        {
-            s.tunnel = None;
+        if s.reap_dead_tunnel() {
             s.status = HostStatus::Disconnected;
         }
         s.status
@@ -367,9 +516,13 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return;
         };
-        // 사용자가 직접 누른 재연결은 다른 창이 내린 '꺼진 기기' 판정도 바로 푼다.
+        // 사용자가 직접 누른 재연결은 다른 창이 내린 '꺼진 기기'·'인증 실패' 판정도 바로 푼다.
+        let key = self.offline_key(&s.spec);
         if let Ok(mut offline) = OFFLINE.lock() {
-            offline.remove(&self.offline_key(&s.spec));
+            offline.remove(&key);
+        }
+        if let Ok(mut auth) = AUTH_BACKOFF.lock() {
+            auth.remove(&key);
         }
         // 살아 있는 터널도 내린다: 원격 데몬 재탐색·깨우기는 터널을 새로 만들 때만 돈다(remote_query).
         s.generation = s.generation.wrapping_add(1);
@@ -377,6 +530,9 @@ impl HostManager {
         s.tunnel = None;
         s.next_retry_at = None;
         s.failures = 0;
+        s.auth_failures = 0;
+        s.agent_fingerprint = None;
+        s.last_agent_probe = None;
         s.last_error = None;
         s.suspended = false;
         s.status = HostStatus::Connecting;
@@ -441,52 +597,80 @@ impl HostManager {
                     Mutex<std::collections::HashMap<std::thread::ThreadId, AttemptToken>>,
                 > = Arc::new(Mutex::new(std::collections::HashMap::new()));
                 let ensure_attempts = Arc::clone(&attempts);
-                let outcome_attempts = Arc::clone(&attempts);
-                let connector = RemoteConnector::new(
-                    move || {
+                let ensure_with_epoch: Arc<dyn Fn() -> io::Result<(PathBuf, u64)> + Send + Sync> =
+                    Arc::new(move || {
                         let tid = std::thread::current().id();
                         if let Ok(mut guard) = ensure_attempts.lock() {
                             guard.remove(&tid);
                         }
-                        let (sock, reg, gen_) =
+                        let (sock, reg, gen_, epoch) =
                             manager.ensure_tunnel_socket_for_attempt(&host_id)?;
                         if let Ok(mut guard) = ensure_attempts.lock() {
                             guard.insert(tid, (reg, gen_));
                         }
-                        Ok(sock)
-                    },
-                    {
+                        Ok((sock, epoch))
+                    });
+                let ensure_sock = Arc::clone(&ensure_with_epoch);
+                let outcome_attempts = Arc::clone(&attempts);
+                let connector =
+                    RemoteConnector::new(move || ensure_sock().map(|(sock, _)| sock), {
                         let manager = self.clone();
                         let host_id = id.clone();
+                        let expected_slot = Arc::downgrade(&slot);
+                        let expected_reg = Arc::clone(&registration);
                         move |ok, err| {
                             let tid = std::thread::current().id();
-                            let token = outcome_attempts
+                            let fence = outcome_attempts
                                 .lock()
                                 .ok()
-                                .and_then(|mut g| g.remove(&tid));
-                            manager.record_ipc_outcome_for_attempt(&host_id, token, ok, err);
+                                .and_then(|mut g| g.remove(&tid))
+                                .map_or(OutcomeFence::None, OutcomeFence::Attempt);
+                            manager.record_ipc_outcome_for_target(
+                                &host_id,
+                                &expected_slot,
+                                &expected_reg,
+                                fence,
+                                ok,
+                                err,
+                            );
                         }
-                    },
-                )
-                .with_lifetime(registration.clone(), {
-                    let manager = self.clone();
-                    let host_id = id.clone();
-                    let expected = Arc::downgrade(&slot);
-                    move || {
-                        let (Some(current), Some(expected)) =
-                            (manager.slot(&host_id), expected.upgrade())
-                        else {
-                            return false;
-                        };
-                        if !Arc::ptr_eq(&current, &expected) {
-                            return false;
+                    })
+                    .with_ensure_socket_epoch(move || ensure_with_epoch())
+                    .with_epoch_outcome({
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        let expected_slot = Arc::downgrade(&slot);
+                        let expected_reg = Arc::clone(&registration);
+                        move |expected_epoch, ok, err| {
+                            manager.record_ipc_outcome_for_target(
+                                &host_id,
+                                &expected_slot,
+                                &expected_reg,
+                                OutcomeFence::Epoch(expected_epoch),
+                                ok,
+                                err,
+                            );
                         }
-                        current.lock().is_ok_and(|slot| {
-                            !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
-                        })
-                    }
-                })
-                .with_transport_epoch(move || transport_epoch.load(Ordering::Acquire));
+                    })
+                    .with_lifetime(registration.clone(), {
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        let expected = Arc::downgrade(&slot);
+                        move || {
+                            let (Some(current), Some(expected)) =
+                                (manager.slot(&host_id), expected.upgrade())
+                            else {
+                                return false;
+                            };
+                            if !Arc::ptr_eq(&current, &expected) {
+                                return false;
+                            }
+                            current.lock().is_ok_and(|slot| {
+                                !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
+                            })
+                        }
+                    })
+                    .with_transport_epoch(move || transport_epoch.load(Ordering::Acquire));
                 Some(HostTarget::remote_with_connector(
                     id.clone(),
                     initial_socket,
@@ -527,10 +711,13 @@ impl HostManager {
     #[cfg(all(test, unix))]
     fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
         self.ensure_tunnel_socket_for_attempt(id)
-            .map(|(sock, _, _)| sock)
+            .map(|(sock, _, _, _)| sock)
     }
 
-    fn ensure_tunnel_socket_for_attempt(&self, id: &str) -> io::Result<(PathBuf, Arc<()>, u64)> {
+    fn ensure_tunnel_socket_for_attempt(
+        &self,
+        id: &str,
+    ) -> io::Result<(PathBuf, Arc<()>, u64, u64)> {
         let slot = self.slot(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "unknown remote host")
         })?;
@@ -554,23 +741,57 @@ impl HostManager {
             ));
         }
 
-        if let Some(t) = &mut s.tunnel
-            && !t.is_alive()
-        {
-            s.tunnel = None;
-        }
+        s.reap_dead_tunnel();
 
+        let key = self.offline_key(&s.spec);
         if let Some(until) = s.next_retry_at {
             if Instant::now() < until {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    s.last_error
-                        .clone()
-                        .unwrap_or_else(|| "remote host backoff active".to_owned()),
-                ));
+                // 인증 실패로 느린 백오프 대기 중이라도 사용자가 `ssh-agent` 잠금을 풀거나 키를 추가하면 즉시 재시도한다.
+                let agent_unlocked = if s.status == HostStatus::AuthFailed
+                    && (self.agent_probe.is_some()
+                        || s.last_agent_probe
+                            .is_none_or(|t| t.elapsed() >= AGENT_PROBE_INTERVAL))
+                {
+                    let prev_fp = s.agent_fingerprint;
+                    s.last_agent_probe = Some(Instant::now());
+                    drop(s);
+                    let now_fp = self.probe_agent();
+                    s = slot
+                        .lock()
+                        .map_err(|_| io::Error::other("remote host slot poisoned"))?;
+                    if s.suspended {
+                        s.status = HostStatus::Disconnected;
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "remote host disconnected",
+                        ));
+                    }
+                    let changed = now_fp.is_some() && now_fp != prev_fp;
+                    if changed {
+                        s.agent_fingerprint = now_fp;
+                        s.auth_failures = 0;
+                        s.next_retry_at = None;
+                        s.status = HostStatus::Connecting;
+                        if let Ok(mut auth) = AUTH_BACKOFF.lock() {
+                            auth.remove(&key);
+                        }
+                    }
+                    changed
+                } else {
+                    false
+                };
+                if !agent_unlocked {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        s.last_error
+                            .clone()
+                            .unwrap_or_else(|| "remote host backoff active".to_owned()),
+                    ));
+                }
+            } else {
+                s.next_retry_at = None;
+                s.status = HostStatus::Connecting;
             }
-            s.next_retry_at = None;
-            s.status = HostStatus::Connecting;
         }
 
         if let Some(t) = &s.tunnel {
@@ -578,10 +799,47 @@ impl HostManager {
                 t.socket().to_path_buf(),
                 Arc::clone(&s.registration),
                 s.generation,
+                s.transport_epoch.load(Ordering::Acquire),
             ));
         }
 
-        let key = self.offline_key(&s.spec);
+        // 다른 창에서 이미 SSH 인증 실패 백오프에 들어갔고 `ssh-agent` 상태도 그대로면 중복 시도를 막는다.
+        if let Some((until, auth_failures, error, shared_fp)) = AUTH_BACKOFF
+            .lock()
+            .ok()
+            .and_then(|auth| auth.get(&key).cloned())
+            .filter(|(until, _, _, _)| Instant::now() < *until)
+        {
+            drop(s);
+            let now_fp = self.probe_agent();
+            let unlocked = now_fp.is_some() && now_fp != shared_fp;
+            s = slot
+                .lock()
+                .map_err(|_| io::Error::other("remote host slot poisoned"))?;
+            if s.suspended {
+                s.status = HostStatus::Disconnected;
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "remote host disconnected",
+                ));
+            }
+            if unlocked {
+                if let Ok(mut auth) = AUTH_BACKOFF.lock() {
+                    auth.remove(&key);
+                }
+                s.auth_failures = 0;
+                s.agent_fingerprint = now_fp;
+            } else {
+                s.auth_failures = s.auth_failures.max(auth_failures);
+                s.next_retry_at = Some(until);
+                s.last_error = Some(error.clone());
+                s.agent_fingerprint = shared_fp;
+                s.last_agent_probe = Some(Instant::now());
+                s.status = HostStatus::AuthFailed;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
+            }
+        }
+
         let tried = s.failures > 0;
         if let Some((until, error)) = OFFLINE
             .lock()
@@ -604,13 +862,21 @@ impl HostManager {
         drop(s);
         let started = if let (Some(local_dir), Some(ssh_bin)) = (&self.local_dir, &self.ssh_bin) {
             opts.validate()
-                .and_then(|()| ssh::resolve_remote_endpoint_with_program(&opts, ssh_bin))
-                .and_then(|remote| {
+                .and_then(|()| ssh::resolve_remote_endpoint_with_linger_and_program(&opts, ssh_bin))
+                .and_then(|(remote, linger)| {
                     let local = ssh::local_socket_in(local_dir, &opts.destination)?;
                     Tunnel::start_endpoint_with_program(&opts, local, &remote, ssh_bin)
+                        .map(|tunnel| (tunnel, linger))
                 })
         } else {
-            Tunnel::start_with_options(&opts)
+            let prog = ssh::ssh_program();
+            opts.validate()
+                .and_then(|()| ssh::resolve_remote_endpoint_with_linger_and_program(&opts, &prog))
+                .and_then(|(remote, linger)| {
+                    let local = ssh::local_socket(&opts.destination)?;
+                    Tunnel::start_endpoint_with_program(&opts, local, &remote, &prog)
+                        .map(|tunnel| (tunnel, linger))
+                })
         };
         let mut s = slot
             .lock()
@@ -622,26 +888,61 @@ impl HostManager {
             ));
         }
         match started {
-            Ok(tunnel) => {
+            Ok((tunnel, linger)) => {
                 if let Ok(mut offline) = OFFLINE.lock() {
                     offline.remove(&key);
                 }
+                if let Ok(mut auth) = AUTH_BACKOFF.lock() {
+                    auth.remove(&key);
+                }
                 let sock = tunnel.socket().to_path_buf();
                 s.tunnel = Some(tunnel);
+                s.auth_failures = 0;
+                s.agent_fingerprint = None;
+                s.last_agent_probe = None;
+                s.linger = linger;
                 s.tunnel_starts = s.tunnel_starts.saturating_add(1);
-                Ok((sock, Arc::clone(&s.registration), s.generation))
+                Ok((
+                    sock,
+                    Arc::clone(&s.registration),
+                    s.generation,
+                    s.transport_epoch.load(Ordering::Acquire),
+                ))
             }
             Err(err) => {
+                let message = err.to_string();
+                let is_auth = ssh::is_ssh_auth_failure(&message);
+                if is_auth {
+                    s.auth_failures = s.auth_failures.saturating_add(1);
+                    let delay = Self::auth_backoff_delay(s.auth_failures);
+                    let until = Instant::now() + delay;
+                    s.next_retry_at = Some(until);
+                    s.last_error = Some(message.clone());
+                    s.status = HostStatus::AuthFailed;
+                    let auth_failures = s.auth_failures;
+                    drop(s);
+                    let fp = self.probe_agent();
+                    if let Ok(mut s) = slot.lock()
+                        && s.generation == generation
+                    {
+                        s.agent_fingerprint = fp;
+                        s.last_agent_probe = Some(Instant::now());
+                    }
+                    if let Ok(mut auth) = AUTH_BACKOFF.lock() {
+                        auth.insert(key, (until, auth_failures, message.clone(), fp));
+                    }
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+                }
                 s.failures = s.failures.saturating_add(1);
                 let delay = Self::backoff_delay(s.failures);
                 let until = Instant::now() + delay;
                 s.next_retry_at = Some(until);
-                s.last_error = Some(err.to_string());
+                s.last_error = Some(message.clone());
                 s.status = HostStatus::Disconnected;
                 if delay == OFFLINE_BACKOFF
                     && let Ok(mut offline) = OFFLINE.lock()
                 {
-                    offline.insert(key, (until, err.to_string()));
+                    offline.insert(key, (until, message.clone()));
                 }
                 // Normalize NotFound so callers (e.g. shell::is_permanent_error) treat remote
                 // tunnel setup failure as transient and keep retrying with backoff.
@@ -650,7 +951,7 @@ impl HostManager {
                 } else {
                     err.kind()
                 };
-                Err(io::Error::new(kind, err.to_string()))
+                Err(io::Error::new(kind, message))
             }
         }
     }
@@ -677,6 +978,25 @@ impl HostManager {
         self.record_ipc_outcome_for_attempt(id, None, ok, err);
     }
 
+    fn record_ipc_outcome_for_target(
+        &self,
+        id: &str,
+        expected_slot: &std::sync::Weak<Mutex<RemoteSlot>>,
+        expected_reg: &Arc<()>,
+        fence: OutcomeFence,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
+        let (Some(slot), Some(expected)) = (self.slot(id), expected_slot.upgrade()) else {
+            return;
+        };
+        if !Arc::ptr_eq(&slot, &expected) {
+            return;
+        }
+        Self::record_ipc_outcome_in_slot(&slot, Some(expected_reg), fence, ok, err);
+    }
+
+    #[cfg(all(test, unix))]
     fn record_ipc_outcome_for_attempt(
         &self,
         id: &str,
@@ -687,13 +1007,37 @@ impl HostManager {
         let Some(slot) = self.slot(id) else {
             return;
         };
+        let fence = attempt.map_or(OutcomeFence::None, OutcomeFence::Attempt);
+        Self::record_ipc_outcome_in_slot(&slot, None, fence, ok, err);
+    }
+
+    fn record_ipc_outcome_in_slot(
+        slot: &Mutex<RemoteSlot>,
+        expected_reg: Option<&Arc<()>>,
+        fence: OutcomeFence,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
         let Ok(mut s) = slot.lock() else {
             return;
         };
-        if let Some((expected_reg, expected_gen)) = attempt
-            && (!Arc::ptr_eq(&s.registration, &expected_reg) || s.generation != expected_gen)
+        if let Some(reg) = expected_reg
+            && !Arc::ptr_eq(&s.registration, reg)
         {
             return;
+        }
+        match fence {
+            OutcomeFence::None => {}
+            OutcomeFence::Attempt((attempt_reg, attempt_gen)) => {
+                if !Arc::ptr_eq(&s.registration, &attempt_reg) || s.generation != attempt_gen {
+                    return;
+                }
+            }
+            OutcomeFence::Epoch(expected_epoch) => {
+                if s.transport_epoch.load(Ordering::Acquire) != expected_epoch {
+                    return;
+                }
+            }
         }
         if s.suspended {
             s.status = HostStatus::Disconnected;
@@ -701,21 +1045,32 @@ impl HostManager {
         }
         if ok {
             s.failures = 0;
+            s.auth_failures = 0;
+            s.agent_fingerprint = None;
+            s.last_agent_probe = None;
             s.next_retry_at = None;
             s.last_error = None;
             s.status = HostStatus::Connected;
             return;
         }
         // 이미 ensure_tunnel_socket에서 백오프가 걸린 상태(WouldBlock)라면 실패 횟수를 중복 증가시키지 않는다.
+        // 인증 실패 백오프(`AuthFailed`) 상태도 그대로 보존한다.
         if err.is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
-            s.status = HostStatus::Disconnected;
+            if s.status != HostStatus::AuthFailed {
+                s.status = HostStatus::Disconnected;
+            }
+            return;
+        }
+        if err.is_some_and(|e| ssh::is_ssh_auth_failure(&e.to_string())) {
+            s.status = HostStatus::AuthFailed;
             return;
         }
         s.transport_epoch.fetch_add(1, Ordering::Release);
+        let mut dropped_tunnel = false;
         if let Some(t) = &mut s.tunnel
             && !t.is_alive()
         {
-            s.tunnel = None;
+            dropped_tunnel |= s.tunnel.take().is_some();
         }
         s.failures = s.failures.saturating_add(1);
         // 터널은 살았는데 원격 krilld에 닿지 못했다(원격 소켓 없음·데몬 죽음·채널 시간 초과). 터널을 내려야
@@ -730,7 +1085,10 @@ impl HostManager {
             )
         }) || s.failures >= OFFLINE_AFTER_FAILURES
         {
-            s.tunnel = None;
+            dropped_tunnel |= s.tunnel.take().is_some();
+        }
+        if dropped_tunnel {
+            s.generation = s.generation.wrapping_add(1);
         }
         let delay = Self::backoff_delay(s.failures);
         s.next_retry_at = Some(Instant::now() + delay);
@@ -858,9 +1216,9 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
             identity_file: None,
             remote_socket: Some("/tmp/remote.sock".into()),
         }]);
-        let (_, reg1, gen1) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        let (_, reg1, gen1, _) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
         manager2.reconnect_now("studio");
-        let (_, reg2, gen2) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        let (_, reg2, gen2, _) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
         manager2.record_ipc_outcome_for_attempt("studio", Some((reg2, gen2)), true, None);
         let pid2 = manager2.tunnel_pid("studio").unwrap();
 

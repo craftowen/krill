@@ -48,7 +48,6 @@ pub fn civil_from_epoch(epoch: i64) -> Option<CivilTime> {
 }
 
 /// Howard Hinnant의 `days_from_civil`(1970-01-01 기준 일수)로 epoch 초를 구한다.
-#[cfg(any(windows, test))]
 pub fn epoch_from_civil(time: CivilTime) -> Option<i64> {
     let year = i64::from(time.year);
     let month = i64::from(time.month);

@@ -939,6 +939,7 @@ fn raw(target: &Target, session: SessionId, from: Seq) -> Result<Connection> {
 
 /// Windows pipes end lines with CRLF; a terminal reads CR as Enter. Send the LF a Unix pipe
 /// would carry so `--stdin` never submits early (submission stays with `--enter`).
+#[cfg(test)]
 fn lf_lines(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut it = bytes.iter().peekable();
@@ -949,6 +950,62 @@ fn lf_lines(bytes: &[u8]) -> Vec<u8> {
         out.push(byte);
     }
     out
+}
+
+/// Read stdin up to `max_bytes + 1` post-normalization bytes so oversized inputs are detected
+/// instead of silently truncated and CRLF pairs spanning read chunks never leave a bare CR.
+fn read_stdin_bounded(
+    mut reader: impl io::Read,
+    normalize_crlf: bool,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let limit = max_bytes.saturating_add(1);
+    if !normalize_crlf {
+        let mut out = Vec::new();
+        let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+        reader.take(limit_u64).read_to_end(&mut out)?;
+        return Ok(out);
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut pending_cr = false;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if n == 0 {
+            if pending_cr && out.len() < limit {
+                out.push(b'\r');
+            }
+            return Ok(out);
+        }
+        for &byte in &buf[..n] {
+            if pending_cr {
+                if byte == b'\n' {
+                    pending_cr = false;
+                    out.push(b'\n');
+                } else if byte == b'\r' {
+                    out.push(b'\r');
+                } else {
+                    pending_cr = false;
+                    out.push(b'\r');
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                    out.push(byte);
+                }
+            } else if byte == b'\r' {
+                pending_cr = true;
+            } else {
+                out.push(byte);
+            }
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
+    }
 }
 
 fn send(target: &Target, args: &[OsString]) -> Result<()> {
@@ -989,13 +1046,7 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
         if !text.is_empty() {
             return Err(usage());
         }
-        io::stdin()
-            .take(u64::try_from(MAX_INPUT + 1).map_err(fail)?)
-            .read_to_end(&mut text)
-            .map_err(fail)?;
-        if cfg!(windows) {
-            text = lf_lines(&text);
-        }
+        text = read_stdin_bounded(io::stdin(), cfg!(windows), MAX_INPUT).map_err(fail)?;
     }
     let total_bytes = text.len().saturating_add(usize::from(enter));
     if total_bytes == 0 || total_bytes > MAX_INPUT {
@@ -1268,6 +1319,9 @@ fn wait_for_agent_prompt_ready(
     let sid = SessionId(session_id);
     while start.elapsed() < timeout {
         let remaining = timeout.saturating_sub(start.elapsed()).min(IO_TIMEOUT);
+        if remaining.is_zero() {
+            break;
+        }
         conn.stream
             .set_read_timeout(Some(remaining))
             .map_err(|e| e.to_string())?;
@@ -1843,5 +1897,59 @@ mod tests {
         );
         let parsed = parse_fork_args(&[], true, Some(OsString::from("9")), (80, 24));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn read_stdin_bounded_normalizes_crlf_incrementally_without_truncating() {
+        // 1) CRLF payload exceeding raw limit (6 raw bytes -> 4 LF bytes == max_bytes) succeeds without truncation.
+        let exact = read_stdin_bounded(io::Cursor::new(b"a\r\nb\r\n"), true, 4).unwrap();
+        assert_eq!(exact, b"a\nb\n");
+
+        // 2) CRLF payload whose first max_bytes+1 raw bytes shrink <= max_bytes, but total normalized > max_bytes,
+        //    must still report overflow (> max_bytes) instead of silently truncating.
+        let mut big = Vec::new();
+        for _ in 0..40_000 {
+            big.extend_from_slice(b"x\r\n");
+        }
+        let over = read_stdin_bounded(io::Cursor::new(&big), true, MAX_INPUT).unwrap();
+        assert!(
+            over.len() > MAX_INPUT,
+            "expected overflow, got {}",
+            over.len()
+        );
+
+        // 3) Exactly MAX_INPUT normalized bytes made of 32,768 "x\r\n" pairs (98,304 raw bytes) is preserved intact.
+        let mut exact_max = Vec::with_capacity(32_768 * 3);
+        for _ in 0..32_768 {
+            exact_max.extend_from_slice(b"x\r\n");
+        }
+        let kept = read_stdin_bounded(io::Cursor::new(&exact_max), true, MAX_INPUT).unwrap();
+        assert_eq!(kept.len(), MAX_INPUT);
+        assert!(!kept.contains(&b'\r'));
+
+        // 4) CRLF split across the 8192-byte read chunk boundary leaves no bare CR.
+        let mut boundary = vec![b'a'; 8191];
+        boundary.extend_from_slice(b"\r\nb");
+        let crossed = read_stdin_bounded(io::Cursor::new(&boundary), true, MAX_INPUT).unwrap();
+        assert_eq!(crossed.len(), 8193);
+        assert_eq!(&crossed[8190..], b"a\nb");
+
+        // 5) Bare CR, CR+CRLF, and trailing CR match lf_lines.
+        assert_eq!(
+            read_stdin_bounded(io::Cursor::new(b"a\rb\r"), true, 64).unwrap(),
+            b"a\rb\r"
+        );
+        assert_eq!(
+            read_stdin_bounded(io::Cursor::new(b"\r\r\n"), true, 64).unwrap(),
+            b"\r\n"
+        );
+        assert_eq!(
+            read_stdin_bounded(io::Cursor::new(b"abcd\r"), true, 4).unwrap(),
+            b"abcd\r"
+        );
+
+        // 6) Non-CRLF mode reads at most max_bytes + 1 raw bytes.
+        let raw = read_stdin_bounded(io::Cursor::new(b"abcdef"), false, 4).unwrap();
+        assert_eq!(raw, b"abcde");
     }
 }

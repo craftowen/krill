@@ -1443,7 +1443,7 @@ async function mobileAuditWave2Regressions(){
   // M-05: verify isRead() via transport.rpcLatest (closed transport rejects reads immediately without 20s reconnect wait).
   const tr=cBox.KrillMobile.transport.create({credentials:{device_id:'d1',credential:'c1'},url:'wss://example.test/ws',warmTerminal:false});
   tr.close();
-  const readActions=['chat_composer','bots.list','bots.templates','bots.models','bots.upcoming','bots.items','bots.access.list','bots.connectors.status','bots.groups.list','bots.groups.read','bots.suggestions.list','bots.avatar.read','bots.soul.get','bots.memory.get'];
+  const readActions=['chat_composer','bots.list','bots.hub','bots.workspace','bots.todo','bots.avatars.read','bots.templates','bots.models','bots.upcoming','bots.items','bots.access.list','bots.connectors.status','bots.groups.list','bots.groups.read','bots.suggestions.list','bots.avatar.read','bots.soul.get','bots.memory.get'];
   for(const action of readActions){
    const p=tr.rpcLatest('k:'+action,{action});
    let err=null;try{await p;}catch(e){err=e;}
@@ -3053,5 +3053,274 @@ async function mobileI18nAuditRegressions(){
  }
  console.log('PASS mobile i18n audit regressions: 0 duplicate keys, placeholder parity, literal coverage, ko_KR/languages, Object.hasOwn, autonyms, banner switch, privacy link, bots timeline, details/workspaces/client ko');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function botItemWaitingRegressions(){
+ const now=Date.now();
+ const calls=[];
+ const waitItem={
+  uid:'it-wait-1',owner_bot_id:'b1',title:'Merge release PR',status:'waiting',
+  waiting_reason:'CI on PR #42',waiting_since_ms:now-60000,snoozed_until_ms:null,
+  links:[],events:[
+   {id:1,kind:'made',actor:{bot:{bot_id:'b1'}},text:'Merge release PR',decisions:[],created_at_ms:now-120000},
+   {id:2,kind:'status',actor:{bot:{bot_id:'b1'}},text:'status -> waiting: CI on PR #42',decisions:[],created_at_ms:now-60000},
+  ],
+ };
+ const uf=fixture('up-next',{
+  rpc:async req=>{
+   calls.push(req);
+   if(req.action==='bots.list')return {bots:[{id:'b1',name:'Release Bot',agent_id:'agy'}]};
+   if(req.action==='bots.items')return {items:req.status==='needs_you'?[]:[waitItem]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.upcoming')return {schedules:[]};
+   if(req.action==='bots.item.update')return {item:{...waitItem,waiting_reason:req.waiting_reason}};
+   return {};
+  },
+ });
+ uf.ctx.connections=[{id:'h1',active:true,name:'Desktop',connection:{phase:'ready'},snapshot:{capabilities:{bots:true,bots_item_waiting:true},bots:{count:1,needs_you:0,pending_access:0},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}];
+ uf.view.update();
+ await uf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ // Clicking Waiting filter sends capabilities:["bots.item-waiting.v1"] and status:"waiting".
+ const waitChip=uf.all().find(n=>n.dataset?.filter==='waiting');
+ assert(waitChip,'Waiting filter chip rendered on up-next');
+ await waitChip.action();
+ await uf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert(calls.some(c=>c.action==='bots.items'&&c.status==='waiting'&&Array.isArray(c.capabilities)&&c.capabilities.includes('bots.item-waiting.v1')),'modern host sends bots.item-waiting.v1 capability and waiting filter');
+ const card=uf.all().find(n=>n.dataset?.item==='it-wait-1');
+ assert(card,'waiting item card rendered');
+ assert(card.className.includes('item-waiting')&&!card.className.includes(' waiting'),'waiting card uses distinct item-waiting class');
+ const pill=card.querySelector('.bot-status-pill');
+ assert(pill&&pill.textContent==='Waiting'&&pill.className.includes('item-waiting'),'distinct Waiting pill rendered');
+ const waitLine=card.querySelector('.bot-item-wait-line');
+ assert(waitLine&&!waitLine.hidden&&waitLine.textContent.includes('CI on PR #42'),'waiting_reason rendered directly under item title');
+ // Opening detail sheet renders "Waiting on" card at end of Activity and hides duplicate latest status->waiting line.
+ const detailBtn=card.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Details');
+ await detailBtn.action();
+ const sheetSpec=uf.sheets.at(-1);
+ const sheetBody=uf.ctx.el('div');
+ sheetSpec[3](sheetBody);
+ const waitCard=sheetBody.querySelector('.bot-wait-card');
+ assert(waitCard&&waitCard.textContent.includes('Waiting on')&&waitCard.textContent.includes('CI on PR #42'),'Waiting on card rendered in item detail Activity');
+ assert(!sheetBody.textContent.includes('status -> waiting: CI on PR #42'),'duplicate latest status -> waiting event hidden while Waiting');
+ // Updating wait reason from detail sheet sends bots.item.update with status:"waiting" and waiting_reason.
+ const waitToggle=sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Waiting');
+ await waitToggle.action();
+ const waitInp=sheetBody.querySelectorAll('input').find(i=>i.getAttribute('aria-label')==='Waiting on');
+ assert(waitInp,'waiting reason input rendered');
+ waitInp.value='Review from Alice';
+ const saveWaitBtn=sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Mark waiting');
+ await saveWaitBtn.action();
+ assert(calls.some(c=>c.action==='bots.item.update'&&c.item_id==='it-wait-1'&&c.status==='waiting'&&c.waiting_reason==='Review from Alice'),'detail sheet updates waiting_reason via bots.item.update');
+ uf.abort.abort();
+
+ // Korean i18n translations for Waiting item UI.
+ const koBox=vm.createContext({navigator:{language:'ko'}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
+ const K=koBox.KrillMobile.i18n;
+ assert.equal(K.t('Waiting'),'대기 중');
+ assert.equal(K.t('Waiting on'),'대기 사유');
+ for(const key of ['What is it waiting on?','Mark waiting','Marked waiting']){
+  assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
+ }
+ console.log('PASS bot item Waiting regressions: capability, filter, badge, waiting_reason under title, detail Waiting on card, ko i18n');
+}
+async function botInstantLoadingRegressions(){
+ const fakePng=Buffer.from('fake-png-bytes').toString('base64');
+ const botsList=[
+  {id:'b1',slug:'b1',name:'Alpha Bot',agent_id:'agy',model:'gemini-4-carbon',avatar:'a.png',schedules:[{id:'s1',name:'Daily',cron:'0 9 * * *',enabled:true}]},
+  {id:'b2',slug:'b2',name:'Beta Bot',agent_id:'claude',model:'claude-sonnet-4-6',avatar:'b.png',schedules:[]},
+ ];
+ const sessList=[
+  {session_id:101,bot_id:'b1',pid:1001,live:true,working:false,label:'Home'},
+  {session_id:102,bot_id:'b2',pid:1002,live:true,working:true,label:'Home'},
+ ];
+ const hubEtag='hub-etag-0001';
+ const wsEtagB1='ws-etag-b1-001';
+ const todoEtag='todo-etag-0001';
+ const calls=[];
+ const host={
+  id:'h1',name:'Mac Mini',active:true,cacheScope:'scope-cred-1',
+  connection:{phase:'ready'},cached:false,
+  snapshot:{capabilities:{bots:true,bots_item_waiting:true,bots_bundle:true},bots:{count:2,needs_you:1,pending_access:0},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}},
+ };
+ const rpcImpl=async req=>{
+  calls.push(req);
+  if(req.action==='bots.hub'){
+   if(req.since===hubEtag)return {unchanged:true,etag:hubEtag};
+   return {
+    bots:botsList,bots_next_cursor:null,
+    items:[{uid:'it-1',owner_bot_id:'b1',title:'Approve deploy',status:'needs_you',events:[]}],
+    requests:[],statuses:[],groups:[],sessions:sessList,etag:hubEtag,
+   };
+  }
+  if(req.action==='bots.avatars.read'){
+   const avatars={};
+   for(const id of req.bot_ids||[])avatars[id]={bot_id:id,mime:'image/png',data_base64:fakePng};
+   return {avatars,remaining:[]};
+  }
+  if(req.action==='bots.workspace'){
+   if(req.bot_id==='b1'&&req.since===wsEtagB1)return {unchanged:true,etag:wsEtagB1};
+   const bot=botsList.find(b=>b.id===req.bot_id)||null;
+   return {
+    bot,items:[],items_next_cursor:null,statuses:[],suggestions:[],requests:[],
+    upcoming:{look_around_last_ms:null,look_around_next_ms:null,schedules:[]},
+    sessions:req.include_rail?sessList:sessList.filter(s=>s.bot_id===req.bot_id),
+    ...(req.include_rail?{bots:botsList,all_items:[{uid:'it-1',owner_bot_id:'b1',title:'Approve deploy',status:'needs_you',events:[]}],groups:[]}:{}),
+    etag:req.bot_id==='b1'?wsEtagB1:'ws-etag-b2-001',
+   };
+  }
+  if(req.action==='bots.todo'){
+   if(req.since===todoEtag)return {unchanged:true,etag:todoEtag};
+   return {
+    bots:botsList,items:[{uid:'it-1',owner_bot_id:'b1',title:'Approve deploy',status:'needs_you',events:[]}],
+    items_next_cursor:null,requests:[],suggestions:[],
+    failed_automations:[{bot_id:'b1',schedule_id:'s1',title:'Daily',last_error:'quota'}],
+    etag:todoEtag,
+   };
+  }
+  if(req.action==='chat_poll')return {bound:true,agent:'agy',items:[]};
+  if(req.action==='bots.update')return {bot:{...botsList[0],paused:true}};
+  return {};
+ };
+
+ const makeStore=(entries=[])=>{
+  const map=new Map(entries);
+  return {
+   map,
+   localStorage:{
+    getItem:k=>(map.has(k)?map.get(k):null),
+    setItem:(k,v)=>map.set(k,String(v)),
+    removeItem:k=>map.delete(k),
+   },
+  };
+ };
+
+ // 1. Cold open #/bots uses 1 bots.hub + 1 batched bots.avatars.read (zero legacy N+1 calls).
+ const store1=makeStore();
+ const bf=fixture('bots',{
+  state:{snapshot:host.snapshot},
+  globals:{localStorage:store1.localStorage},
+  rpc:rpcImpl,
+ });
+ calls.length=0;
+ bf.M.botsCache.clearHost();
+ bf.ctx.connections=[host];
+ bf.ctx.getConnections=()=>[host];
+ bf.ctx.filteredConnections=()=>[host];
+ bf.ctx.rpcForHost=(_hid,req)=>rpcImpl(req);
+ bf.view.update();
+ await bf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert(bf.root.textContent.includes('Alpha Bot')&&bf.root.textContent.includes('Beta Bot'),'bots.hub renders bot list');
+ assert.deepEqual(calls.map(c=>c.action),['bots.hub','bots.avatars.read'],'cold #/bots uses 1 bots.hub + 1 batched bots.avatars.read');
+ assert.deepEqual([...calls[1].bot_ids],['b1','b2'],'bots.avatars.read batches all missing avatars');
+
+ // 2. Opening #/bots/b1 inside same VM hydrates synchronously on frame 0 and queues chat_poll BEFORE bots.workspace with 0 avatar RPCs.
+ calls.length=0;
+ const mountedSids=[];
+ bf.M.chat={
+  mount(_stage,opts){
+   mountedSids.push(opts.sessionId);
+   rpcImpl({action:'chat_poll',session:opts.sessionId,offset:0,latest:true});
+   return {setVisible(){},update(){},unmount(){}};
+  },
+ };
+ const d1Root=bf.ctx.el('main');
+ const d1Abort=new AbortController();
+ const d1Ctx={...bf.ctx,route:{botId:'b1'},signal:d1Abort.signal};
+ const d1View=bf.M.screens.bots(d1Root,d1Ctx);
+ assert(d1Root.textContent.includes('Alpha Bot'),'#/bots/b1 paints bot header/rail synchronously on frame 0 from cache');
+ assert.deepEqual(mountedSids,[101],'#/bots/b1 mounts M.chat synchronously on frame 0 from cached session');
+ await bf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert.deepEqual(calls.map(c=>c.action),['chat_poll','bots.workspace'],'chat_poll queues ahead of bots.workspace and cached avatars are not re-fetched');
+ assert.equal(calls[1].include_rail,false,'fresh hub cache skips redundant rail payload in bots.workspace');
+ d1View.cleanup?.();
+ d1Abort.abort();
+
+ // 3. Returning to #/bots renders synchronously on frame 0 and sends since:hubEtag -> unchanged:true.
+ calls.length=0;
+ const hub2Root=bf.ctx.el('main');
+ const hub2Abort=new AbortController();
+ bf.M.screens.bots(hub2Root,{...bf.ctx,route:{},signal:hub2Abort.signal});
+ assert(hub2Root.textContent.includes('Alpha Bot'),'return to #/bots paints cached bots on frame 0');
+ await bf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert.deepEqual(calls.map(c=>c.action),['bots.hub'],'return to #/bots sends 1 bots.hub RPC');
+ assert.equal(calls[0].since,hubEtag,'return to #/bots sends since:hubEtag');
+ hub2Abort.abort();
+
+ // 4. Revisiting #/bots/b1 sends since:wsEtagB1 and keeps rendered state on unchanged:true; Refresh invalidates etag.
+ calls.length=0;
+ const d1AgainRoot=bf.ctx.el('main');
+ const d1AgainAbort=new AbortController();
+ const d1AgainCtx={...bf.ctx,route:{botId:'b1'},signal:d1AgainAbort.signal};
+ const d1AgainView=bf.M.screens.bots(d1AgainRoot,d1AgainCtx);
+ await bf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ const wsCall=calls.find(c=>c.action==='bots.workspace');
+ assert.equal(wsCall?.since,wsEtagB1,'revisit #/bots/b1 sends since etag');
+ assert(d1AgainRoot.textContent.includes('Alpha Bot'),'unchanged:true preserves cached workspace UI');
+ // Manual Refresh invalidates etag and omits since.
+ calls.length=0;
+ const refreshBtn=d1AgainRoot.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Refresh');
+ assert(refreshBtn,'Refresh button present on bot detail');
+ await refreshBtn.action();
+ await bf.flush();
+ const freshWsCall=calls.find(c=>c.action==='bots.workspace');
+ assert.equal(freshWsCall?.since,undefined,'manual refresh invalidates etag and omits since');
+ d1AgainView.cleanup?.();
+ d1AgainAbort.abort();
+
+ // 5. #/up-next uses 1 bots.todo RPC with server-computed failed_automations (0 bots.upcoming calls) and since:todoEtag on revisit.
+ calls.length=0;
+ const tdRoot=bf.ctx.el('main');
+ const tdAbort=new AbortController();
+ bf.M.screens['up-next'](tdRoot,{...bf.ctx,route:{},signal:tdAbort.signal});
+ assert(tdRoot.textContent.includes('Approve deploy'),'#/up-next hydrates needs_you items synchronously from hub cache');
+ await bf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert.deepEqual(calls.map(c=>c.action),['bots.todo'],'#/up-next uses 1 bots.todo RPC with zero bots.upcoming calls');
+ assert(tdRoot.textContent.includes('Daily'),'server-computed failed_automations rendered in #/up-next');
+ tdAbort.abort();
+ calls.length=0;
+ const td2Root=bf.ctx.el('main');
+ const td2Abort=new AbortController();
+ bf.M.screens['up-next'](td2Root,{...bf.ctx,route:{},signal:td2Abort.signal});
+ await bf.flush();
+ assert.equal(calls[0]?.since,todoEtag,'revisiting #/up-next sends since:todoEtag');
+ td2Abort.abort();
+
+ // 6. Cold-boot localStorage seed: persisted seed hydrates on frame 0 with matching cacheScope, rejects mismatched cacheScope, and clears on clearHost().
+ const seedKey='krill-mobile-bots-seed-v1:h1';
+ const savedSeed=store1.map.get(seedKey);
+ assert(savedSeed,'bots seed persisted to localStorage for scoped host');
+ const storeMatch=makeStore([[seedKey,savedSeed]]);
+ const coldMatch=fixture('bots',{state:{snapshot:host.snapshot},globals:{localStorage:storeMatch.localStorage},rpc:async()=>new Promise(()=>{})});
+ coldMatch.ctx.connections=[host];
+ coldMatch.ctx.getConnections=()=>[host];
+ coldMatch.ctx.filteredConnections=()=>[host];
+ const coldHubRoot=coldMatch.ctx.el('main');
+ coldMatch.M.screens.bots(coldHubRoot,{...coldMatch.ctx,route:{}});
+ assert(coldHubRoot.textContent.includes('Alpha Bot'),'cold boot with matching cacheScope paints bots synchronously from localStorage seed');
+ coldMatch.abort.abort();
+
+ const storeMismatch=makeStore([[seedKey,savedSeed]]);
+ const coldMismatch=fixture('bots',{state:{snapshot:host.snapshot},globals:{localStorage:storeMismatch.localStorage},rpc:async()=>new Promise(()=>{})});
+ const rotatedHost={...host,cacheScope:'scope-cred-rotated'};
+ coldMismatch.ctx.connections=[rotatedHost];
+ coldMismatch.ctx.getConnections=()=>[rotatedHost];
+ coldMismatch.ctx.filteredConnections=()=>[rotatedHost];
+ const mismatchRoot=coldMismatch.ctx.el('main');
+ coldMismatch.M.screens.bots(mismatchRoot,{...coldMismatch.ctx,route:{}});
+ assert(!mismatchRoot.textContent.includes('Alpha Bot'),'rotated cacheScope rejects stale localStorage seed');
+ coldMismatch.abort.abort();
+
+ bf.M.botsCache.clearHost('h1');
+ assert.equal(store1.map.get(seedKey),undefined,'botsCache.clearHost removes localStorage seed');
+ bf.abort.abort();
+ console.log('PASS bot instant loading regressions: bots.hub/workspace/todo/avatars.read, 0ms SWR cache, chat-first ordering, ETag unchanged, localStorage seed scope & clearHost');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

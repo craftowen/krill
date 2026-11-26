@@ -129,7 +129,7 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_SESSION_ACCOUNT_SWITCH | `1 << 28` | `krill_proto::usage` (클릭한 호스트의 단일 세션 계정 전환 `UsageRequest::SwitchSessionAccount`; 기본 계정·다른 세션 유지, 지휘자 배정 2026-10-27) |
 | FEAT_ACCOUNT_SWITCH_CONTROL | `1 << 43` | `krill_proto::usage` (기본 계정만 전환 `UsageRequest::SwitchAccountOnly`, 실행 중 세션 사전 진단 `InspectSessionSwitches`/`UsageReply::SessionSwitchPlan`, 선택 세션만 인계 `SwitchSelectedSessions`; enum 끝에 추가, 미협상 피어에 전송 금지, 미협상 피어의 계획 응답은 `Failed(BadRequest)`) |
 | FEAT_HISTORY | `1 << 16` | `krill_proto::history` (기록 삭제, 전용 요청·응답, OWE-440) |
-| FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·전환·자동전환, 전용 요청·응답, MK-084·MK-107·MK-108) |
+| FEAT_USAGE | `1 << 17` | `krill_proto::usage` (사용량·프로바이더 다계정 조회·수동 전환, 전용 요청·응답, MK-084·MK-107·MK-108; 구 자동전환 요청은 N-1 호환용 무동작) |
 | FEAT_ORCH_RETAIN | `1 << 19` | `krill_proto::orchestration` (retain 요청·상태, v0.1.23 지휘자 배정; 구 피어 응답은 Stopped로 변환) |
 | FEAT_COLD | `1 << 18` | `krill_proto::control` (콜드 복원 화면 조회, Request 14 / Reply 18 — 2026-10-15 main e5f7ec4 기준, 병합 순서로 지휘자가 맞춘다, OWE-397 지휘자 배정) |
 | FEAT_AGENTS | `1 << 31` | `krill_proto::control` (전역 권한·프로필, 세션 실행 권한 조회, OWE-488; 기존 Create 재사용) |
@@ -154,15 +154,15 @@ Windows **원격** 호스트(macOS 앱·CLI → Windows PC)는 원격 krill이 �
 | FEAT_HIBERNATION | `1 << 51` | `krill_proto::control` (자동 종료 세션 재개 `Request::Hibernation`/`Reply::Hibernation`, MK-081·OWE-446 지휘자 배정) |
 | FEAT_WORKTREE_PREPARE | `1 << 52` | `krill_proto::control` (`Request::PrepareWorktree`/`Reply::WorktreePreparation`, MK-095·OWE-460 지휘자 배정; enum 끝에 추가) |
 | FEAT_USAGE_AGY | `1 << 53` | `krill_proto::usage` (Antigravity 계정 enum 확장; 미협상 피어 응답에서 해당 계정·전환 이벤트 제외) |
-| FEAT_USAGE_PROVIDER_METRICS | `1 << 26` | `krill_proto::usage` (제공자별 자동전환 기준 확장. 미협상 피어에는 해당 규칙을 응답에서 제외하고 변경 요청 전송을 거부한다. v0.1.44 배정) |
-| FEAT_USAGE_RULES | `1 << 54` | `krill_proto::usage` (계정별 자동전환 규칙 요청 및 응답 꼬리 확장) |
+| FEAT_USAGE_PROVIDER_METRICS | `1 << 26` | `krill_proto::usage` (구 제공자별 자동전환 기준 확장; 자동전환 제거 후 N-1 와이어 호환용 예약 비트, v0.1.44 배정) |
+| FEAT_USAGE_RULES | `1 << 54` | `krill_proto::usage` (구 계정별 자동전환 규칙 요청·꼬리; 자동전환 제거 후 N-1 와이어 호환용 무동작/예약 비트) |
 | FEAT_HISTORY_PAUSE | `1 << 55` | `krill_proto::history` (기록 일시중지·재개 요청/ACK; 세션·PTY·라이브 화면 유지) |
 | FEAT_MOBILE | `1 << 56` | `krill_proto::mobile` (M9 기기·페어링·게이트웨이, OWE-678) |
 | FEAT_USAGE_STATUS | `1 << 57` | `krill_proto::usage` (계정별 사용량 상태·갱신 시각 응답 꼬리 확장, MK-143·OWE-703) |
 | FEAT_SESSION_ACCOUNT | `1 << 58` | `krill_proto::control` (세션별 사용 계정 `Request::SessionAccounts`/`Reply::SessionAccounts` 한 쌍, MK-147·OWE-707; enum 끝에 추가) |
 | FEAT_USAGE_RATELIMIT | `1 << 60` | `krill_proto::usage` (상태 꼬리 한도 도달 구분 수신, 없으면 `Error`로 폴백, OWE-703·OWE-710) |
 | FEAT_USAGE_MANAGE | `1 << 59` | `krill_proto::usage` (계정 라벨 변경·데이터 삭제·고아 프로필 정리 요청과 `UsageReply::Orphans`, MK-144·145·OWE-704·705 지휘자 배정; enum 끝에 추가) |
-| FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·고급 자동전환 정책·전환 이력·모델별 주간 창, MK-152·OWE-712 지휘자 배정; 구 피어에는 꼬리 생략) |
+| FEAT_ACCOUNT_POLICY | `1 << 61` | `krill_proto::usage::policy` (`Create.account` 선택 꼬리·모델별 주간 창·한도 도달 상태, MK-152·OWE-712 지휘자 배정; 구 자동전환 정책 필드는 N-1 호환용 기본값/무동작, 구 피어에는 꼬리 생략) |
 | FEAT_ACCOUNT_CONNECTION | `1 << 62` | `krill_proto::usage::connections` (연결 상태 꼬리, OWE-719; 구 피어에는 꼬리 생략. `direct_usage`는 항상 true, `SetDirectUsage`는 구버전 호환용 무동작 요청이며 사용량은 항상 자동 수집) |
 | FEAT_WORKTREE_REFS | `1 << 37` | `krill_proto::control` (호스트별 Git 브랜치·태그 조회) |
 | FEAT_REMOTE_FS | `1 << 27` | `krill_proto::control` (원격 파일 탐색·열기·원자적 저장·Quick Open·루프백 포트 포워딩 `Request::RemoteFs`/`Reply::RemoteFs` 한 쌍; enum 끝에 추가) |

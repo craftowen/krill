@@ -1186,6 +1186,7 @@
                     ((entry.connection = status),
                       status.blocked &&
                         (entry.cache?.remove(),
+                        M.botsCache?.clearHost?.(entry.id),
                         (entry.cache = null),
                         (entry.snapshot = null),
                         (entry.cached = !1)),
@@ -1217,6 +1218,7 @@
           entry &&
             entry.cache?.scope !== keep &&
             (entry.cache?.close(),
+            M.botsCache?.clearHost?.(host),
             (entry.cache = null),
             (entry.snapshot = null),
             (entry.cached = !1),
@@ -1251,6 +1253,10 @@
             "mention_files",
             "composer_models",
             "bots.list",
+            "bots.hub",
+            "bots.workspace",
+            "bots.todo",
+            "bots.avatars.read",
             "bots.templates",
             "bots.models",
             "bots.upcoming",
@@ -1484,7 +1490,7 @@
                           C.concat(
                             v(1),
                             v(1),
-                            v((1n << 56n) | 1n | 4n | 4096n | 8192n),
+                            v((1n << 56n) | (1n << 24n) | 1n | 4n | 4096n | 8192n),
                             v(0),
                             text("krill-mobile-grid"),
                           ),

@@ -344,11 +344,10 @@ fn short_path(exe: &str) -> Option<String> {
         return None;
     }
     let cmd = Path::new(&std::env::var_os("SystemRoot")?).join(r"System32\cmd.exe");
-    let output = std::process::Command::new(cmd)
+    let output = crate::os::background_command(cmd)
         .raw_arg(format!(
             r#"/d /v:off /u /c for %I in ("{exe}") do @echo %~sI"#
         ))
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()

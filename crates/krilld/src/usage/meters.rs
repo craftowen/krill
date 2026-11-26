@@ -175,9 +175,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                                         .map(|s| s / 60)
                                 });
                         let label = match minutes {
-                            Some(300) => "5h".into(),
-                            Some(10_080) => "7d".into(),
-                            Some(n) => format!("{n}m"),
+                            Some(n) => format_window_minutes(n),
                             None => continue,
                         };
                         push(
@@ -286,7 +284,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                             .strip_suffix(unit)?
                             .parse::<u64>()
                             .ok()
-                            .map(|n| n * mul)
+                            .map(|n| n.saturating_mul(mul))
                     };
                     hours('h', 1).or_else(|| hours('d', 24)).unwrap_or(u64::MAX)
                 });
@@ -397,6 +395,16 @@ fn value_meter(out: &mut AccountMeters, key: &str, label: &str, value: String) {
     });
 }
 
+fn format_window_minutes(minutes: u64) -> String {
+    if minutes > 0 && minutes.is_multiple_of(1440) {
+        format!("{}d", minutes / 1440)
+    } else if minutes > 0 && minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +453,19 @@ mod tests {
         }
     }
     #[test]
+    fn codex_window_minutes_format_days_and_hours_cleanly() {
+        let meters = parse(
+            ProviderKind::Codex,
+            r#"{"rate_limit":{"primary_window":{"used_percent":40,"window_minutes":43200},"secondary_window":{"used_percent":12,"window_minutes":10080}}}"#,
+        );
+        let labels: Vec<_> = meters.meters.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["30d", "7d"]);
+        assert_eq!(format_window_minutes(300), "5h");
+        assert_eq!(format_window_minutes(1440), "1d");
+        assert_eq!(format_window_minutes(45), "45m");
+    }
+
+    #[test]
     fn provider_meters_preserve_pools_credits_and_monthly_limits() {
         let agy = parse(
             ProviderKind::Antigravity,
@@ -475,7 +496,7 @@ mod tests {
             r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":7,"limit_window_seconds":3600}},"credits":{"has_credits":true,"balance":"42"},"rate_limit_reset_credits":{"available_count":2}}"#,
         );
         assert_eq!(codex.plan.as_deref(), Some("pro"));
-        assert_eq!(codex.meters[0].label, "60m");
+        assert_eq!(codex.meters[0].label, "1h");
         assert_eq!(codex.meters[1].value.as_deref(), Some("42"));
         assert_eq!(codex.meters[2].value.as_deref(), Some("2"));
         let claude = parse(
@@ -488,6 +509,16 @@ mod tests {
             Some("$1.23 / $20.00")
         );
         assert!(parse(ProviderKind::OpenCode, "{}").meters.is_empty());
+    }
+
+    #[test]
+    fn antigravity_huge_day_window_saturates_without_overflow_panic() {
+        let reading = parse(
+            ProviderKind::Antigravity,
+            r#"{"groups":[{"name":"Gemini","buckets":[{"id":"huge","window":"1000000000000000000d","remaining_fraction":0.5},{"id":"short","window":"5h","remaining_fraction":0.2}]}]}"#,
+        );
+        let labels: Vec<_> = reading.meters.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini · 5h", "Gemini · 1000000000000000000d"]);
     }
 
     #[test]

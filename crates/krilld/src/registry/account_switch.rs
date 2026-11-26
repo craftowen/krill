@@ -1370,7 +1370,7 @@ impl Registry {
             lock(&self.account_handoffs).prune_dead(|id| ended.contains(&id));
         }
         let state_dir = self.state_dir();
-        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
+        let snapshot = accounts::refresh_accounts(home, state_dir.as_deref());
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
@@ -1410,24 +1410,55 @@ impl Registry {
                 continue;
             }
             if let Some(new) = handoff.to {
-                if new_live {
+                let unlink_journal = if new_live {
                     lock(&self.account_replacements).insert(new);
-                    if let Err(error) = self.close(&peer, handoff.from) {
-                        self.close(&peer, new).ok();
+                    let close_err = if self.account_original_ended(handoff.from) {
+                        None
+                    } else {
+                        self.close(&peer, handoff.from).err()
+                    };
+                    let unlink = if let Some(error) = close_err {
+                        let stopped = self.stop_account_replacement(new);
                         handoff.to = None;
                         handoff.error = Some(format!(
                             "Could not retire original session ({error}); original session preserved"
                         ));
-                    }
+                        stopped
+                    } else {
+                        let deadline = Instant::now() + Duration::from_secs(7);
+                        while !self.account_original_ended(handoff.from)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if !self.account_original_ended(handoff.from) {
+                            handoff = SessionHandoff::retained(
+                                handoff.from,
+                                new,
+                                handoff.account_id.clone(),
+                                RetainedReason::OriginalExitUnconfirmed,
+                            );
+                        }
+                        true
+                    };
                     lock(&self.account_handoffs).insert(handoff.from, handoff.clone());
                     lock(&self.account_replacements).remove(&new);
+                    unlink
                 } else {
                     handoff.to = None;
                     handoff.error = Some(
                         "Replacement session is unavailable; original session preserved".into(),
                     );
+                    let stopped = self.stop_account_replacement(new);
+                    lock(&self.account_handoffs).insert(handoff.from, handoff.clone());
+                    stopped
+                };
+                if unlink_journal
+                    && self.save_account_handoffs().is_ok()
+                    && let Some(dir) = self.dir.as_deref()
+                {
+                    std::fs::remove_file(replacement_journal(dir, new)).ok();
                 }
-                lock(&self.account_handoffs).insert(handoff.from, handoff);
             } else if recovery.blocks(handoff.from) {
                 handoff.error =
                     Some("Unconfirmed replacement recovery is pending; retry withheld".into());
@@ -1551,10 +1582,16 @@ impl Registry {
     }
 
     fn stop_account_replacement(&self, session: SessionId) -> bool {
-        if self.account_original_ended(session) {
-            return true;
+        let (in_sessions, closing) = {
+            let state = lock(&self.state);
+            (
+                state.sessions.contains_key(&session),
+                state.closing.contains(&session),
+            )
+        };
+        if !in_sessions {
+            return self.account_original_ended(session);
         }
-        let closing = lock(&self.state).closing.contains(&session);
         if !closing
             && self
                 .close(
@@ -1566,7 +1603,7 @@ impl Registry {
                 )
                 .is_err()
         {
-            return false;
+            return self.account_original_ended(session);
         }
         let deadline = Instant::now() + Duration::from_secs(7);
         while !self.account_original_ended(session) && Instant::now() < deadline {
@@ -1679,7 +1716,7 @@ impl Registry {
             stored.permission = krill_proto::agent::Permission::Yolo;
         }
         let state_dir = self.state_dir();
-        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
+        let snapshot = accounts::refresh_accounts(home, state_dir.as_deref());
         let target = snapshot
             .accounts
             .iter()
@@ -1689,8 +1726,8 @@ impl Registry {
         let login_deadline = Instant::now() + Duration::from_secs(6);
         while connection == ConnectionStatus::Checking && Instant::now() < login_deadline {
             std::thread::sleep(Duration::from_millis(50));
-            connection = accounts::refresh_accounts_with(home, state_dir.as_deref(), false)
-                .connection_for(account_id);
+            connection =
+                accounts::refresh_accounts(home, state_dir.as_deref()).connection_for(account_id);
         }
         if snapshot.connections.supported
             && matches!(
@@ -1885,6 +1922,7 @@ impl Registry {
             registry: self,
             original: old,
             session: new,
+            spawned: false,
             disposition: ReplacementDisposition::Unresolved,
             bot_grant_token: None,
         };
@@ -1990,7 +2028,7 @@ impl Registry {
             accounts::write_atomic_0600(&replacement_journal(dir, new), &raw)
                 .map_err(|e| prepare_failure(old, "replacement_journal", &e))?;
         }
-        let (new, _) = self.spawn_holder(
+        let (new, _) = match self.spawn_holder_outcome(
             holder,
             new,
             launch.argv,
@@ -1998,7 +2036,18 @@ impl Registry {
             cwd,
             size.cols,
             size.rows,
-        )?;
+        ) {
+            Ok(spawned) => {
+                replacement.mark_spawned();
+                spawned
+            }
+            Err((error, not_spawned)) => {
+                if not_spawned {
+                    replacement.mark_not_spawned();
+                }
+                return Err(error);
+            }
+        };
         let (tap, new_pid) = {
             let state = lock(&self.state);
             let entry = state.sessions.get(&new).ok_or(Failure::NoSession)?;
@@ -2018,7 +2067,6 @@ impl Registry {
                 break;
             }
             if lock(&self.state).exited.contains_key(&new) || tap.pulse().closed {
-                self.close(peer, new).ok();
                 return Err(Failure::BadRequest);
             }
             if !self.agents.account_resume_observed(new, &session_id)
@@ -2187,7 +2235,8 @@ impl Registry {
                 bots.revoke_launch_token(new_bot_token.as_ref());
             }
             // Do not leave two live agents consuming different accounts after a failed termination.
-            self.close(peer, new).ok();
+            // `Replacement::drop` stops `new` (or retains it if `old` just exited) and unlinks
+            // the journal once `new` is confirmed ended.
             lock(&self.account_handoffs).insert(
                 old,
                 SessionHandoff {
@@ -2310,7 +2359,7 @@ impl Registry {
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         self.transfer_account_selection(old, new, provider, account_id, || {
-            accounts::refresh_accounts_with(home, state_dir.as_deref(), false)
+            accounts::refresh_accounts(home, state_dir.as_deref())
         })
         .ok();
         Ok(new)
@@ -2361,6 +2410,7 @@ fn run_bounded<T: Sync>(jobs: &[T], work: impl Fn(&T) + Sync) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplacementDisposition {
     Unresolved,
+    NotSpawned,
     Retained { persisted: bool },
     Committed,
 }
@@ -2369,11 +2419,20 @@ struct Replacement<'a> {
     registry: &'a Registry,
     original: SessionId,
     session: SessionId,
+    spawned: bool,
     disposition: ReplacementDisposition,
     bot_grant_token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl Replacement<'_> {
+    fn mark_spawned(&mut self) {
+        self.spawned = true;
+    }
+
+    fn mark_not_spawned(&mut self) {
+        self.disposition = ReplacementDisposition::NotSpawned;
+    }
+
     fn mark_retained(&mut self, persisted: bool) {
         self.disposition = ReplacementDisposition::Retained { persisted };
     }
@@ -2391,13 +2450,15 @@ impl Drop for Replacement<'_> {
         }
         lock(&self.registry.account_replacements).remove(&self.session);
         let resolved = match self.disposition {
+            ReplacementDisposition::NotSpawned => true,
             ReplacementDisposition::Retained { persisted } => persisted,
             ReplacementDisposition::Committed => {
                 self.registry.account_original_ended(self.original)
             }
             ReplacementDisposition::Unresolved => {
                 // Without a handoff record the switch was cancelled, so the replacement has no claim to stay.
-                let only_remaining = self.registry.account_original_ended(self.original)
+                let only_remaining = self.spawned
+                    && self.registry.account_original_ended(self.original)
                     && !self.registry.account_original_ended(self.session)
                     && lock(&self.registry.account_handoffs).contains_key(&self.original);
                 if only_remaining {
@@ -2436,11 +2497,8 @@ impl Drop for Replacement<'_> {
                     {
                         bots.revoke_launch_token(Some(&token));
                     }
-                    // An unregistered target may be an unknown Spawn outcome. Leave its journal.
-                    let registered = lock(&self.registry.state)
-                        .sessions
-                        .contains_key(&self.session);
-                    registered && self.registry.stop_account_replacement(self.session)
+                    // An unspawned target may be an unknown Spawn outcome. Leave its journal.
+                    self.spawned && self.registry.stop_account_replacement(self.session)
                 }
             }
         };

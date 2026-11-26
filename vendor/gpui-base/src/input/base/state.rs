@@ -177,6 +177,14 @@ pub(crate) fn init(cx: &mut App) {
             },
             Some(CONTEXT),
         ),
+        KeyBinding::new(
+            "secondary-shift-enter",
+            Enter {
+                secondary: true,
+                shift: true,
+            },
+            Some(CONTEXT),
+        ),
         KeyBinding::new("escape", Escape, Some(CONTEXT)),
         KeyBinding::new("up", MoveUp, Some(CONTEXT)),
         KeyBinding::new("down", MoveDown, Some(CONTEXT)),
@@ -2053,11 +2061,14 @@ impl<M: InputModeKind> InputBaseState<M> {
             M::clear_inline_completion(self, cx);
         }
 
-        // In multi-line mode with `submit_on_enter` enabled, a plain `Enter`
-        // (without Shift) is treated as submit: propagate the action and emit
-        // PressEnter without inserting a newline. `Shift+Enter` still inserts
-        // a newline.
-        let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
+        // Secondary-modified Enter (Cmd/Ctrl+Enter, Cmd/Ctrl+Shift+Enter) is
+        // always treated as a submit/action shortcut and never inserts a
+        // newline. In multi-line mode with `submit_on_enter` enabled, a plain
+        // `Enter` (without Shift) is also treated as submit: propagate the
+        // action and emit PressEnter without inserting a newline, while
+        // `Shift+Enter` still inserts a newline.
+        let insert_newline =
+            self.is_multi_line() && !action.secondary && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
             if !self.selections.is_single() {
@@ -2197,6 +2208,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
+            cx.notify();
+            return;
         }
 
         if self.clean_on_escape {
@@ -7009,6 +7022,87 @@ mod tests {
                 assert_eq!(state.value(), "");
             });
         });
+    }
+
+    #[gpui::test]
+    fn test_secondary_enter_never_inserts_newline_in_multiline_textarea(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(bool, bool)>::new()));
+        let received_sub = received.clone();
+
+        cx.update(|window, cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                if let InputEvent::PressEnter { secondary, shift } = event {
+                    received_sub.borrow_mut().push((*secondary, *shift));
+                }
+            })
+            .detach();
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "line1", window, cx);
+                // Plain Enter inserts a newline when submit_on_enter is false.
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line1\n");
+                // Shift+Enter inserts a newline.
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line1\n\n");
+                // Secondary+Enter and Secondary+Shift+Enter must not insert a newline.
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line1\n\n");
+                // With submit_on_enter(true), Secondary+Shift+Enter also never inserts a newline.
+                state.set_submit_on_enter(true, cx);
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line1\n\n");
+            });
+        });
+
+        assert_eq!(
+            *received.borrow(),
+            vec![
+                (false, false),
+                (false, true),
+                (true, false),
+                (true, true),
+                (true, true),
+            ]
+        );
     }
 
     #[gpui::test]

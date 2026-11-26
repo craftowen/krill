@@ -2615,8 +2615,8 @@ test("unexpected text or protocol error during stage-2 authentication does not s
   assert.equal(h.transport.ready, true);
   h.transport.close();
 });
-test("MB-32: chat_subscribe, chat_unsubscribe and bots.sessions.list are reads and never poison updateBusy", async () => {
-  for (const action of ["chat_subscribe", "chat_unsubscribe", "bots.sessions.list"]) {
+test("MB-32: chat_subscribe, chat_unsubscribe and bot bundle reads are reads and never poison updateBusy", async () => {
+  for (const action of ["chat_subscribe", "chat_unsubscribe", "bots.sessions.list", "bots.hub", "bots.workspace", "bots.todo", "bots.avatars.read"]) {
     const h = harness(),
       { pending, socket } = await h.start(4);
     h.response(socket, { sessions: [] });

@@ -345,7 +345,140 @@ async function main(){
  context.performance={now:()=>clock};try{await testTuiScrollRouting();await testShortCanvasScroll();await testScrollPhysics();await testHistoryRefreshMerge();await testInitialAndQueuedHistoryScroll();await testFeedback2And5Regressions();}finally{delete context.performance;}
  await testKeyboardKeepsLiveView();
  await testFrozenRoleReply();
+ await testHistoryViewAndScrollStability();
  console.log('All terminal adapter regression checks passed.');
+}
+async function testHistoryViewAndScrollStability(){
+ const FEAT_HV=1n<<24n,cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)),row=t=>C.concat(T.v([...t].length),...[...t].map(cell));
+ const hvReply=(sock,req,view,status,skip,total,complete,texts)=>sock.frame(0x2d,T.v(req),T.v(view),T.v(7),T.v(0),T.v(0),T.v(0),T.v(status),T.v(0),T.v(skip),T.v(total),T.v(complete?1:0),T.v(texts.length),...texts.map(row));
+ // 1. FEAT_HISTORY_VIEW negotiation, deduplicated paging, clamped oldest boundary, bidirectional newer paging (including source-boundary straddle), and Invalidated/Missing recovery.
+ {
+  const root=new Element('div'),handle=context.mountFixture(root,2301,{preferences:{fitToPhone:false}});
+  await flush();const socket=context.sockets.at(-1),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history'),grid=find(root,'terminal-grid');
+  let top=0;port.clientHeight=400;
+  Object.defineProperty(grid,'offsetTop',{get:()=>hist.hidden?0:32+hist.children.length*18});
+  Object.defineProperty(port,'scrollHeight',{get:()=>grid.offsetTop+(grid.hidden?0:400)});
+  Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,Math.max(0,port.scrollHeight-port.clientHeight)));event(port,'scroll');}});
+  socket.handshake((1n<<56n)|FEAT_HV|8192n|4096n|5n);
+  const hello=socket.sent.find(a=>a[4]===2),hr=T.reader(hello.slice(5));hr.n();hr.n();assert((hr.u()&FEAT_HV)!==0n,'client advertises FEAT_HISTORY_VIEW');
+  socket.screen('live');await flush();
+  const hotReqs=()=>socket.sent.filter(a=>a[4]===0x12).map(a=>{const r=T.reader(a.slice(5));return {req:r.n(),source:r.n(),skip:r.n(),count:r.n()};});
+  const reqs=()=>socket.sent.filter(a=>a[4]===0x18).map(a=>{const r=T.reader(a.slice(5));return {req:r.n(),view:r.u(),skip:Number(r.u()),count:r.n()};});
+  const hotReply=(total,pages,skip,texts)=>socket.frame(0x26,T.v(hotReqs().at(-1).req),T.v(total),T.v(pages),T.v(skip),T.v(texts.length),...texts.map(row));
+  const newestFirst=(from,n)=>Array.from({length:n},(_,i)=>`row_${from+i}`);
+  // Initial warm stays on stateless 0x12 Hot reads (0 daemon HistoryView RAM retained while at live bottom).
+  assert.equal(hotReqs().length,1);assert.equal(reqs().length,0);
+  hotReply(900,1,0,newestFirst(0,300).reverse());await advance(0);
+  hotReply(900,1,300,newestFirst(300,300).reverse());await advance(0);
+  hotReply(900,1,600,newestFirst(600,300).reverse());await advance(0);
+  assert.equal(hist.children.length,900);assert.equal(hist.children[0].textContent,'row_899\n');assert.equal(hist.children[899].textContent,'row_0\n');
+  assert.equal(grid.hidden,false);assert.equal(reqs().length,0,'warming at live bottom opens zero HistoryView state in krilld');
+  // Upward drag from live bottom with 900 warmed rows and unchanged historyVersion must NOT fire an unnecessary older load.
+  event(port,'touchstart',{touches:[{clientX:150,clientY:200}]});
+  event(port,'touchmove',{touches:[{clientX:150,clientY:240}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(reqs().length,0,'upward drag from bottom with warmed unmodified history does not trigger premature cold load');
+  // Scroll near top past Hot -> lazily upgrades to frozen deduplicated 0x18 HistoryView at skip=900 (900 + 300 -> 1000 rows, windowStart = 200, windowEnd = 1200).
+  port.scrollTop=100;
+  assert.equal(reqs().length,1);assert.equal(reqs()[0].view,0n);assert.equal(reqs()[0].skip,900);
+  hvReply(socket,reqs().at(-1).req,1n,0,900,1500,false,newestFirst(900,300));
+  assert.equal(hist.children.length,1000);assert.equal(grid.hidden,true);
+  assert.equal(hist.children[0].textContent,'row_1199\n');assert.equal(hist.children[999].textContent,'row_200\n');
+  // Server clamping at oldest boundary (reply.skip < pending.skip) must deduplicate and never duplicate rows.
+  port.scrollTop=50;
+  const clampedReq=reqs().at(-1);assert.equal(clampedReq.view,1n);assert.equal(clampedReq.skip,1200);
+  hvReply(socket,clampedReq.req,1n,0,1150,1500,true,newestFirst(1150,350));
+  assert.equal(hist.children[0].textContent,'row_1499\n');assert.equal(hist.children[999].textContent,'row_500\n');
+  assert.equal(find(root,'load-history').disabled,true);
+  // Scrolling DOWN in windowed mode smoothly pages NEWER rows (no teleport straight to live!), including straddling a source boundary.
+  port.scrollTop=port.scrollHeight-port.clientHeight-100;
+  const newerReq1=reqs().at(-1);assert.equal(newerReq1.skip,200);assert.equal(newerReq1.count,300);
+  // Simulate Hot/Cold source boundary returning only [200, 450) -> adapter must request contiguous [450, 500) before appending!
+  hvReply(socket,newerReq1.req,1n,0,200,1500,false,newestFirst(200,250));
+  const gapReq=reqs().at(-1);assert.equal(gapReq.skip,450);assert.equal(gapReq.count,50);
+  hvReply(socket,gapReq.req,1n,0,450,1500,false,newestFirst(450,50));
+  assert.equal(hist.children[999].textContent,'row_450\n');assert.equal(grid.hidden,true,'still windowed above row 0');
+  // Continue paging down to skip=0 -> live canvas reappears seamlessly!
+  port.scrollTop=port.scrollHeight-port.clientHeight-100;
+  const newerReq2=reqs().at(-1);assert.equal(newerReq2.skip,150);
+  hvReply(socket,newerReq2.req,1n,0,150,1500,false,newestFirst(150,300));
+  assert.equal(hist.children[999].textContent,'row_150\n');
+  port.scrollTop=port.scrollHeight-port.clientHeight-100;
+  const newerReq3=reqs().at(-1);assert.equal(newerReq3.skip,0);assert.equal(newerReq3.count,150);
+  hvReply(socket,newerReq3.req,1n,0,0,1500,false,newestFirst(0,150));
+  assert.equal(hist.children[999].textContent,'row_0\n');assert.equal(grid.hidden,false,'canvas reappears at windowStart 0 without teleport');
+  // Invalidated status resets cleanly without throwing error.
+  port.scrollTop=50;
+  hvReply(socket,reqs().at(-1).req,1n,2,0,0,true,[]);
+  assert.notEqual(root.dataset.phase,'error');
+  handle.unmount();
+ }
+ // 1b. Reflowed 47-col Hot -> 80-col Cold seam with live-screen offset and chunk-split wrapped lines strips all duplicates seamlessly.
+ {
+  const root=new Element('div'),handle=context.mountFixture(root,2304,{preferences:{fitToPhone:false}});
+  await flush();const socket=context.sockets.at(-1),port=find(root,'terminal-scroll'),hist=find(root,'terminal-history');
+  const wCell=(ch,wrap)=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(wrap?1024:0));
+  const wRow=(t,wrap=false)=>{const cs=[...t];return C.concat(T.v(cs.length),...cs.map((ch,i)=>wCell(ch,wrap&&i===cs.length-1)));};
+  let top=0;port.clientHeight=400;port.scrollHeight=2000;
+  Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,Math.max(0,port.scrollHeight-port.clientHeight)));event(port,'scroll');}});
+  socket.handshake((1n<<56n)|FEAT_HV|8192n|4096n|5n);socket.screen('L004_HEAD_BODY_TAIL');await flush();
+  const hotReqs=()=>socket.sent.filter(a=>a[4]===0x12).map(a=>{const r=T.reader(a.slice(5));return {req:r.n()};});
+  const hvReqs=()=>socket.sent.filter(a=>a[4]===0x18).map(a=>{const r=T.reader(a.slice(5));return {req:r.n(),view:r.u(),skip:Number(r.u()),count:r.n()};});
+  // Hot has 3 wrapped logical lines L001..L003 (2 rows each = 6 rows, total=6, pages=1), while L004 is on live screen.
+  socket.frame(0x26,T.v(hotReqs().at(-1).req),T.v(6),T.v(1),T.v(0),T.v(6),
+   wRow('L001_HEAD_',true),wRow('BODY_TAIL',false),
+   wRow('L002_HEAD_',true),wRow('BODY_TAIL',false),
+   wRow('L003_HEAD_',true),wRow('BODY_TAIL',false));
+  // Scroll up to trigger Cold HistoryView opening at skip=6.
+  port.scrollTop=10;
+  assert.equal(hvReqs().length,1);
+  // Cold chunk 1 (newest-first): L004 (on live screen) + L003 + tail-only of L002 (split across chunk boundary!).
+  socket.frame(0x2d,T.v(hvReqs().at(-1).req),T.v(1n),T.v(7),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0),T.v(6),T.v(20),T.v(0),T.v(3),
+   wRow('L004_HEAD_BODY_TAIL',false),wRow('L003_HEAD_BODY_TAIL',false),wRow('BODY_TAIL',false));
+  // Entire chunk 1 was duplicate -> adapter automatically requests chunk 2 at skip=9!
+  assert.equal(hvReqs().length,2);assert.equal(hvReqs().at(-1).skip,9);
+  // Cold chunk 2 (newest-first): head-only of L002 (tailWrapped!) + L001 (duplicate) + L000 (genuinely older!).
+  socket.frame(0x2d,T.v(hvReqs().at(-1).req),T.v(1n),T.v(7),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0),T.v(9),T.v(20),T.v(1),T.v(3),
+   wRow('L002_HEAD_',true),wRow('L001_HEAD_BODY_TAIL',false),wRow('L000_OLDER_LINE',false));
+  assert.equal(hist.children[0].textContent,'L000_OLDER_LINE\n','only genuinely older cold line prepended above L001');
+  assert.equal(hist.children[1].textContent,'L001_HEAD_\n','L001 is never duplicated');
+  assert.equal(hist.children.length,7);
+  handle.unmount();
+ }
+ // 2. Keyboard open while scrolled up (!stick) must NOT yank scrollTop down to cursor.
+ {
+  const {root,handle,socket}=await mount(2302,{preferences:{fitToPhone:false}}),port=find(root,'terminal-scroll');
+  let top=0;port.clientHeight=200;port.scrollHeight=2000;
+  Object.defineProperty(port,'scrollTop',{get:()=>top,set:v=>{top=Math.max(0,Math.min(v,port.scrollHeight-port.clientHeight));event(port,'scroll');}});
+  context.requestAnimationFrame=fn=>context.setTimeout(fn,16);
+  viewport.height=844;event(viewport,'resize');await advance(32);
+  port.scrollTop=300;assert.equal(top,300);
+  viewport.height=444;event(viewport,'resize');await advance(32);
+  assert.equal(top,300,'keyboard open while scrolled up keeps reading position pinned');
+  viewport.height=844;event(viewport,'resize');await advance(32);handle.unmount();delete context.requestAnimationFrame;
+ }
+ // 3. Zero-distance pinch & non-cancelable touch/gesture events never throw or produce NaN; transient 0x21 delta error resyncs without phase=error; disconnect never enters phase=error.
+ {
+  const statuses=[];const {root,handle,socket}=await mount(2303,{preferences:{fitToPhone:false},onStatus:s=>statuses.push(s)});
+  const port=find(root,'terminal-scroll'),canvas=find(root,'terminal-grid');
+  const nonCancel=new Event('touchmove',{cancelable:false});nonCancel.touches=[{clientX:100,clientY:100},{clientX:100,clientY:100}];
+  context.document.dispatchEvent(nonCancel);
+  event(port,'touchstart',{touches:[{clientX:100,clientY:100},{clientX:100,clientY:100}]});
+  event(port,'touchmove',{touches:[{clientX:100,clientY:100},{clientX:120,clientY:120}]});
+  event(port,'touchend',{touches:[]});
+  assert.equal(canvas.style.transform,'');assert(!Number.isNaN(port.scrollTop));
+  // Recoverable 0x21 delta error (Invalid scroll k >= lines) sends 0x11 RESYNC without transitioning to phase=error.
+  const resyncBefore=socket.sent.filter(a=>a[4]===0x11).length;
+  socket.frame(0x21,T.v(9),T.v(9),T.v(1),T.v(1),T.v(1),T.v(200));
+  assert.equal(socket.sent.filter(a=>a[4]===0x11).length,resyncBefore+1,'recoverable 0x21 delta sends RESYNC');
+  assert.equal(root.dataset.phase,'ready','single recoverable delta error does not lock terminal into phase=error');
+  // Disconnect during background send transitions cleanly to disconnected, never phase=error.
+  socket.readyState=3;
+  event(find(root,'load-history'),'click');
+  assert.equal(root.dataset.phase,'disconnected');
+  handle.unmount();
+ }
+ console.log('PASS FEAT_HISTORY_VIEW frozen/bidirectional scroll, non-cancelable/zero-pinch safety, scrolled-up keyboard pin, and recoverable resync');
 }
 async function testFeedback2And5Regressions(){
  // Feedback #2: keyboardOpen=true (e.g. Android dynamic toolbar or another field) while THIS terminal's input is unfocused must still focus on tap.

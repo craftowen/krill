@@ -166,6 +166,7 @@ fn watch_for_with(
             Err(e)
                 if e.kind() == io::ErrorKind::TimedOut
                     && pending
+                    && consumed == 0
                     && missed.saturating_add(1) < MISSES =>
             {
                 missed = missed.saturating_add(1);
@@ -303,7 +304,8 @@ pub const SUN_PATH_MAX: usize = 108;
 /// launchd 잡 소프트 fd 한도(launchd 기본 256, C2 실측). holder가 스스로 올리는 값과 같다.
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// macOS 앱 업데이트 직후 `launchd`·`syspolicyd` 콜드 스타트 지연을 흡수하도록 `UNDER_LOCK_BUDGET`(15s) 안에서 넉넉히 잡는다.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(12);
 /// 실패한 기동의 holder가 SIGTERM으로 끝나기를 기다리는 최대 시간(세션을 새 krilld에 넘기는 시간 포함).
 #[cfg(unix)]
 const STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -564,7 +566,11 @@ fn allow_installed_apps_for_paths(exe: &Path, home: Option<&Path>) -> bool {
 /// 없으면 진단 메시지가 기대 위치를 가리키도록 `<실행 파일 디렉터리>/<name>`을 돌려준다.
 pub fn sibling_exe(name: &str) -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    sibling_exe_from(&exe, name)
+}
+
+fn sibling_exe_from(exe: &Path, name: &str) -> io::Result<PathBuf> {
+    let exe = crate::os::canonicalize(exe).unwrap_or_else(|_| crate::os::shell_path(exe));
     let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
     Ok(find_exe(bin, &[], name))
 }
@@ -799,12 +805,7 @@ pub fn preflight(path: &Path) -> io::Result<()> {
     if !valid_magic {
         return Err(io::Error::from_raw_os_error(8)); // ENOEXEC
     }
-    let mut command = Command::new(path);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    let mut command = crate::os::background_command(path);
     let status = command
         .env_clear()
         .stdin(Stdio::null())

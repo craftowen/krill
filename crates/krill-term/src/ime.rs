@@ -157,6 +157,8 @@ impl Ime {
         if discard_ime {
             self.push_pending(&text);
             self.committed = Some(text);
+        } else if !bytes.is_empty() {
+            self.committed = None;
         }
         Output { pty, discard_ime }
     }
@@ -419,5 +421,29 @@ mod edge_tests {
         assert_eq!(ime.selected_columns(), None);
         drop(ime.commit());
         assert_eq!(ime.selected_columns(), None);
+    }
+
+    #[test]
+    fn non_empty_commit_then_clears_stale_duplicate_guard_while_empty_commit_preserves_it() {
+        let mut ime = Ime::default();
+        ime.set_marked("한", None);
+        assert_eq!(ime.commit_then(b"\r").pty, "한\r".as_bytes());
+        // Platform honored discardMarkedText (no late duplicate arrived).
+        // A subsequent keystroke clears the one-shot guard so direct insertText("한") is kept.
+        assert_eq!(ime.commit_then(b"\r").pty, b"\r");
+        assert_eq!(ime.insert("한").pty, "한".as_bytes());
+
+        // Same for paste after a force-commit.
+        ime.set_marked("한", None);
+        assert_eq!(ime.commit_then(b"\r").pty, "한\r".as_bytes());
+        assert_eq!(ime.commit_then(b"XY").pty, b"XY");
+        assert_eq!(ime.insert("한").pty, "한".as_bytes());
+
+        // Empty commit() (e.g. duplicate focus loss) preserves the guard for a late duplicate.
+        ime.set_marked("한", None);
+        assert_eq!(ime.commit().pty, "한".as_bytes());
+        assert_eq!(ime.commit().pty, b"");
+        assert_eq!(ime.insert("한").pty, b"");
+        assert_eq!(ime.insert("한").pty, "한".as_bytes());
     }
 }

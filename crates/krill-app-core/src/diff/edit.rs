@@ -643,6 +643,79 @@ fn counterpart_marker(
     None
 }
 
+struct PatchGroupLine {
+    line_no: usize,
+    patch_ix: usize,
+    text: String,
+    no_nl: bool,
+}
+
+enum LineSelection {
+    SingleSide {
+        side: gpui_component::diff::DiffSide,
+        lo: usize,
+        hi: usize,
+    },
+    PatchSpan {
+        lo: usize,
+        hi: usize,
+    },
+}
+
+fn find_patch_span(
+    hunks: &[String],
+    start_side: gpui_component::diff::DiffSide,
+    start_line: usize,
+    end_side: gpui_component::diff::DiffSide,
+    end_line: usize,
+) -> Option<(usize, usize)> {
+    let mut patch_ix = 0usize;
+    let mut start_ix = None;
+    let mut end_ix = None;
+    for hunk in hunks {
+        let mut lines = hunk
+            .split_inclusive('\n')
+            .map(|line| line.strip_suffix('\n').unwrap_or(line));
+        let Some(hunk_header) = lines.next() else {
+            continue;
+        };
+        let Some((mut old_ln, mut new_ln, _)) = parse_hunk_header_starts(hunk_header) else {
+            continue;
+        };
+        for raw_line in lines {
+            let (orig_ln, mod_ln) = if raw_line.starts_with('-') {
+                let pair = (Some(old_ln), None);
+                old_ln += 1;
+                pair
+            } else if raw_line.starts_with('+') {
+                let pair = (None, Some(new_ln));
+                new_ln += 1;
+                pair
+            } else if raw_line.starts_with(' ') {
+                let pair = (Some(old_ln), Some(new_ln));
+                old_ln += 1;
+                new_ln += 1;
+                pair
+            } else {
+                continue;
+            };
+            let matches_side = |side, target| match side {
+                gpui_component::diff::DiffSide::Original => orig_ln == Some(target),
+                gpui_component::diff::DiffSide::Modified => mod_ln == Some(target),
+            };
+            if start_ix.is_none() && matches_side(start_side, start_line) {
+                start_ix = Some(patch_ix);
+            }
+            if end_ix.is_none() && matches_side(end_side, end_line) {
+                end_ix = Some(patch_ix);
+            }
+            patch_ix += 1;
+        }
+    }
+    let (s, e) = (start_ix?, end_ix?);
+    Some((s.min(e), s.max(e)))
+}
+
 #[must_use]
 pub fn build_line_patch(
     raw_patch: &str,
@@ -651,18 +724,41 @@ pub fn build_line_patch(
     end_line: usize,
     use_new_line_numbers: bool,
 ) -> Option<String> {
-    let (lo, hi) = if start_line <= end_line {
-        (start_line, end_line)
+    let side = if use_new_line_numbers {
+        gpui_component::diff::DiffSide::Modified
     } else {
-        (end_line, start_line)
+        gpui_component::diff::DiffSide::Original
     };
+    build_line_patch_for_sides(raw_patch, is_reverse, side, start_line, side, end_line)
+}
+
+#[must_use]
+pub fn build_line_patch_for_sides(
+    raw_patch: &str,
+    is_reverse: bool,
+    start_side: gpui_component::diff::DiffSide,
+    start_line: usize,
+    end_side: gpui_component::diff::DiffSide,
+    end_line: usize,
+) -> Option<String> {
     let (header, hunks) = extract_patch_header_and_hunks(raw_patch);
     if header.trim().is_empty() || hunks.is_empty() || !patch_roundtrips(&header) {
         return None;
     }
+    let selection = if start_side == end_side {
+        LineSelection::SingleSide {
+            side: start_side,
+            lo: start_line.min(end_line),
+            hi: start_line.max(end_line),
+        }
+    } else {
+        let (lo, hi) = find_patch_span(&hunks, start_side, start_line, end_side, end_line)?;
+        LineSelection::PatchSpan { lo, hi }
+    };
     let mut out_hunks = Vec::new();
     let mut has_old_lines = false;
     let mut has_new_lines = false;
+    let mut patch_ix = 0usize;
     for hunk in &hunks {
         // `\n`만 떼고 `\r`은 본문의 일부로 남긴다(CRLF 보존).
         let mut lines = hunk
@@ -678,53 +774,88 @@ pub fn build_line_patch(
         let mut new_ln = new_start;
         let mut body_lines: Vec<String> = Vec::new();
         let mut changed = false;
-        let mut minus_group: Vec<(usize, String, bool)> = Vec::new();
-        let mut plus_group: Vec<(usize, String, bool)> = Vec::new();
+        let mut minus_group: Vec<PatchGroupLine> = Vec::new();
+        let mut plus_group: Vec<PatchGroupLine> = Vec::new();
         let mut last_kind: Option<char> = None;
-        let flush_group = |minus_group: &mut Vec<(usize, String, bool)>,
-                           plus_group: &mut Vec<(usize, String, bool)>,
+        let flush_group = |minus_group: &mut Vec<PatchGroupLine>,
+                           plus_group: &mut Vec<PatchGroupLine>,
                            body_lines: &mut Vec<String>,
                            changed: &mut bool| {
             if minus_group.is_empty() && plus_group.is_empty() {
                 return;
             }
-            let max_len = minus_group.len().max(plus_group.len());
-            for i in 0..max_len {
-                let m = minus_group.get(i);
-                let p = plus_group.get(i);
-                let selected = if use_new_line_numbers {
-                    p.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi)
-                        || (p.is_none() && m.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi))
-                } else {
-                    m.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi)
-                        || (m.is_none() && p.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi))
-                };
-                if selected {
-                    if let Some((_, text, no_nl)) = m {
-                        body_lines.push(format!("-{text}"));
-                        if *no_nl {
-                            body_lines.push("\\ No newline at end of file".to_owned());
+            match &selection {
+                LineSelection::SingleSide { side, lo, hi } => {
+                    let max_len = minus_group.len().max(plus_group.len());
+                    for i in 0..max_len {
+                        let m = minus_group.get(i);
+                        let p = plus_group.get(i);
+                        let selected = match side {
+                            gpui_component::diff::DiffSide::Modified => {
+                                p.is_some_and(|line| line.line_no >= *lo && line.line_no <= *hi)
+                            }
+                            gpui_component::diff::DiffSide::Original => {
+                                m.is_some_and(|line| line.line_no >= *lo && line.line_no <= *hi)
+                            }
+                        };
+                        if selected {
+                            if let Some(line) = m {
+                                body_lines.push(format!("-{}", line.text));
+                                if line.no_nl {
+                                    body_lines.push("\\ No newline at end of file".to_owned());
+                                }
+                                *changed = true;
+                            }
+                            if let Some(line) = p {
+                                body_lines.push(format!("+{}", line.text));
+                                if line.no_nl {
+                                    body_lines.push("\\ No newline at end of file".to_owned());
+                                }
+                                *changed = true;
+                            }
+                        } else if !is_reverse {
+                            if let Some(line) = m {
+                                body_lines.push(format!(" {}", line.text));
+                                if line.no_nl {
+                                    body_lines.push("\\ No newline at end of file".to_owned());
+                                }
+                            }
+                        } else if let Some(line) = p {
+                            body_lines.push(format!(" {}", line.text));
+                            if line.no_nl {
+                                body_lines.push("\\ No newline at end of file".to_owned());
+                            }
                         }
-                        *changed = true;
                     }
-                    if let Some((_, text, no_nl)) = p {
-                        body_lines.push(format!("+{text}"));
-                        if *no_nl {
-                            body_lines.push("\\ No newline at end of file".to_owned());
+                }
+                LineSelection::PatchSpan { lo, hi } => {
+                    for line in minus_group.drain(..) {
+                        if line.patch_ix >= *lo && line.patch_ix <= *hi {
+                            body_lines.push(format!("-{}", line.text));
+                            if line.no_nl {
+                                body_lines.push("\\ No newline at end of file".to_owned());
+                            }
+                            *changed = true;
+                        } else if !is_reverse {
+                            body_lines.push(format!(" {}", line.text));
+                            if line.no_nl {
+                                body_lines.push("\\ No newline at end of file".to_owned());
+                            }
                         }
-                        *changed = true;
                     }
-                } else if !is_reverse {
-                    if let Some((_, text, no_nl)) = m {
-                        body_lines.push(format!(" {text}"));
-                        if *no_nl {
-                            body_lines.push("\\ No newline at end of file".to_owned());
+                    for line in plus_group.drain(..) {
+                        if line.patch_ix >= *lo && line.patch_ix <= *hi {
+                            body_lines.push(format!("+{}", line.text));
+                            if line.no_nl {
+                                body_lines.push("\\ No newline at end of file".to_owned());
+                            }
+                            *changed = true;
+                        } else if is_reverse {
+                            body_lines.push(format!(" {}", line.text));
+                            if line.no_nl {
+                                body_lines.push("\\ No newline at end of file".to_owned());
+                            }
                         }
-                    }
-                } else if let Some((_, text, no_nl)) = p {
-                    body_lines.push(format!(" {text}"));
-                    if *no_nl {
-                        body_lines.push("\\ No newline at end of file".to_owned());
                     }
                 }
             }
@@ -741,12 +872,24 @@ pub fn build_line_patch(
                         &mut changed,
                     );
                 }
-                minus_group.push((old_ln, rest.to_owned(), false));
+                minus_group.push(PatchGroupLine {
+                    line_no: old_ln,
+                    patch_ix,
+                    text: rest.to_owned(),
+                    no_nl: false,
+                });
                 old_ln += 1;
+                patch_ix += 1;
                 last_kind = Some('-');
             } else if let Some(rest) = raw_line.strip_prefix('+') {
-                plus_group.push((new_ln, rest.to_owned(), false));
+                plus_group.push(PatchGroupLine {
+                    line_no: new_ln,
+                    patch_ix,
+                    text: rest.to_owned(),
+                    no_nl: false,
+                });
                 new_ln += 1;
+                patch_ix += 1;
                 last_kind = Some('+');
             } else if let Some(rest) = raw_line.strip_prefix(' ') {
                 flush_group(
@@ -758,17 +901,18 @@ pub fn build_line_patch(
                 body_lines.push(format!(" {rest}"));
                 old_ln += 1;
                 new_ln += 1;
+                patch_ix += 1;
                 last_kind = Some(' ');
             } else if raw_line.starts_with('\\') {
                 match last_kind {
                     Some('-') => {
                         if let Some(last) = minus_group.last_mut() {
-                            last.2 = true;
+                            last.no_nl = true;
                         }
                     }
                     Some('+') => {
                         if let Some(last) = plus_group.last_mut() {
-                            last.2 = true;
+                            last.no_nl = true;
                         }
                     }
                     Some(' ') => {
@@ -880,6 +1024,16 @@ pub fn apply_git_patch(
     cached: bool,
     reverse: bool,
 ) -> io::Result<()> {
+    apply_git_patch_with_timeout(repo, patch_text, cached, reverse, TIMEOUT)
+}
+
+fn apply_git_patch_with_timeout(
+    repo: &Path,
+    patch_text: &str,
+    cached: bool,
+    reverse: bool,
+    timeout: Duration,
+) -> io::Result<()> {
     let mut cmd = crate::platform::background_command("git");
     cmd.current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -898,20 +1052,19 @@ pub fn apply_git_patch(
             .stderr(Stdio::piped())
             .spawn()?,
     );
-    if let Some(mut stdin) = child.0.stdin.take() {
-        stdin.write_all(patch_text.as_bytes())?;
-    }
+    let stdin = child
+        .0
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing git apply stdin"))?;
     let stderr = child
         .0
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing git apply stderr"))?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.take(64 * 1024).read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
+    let writer = crate::process_io::write(stdin, patch_text.as_bytes().to_vec(), deadline)?;
+    let reader = crate::process_io::read(stderr, 64 * 1024, deadline)?;
     let status = loop {
         match child.0.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -927,20 +1080,30 @@ pub fn apply_git_patch(
     };
     child.0.kill().ok();
     child.0.wait().ok();
-    let err_bytes = reader
-        .join()
-        .map_err(|_| io::Error::other("git apply reader failed"))??;
     let status = status?;
-    if status.success() {
-        Ok(())
-    } else {
-        let msg = String::from_utf8_lossy(&err_bytes).trim().to_owned();
-        Err(io::Error::other(if msg.is_empty() {
+    let finish_deadline = deadline + Duration::from_millis(50);
+    let write_res = writer.finish(finish_deadline);
+    let captured = reader.finish(finish_deadline)?;
+    if captured.timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "git apply pipe timed out",
+        ));
+    }
+    if !status.success() {
+        let msg = String::from_utf8_lossy(&captured.bytes).trim().to_owned();
+        return Err(io::Error::other(if msg.is_empty() {
             "git apply failed".to_owned()
         } else {
             msg
-        }))
+        }));
     }
+    if let Err(err) = write_res
+        && err.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub(super) struct State {
@@ -1228,10 +1391,14 @@ impl Panel {
         let Some(range) = self.state.read(cx).selected_lines() else {
             return;
         };
-        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
-        let Some(patch_text) =
-            build_line_patch(&self.raw_patch, false, range.start(), range.end(), use_new)
-        else {
+        let Some(patch_text) = build_line_patch_for_sides(
+            &self.raw_patch,
+            false,
+            range.side(),
+            range.start(),
+            range.end_side(),
+            range.end(),
+        ) else {
             self.reject_unsafe_patch(cx);
             return;
         };
@@ -1245,10 +1412,14 @@ impl Panel {
         let Some(range) = self.state.read(cx).selected_lines() else {
             return;
         };
-        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
-        let Some(patch_text) =
-            build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
-        else {
+        let Some(patch_text) = build_line_patch_for_sides(
+            &self.raw_patch,
+            true,
+            range.side(),
+            range.start(),
+            range.end_side(),
+            range.end(),
+        ) else {
             self.reject_unsafe_patch(cx);
             return;
         };
@@ -1262,10 +1433,14 @@ impl Panel {
         let Some(range) = self.state.read(cx).selected_lines() else {
             return;
         };
-        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
-        let Some(patch_text) =
-            build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
-        else {
+        let Some(patch_text) = build_line_patch_for_sides(
+            &self.raw_patch,
+            true,
+            range.side(),
+            range.start(),
+            range.end_side(),
+            range.end(),
+        ) else {
             self.reject_unsafe_patch(cx);
             return;
         };
@@ -1645,13 +1820,11 @@ impl Panel {
             .into_any_element()
     }
 
-    /// Commit message input, created lazily. `submit_on_enter(true)` suppresses
-    /// the native newline for `⌘Enter` (`secondary-enter`) so it submits
-    /// without leaving a stray newline in the message; plain/shift `Enter`
-    /// still insert exactly one newline natively. Element-level
-    /// `capture_key_down` cannot intercept it: the input's `secondary-enter`
-    /// binding consumes the keystroke before element handlers run, so this
-    /// helper subscribes to `InputEvent::PressEnter` instead.
+    /// Commit message input, created lazily. Plain `Enter` and `Shift+Enter`
+    /// insert newlines natively in the multi-line textarea, while
+    /// `⌘Enter`/`Ctrl+Enter` (`secondary-enter`) and `⇧⌘Enter`/`Ctrl+Shift+Enter`
+    /// (`secondary-shift-enter`) emit `InputEvent::PressEnter` without inserting
+    /// a newline and submit Commit / Commit & Push.
     fn ensure_commit_input(
         &mut self,
         window: &mut Window,
@@ -1661,14 +1834,9 @@ impl Panel {
             .editing
             .input
             .get_or_insert_with(|| {
-                cx.new(|cx| {
-                    TextareaState::new(window, cx)
-                        .placeholder(text::MESSAGE.get())
-                        .submit_on_enter(true)
-                })
+                cx.new(|cx| TextareaState::new(window, cx).placeholder(text::MESSAGE.get()))
             })
             .clone();
-        input.update(cx, |state, cx| state.set_submit_on_enter(true, cx));
         if self.editing.input_enter_sub.is_none() {
             let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { secondary, shift } = event
@@ -1803,6 +1971,13 @@ impl Panel {
                     .id("git-commit-input")
                     .debug_selector(|| "git-commit-input".into())
                     .w_full()
+                    .on_action(
+                        cx.listener(|_, action: &gpui_component::input::Enter, _, cx| {
+                            if !action.secondary {
+                                cx.propagate();
+                            }
+                        }),
+                    )
                     .child(
                         Textarea::new(&input)
                             .h(crate::ui::SPACE_4 * 3.5)

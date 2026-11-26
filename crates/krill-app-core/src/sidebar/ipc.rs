@@ -150,6 +150,7 @@ fn watch_exchange(stream: &mut UnixStream, req: GitWatchRequest) -> io::Result<G
 struct Conn {
     stream: UnixStream,
     features: u64,
+    epoch: u64,
     daemon_identity: Option<krill_proto::ipc::DaemonIdentity>,
     machine_identity: Option<krill_proto::ipc::MachineIdentity>,
 }
@@ -441,7 +442,7 @@ impl Shared {
         f: impl FnOnce(&mut UnixStream) -> io::Result<T>,
     ) -> io::Result<T> {
         self.with_identified_conn(required, read, f)
-            .map(|(value, _)| value)
+            .map(|(value, _, _)| value)
     }
 
     fn with_identified_conn<T>(
@@ -449,7 +450,7 @@ impl Shared {
         required: u64,
         read: Duration,
         f: impl FnOnce(&mut UnixStream) -> io::Result<T>,
-    ) -> io::Result<(T, ConnectionIdentities)> {
+    ) -> io::Result<(T, ConnectionIdentities, u64)> {
         let mut guard = self
             .conn
             .lock()
@@ -458,9 +459,10 @@ impl Shared {
             *guard = None;
             return Err(io::ErrorKind::Interrupted.into());
         }
+        let current_epoch = self.target.transport_epoch();
         if guard
             .as_ref()
-            .is_none_or(|c| c.features & required != required)
+            .is_none_or(|c| c.features & required != required || c.epoch != current_epoch)
         {
             *guard = Some(connect(&self.target, required, read)?);
         }
@@ -471,6 +473,7 @@ impl Shared {
             *guard = None;
             return Err(e);
         }
+        let epoch = conn.epoch;
         let identity = ConnectionIdentities {
             daemon: conn.daemon_identity,
             machine: conn.machine_identity,
@@ -481,13 +484,18 @@ impl Shared {
             return Err(io::ErrorKind::Interrupted.into());
         }
         match &res {
-            Ok(_) => self.target.record_outcome(true, None),
+            Ok(_) => {
+                if self.target.transport_epoch() != epoch {
+                    *guard = None;
+                }
+                self.target.record_outcome_for_epoch(epoch, true, None);
+            }
             Err(e) => {
                 *guard = None;
-                self.target.record_outcome(false, Some(e));
+                self.target.record_outcome_for_epoch(epoch, false, Some(e));
             }
         }
-        res.map(|value| (value, identity))
+        res.map(|value| (value, identity, epoch))
     }
 
     /// 워크트리별 미커밋 파일 수(`Request::GitWatch` 재사용).
@@ -626,7 +634,7 @@ impl Shared {
             |stream| fetch_from(stream, &external, is_local),
         );
         match result {
-            Ok(((snapshot, branches, histories, closed), identities)) => {
+            Ok(((snapshot, branches, histories, closed), identities, epoch)) => {
                 if let Ok(mut guard) = self.branches.lock() {
                     *guard = branches;
                 }
@@ -637,7 +645,7 @@ impl Shared {
                 };
                 *cached = Some(CachedSnapshot {
                     at: Instant::now(),
-                    epoch: self.target.transport_epoch(),
+                    epoch,
                     observed: snapshot.clone(),
                     histories,
                     closed,
@@ -937,11 +945,12 @@ fn connect(target: &HostTarget, required: u64, read: Duration) -> io::Result<Con
         Ok(Conn {
             stream,
             features: negotiated.features,
+            epoch: target.transport_epoch(),
             daemon_identity,
             machine_identity,
         })
     } else {
-        let c = target.connect(&hello).map_err(|e| match e {
+        let (c, epoch) = target.connect_with_epoch(&hello).map_err(|e| match e {
             krill_proto::daemon::Error::Io(io_err) => io_err,
             other => io::Error::other(other.to_string()),
         })?;
@@ -953,6 +962,7 @@ fn connect(target: &HostTarget, required: u64, read: Duration) -> io::Result<Con
         Ok(Conn {
             stream: c.stream,
             features: c.negotiated.features,
+            epoch,
             daemon_identity: c.daemon_identity,
             machine_identity: c.machine_identity,
         })
@@ -1907,5 +1917,114 @@ mod tests {
         worker.join().unwrap();
         drop(socket);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_conn_discards_stream_and_fences_outcome_on_epoch_advance() {
+        use krill_hosts::RemoteConnector;
+        use krill_proto::ipc::{self as wire, ServerHello};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let root = std::env::temp_dir().join(format!("krill-sb-epoch-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let sock1 = root.join("t1.sock");
+        let sock2 = root.join("t2.sock");
+        let l1 = UnixListener::bind(&sock1).unwrap();
+        let l2 = UnixListener::bind(&sock2).unwrap();
+
+        let keep_open = Arc::new(AtomicBool::new(true));
+        let spawn_echo = |listener: UnixListener, reply: u8, hold: Arc<AtomicBool>| {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let hello = ServerHello {
+                    proto_min: wire::PROTO_MIN,
+                    proto_max: wire::PROTO_MAX,
+                    features: wire::FEATURES,
+                    build: "fixture".into(),
+                    instance_id: 1,
+                };
+                stream.write_all(&hello.encode().unwrap()).unwrap();
+                wire::read_frame(&mut stream).unwrap().unwrap();
+                let mut buf = [0u8; 1];
+                stream.read_exact(&mut buf).unwrap();
+                stream.write_all(&[reply]).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while hold.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let t1 = spawn_echo(l1, b'1', Arc::clone(&keep_open));
+        let t2 = spawn_echo(l2, b'2', Arc::clone(&keep_open));
+
+        let epoch = Arc::new(AtomicU64::new(0));
+        let outcomes: Arc<Mutex<Vec<(u64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ensure_epoch = Arc::clone(&epoch);
+        let p1 = sock1.clone();
+        let p2 = sock2.clone();
+        let read_epoch = Arc::clone(&epoch);
+        let rec_outcomes = Arc::clone(&outcomes);
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            sock1,
+            RemoteConnector::new(
+                move || {
+                    Ok(if ensure_epoch.load(Ordering::Acquire) == 0 {
+                        p1.clone()
+                    } else {
+                        p2.clone()
+                    })
+                },
+                |_, _| {},
+            )
+            .with_transport_epoch(move || read_epoch.load(Ordering::Acquire))
+            .with_epoch_outcome(move |ep, ok, _| {
+                rec_outcomes.lock().unwrap().push((ep, ok));
+            }),
+        );
+
+        let socket = Socket::new(target);
+        let first = socket
+            .shared
+            .with_conn(FEAT_CONTROL, Duration::from_secs(2), |stream| {
+                stream.write_all(b"a")?;
+                let mut out = [0u8; 1];
+                stream.read_exact(&mut out)?;
+                Ok(out[0])
+            })
+            .unwrap();
+        assert_eq!(first, b'1');
+
+        // Advance transport_epoch while t1 is still open; with_conn must discard cached t1 and dial t2.
+        epoch.store(1, Ordering::Release);
+        let epoch_mid = Arc::clone(&epoch);
+        let second = socket
+            .shared
+            .with_conn(FEAT_CONTROL, Duration::from_secs(2), |stream| {
+                stream.write_all(b"b")?;
+                let mut out = [0u8; 1];
+                stream.read_exact(&mut out)?;
+                // Advance epoch mid-request: outcome must still be fenced to epoch 1 and cached stream dropped.
+                epoch_mid.store(2, Ordering::Release);
+                Ok(out[0])
+            })
+            .unwrap();
+        assert_eq!(second, b'2');
+        assert_eq!(*outcomes.lock().unwrap(), vec![(0, true), (1, true)]);
+        assert!(
+            socket.shared.conn.lock().unwrap().is_none(),
+            "stream whose epoch advanced mid-request must be evicted"
+        );
+
+        keep_open.store(false, Ordering::Release);
+        t1.join().unwrap();
+        t2.join().unwrap();
+        drop(socket);
+        fs::remove_dir_all(&root).ok();
     }
 }

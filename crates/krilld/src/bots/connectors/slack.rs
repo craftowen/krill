@@ -24,8 +24,8 @@ use zeroize::Zeroizing;
 
 use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
-    ConversationRouter, DeliveryTarget, InboundRouteOutcome, PlatformSender, classify_error,
-    now_ms, sanitize_error_for_status,
+    ConversationRouter, DeliveryTarget, InboundRouteOutcome, PlatformSender, ResumeCallbackOutcome,
+    SLACK_RESUME_ACTION_ID, classify_error, now_ms, sanitize_error_for_status,
 };
 use crate::bots::connectors::ws_client::{WsClient, WsEvent};
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
@@ -270,6 +270,51 @@ impl SlackSender {
             },
         }
     }
+    /// Builds Slack Block Kit blocks attaching an interactive `Resume` button to a failed or
+    /// interrupted status message (Orca #47233, #47898).
+    #[must_use]
+    pub fn build_failure_blocks(text: &str, resume_action_value: &str) -> Value {
+        json!([
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Resume"
+                        },
+                        "action_id": SLACK_RESUME_ACTION_ID,
+                        "value": resume_action_value
+                    }
+                ]
+            }
+        ])
+    }
+
+    /// Updates an existing Slack message in place and clears any interactive Block Kit buttons.
+    pub fn edit_message_clearing_blocks(
+        &self,
+        target: &DeliveryTarget,
+        message_id: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        let payload = json!({
+            "channel": target.channel_id,
+            "ts": message_id,
+            "text": text,
+            "blocks": [],
+        });
+        self.post_api("chat.update", self.bot_token.as_str(), &payload)?;
+        Ok(())
+    }
 }
 
 impl PlatformSender for SlackSender {
@@ -312,6 +357,63 @@ impl PlatformSender for SlackSender {
             "ts": message_id,
             "text": text,
         });
+        self.post_api("chat.update", self.bot_token.as_str(), &payload)?;
+        Ok(())
+    }
+
+    fn send_failure_message(
+        &self,
+        target: &DeliveryTarget,
+        text: &str,
+        resume_action_value: Option<&str>,
+    ) -> io::Result<String> {
+        let mut payload = json!({
+            "channel": target.channel_id,
+            "text": text,
+        });
+        if let Some(ref ts) = target.thread_id
+            && !ts.trim().is_empty()
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert("thread_ts".to_owned(), json!(ts));
+        }
+        if let Some(resume_val) = resume_action_value.filter(|s| !s.trim().is_empty())
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "blocks".to_owned(),
+                Self::build_failure_blocks(text, resume_val),
+            );
+        }
+        let parsed = self.post_api("chat.postMessage", self.bot_token.as_str(), &payload)?;
+        let ts = parsed
+            .get("ts")
+            .and_then(Value::as_str)
+            .unwrap_or("0")
+            .to_owned();
+        Ok(ts)
+    }
+
+    fn edit_failure_message(
+        &self,
+        target: &DeliveryTarget,
+        message_id: &str,
+        text: &str,
+        resume_action_value: Option<&str>,
+    ) -> io::Result<()> {
+        let mut payload = json!({
+            "channel": target.channel_id,
+            "ts": message_id,
+            "text": text,
+        });
+        if let Some(resume_val) = resume_action_value.filter(|s| !s.trim().is_empty())
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "blocks".to_owned(),
+                Self::build_failure_blocks(text, resume_val),
+            );
+        }
         self.post_api("chat.update", self.bot_token.as_str(), &payload)?;
         Ok(())
     }
@@ -1007,20 +1109,68 @@ fn handle_interactive(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
+    let message_ts = payload
+        .get("message")
+        .and_then(|m| m.get("ts"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("container")
+                .and_then(|c| c.get("message_ts"))
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned);
     let Some(actions) = payload.get("actions").and_then(Value::as_array) else {
         return;
     };
     for action in actions {
-        let candidate = action
-            .get("value")
+        let action_id = action
+            .get("action_id")
             .and_then(Value::as_str)
-            .filter(|v| v.starts_with("gate:"))
-            .or_else(|| {
-                action
-                    .get("action_id")
-                    .and_then(Value::as_str)
-                    .filter(|v| v.starts_with("gate:"))
-            });
+            .unwrap_or_default();
+        let action_val = action.get("value").and_then(Value::as_str);
+
+        if action_id == SLACK_RESUME_ACTION_ID
+            || action_val.is_some_and(|v| v.starts_with("resume:"))
+        {
+            let resume_payload = action_val
+                .filter(|v| v.starts_with("resume:"))
+                .unwrap_or(action_id);
+            let outcome = router.handle_resume_callback_with_context(
+                bot_id,
+                ExternalSource::Slack,
+                workspace_id.as_deref(),
+                sender_id,
+                sender_name,
+                channel_id,
+                thread_ts.as_deref(),
+                resume_payload,
+            );
+            if !channel_id.is_empty() {
+                let target = DeliveryTarget {
+                    source: ExternalSource::Slack,
+                    workspace_id: workspace_id.clone(),
+                    channel_id: channel_id.to_owned(),
+                    thread_id: thread_ts.clone(),
+                    reply_to_message_id: None,
+                };
+                let notice = outcome.user_notice();
+                if matches!(outcome, ResumeCallbackOutcome::Resumed { .. })
+                    && let Some(ref mts) = message_ts
+                    && sender
+                        .edit_message_clearing_blocks(&target, mts, &notice)
+                        .is_ok()
+                {
+                    continue;
+                }
+                sender.send_message(&target, &notice).ok();
+            }
+            continue;
+        }
+
+        let candidate = action_val.filter(|v| v.starts_with("gate:")).or_else(|| {
+            (!action_id.is_empty() && action_id.starts_with("gate:")).then_some(action_id)
+        });
         let Some(gate_payload) = candidate else {
             continue;
         };
@@ -1921,6 +2071,235 @@ mod tests {
         assert!(
             gap_after_2 >= Duration::from_millis(160),
             "MB-40: backoff must escalate instead of resetting on connect (gap_after_2={gap_after_2:?})"
+        );
+    }
+
+    #[test]
+    fn slack_failed_turn_emits_resume_button_and_interactive_click_retries_and_clears_blocks() {
+        struct SlackResumeBridge {
+            bot: BotConfig,
+            link: krill_proto::bots::ExternalConversationLink,
+            pending: Mutex<bool>,
+            resumed: Mutex<Vec<(String, u64, String)>>,
+        }
+        impl ConnectorBridge for SlackResumeBridge {
+            fn dispatch_external_message(
+                &self,
+                _msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                if sender_id == "U_ALLOWED" {
+                    Ok(AccessDecision::Allowed)
+                } else {
+                    Ok(AccessDecision::Denied("denied".to_owned()))
+                }
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _workspace_id: Option<&str>,
+                _channel_id: &str,
+                _thread_id: Option<&str>,
+                _acts_for: ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Ok(self.link.clone())
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.bot.id == bot_id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+            fn get_link(
+                &self,
+                link_id: &str,
+            ) -> io::Result<Option<krill_proto::bots::ExternalConversationLink>> {
+                Ok((self.link.id == link_id).then(|| self.link.clone()))
+            }
+            fn resume_failed_external_turn(
+                &self,
+                bot_id: &BotId,
+                link_id: &str,
+                turn_seq: u64,
+                sender_id: &str,
+                _sender_name: &str,
+            ) -> io::Result<super::super::ExternalResumeResult> {
+                let mut pending = lock(&self.pending);
+                if !*pending || &self.link.bot_id != bot_id || self.link.id != link_id {
+                    return Ok(super::super::ExternalResumeResult::NotFailed);
+                }
+                *pending = false;
+                lock(&self.resumed).push((link_id.to_owned(), turn_seq, sender_id.to_owned()));
+                Ok(super::super::ExternalResumeResult::Resumed {
+                    link: Box::new(self.link.clone()),
+                    session_id: SessionId(77),
+                    turn_seq: turn_seq + 1,
+                    queued_count: 1,
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let rec_srv = Arc::clone(&recorded);
+        let srv = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let (path, _auth, body) = read_http(&mut sock);
+                let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                lock(&rec_srv).push((path.clone(), parsed));
+                let resp = if path.ends_with("/chat.postMessage") {
+                    json!({"ok": true, "ts": "500.9"})
+                } else {
+                    json!({"ok": true})
+                };
+                let raw = serde_json::to_vec(&resp).unwrap();
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    raw.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+                sock.write_all(&raw).unwrap();
+            }
+        });
+
+        let bot_id = BotId::new("bot-sl-res").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "SlackRes", "claude", 1_000).unwrap();
+        bot.connectors.slack.allowed_channel_ids = vec!["C_DEV".to_owned()];
+        bot.connectors.slack.allowed_user_ids = vec!["U_ALLOWED".to_owned()];
+        let link = krill_proto::bots::ExternalConversationLink {
+            id: "lnk-sl-1".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Slack,
+            workspace_id: Some("T1".to_owned()),
+            channel_id: "C_DEV".to_owned(),
+            thread_id: Some("200.1".to_owned()),
+            session_id: Some(SessionId(77)),
+            acts_for: ActsFor::Owner,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let bridge = Arc::new(SlackResumeBridge {
+            bot,
+            link: link.clone(),
+            pending: Mutex::new(true),
+            resumed: Mutex::new(Vec::new()),
+        });
+        let router = Arc::new(ConversationRouter::new(
+            Arc::clone(&bridge) as Arc<dyn ConnectorBridge>
+        ));
+        let sender = Arc::new(SlackSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("xoxb-test".to_owned()),
+        ));
+        router.register_sender(
+            bot_id.clone(),
+            ExternalSource::Slack,
+            Arc::clone(&sender) as Arc<dyn PlatformSender>,
+        );
+
+        // 1. Failed turn emits Block Kit Resume button.
+        router.on_turn_failed(
+            &bot_id,
+            SessionId(77),
+            Some(&link.id),
+            3,
+            super::super::router::TurnFailureKind::Error,
+            "upstream failure",
+        );
+
+        let resume_value = format!("resume:{}:{}:3", bot_id.as_str(), link.id);
+        let mk_click = |uid: &str| {
+            json!({
+                "type": "block_actions",
+                "team": {"id": "T1"},
+                "user": {"id": uid, "username": uid},
+                "channel": {"id": "C_DEV"},
+                "message": {"ts": "500.9", "thread_ts": "200.1"},
+                "actions": [{"action_id": SLACK_RESUME_ACTION_ID, "value": resume_value}]
+            })
+        };
+
+        // 2. Unauthorized user click is refused and posts refusal notice without resuming.
+        handle_interactive(&bot_id, &sender, &router, &mk_click("U_INTRUDER"));
+        assert!(lock(&bridge.resumed).is_empty());
+
+        // 3. Authorized click resumes turn and updates failure message with empty `blocks: []`.
+        handle_interactive(&bot_id, &sender, &router, &mk_click("U_ALLOWED"));
+        assert_eq!(lock(&bridge.resumed).len(), 1);
+        assert_eq!(
+            lock(&bridge.resumed)[0],
+            ("lnk-sl-1".to_owned(), 3, "U_ALLOWED".to_owned())
+        );
+
+        // 4. Second click sees NotFailed and posts clean notice.
+        handle_interactive(&bot_id, &sender, &router, &mk_click("U_ALLOWED"));
+
+        srv.join().unwrap();
+
+        let reqs = lock(&recorded);
+        assert_eq!(reqs.len(), 4);
+        // Request 0: chat.postMessage with Block Kit Resume button.
+        assert!(reqs[0].0.ends_with("/chat.postMessage"));
+        let blocks = reqs[0].1["blocks"].as_array().expect("blocks array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "actions");
+        assert_eq!(
+            blocks[1]["elements"][0]["action_id"],
+            SLACK_RESUME_ACTION_ID
+        );
+        assert_eq!(blocks[1]["elements"][0]["value"], resume_value);
+        assert_eq!(blocks[1]["elements"][0]["text"]["text"], "Resume");
+        // Request 1: unauthorized user notice via chat.postMessage.
+        assert!(reqs[1].0.ends_with("/chat.postMessage"));
+        assert!(
+            reqs[1].1["text"]
+                .as_str()
+                .unwrap()
+                .contains("do not have permission")
+        );
+        // Request 2: authorized resume clears blocks via chat.update.
+        assert!(reqs[2].0.ends_with("/chat.update"));
+        assert_eq!(reqs[2].1["ts"], "500.9");
+        assert_eq!(reqs[2].1["blocks"], json!([]));
+        assert!(reqs[2].1["text"].as_str().unwrap().contains("Resuming"));
+        assert!(reqs[2].1["text"].as_str().unwrap().contains("queued"));
+        // Request 3: duplicate click notice.
+        assert!(reqs[3].0.ends_with("/chat.postMessage"));
+        assert!(
+            reqs[3].1["text"]
+                .as_str()
+                .unwrap()
+                .contains("already been resumed")
         );
     }
 }

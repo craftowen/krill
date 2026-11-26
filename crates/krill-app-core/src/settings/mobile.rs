@@ -587,7 +587,7 @@ impl SettingsView {
             } else if self.mobile.pairing == PairingState::Waiting {
                 text::PREPARING.get()
             } else {
-                text::NEW_QR.get()
+                text::QR_PLACEHOLDER.get()
             };
             qr_placeholder(p, side, label)
                 .id("mobile-qr-empty")
@@ -1134,7 +1134,7 @@ impl SettingsView {
                 if busy {
                     text::PREPARING.get()
                 } else {
-                    text::NEW_QR.get()
+                    text::QR_PLACEHOLDER.get()
                 },
             )
             .id("mobile-page-qr-empty")
@@ -1333,13 +1333,14 @@ impl SettingsView {
                                     .w_full()
                                     .min_w_0()
                                     .flex()
-                                    .items_baseline()
+                                    .items_start()
                                     .gap_1p5()
                                     .text_size(crate::ui::TEXT_XS)
                                     .text_color(p.muted_foreground)
                                     .child(
                                         div()
                                             .flex_none()
+                                            .mt_1()
                                             .size(crate::ui::STATE_DOT)
                                             .rounded_full()
                                             .bg(if connected {
@@ -1492,6 +1493,7 @@ impl SettingsView {
                             .ghost()
                             .small()
                             .tooltip(text::PAGE_CLOSE.get())
+                            .accessibility_label(text::PAGE_CLOSE.get())
                             .debug_selector(|| "mobile-page-close".into())
                             .on_click(cx.listener(|_, _, window, cx| {
                                 super::close_settings_page_for(Some(cx.entity_id()), window, cx);

@@ -23,6 +23,7 @@ pub mod managed;
 pub mod manager;
 pub mod ssh;
 
+pub use managed::LingerStatus;
 pub use manager::{ExternalHost, HostConnectionInfo};
 pub use manager::{HostManager, RemoteHostSpec};
 
@@ -74,10 +75,14 @@ pub enum HostStatus {
     #[default]
     Connecting,
     Disconnected,
+    /// SSH 인증 실패(키 미등록·잠긴 ssh-agent·암호 필요). fail2ban/CrowdSec 차단을 막기 위해 느린 백오프로 전환한다.
+    AuthFailed,
 }
 
 type EnsureSocketFn = dyn Fn() -> io::Result<PathBuf> + Send + Sync;
+type EnsureSocketEpochFn = dyn Fn() -> io::Result<(PathBuf, u64)> + Send + Sync;
 type OutcomeFn = dyn Fn(bool, Option<&io::Error>) + Send + Sync;
+type EpochOutcomeFn = dyn Fn(u64, bool, Option<&io::Error>) + Send + Sync;
 
 #[derive(Clone)]
 struct ConnectorLifetime {
@@ -89,7 +94,9 @@ struct ConnectorLifetime {
 #[derive(Clone)]
 pub struct RemoteConnector {
     ensure_socket: Arc<EnsureSocketFn>,
+    ensure_socket_epoch: Option<Arc<EnsureSocketEpochFn>>,
     on_outcome: Arc<OutcomeFn>,
+    on_epoch_outcome: Option<Arc<EpochOutcomeFn>>,
     map_error: Option<Arc<dyn Fn(io::Error) -> io::Error + Send + Sync>>,
     lifetime: Option<ConnectorLifetime>,
     transport_epoch: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
@@ -108,7 +115,9 @@ impl RemoteConnector {
     ) -> Self {
         Self {
             ensure_socket: Arc::new(ensure_socket),
+            ensure_socket_epoch: None,
             on_outcome: Arc::new(on_outcome),
+            on_epoch_outcome: None,
             map_error: None,
             lifetime: None,
             transport_epoch: None,
@@ -142,6 +151,34 @@ impl RemoteConnector {
     #[must_use]
     pub fn with_transport_epoch(mut self, epoch: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.transport_epoch = Some(Arc::new(epoch));
+        self
+    }
+
+    /// 전송 세대(`transport_epoch`) 일치 시에만 요청 결과를 기록하는 훅.
+    #[must_use]
+    pub fn with_epoch_outcome(
+        mut self,
+        on_epoch_outcome: impl Fn(u64, bool, Option<&io::Error>) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_epoch_outcome = Some(Arc::new(on_epoch_outcome));
+        self
+    }
+
+    /// 사용자 문구 매퍼를 거친 뒤에도 순간 단절(소켓 없음 등)은 재시도할 수 있는 종류로 둔다.
+    /// 매퍼가 `NotFound`를 그대로 남기면 칸이 영구 실패로 보고 다시 붙지 않는다.
+    fn map_remote_error(&self, err: io::Error) -> io::Error {
+        normalize_remote_io_error(match &self.map_error {
+            Some(mapper) => mapper(err),
+            None => err,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn with_ensure_socket_epoch(
+        mut self,
+        ensure_socket_epoch: impl Fn() -> io::Result<(PathBuf, u64)> + Send + Sync + 'static,
+    ) -> Self {
+        self.ensure_socket_epoch = Some(Arc::new(ensure_socket_epoch));
         self
     }
 }
@@ -259,8 +296,30 @@ impl HostTarget {
 
     /// 재사용 중인 소켓의 요청 성공/실패를 연결 관리자에 알린다.
     pub fn record_outcome(&self, ok: bool, err: Option<&io::Error>) {
+        if !self.is_current() {
+            return;
+        }
         if let Some(c) = &self.connector {
             (c.on_outcome)(ok, err);
+        }
+    }
+
+    /// 재사용 중인 소켓의 요청 성공/실패를 연결 시점의 전송 세대(`expected_epoch`)와 함께 기록한다.
+    /// 그사이 터널이 교체·종료되어 세대가 진행됐으면 결과를 무시해 새 터널을 끊지 않는다.
+    pub fn record_outcome_for_epoch(&self, expected_epoch: u64, ok: bool, err: Option<&io::Error>) {
+        if !self.is_current() {
+            return;
+        }
+        if let Some(c) = &self.connector {
+            if let Some(on_epoch_outcome) = &c.on_epoch_outcome {
+                on_epoch_outcome(expected_epoch, ok, err);
+            } else if c
+                .transport_epoch
+                .as_ref()
+                .is_none_or(|epoch| epoch() == expected_epoch)
+            {
+                (c.on_outcome)(ok, err);
+            }
         }
     }
 
@@ -305,26 +364,37 @@ impl HostTarget {
     /// - `allow_local_launch == false` (`Remote`): 절대 로컬 `krill-holder`/`krilld`를 띄우지 않고
     ///   포워딩된 소켓에만 Hello 협상을 수행한다.
     pub fn connect(&self, hello: &ClientHello) -> Result<Connection, daemon::Error> {
+        self.connect_with_epoch(hello).map(|(conn, _)| conn)
+    }
+
+    /// 호스트 데몬에 연결하고, 해당 연결이 속한 전송 세대(`transport_epoch`)를 함께 돌려준다.
+    pub fn connect_with_epoch(
+        &self,
+        hello: &ClientHello,
+    ) -> Result<(Connection, u64), daemon::Error> {
         if !self.is_current() {
             return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
         }
         if self.allow_local_launch
             && let Some(paths) = &self.local_paths
         {
-            return daemon::connect(paths, hello);
+            return daemon::connect(paths, hello).map(|conn| (conn, 0));
         }
-        let socket = match &self.connector {
-            Some(c) => match (c.ensure_socket)() {
-                Ok(sock) => sock,
-                Err(err) => {
-                    let err = match &c.map_error {
-                        Some(mapper) => mapper(err),
-                        None => normalize_remote_io_error(err),
-                    };
-                    return Err(daemon::Error::Io(err));
+        let (socket, epoch) = match &self.connector {
+            Some(c) => {
+                let ensured = match &c.ensure_socket_epoch {
+                    Some(ensure) => ensure(),
+                    None => (c.ensure_socket)().map(|sock| (sock, self.transport_epoch())),
+                };
+                match ensured {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        let err = c.map_remote_error(err);
+                        return Err(daemon::Error::Io(err));
+                    }
                 }
-            },
-            None => self.socket.clone(),
+            }
+            None => (self.socket.clone(), 0),
         };
         if !self.is_current() {
             return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
@@ -339,11 +409,11 @@ impl HostTarget {
                 if let Some(c) = &self.connector {
                     (c.on_outcome)(true, None);
                 }
-                Ok(conn)
+                Ok((conn, epoch))
             }
             Err(err) => {
-                let norm = match self.connector.as_ref().and_then(|c| c.map_error.as_ref()) {
-                    Some(mapper) => mapper(err),
+                let norm = match &self.connector {
+                    Some(c) => c.map_remote_error(err),
                     None => normalize_remote_io_error(err),
                 };
                 if let Some(c) = &self.connector {
@@ -430,6 +500,30 @@ mod tests {
             "remote target must never create a local socket"
         );
         assert_eq!(target.upgrade(&hello).expect("upgrade noop"), None);
+    }
+
+    /// iroh 연결처럼 사용자 문구 매퍼를 단 커넥터도 소켓 부재를 재시도할 오류로 돌려준다.
+    /// `NotFound`가 남으면 칸이 영구 실패로 멈춰 연결이 복구돼도 오류 문구에 고정된다.
+    #[test]
+    fn mapped_connector_keeps_missing_socket_retryable() {
+        let sock = std::env::temp_dir().join(format!(
+            "krill-hosts-mapped-{}/missing.sock",
+            std::process::id()
+        ));
+        let missing = sock.clone();
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            sock,
+            RemoteConnector::new(move || Ok(missing.clone()), |_, _| {})
+                .with_error_mapper(|err| io::Error::new(err.kind(), "unavailable")),
+        );
+        let hello = daemon::client_hello(ClientRole::App, "krill-hosts-test");
+        let err = target.connect(&hello).expect_err("missing socket");
+        assert!(
+            matches!(err, daemon::Error::Io(ref e)
+                if e.kind() == io::ErrorKind::ConnectionRefused && e.to_string() == "unavailable"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

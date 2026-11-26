@@ -511,7 +511,19 @@ fn rejoin_round(failed_receiver: bool) {
         seen.windows(2).find(|w| w[1] != w[0] + 1)
     );
     // krilld#1은 리더를 멈추고 세그먼트를 봉인한 뒤 넘겼다: 디스크에 크래시 경계(Gap)가 없다.
-    assert_eq!(disk_gaps(&dir, ticker, all.len() as u64), []);
+    // `all`의 마지막 청크는 krilld#2의 AsyncRecorder가 디스크에 기록 중일 수 있어 꼬리 반영만 기다린다.
+    let target = all.len() as u64;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let gaps = disk_gaps(&dir, ticker, target);
+        let trailing_only =
+            matches!(gaps.as_slice(), [(seq, len)] if *len > 0 && seq + len == target);
+        if gaps.is_empty() || !trailing_only || Instant::now() >= deadline {
+            assert_eq!(gaps, []);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 
     // 재결합 후 새 세션 생성도 다시 가능하다.
     let Reply::Created {

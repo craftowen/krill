@@ -169,8 +169,14 @@ impl SettingsView {
                         .get("verification_uri_complete")
                         .and_then(serde_json::Value::as_str)
                     {
-                        this.mobile.account.pending = true;
-                        cx.open_url(url);
+                        if let Some(clean) = crate::terminal::path_link::sanitize_http_url(url) {
+                            this.mobile.account.pending = true;
+                            cx.open_url(&clean);
+                        } else {
+                            this.mobile.account.pending = false;
+                            this.mobile.account.connect_after_login = None;
+                            this.mobile.error = Some(text::ACCOUNT_ERROR.get().to_owned());
+                        }
                     }
                     if data.get("revoked").and_then(serde_json::Value::as_bool) == Some(false) {
                         this.mobile.error = Some(text::ACCOUNT_REVOKE_FAILED.get().to_owned());

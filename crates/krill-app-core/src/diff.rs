@@ -55,7 +55,8 @@ pub use search::{
 pub const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 mod edit;
 pub use edit::{
-    apply_git_patch, build_hunk_patch, build_line_patch, extract_patch_header_and_hunks,
+    apply_git_patch, build_hunk_patch, build_line_patch, build_line_patch_for_sides,
+    extract_patch_header_and_hunks,
 };
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_POLL: Duration = Duration::from_millis(100);
@@ -95,6 +96,7 @@ pub trait Source: Send + Sync {
 struct Conn {
     stream: UnixStream,
     features: u64,
+    epoch: u64,
 }
 
 struct Socket {
@@ -126,12 +128,16 @@ impl Socket {
             Ok(Conn {
                 stream,
                 features: negotiated.features,
+                epoch: self.target.transport_epoch(),
             })
         } else {
-            let conn = self.target.connect(&hello).map_err(|e| match e {
-                krill_proto::daemon::Error::Io(io_err) => io_err,
-                other => io::Error::other(other.to_string()),
-            })?;
+            let (conn, epoch) = self
+                .target
+                .connect_with_epoch(&hello)
+                .map_err(|e| match e {
+                    krill_proto::daemon::Error::Io(io_err) => io_err,
+                    other => io::Error::other(other.to_string()),
+                })?;
             if conn.negotiated.features & FEAT_CONTROL == 0 {
                 return Err(io::ErrorKind::Unsupported.into());
             }
@@ -140,6 +146,7 @@ impl Socket {
             Ok(Conn {
                 stream: conn.stream,
                 features: conn.negotiated.features,
+                epoch,
             })
         }
     }
@@ -197,16 +204,28 @@ impl Source for Socket {
             .conn
             .lock()
             .map_err(|_| io::Error::other("diff socket mutex poisoned"))?;
+        if !self.target.is_current() {
+            *guard = None;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let current_epoch = self.target.transport_epoch();
         let conn = match guard.take() {
-            Some(conn) => conn,
-            None => self.connect()?,
+            Some(conn) if conn.epoch == current_epoch => conn,
+            _ => self.connect()?,
         };
-        let result = Self::exchange(guard.insert(conn), req);
+        let conn = guard.insert(conn);
+        let epoch = conn.epoch;
+        let result = Self::exchange(conn, req);
         match &result {
-            Ok(_) => self.target.record_outcome(true, None),
+            Ok(_) => {
+                if self.target.transport_epoch() != epoch {
+                    *guard = None;
+                }
+                self.target.record_outcome_for_epoch(epoch, true, None);
+            }
             Err(e) => {
                 *guard = None;
-                self.target.record_outcome(false, Some(e));
+                self.target.record_outcome_for_epoch(epoch, false, Some(e));
             }
         }
         result
@@ -919,6 +938,12 @@ impl Panel {
             self.watch_gen = 0;
             self.refresh_branch_sync(cx);
             self.start_watch(cx);
+            if self.tab == PanelTab::Checks
+                && self.checks.inspection.is_none()
+                && !self.checks.loading
+            {
+                self.refresh_checks(cx);
+            }
         } else {
             self.watch_task = None;
             // 완료된 내용은 보존한다. 전환 중이면 새 선택과 이전 본문을 함께 해제한다.
@@ -938,9 +963,11 @@ impl Panel {
                 }
                 self.invalidate_patch();
             }
-            self.checks.generation = self.checks.generation.wrapping_add(1);
+            if !self.checks.merging {
+                self.checks.generation = self.checks.generation.wrapping_add(1);
+            }
             self.checks.task = None;
-            self.checks.loading = false;
+            self.checks.loading = self.checks.merging;
             if let Some(source) = self.source.clone() {
                 let req = GitWatchRequest {
                     repo: self.repo.as_os_str().as_bytes().to_vec(),
@@ -2542,3 +2569,113 @@ use krill_proto::daemon::Paths;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(unix)]
+mod epoch_tests {
+    use super::*;
+    use krill_hosts::RemoteConnector;
+    use krill_proto::ipc::ServerHello;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn serve_one_watch(
+        listener: UnixListener,
+        reply: GitWatchReply,
+        keep_open: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            stream.write_all(&hello.encode().unwrap()).unwrap();
+            ipc::read_frame(&mut stream).unwrap().unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::GitWatch(_)
+            ));
+            stream
+                .write_all(&Reply::GitWatch(reply).encode().unwrap())
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while keep_open.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    #[test]
+    fn socket_discards_cached_stream_when_transport_epoch_advances() {
+        let dir = std::env::temp_dir().join(format!("krill-diff-epoch-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock1 = dir.join("t1.sock");
+        let sock2 = dir.join("t2.sock");
+        let l1 = UnixListener::bind(&sock1).unwrap();
+        let l2 = UnixListener::bind(&sock2).unwrap();
+
+        let keep_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let s1 = serve_one_watch(
+            l1,
+            GitWatchReply::Unchanged { pending: false },
+            Arc::clone(&keep_open),
+        );
+        let s2 = serve_one_watch(l2, GitWatchReply::Hidden, Arc::clone(&keep_open));
+
+        let epoch = Arc::new(AtomicU64::new(0));
+        let outcomes: Arc<Mutex<Vec<(u64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ensure_epoch = Arc::clone(&epoch);
+        let p1 = sock1.clone();
+        let p2 = sock2.clone();
+        let read_epoch = Arc::clone(&epoch);
+        let rec_outcomes = Arc::clone(&outcomes);
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            sock1,
+            RemoteConnector::new(
+                move || {
+                    Ok(if ensure_epoch.load(Ordering::Acquire) == 0 {
+                        p1.clone()
+                    } else {
+                        p2.clone()
+                    })
+                },
+                |_, _| {},
+            )
+            .with_transport_epoch(move || read_epoch.load(Ordering::Acquire))
+            .with_epoch_outcome(move |ep, ok, _| {
+                rec_outcomes.lock().unwrap().push((ep, ok));
+            }),
+        );
+
+        let socket = Socket::new(target);
+        let req = GitWatchRequest {
+            repo: b"/repo".to_vec(),
+            visible: true,
+            since: 0,
+            force: false,
+        };
+        assert!(matches!(
+            socket.watch(&req).unwrap(),
+            GitWatchReply::Unchanged { pending: false }
+        ));
+
+        epoch.store(1, Ordering::Release);
+        assert!(matches!(socket.watch(&req).unwrap(), GitWatchReply::Hidden));
+        assert_eq!(*outcomes.lock().unwrap(), vec![(0, true), (1, true)]);
+
+        keep_open.store(false, Ordering::Release);
+        s1.join().unwrap();
+        s2.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

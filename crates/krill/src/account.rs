@@ -1,4 +1,4 @@
-//! `krill account`: 프로바이더 다계정 조회·등록·삭제·원클릭 전환·자동전환 설정(MK-107·MK-108).
+//! `krill account`: 프로바이더 다계정 조회·등록·삭제·원클릭 수동 전환(MK-107·MK-108).
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -9,11 +9,10 @@ use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountsSnapshot, AdvancedPolicy, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule,
-    FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
+    AccountsSnapshot, FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | history [--json] | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json] | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
+const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | save agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -38,25 +37,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     if strs.first() == Some(&"provisioning") {
         return run_provisioning(&strs);
     }
-    if matches!(strs.as_slice(), ["history"] | ["history", "--json"]) {
-        return match request(&UsageRequest::ListAccounts).and_then(|snap| {
-            if !snap.advanced.supported {
-                return Err("daemon does not support account history; restart daemon".into());
-            }
-            let rendered = if strs.len() == 2 {
-                serde_json::to_string_pretty(&snap.advanced.history).map_err(|e| e.to_string())?
-            } else {
-                format_history(&snap.advanced.history)
-            };
-            println!("{rendered}");
-            Ok(())
-        }) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("account: {e}");
-                ExitCode::FAILURE
-            }
-        };
+    if matches!(
+        strs.as_slice(),
+        ["save", "agy" | "antigravity"] | ["save", "agy" | "antigravity", "--json"]
+    ) {
+        let json = strs.len() == 3;
+        return run_save_antigravity(json);
     }
     if let ["login", provider, id] = strs.as_slice() {
         return match login(provider, id) {
@@ -78,46 +64,6 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     let (req, json) = match strs.as_slice() {
         [] | ["list" | "ls"] => (UsageRequest::ListAccounts, false),
         ["list" | "ls", "--json"] => (UsageRequest::ListAccounts, true),
-        ["policy", key, value] => {
-            if let Err(e) = parse_advanced_policy(key, value, AdvancedPolicy::default()) {
-                eprintln!("account: {e}");
-                return ExitCode::from(2);
-            }
-            let snap = match request(&UsageRequest::ListAccounts) {
-                Ok(snap) => snap,
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match parse_advanced_policy(key, value, snap.advanced.policy) {
-                Ok(req) => (req, false),
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::from(2);
-                }
-            }
-        }
-        ["rule" | "rule-rm", ..] => {
-            if let Err(e) = parse_rule_with(&strs, |_, value| Ok(value.to_owned())) {
-                eprintln!("account: {e}");
-                return ExitCode::from(2);
-            }
-            let snap = match request(&UsageRequest::ListAccounts) {
-                Ok(snap) => snap,
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match parse_rule_command(&strs, &snap) {
-                Ok(req) => (req, false),
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::from(2);
-                }
-            }
-        }
         ["switch", prov, id] => {
             let Some(provider) = ProviderKind::parse(prov) else {
                 eprintln!(
@@ -140,6 +86,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                eprintln!(
+                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                );
+                return ExitCode::from(2);
+            }
             (
                 UsageRequest::AddAccount {
                     provider,
@@ -157,6 +109,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                eprintln!(
+                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                );
+                return ExitCode::from(2);
+            }
             (
                 UsageRequest::AddAccount {
                     provider,
@@ -174,6 +132,9 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                return run_remove_antigravity(id);
+            }
             (
                 UsageRequest::RemoveAccount {
                     provider,
@@ -181,26 +142,6 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 },
                 false,
             )
-        }
-        ["auto-switch", ..] => {
-            if let Err(e) = parse_auto_switch_command(&strs, &AccountsSnapshot::default()) {
-                eprintln!("account: {e}");
-                return ExitCode::from(2);
-            }
-            let snap = match request(&UsageRequest::ListAccounts) {
-                Ok(snap) => snap,
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match parse_auto_switch_command(&strs, &snap) {
-                Ok(req) => (req, false),
-                Err(e) => {
-                    eprintln!("account: {e}");
-                    return ExitCode::from(2);
-                }
-            }
         }
         _ => {
             eprintln!("{USAGE}");
@@ -319,48 +260,6 @@ fn login_command(
         .ok_or_else(|| "provider does not support interactive account login".to_owned())
 }
 
-/// OWE-709: `auto-switch on|off [threshold]`를 [`UsageRequest::SetAutoSwitch`]로 푼다.
-/// on/off만으로는 기존 임계치·한도·규칙을 그대로 두어야 한다(덮어쓰기 금지).
-fn parse_auto_switch_command(
-    args: &[&str],
-    snap: &AccountsSnapshot,
-) -> Result<UsageRequest, String> {
-    let (state, rest) = match args {
-        ["auto-switch", state, rest @ ..] => (*state, rest),
-        _ => return Err(USAGE.to_owned()),
-    };
-    let enabled = match state {
-        "on" | "enable" | "true" | "1" => true,
-        "off" | "disable" | "false" | "0" => false,
-        _ => return Err(USAGE.to_owned()),
-    };
-    if rest.len() > 1 {
-        return Err(USAGE.to_owned());
-    }
-    // 임계치를 함께 주면 그 값만 바꾸고, 생략하면 기존 값을 보존한다.
-    // 공유 상수 범위로 자른다(OWE-673·675 유지).
-    let threshold_percent = match rest.first() {
-        None => snap.auto_switch.threshold_percent.clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        ),
-        Some(s) => s
-            .trim_end_matches('%')
-            .parse::<u8>()
-            .map_err(|_| format!("invalid threshold: {s}"))?
-            .clamp(
-                krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-                krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-            ),
-    };
-    Ok(UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
-        enabled,
-        threshold_percent,
-        switch_on_rate_limit: snap.auto_switch.switch_on_rate_limit,
-        rules: snap.auto_switch.rules.clone(),
-    }))
-}
-
 fn resolve_account(
     snap: &AccountsSnapshot,
     provider: ProviderKind,
@@ -386,76 +285,6 @@ fn resolve_account(
         ));
     }
     Ok(account.id.clone())
-}
-
-fn parse_rule_command(args: &[&str], snap: &AccountsSnapshot) -> Result<UsageRequest, String> {
-    parse_rule_with(args, |provider, value| {
-        resolve_account(snap, provider, value)
-    })
-}
-
-/// 계정 해석(`resolve`)만 빼고 규칙 인자를 검사한다. 데몬 조회 전 문법 검사는 해석 없이 부른다.
-fn parse_rule_with(
-    args: &[&str],
-    resolve: impl Fn(ProviderKind, &str) -> Result<String, String>,
-) -> Result<UsageRequest, String> {
-    let (command, provider, from, rest) = match args {
-        [command @ ("rule" | "rule-rm"), provider, from, rest @ ..] => {
-            (*command, *provider, *from, rest)
-        }
-        _ => return Err(USAGE.to_owned()),
-    };
-    let provider =
-        ProviderKind::parse(provider).ok_or_else(|| format!("unknown provider: {provider}"))?;
-    let from_account_id = resolve(provider, from)?;
-    if command == "rule-rm" {
-        return if rest.is_empty() {
-            Ok(UsageRequest::RemoveAutoSwitchRule {
-                provider,
-                from_account_id,
-            })
-        } else {
-            Err(USAGE.to_owned())
-        };
-    }
-    let (state, options) = rest.split_first().ok_or_else(|| USAGE.to_owned())?;
-    if options.len() > 3 {
-        return Err(USAGE.to_owned());
-    }
-    let enabled = match *state {
-        "on" => true,
-        "off" => false,
-        _ => return Err("rule state must be on or off".to_owned()),
-    };
-    let threshold_percent = options
-        .first()
-        .map_or(Ok(90), |s| {
-            s.trim_end_matches('%')
-                .parse::<u8>()
-                .map_err(|_| format!("invalid threshold: {s}"))
-        })?
-        .clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        );
-    let metric = options.get(1).map_or(Ok(AutoSwitchMetric::Max), |s| {
-        AutoSwitchMetric::parse(s).ok_or_else(|| format!("invalid metric: {s}; expected max|5h|7d"))
-    })?;
-    let target_account_id = match options.get(2) {
-        None | Some(&"auto") => None,
-        Some(target) => Some(resolve(provider, target)?),
-    };
-    if target_account_id.as_deref() == Some(from_account_id.as_str()) {
-        return Err("target account must differ from source account".to_owned());
-    }
-    Ok(UsageRequest::UpsertAutoSwitchRule(AutoSwitchRule {
-        provider,
-        from_account_id,
-        enabled,
-        threshold_percent,
-        metric,
-        target_account_id,
-    }))
 }
 
 /// OWE-722: 설정의 유일한 쓰기 주체는 krilld다(AS-03).
@@ -493,14 +322,90 @@ fn run_provisioning(args: &[&str]) -> ExitCode {
     }
 }
 
+fn run_remove_antigravity(account_id: &str) -> ExitCode {
+    let req = UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::Remove {
+        account_id: account_id.to_owned(),
+    });
+    match exchange(&req) {
+        Ok(UsageReply::AntigravityAccounts(Ok(_))) => match request(&UsageRequest::ListAccounts) {
+            Ok(snap) => {
+                print_snapshot(&snap);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("account: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(UsageReply::Failed(e)) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(_) => {
+            eprintln!("account: unexpected Antigravity account reply");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_save_antigravity(json: bool) -> ExitCode {
+    let req =
+        UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::AddCurrent);
+    match exchange(&req) {
+        Ok(UsageReply::AntigravityAccounts(Ok(state))) => {
+            if json {
+                match serde_json::to_string_pretty(&state) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(e) => {
+                        eprintln!("account: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("Managed Antigravity accounts ({}):", state.accounts.len());
+                for acc in &state.accounts {
+                    let active = if state.active_account_id.as_deref() == Some(acc.id.as_str()) {
+                        " (active)"
+                    } else {
+                        ""
+                    };
+                    let name = acc
+                        .email
+                        .as_deref()
+                        .or(acc.subject.as_deref())
+                        .unwrap_or(&acc.id);
+                    println!("  {}  {}{active}", acc.id, name);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(UsageReply::Failed(e)) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(_) => {
+            eprintln!("account: unexpected Antigravity account reply");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
     match exchange(req)? {
         UsageReply::Accounts(snap) => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) => Ok(AccountsSnapshot::default()),
         UsageReply::ResetConsumed { snapshot, .. } => Ok(snapshot),
-        UsageReply::Provisioning(_) | UsageReply::SessionSwitchPlan(_) => {
-            Err("unexpected account reply".to_owned())
-        }
+        UsageReply::Provisioning(_)
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => Err("unexpected account reply".to_owned()),
         UsageReply::Failed(e) => Err(e.to_string()),
     }
 }
@@ -575,6 +480,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_USAGE_MANAGE
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
+        | krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL
         | krill_proto::usage::FEAT_USAGE_RESET;
     let mut conn = if matches!(
         req,
@@ -645,40 +551,6 @@ fn format_window(w: &krill_proto::usage::Window) -> String {
 }
 
 fn print_snapshot(snap: &AccountsSnapshot) {
-    println!(
-        "auto-switch: {} (threshold: {}%, rate-limit switch: {})",
-        if snap.auto_switch.enabled {
-            "ON"
-        } else {
-            "OFF"
-        },
-        snap.auto_switch.threshold_percent,
-        if snap.auto_switch.switch_on_rate_limit {
-            "ON"
-        } else {
-            "OFF"
-        }
-    );
-    for rule in &snap.auto_switch.rules {
-        println!(
-            "rule: [{}] {} {} at {}% ({}) -> {}",
-            rule.provider.as_str(),
-            rule.from_account_id,
-            if rule.enabled { "ON" } else { "OFF" },
-            rule.threshold_percent,
-            rule.metric.short_code(),
-            rule.target_account_id.as_deref().unwrap_or("auto")
-        );
-    }
-    for ev in &snap.switched {
-        println!(
-            "switched:    [{}] {} -> {} (at {}%)",
-            ev.provider.as_str(),
-            ev.from_label,
-            ev.to_label,
-            ev.reason_percent
-        );
-    }
     for a in &snap.accounts {
         let mark = if a.active { "*" } else { " " };
         let h5 = a
@@ -773,83 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn rule_command_resolves_ids_and_labels_and_parses_options() {
-        let snap = accounts();
-        assert_eq!(
-            parse_rule_command(
-                &["rule", "claude", "Personal", "on", "85%", "7d", "work max"],
-                &snap
-            )
-            .unwrap(),
-            UsageRequest::UpsertAutoSwitchRule(AutoSwitchRule {
-                provider: ProviderKind::Claude,
-                from_account_id: "claude-host".into(),
-                enabled: true,
-                threshold_percent: 85,
-                metric: AutoSwitchMetric::SevenDay,
-                target_account_id: Some("claude-work".into()),
-            })
-        );
-        for provider in ["claude", "codex", "agy", "opencode"] {
-            let UsageRequest::UpsertAutoSwitchRule(rule) =
-                parse_rule_command(&["rule", provider, "Personal", "off"], &snap).unwrap()
-            else {
-                panic!("expected rule");
-            };
-            assert!(!rule.enabled);
-            assert_eq!(rule.threshold_percent, 90);
-            assert_eq!(rule.metric, AutoSwitchMetric::Max);
-            assert_eq!(rule.target_account_id, None);
-        }
-        let UsageRequest::UpsertAutoSwitchRule(rule) = parse_rule_command(
-            &["rule", "claude", "claude-host", "on", "100", "5h", "auto"],
-            &snap,
-        )
-        .unwrap() else {
-            panic!("expected rule");
-        };
-        // 규칙 임계값은 문서·데몬과 같은 1~100(K-27): 100은 그대로, 30은 50으로 올리지 않는다.
-        assert_eq!(rule.threshold_percent, 100);
-        assert_eq!(rule.metric, AutoSwitchMetric::FiveHour);
-        let UsageRequest::UpsertAutoSwitchRule(rule) =
-            parse_rule_command(&["rule", "claude", "claude-host", "on", "30"], &snap).unwrap()
-        else {
-            panic!("expected rule");
-        };
-        assert_eq!(rule.threshold_percent, 30);
-        assert_eq!(
-            parse_rule_command(&["rule-rm", "claude", "Work Max"], &snap).unwrap(),
-            UsageRequest::RemoveAutoSwitchRule {
-                provider: ProviderKind::Claude,
-                from_account_id: "claude-work".into()
-            }
-        );
-    }
-
-    #[test]
-    fn rule_command_rejects_invalid_or_ambiguous_arguments() {
-        let mut snap = accounts();
-        for args in [
-            vec!["rule"],
-            vec!["rule", "unknown", "Personal", "on"],
-            vec!["rule", "claude", "missing", "on"],
-            vec!["rule", "claude", "Personal", "maybe"],
-            vec!["rule", "claude", "Personal", "on", "abc"],
-            vec!["rule", "claude", "Personal", "on", "90", "daily"],
-            vec!["rule", "claude", "Personal", "on", "90", "max", "missing"],
-            vec!["rule", "claude", "Personal", "on", "90", "max", "Personal"],
-            vec![
-                "rule", "claude", "Personal", "on", "90", "max", "auto", "extra",
-            ],
-            vec!["rule-rm", "claude", "Personal", "extra"],
-        ] {
-            assert!(parse_rule_command(&args, &snap).is_err(), "{args:?}");
-        }
-        snap.accounts[1].label = "Personal".into();
-        assert!(parse_rule_command(&["rule-rm", "claude", "Personal"], &snap).is_err());
-        assert!(parse_rule_command(&["rule-rm", "claude", "claude-host"], &snap).is_ok());
-    }
-    #[test]
     fn usage_window_includes_only_known_reset_times() {
         for (reset, expected) in [
             (
@@ -868,145 +663,26 @@ mod tests {
         }
     }
 
-    fn customized_snapshot() -> AccountsSnapshot {
-        let mut snap = accounts();
-        snap.auto_switch.enabled = false;
-        snap.auto_switch.threshold_percent = 77;
-        snap.auto_switch.switch_on_rate_limit = false;
-        snap.auto_switch.rules.push(AutoSwitchRule {
-            provider: ProviderKind::Claude,
-            from_account_id: "claude-host".into(),
-            enabled: true,
-            threshold_percent: 60,
-            metric: AutoSwitchMetric::SevenDay,
-            target_account_id: Some("claude-work".into()),
-        });
-        snap
-    }
-
-    /// OWE-709: on/off만으로는 기존 임계치·한도·규칙을 덮어쓰지 않는다.
     #[test]
-    fn auto_switch_on_off_preserves_threshold_limit_and_rules() {
-        let snap = customized_snapshot();
-        for (state, enabled) in [("on", true), ("off", false)] {
-            let UsageRequest::SetAutoSwitch(policy) =
-                parse_auto_switch_command(&["auto-switch", state], &snap).unwrap()
-            else {
-                panic!("expected SetAutoSwitch");
-            };
-            assert_eq!(policy.enabled, enabled);
-            assert_eq!(policy.threshold_percent, 77);
-            assert!(!policy.switch_on_rate_limit);
-            assert_eq!(policy.rules, snap.auto_switch.rules);
-        }
-        // 임계치를 함께 주면 그 값만 바뀐다(공유 상수 범위로 자름).
-        let UsageRequest::SetAutoSwitch(policy) =
-            parse_auto_switch_command(&["auto-switch", "on", "85%"], &snap).unwrap()
-        else {
-            panic!("expected SetAutoSwitch");
-        };
-        assert!(policy.enabled);
-        assert_eq!(policy.threshold_percent, 85);
-        assert!(!policy.switch_on_rate_limit);
-        assert_eq!(policy.rules, snap.auto_switch.rules);
-    }
-
-    #[test]
-    fn auto_switch_command_rejects_invalid_arguments() {
-        let snap = customized_snapshot();
+    fn removed_auto_switch_subcommands_return_usage_error() {
         for args in [
-            vec!["auto-switch"],
-            vec!["auto-switch", "maybe"],
-            vec!["auto-switch", "on", "abc"],
-            vec!["auto-switch", "on", "90", "extra"],
-            vec!["auto-switch", "off", "75%", "extra"],
+            vec!["auto-switch", "on"],
+            vec!["rule", "claude", "claude-host", "on"],
+            vec!["rule-rm", "claude", "claude-host"],
+            vec!["policy", "predict", "on"],
+            vec!["history"],
         ] {
-            assert!(parse_auto_switch_command(&args, &snap).is_err(), "{args:?}");
+            let raw: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            assert_eq!(run(&raw), ExitCode::from(2));
         }
     }
 
     /// OWE-709: `--json` 출력은 스냅샷과 같은 내용이다.
     #[test]
     fn list_json_roundtrips_snapshot() {
-        let snap = customized_snapshot();
+        let snap = accounts();
         let rendered = snapshot_to_json(&snap).unwrap();
         let back: AccountsSnapshot = serde_json::from_str(&rendered).unwrap();
         assert_eq!(back, snap);
-    }
-}
-
-fn parse_advanced_policy(
-    key: &str,
-    value: &str,
-    mut policy: krill_proto::usage::AdvancedPolicy,
-) -> Result<UsageRequest, String> {
-    match (key, value) {
-        ("predict", "on" | "off") => policy.predict_exhaustion = value == "on",
-        ("reset-first", "on" | "off") => policy.prefer_soonest_reset = value == "on",
-        ("cooldown", value) => {
-            policy.cooldown_secs = value
-                .parse::<u64>()
-                .ok()
-                .and_then(|v| v.checked_mul(60))
-                .ok_or("cooldown expects minutes")?;
-        }
-        _ => return Err("policy expects predict/reset-first on|off, or cooldown minutes".into()),
-    }
-    Ok(UsageRequest::SetAdvancedPolicy(policy))
-}
-
-fn format_history(history: &[krill_proto::usage::SwitchRecord]) -> String {
-    if history.is_empty() {
-        return "No automatic switches yet".into();
-    }
-    history
-        .iter()
-        .map(|r| {
-            format!(
-                "{} [{}] {} -> {} ({}%, {})",
-                r.at,
-                r.event.provider.as_str(),
-                r.event.from_label,
-                r.event.to_label,
-                r.event.reason_percent,
-                if r.predicted {
-                    "predicted exhaustion"
-                } else {
-                    "threshold or limit"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[cfg(test)]
-mod policy_tests {
-    use super::*;
-    #[test]
-    fn advanced_policy_changes_only_requested_setting_and_rejects_overflow() {
-        let old = krill_proto::usage::AdvancedPolicy {
-            predict_exhaustion: true,
-            prefer_soonest_reset: true,
-            cooldown_secs: 900,
-        };
-        let UsageRequest::SetAdvancedPolicy(p) =
-            parse_advanced_policy("predict", "off", old.clone()).unwrap()
-        else {
-            panic!("policy")
-        };
-        assert!(!p.predict_exhaustion);
-        assert!(p.prefer_soonest_reset);
-        assert_eq!(p.cooldown_secs, 900);
-        let UsageRequest::SetAdvancedPolicy(p) =
-            parse_advanced_policy("cooldown", "5", old.clone()).unwrap()
-        else {
-            panic!("policy")
-        };
-        assert_eq!(p.cooldown_secs, 300);
-        assert!(p.predict_exhaustion);
-        assert!(parse_advanced_policy("cooldown", &u64::MAX.to_string(), old.clone()).is_err());
-        assert!(parse_advanced_policy("predict", "maybe", old).is_err());
-        assert!(format_history(&[]).contains("No automatic switches"));
     }
 }

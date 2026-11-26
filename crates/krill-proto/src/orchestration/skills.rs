@@ -305,6 +305,8 @@ pub struct SkillSyncReport {
     pub updated: usize,
     pub unchanged: usize,
     pub failures: Vec<String>,
+    /// Targets skipped intentionally because the user or another tool (e.g. Orca) owns the path.
+    pub skipped_external: Vec<String>,
     /// Roots another installer (app, daemon, or CLI) was writing; it publishes the same bundle,
     /// and every later launch or session start retries, so this is expected, not a failure.
     pub busy: Vec<PathBuf>,
@@ -343,6 +345,17 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
                     ) || (cfg!(unix) && error.raw_os_error() == Some(1)) =>
                 {
                     break;
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && error.to_string()
+                            == "skill paths belong to external skills or symlinks" =>
+                {
+                    report.skipped_external.push(format!(
+                        "{} ({}): {error}",
+                        skill.name,
+                        dir.display()
+                    ));
                 }
                 Err(error) => {
                     report
@@ -432,11 +445,10 @@ fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<Pat
     if orca_owned {
         stale.push(base_dir.join(skill.name));
     }
-    if stale
-        .into_iter()
-        .any(|old| old != dir && old.join("SKILL.md").is_file())
-    {
-        return Ok(None);
+    for old in stale {
+        if old != dir && old.join("SKILL.md").is_file() && candidate_writable(&old, skill)? {
+            return Ok(None);
+        }
     }
     let body = if prefixed {
         prefixed_content(skill, "krill-")
@@ -452,7 +464,7 @@ fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<Pat
     }
     let references = skill_references(skill.name);
     if references.is_empty() {
-        if dir.join("references").exists() {
+        if has_removable_stale_references(&dir.join("references")) {
             return Ok(None);
         }
         return Ok(Some(entry));
@@ -472,6 +484,29 @@ fn already_current(skill: &SkillEntry, base_dir: &Path) -> io::Result<Option<Pat
         }
     }
     Ok(Some(entry))
+}
+
+fn has_removable_stale_references(refs_dir: &Path) -> bool {
+    if ensure_directory_safe(refs_dir).is_err() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(refs_dir) else {
+        return false;
+    };
+    let mut empty = true;
+    for entry in entries {
+        empty = false;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let p = entry.path();
+        if regular_or_missing(&p).unwrap_or(false)
+            && fs::read_to_string(&p).is_ok_and(|s| s.contains(marker_for_path(&p)))
+        {
+            return true;
+        }
+    }
+    empty
 }
 
 fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {

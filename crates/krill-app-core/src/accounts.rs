@@ -1,8 +1,7 @@
-//! 프로바이더 다계정·사용량(5h/7d)·원클릭 전환 클라이언트 및 읽기 전용 로컬 폴백(MK-107·MK-108).
+//! 프로바이더 다계정·사용량(5h/7d)·원클릭 수동 전환 클라이언트 및 읽기 전용 로컬 폴백(MK-107·MK-108).
 //!
 //! - 데몬(`krilld`)이 연결되어 있으면 `FEAT_USAGE` IPC(`UsageRequest`/`UsageReply`)로 요청한다.
-//! - 자동전환 판정·기록은 krilld 하나만 한다(OWE-697). 로컬 폴백은 `accounts.toml`과 캐시를 읽기만 하고
-//!   자동전환을 평가하지 않는다. 로컬 변이(`request_local`)는 데몬 없는 임시 상태 디렉터리(테스트)용이다.
+//! - 로컬 폴백은 `accounts.toml`과 캐시를 읽기만 하며, 로컬 변이(`request_local`)는 데몬 없는 임시 상태 디렉터리(테스트)용이다.
 //!
 //! OAuth process lifecycle reference: Orca claude-login-session.ts / codex-login-session.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
@@ -26,9 +25,8 @@ use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountInfo, AccountsSnapshot, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, OrphanProfile,
-    ProviderKind, ResetConsumeOutcome, SessionSwitchPlan, Snapshot, UsageReply, UsageRequest,
-    Window,
+    AccountInfo, AccountsSnapshot, AutoSwitchPolicy, FEAT_USAGE, OrphanProfile, ProviderKind,
+    ResetConsumeOutcome, SessionSwitchPlan, Snapshot, UsageReply, UsageRequest, Window,
 };
 
 /// 이 앱(셸·설정 창)이 방금 요청한 기본 계정 전환. 외부 전환 알림이 자기 요청을 외부로 오인하지 않게
@@ -85,7 +83,9 @@ mod status_negotiation_tests {
 
     #[test]
     fn provider_metric_mutation_is_rejected_before_sending_to_legacy_daemon() {
-        use krill_proto::usage::{AutoSwitchMetric, FEAT_USAGE_PROVIDER_METRICS, FEAT_USAGE_RULES};
+        use krill_proto::usage::{
+            AutoSwitchMetric, AutoSwitchRule, FEAT_USAGE_PROVIDER_METRICS, FEAT_USAGE_RULES,
+        };
         let root = std::env::temp_dir().join(format!("acct-metric-gate-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let paths = Paths {
@@ -379,8 +379,6 @@ pub struct StoredAccount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsFile {
     #[serde(default)]
-    pub auto_switch: StoredAutoSwitch,
-    #[serde(default)]
     pub active: BTreeMap<String, String>,
     #[serde(default)]
     pub accounts: Vec<StoredAccount>,
@@ -399,47 +397,10 @@ fn provisioning_default() -> bool {
 impl Default for AccountsFile {
     fn default() -> Self {
         Self {
-            auto_switch: StoredAutoSwitch::default(),
             active: BTreeMap::new(),
             accounts: Vec::new(),
             provisioning: provisioning_default(),
             hidden_accounts: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredAutoSwitch {
-    #[serde(default = "default_switch_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_switch_threshold")]
-    pub threshold_percent: u8,
-    #[serde(default = "default_switch_on_rate_limit")]
-    pub switch_on_rate_limit: bool,
-    #[serde(default)]
-    pub rules: Vec<AutoSwitchRule>,
-}
-
-fn default_switch_enabled() -> bool {
-    AutoSwitchPolicy::default().enabled
-}
-
-fn default_switch_threshold() -> u8 {
-    krill_proto::usage::DEFAULT_AUTO_SWITCH_PERCENT
-}
-
-fn default_switch_on_rate_limit() -> bool {
-    AutoSwitchPolicy::default().switch_on_rate_limit
-}
-
-impl Default for StoredAutoSwitch {
-    fn default() -> Self {
-        let d = AutoSwitchPolicy::default();
-        Self {
-            enabled: d.enabled,
-            threshold_percent: d.threshold_percent,
-            switch_on_rate_limit: d.switch_on_rate_limit,
-            rules: d.rules,
         }
     }
 }
@@ -512,7 +473,8 @@ pub fn request_target_with_features(
         UsageReply::Current(_)
         | UsageReply::Orphans(_)
         | UsageReply::Provisioning(_)
-        | UsageReply::SessionSwitchPlan(_) => AccountsSnapshot::default(),
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => AccountsSnapshot::default(),
         UsageReply::Failed(e) => return Err(failure_text(e)),
     };
     Ok((snapshot, features))
@@ -624,7 +586,22 @@ pub fn orphans_target(
         | UsageReply::Current(_)
         | UsageReply::Provisioning(_)
         | UsageReply::ResetConsumed { .. }
-        | UsageReply::SessionSwitchPlan(_) => Ok(Vec::new()),
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => Ok(Vec::new()),
+    }
+}
+
+/// 지정한 호스트 타깃(로컬·원격) 데몬에 네이티브 Antigravity 계정 동작을 요청한다.
+pub fn antigravity_accounts_target(
+    target: &krill_hosts::HostTarget,
+    op: krill_proto::usage::AntigravityAccountOp,
+) -> Result<krill_proto::usage::AntigravityAccountState, String> {
+    match exchange_target(target, &UsageRequest::AntigravityAccounts(op))? {
+        UsageReply::AntigravityAccounts(result) => result,
+        UsageReply::Failed(e) => Err(failure_text(e)),
+        _ => Err(crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()),
     }
 }
 
@@ -699,8 +676,8 @@ fn exchange_target_with_features(
         | krill_proto::usage::FEAT_USAGE_REFRESH
         | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
         | krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL;
-    let mut conn = target
-        .connect(&hello)
+    let (mut conn, epoch) = target
+        .connect_with_epoch(&hello)
         .map_err(|e| crate::errors::user_daemon_error(&e))?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err(
@@ -732,7 +709,7 @@ fn exchange_target_with_features(
             .to_owned()
     })?;
     if let Err(err) = conn.stream.write_all(&encoded) {
-        target.record_outcome(false, Some(&err));
+        target.record_outcome_for_epoch(epoch, false, Some(&err));
         return Err(crate::errors::user_io_error(&err));
     }
     let (kind, body) = match ipc::read_frame(&mut conn.stream) {
@@ -743,7 +720,7 @@ fn exchange_target_with_features(
                 .to_owned());
         }
         Err(err) => {
-            target.record_outcome(false, Some(&err));
+            target.record_outcome_for_epoch(epoch, false, Some(&err));
             if matches!(req, UsageRequest::ConsumeResetCredit { .. })
                 && matches!(
                     err.kind(),
@@ -762,7 +739,7 @@ fn exchange_target_with_features(
             .get()
             .to_owned()
     })?;
-    target.record_outcome(true, None);
+    target.record_outcome_for_epoch(epoch, true, None);
     Ok((reply, conn.negotiated.features))
 }
 
@@ -781,6 +758,7 @@ pub fn request_local(
         | UsageRequest::SetAdvancedPolicy(_)
         | UsageRequest::SetDirectUsage(_)
         | UsageRequest::ImportOrcaAntigravity { .. }
+        | UsageRequest::AntigravityAccounts(_)
         | UsageRequest::SetProvisioning(_)
         | UsageRequest::GetProvisioning
         | UsageRequest::ConsumeResetCredit { .. } => Err(io::Error::new(
@@ -790,7 +768,10 @@ pub fn request_local(
         UsageRequest::Get
         | UsageRequest::ListAccounts
         | UsageRequest::RefreshUsage
-        | UsageRequest::ListOrphanProfiles => Ok(refresh_local(home, state_dir)),
+        | UsageRequest::ListOrphanProfiles
+        | UsageRequest::SetAutoSwitch(_)
+        | UsageRequest::UpsertAutoSwitchRule(_)
+        | UsageRequest::RemoveAutoSwitchRule { .. } => Ok(refresh_local(home, state_dir)),
         UsageRequest::SwitchAccount {
             provider,
             account_id,
@@ -953,29 +934,6 @@ pub fn request_local(
             }
             Ok(refresh_local(home, state_dir))
         }
-        UsageRequest::SetAutoSwitch(policy) => set_auto_switch_local(home, state_dir, policy),
-        UsageRequest::UpsertAutoSwitchRule(rule) => {
-            let mut file = load_file_result(home, state_dir)?;
-            let mut policy = AutoSwitchPolicy {
-                rules: file.auto_switch.rules,
-                ..AutoSwitchPolicy::default()
-            };
-            policy.upsert_rule(rule.clone());
-            file.auto_switch.rules = policy.rules;
-            save_file(home, state_dir, &file)?;
-            Ok(refresh_local(home, state_dir))
-        }
-        UsageRequest::RemoveAutoSwitchRule {
-            provider,
-            from_account_id,
-        } => {
-            let mut file = load_file_result(home, state_dir)?;
-            file.auto_switch
-                .rules
-                .retain(|r| r.provider != *provider || r.from_account_id != *from_account_id);
-            save_file(home, state_dir, &file)?;
-            Ok(refresh_local(home, state_dir))
-        }
     }
 }
 
@@ -1036,18 +994,20 @@ pub fn start_login_with_mode(
             })?;
     command.env("PATH", path);
     let (paths, account) = (paths.clone(), account.clone());
+    let generation = begin_login_attempt(&account.id);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
     std::thread::Builder::new()
         .name("account-login-browser".into())
         .spawn(move || {
-            run_browser_login_with_mode(
+            run_browser_login_for_generation(
                 &paths,
                 &account,
                 newly_added,
                 command,
                 &cancel_for_thread,
                 open_browser,
+                generation,
             );
         })
         .map_err(|e| crate::errors::user_io_error(&e))?;
@@ -1145,80 +1105,169 @@ pub enum LoginFailReason {
     Unsuccessful,
 }
 
-fn login_outcomes() -> &'static std::sync::Mutex<std::collections::HashMap<String, LoginOutcome>> {
+static NEXT_LOGIN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_login_generation() -> u64 {
+    NEXT_LOGIN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoginOutcomeSlot {
+    generation: u64,
+    outcome: Option<LoginOutcome>,
+}
+
+fn login_outcomes() -> &'static std::sync::Mutex<std::collections::HashMap<String, LoginOutcomeSlot>>
+{
     static OUTCOMES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, LoginOutcome>>,
+        std::sync::Mutex<std::collections::HashMap<String, LoginOutcomeSlot>>,
     > = std::sync::OnceLock::new();
     OUTCOMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn lock_login_outcomes()
--> std::sync::MutexGuard<'static, std::collections::HashMap<String, LoginOutcome>> {
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, LoginOutcomeSlot>> {
     login_outcomes()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn record_login_outcome(account_id: &str, outcome: LoginOutcome) {
-    lock_login_outcomes().insert(account_id.to_owned(), outcome);
+fn begin_login_attempt(account_id: &str) -> u64 {
+    let generation = next_login_generation();
+    let mut outcomes = lock_login_outcomes();
+    outcomes.insert(
+        account_id.to_owned(),
+        LoginOutcomeSlot {
+            generation,
+            outcome: None,
+        },
+    );
+    lock_login_urls().remove(account_id);
+    generation
+}
+
+fn record_login_outcome_for_generation(account_id: &str, generation: u64, outcome: LoginOutcome) {
+    let mut outcomes = lock_login_outcomes();
+    if outcomes
+        .get(account_id)
+        .is_some_and(|slot| slot.generation > generation)
+    {
+        return;
+    }
+    outcomes.insert(
+        account_id.to_owned(),
+        LoginOutcomeSlot {
+            generation,
+            outcome: Some(outcome),
+        },
+    );
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) fn record_login_outcome_for_test(account_id: &str, outcome: LoginOutcome) {
-    record_login_outcome(account_id, outcome);
+    let generation = next_login_generation();
+    record_login_outcome_for_generation(account_id, generation, outcome);
+}
+
+fn take_slot_outcome(
+    outcomes: &mut std::collections::HashMap<String, LoginOutcomeSlot>,
+    account_id: &str,
+) -> Option<(u64, LoginOutcome)> {
+    let slot = outcomes.get_mut(account_id)?;
+    let outcome = slot.outcome.take()?;
+    Some((slot.generation, outcome))
 }
 
 /// 백그라운드 로그인 스레드가 남긴 종료 사유를 꺼낸다. 없으면 아직 진행 중이다(OWE-881).
 #[must_use]
 pub fn take_login_outcome(account_id: &str) -> Option<LoginOutcome> {
-    let outcome = match login_outcomes().try_lock() {
-        Ok(mut outcomes) => outcomes.remove(account_id),
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().remove(account_id),
+    let taken = match login_outcomes().try_lock() {
+        Ok(mut outcomes) => take_slot_outcome(&mut outcomes, account_id),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            take_slot_outcome(&mut error.into_inner(), account_id)
+        }
         Err(std::sync::TryLockError::WouldBlock) => None,
     };
-    if outcome.is_some() {
-        clear_login_url(account_id);
+    if let Some((generation, outcome)) = taken {
+        clear_login_url_if_not_newer(account_id, generation);
+        return Some(outcome);
     }
-    outcome
+    None
 }
 
-fn login_urls() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static URLS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
+fn login_urls() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, String)>> {
+    static URLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (u64, String)>>,
+    > = std::sync::OnceLock::new();
     URLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn lock_login_urls() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+fn lock_login_urls()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, (u64, String)>> {
     login_urls()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn record_login_url(account_id: &str, url: &str) {
-    lock_login_urls().insert(account_id.to_owned(), url.to_owned());
+fn record_login_url_for_generation(account_id: &str, generation: u64, url: &str) {
+    let outcomes = lock_login_outcomes();
+    if outcomes
+        .get(account_id)
+        .is_some_and(|slot| slot.generation > generation)
+    {
+        return;
+    }
+    let mut urls = lock_login_urls();
+    if urls
+        .get(account_id)
+        .is_some_and(|(existing_gen, _)| *existing_gen > generation)
+    {
+        return;
+    }
+    urls.insert(account_id.to_owned(), (generation, url.to_owned()));
 }
 
-fn clear_login_url(account_id: &str) {
-    lock_login_urls().remove(account_id);
+fn clear_login_url_if_not_newer(account_id: &str, generation: u64) {
+    let mut urls = lock_login_urls();
+    if urls
+        .get(account_id)
+        .is_some_and(|(existing_gen, _)| *existing_gen <= generation)
+    {
+        urls.remove(account_id);
+    }
 }
 
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) fn record_login_url_for_test(account_id: &str, url: &str) {
-    record_login_url(account_id, url);
+    let generation = next_login_generation();
+    record_login_url_for_generation(account_id, generation, url);
 }
 
 /// 백그라운드 로그인 스레드가 캡처한 인증 URL을 읽는다(진행 중에 여러 번 복사할 수 있게 유지).
 #[must_use]
 pub fn login_url(account_id: &str) -> Option<String> {
-    match login_urls().try_lock() {
+    let active_gen = match login_outcomes().try_lock() {
+        Ok(outcomes) => outcomes.get(account_id).map(|slot| slot.generation),
+        Err(std::sync::TryLockError::Poisoned(error)) => error
+            .into_inner()
+            .get(account_id)
+            .map(|slot| slot.generation),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let entry = match login_urls().try_lock() {
         Ok(urls) => urls.get(account_id).cloned(),
         Err(std::sync::TryLockError::Poisoned(error)) => {
             error.into_inner().get(account_id).cloned()
         }
         Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    };
+    entry.and_then(|(generation, url)| {
+        active_gen
+            .is_none_or(|active| generation >= active)
+            .then_some(url)
+    })
 }
 
 #[cfg(test)]
@@ -1233,22 +1282,44 @@ fn run_browser_login(
     run_browser_login_with_mode(paths, account, newly_added, command, cancel, true);
 }
 
+#[cfg(test)]
+#[cfg(unix)]
 fn run_browser_login_with_mode(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+    command: std::process::Command,
+    cancel: &std::sync::atomic::AtomicBool,
+    open_browser: bool,
+) {
+    let generation = begin_login_attempt(&account.id);
+    run_browser_login_for_generation(
+        paths,
+        account,
+        newly_added,
+        command,
+        cancel,
+        open_browser,
+        generation,
+    );
+}
+
+fn run_browser_login_for_generation(
     paths: &Paths,
     account: &AccountInfo,
     newly_added: bool,
     mut command: std::process::Command,
     cancel: &std::sync::atomic::AtomicBool,
     open_browser: bool,
+    generation: u64,
 ) {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::Ordering;
-    clear_login_url(&account.id);
-    // 실패 기록+정리를 한 번에 한다. 취소는 별도 경로(호출자가 구분해야 한다).
+    // 정리 완료 뒤에 실패 결과를 기록해 폴링 UI가 지워지기 전 계정을 다시 읽지 않게 한다.
     let fail = |reason: LoginFailReason| {
-        record_login_outcome(&account.id, LoginOutcome::Failed(reason));
         cleanup_failed_login(paths, account, newly_added);
+        record_login_outcome_for_generation(&account.id, generation, LoginOutcome::Failed(reason));
     };
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1304,7 +1375,7 @@ fn run_browser_login_with_mode(
                 printed_link.as_deref(),
             )
         {
-            record_login_url(&account.id, url);
+            record_login_url_for_generation(&account.id, generation, url);
             opened = handed
                 && if open_browser {
                     if cfg!(target_os = "macos") {
@@ -1399,10 +1470,10 @@ fn run_browser_login_with_mode(
             .ok();
         }
         request_ipc(paths, &UsageRequest::RefreshUsage).ok();
-        record_login_outcome(&account.id, LoginOutcome::Succeeded);
+        record_login_outcome_for_generation(&account.id, generation, LoginOutcome::Succeeded);
     } else if cancelled {
         cleanup_failed_login(paths, account, newly_added);
-        record_login_outcome(&account.id, LoginOutcome::Cancelled);
+        record_login_outcome_for_generation(&account.id, generation, LoginOutcome::Cancelled);
     } else {
         let reason = if timed_out {
             LoginFailReason::TimedOut
@@ -1527,50 +1598,6 @@ pub fn orphans_local(home: &Path, state_dir: Option<&Path>) -> Vec<OrphanProfile
     krill_proto::usage::profiles::orphans(home, &keep)
 }
 
-/// 데몬 연결을 우선하고 로컬 파일로 폴백한다.
-pub fn upsert_auto_switch_rule(rule: AutoSwitchRule) -> Result<AccountsSnapshot, String> {
-    let paths = Paths::dev().ok();
-    request(paths.as_ref(), &UsageRequest::UpsertAutoSwitchRule(rule))
-}
-
-pub fn remove_auto_switch_rule(
-    provider: ProviderKind,
-    from_account_id: &str,
-) -> Result<AccountsSnapshot, String> {
-    let paths = Paths::dev().ok();
-    request(
-        paths.as_ref(),
-        &UsageRequest::RemoveAutoSwitchRule {
-            provider,
-            from_account_id: from_account_id.to_owned(),
-        },
-    )
-}
-
-pub fn set_auto_switch_local(
-    home: &Path,
-    state_dir: Option<&Path>,
-    policy: &AutoSwitchPolicy,
-) -> io::Result<AccountsSnapshot> {
-    let mut file = load_file_result(home, state_dir)?;
-    let rules = if policy.rules.is_empty() {
-        file.auto_switch.rules
-    } else {
-        policy.rules.clone()
-    };
-    file.auto_switch = StoredAutoSwitch {
-        enabled: policy.enabled,
-        threshold_percent: policy.threshold_percent.clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        ),
-        switch_on_rate_limit: policy.switch_on_rate_limit,
-        rules,
-    };
-    save_file(home, state_dir, &file)?;
-    Ok(refresh_local(home, state_dir))
-}
-
 pub fn default_home() -> PathBuf {
     // 단위 테스트가 실제 사용자 홈(~/.config/krill/profiles 등)을 읽거나
     // 고아 프로필 정리로 휴지통에 옮기지 않게 프로세스별 임시 홈으로 격리한다.
@@ -1675,19 +1702,10 @@ pub fn switch_account(
     Ok(refresh_local(home, state_dir))
 }
 
-/// 읽기 전용 스냅샷. 자동전환을 평가하지도 `accounts.toml`을 쓰지도 않는다(OWE-697) — 판정은 krilld만.
-/// 앱이 데몬이 쓴 파일을 1초 감시로 다시 읽어도 왕복 전환이 생기지 않는다.
+/// 읽기 전용 스냅샷. `accounts.toml`을 쓰지 않는다.
 pub fn refresh_local(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot {
     let file = load_file(home, state_dir);
-    let policy = AutoSwitchPolicy {
-        enabled: file.auto_switch.enabled,
-        threshold_percent: file.auto_switch.threshold_percent.clamp(
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MIN,
-            krill_proto::usage::AUTO_SWITCH_THRESHOLD_MAX,
-        ),
-        switch_on_rate_limit: file.auto_switch.switch_on_rate_limit,
-        rules: file.auto_switch.rules,
-    };
+    let policy = AutoSwitchPolicy::default();
 
     let mut all = Vec::new();
     for provider in ProviderKind::ALL {
@@ -2343,19 +2361,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = request_local(
-            &home,
-            Some(&state),
-            &UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
-                enabled: true,
-                threshold_percent: 80,
-                switch_on_rate_limit: true,
-                rules: Vec::new(),
-            }),
-        )
-        .unwrap();
-
-        // Manual switch to the 95% account must NOT be immediately overridden by auto-switch.
+        // Manual switch to the 95% account stays selected and never triggers automatic switching.
         let snap =
             switch_account(&home, Some(&state), ProviderKind::Claude, "claude-high-max").unwrap();
         assert!(snap.switched.is_empty());
@@ -2579,12 +2585,6 @@ mod as_regression_tests {
                 std::fs::write(backup.join("usage_cache.json"), usage).unwrap();
             }
             let file = AccountsFile {
-                auto_switch: StoredAutoSwitch {
-                    enabled: true,
-                    threshold_percent: 90,
-                    switch_on_rate_limit: on_rate_limit,
-                    rules: Vec::new(),
-                },
                 active: BTreeMap::new(),
                 accounts: vec![StoredAccount {
                     id: "claude-backup".into(),
@@ -2598,6 +2598,11 @@ mod as_regression_tests {
             };
             save_file(&home, Some(&state), &file).unwrap();
             let path = config_path(&home, Some(&state));
+            let legacy = format!(
+                "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = {on_rate_limit}\n\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+            std::fs::write(&path, &legacy).unwrap();
             let before = std::fs::read(&path).unwrap();
             let snap = refresh_local(&home, Some(&state));
             assert!(snap.switched.is_empty(), "{name}: {:?}", snap.switched);
@@ -2753,65 +2758,31 @@ mod as_regression_tests {
 }
 
 #[cfg(test)]
-mod rule_tests {
+mod legacy_config_tests {
     use super::*;
 
-    /// 규칙 저장·삭제와 전역 정책 갱신은 로컬 파일에 그대로 남는다. 평가는 데몬 몫이라 `switched`는 비어 있다.
     #[test]
-    fn per_account_rules_persist_and_survive_global_updates() {
-        use krill_proto::usage::{AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule};
-
-        let root =
-            std::env::temp_dir().join(format!("krill-app-rule-behavior-{}", std::process::id()));
+    fn legacy_accounts_toml_with_auto_switch_and_rules_loads_and_saves_cleanly() {
+        let root = std::env::temp_dir().join(format!("krill-app-legacy-as-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let home = root.join("home");
         let state = root.join("state");
-        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
-            let rule = AutoSwitchRule {
-                provider,
-                from_account_id: format!("{}-host", provider.as_str()),
-                enabled: true,
-                threshold_percent: 90,
-                metric: AutoSwitchMetric::SevenDay,
-                target_account_id: Some(format!("{}-target", provider.as_str())),
-            };
-            let snap = request_local(
-                &home,
-                Some(&state),
-                &UsageRequest::UpsertAutoSwitchRule(rule.clone()),
-            )
-            .unwrap();
-            assert!(snap.switched.is_empty());
-            assert!(snap.auto_switch.rules.contains(&rule));
-            let policy = AutoSwitchPolicy {
-                enabled: false,
-                ..AutoSwitchPolicy::default()
-            };
-            let updated = set_auto_switch_local(&home, Some(&state), &policy).unwrap();
-            assert_eq!(updated.auto_switch.rules, vec![rule.clone()]);
-            assert_eq!(load_file(&home, Some(&state)).auto_switch.rules, vec![rule]);
-            let removed = request_local(
-                &home,
-                Some(&state),
-                &UsageRequest::RemoveAutoSwitchRule {
-                    provider,
-                    from_account_id: format!("{}-host", provider.as_str()),
-                },
-            )
-            .unwrap();
-            assert!(removed.auto_switch.rules.is_empty());
-            assert!(load_file(&home, Some(&state)).auto_switch.rules.is_empty());
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let path = config_path(&home, Some(&state));
+        let raw = "[auto_switch]\nenabled = true\nthreshold_percent = 80\nswitch_on_rate_limit = true\n[[auto_switch.rules]]\nprovider = 'Claude'\nfrom_account_id = 'claude-host'\nenabled = true\nthreshold_percent = 70\nmetric = 'seven_day'\n[advanced_policy]\npredict_exhaustion = true\n";
+        std::fs::write(&path, raw).unwrap();
 
-    #[test]
-    fn legacy_accounts_toml_defaults_rules_to_empty() {
-        let file: AccountsFile = toml::from_str(
-            "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = true\n",
-        )
-        .unwrap();
-        assert!(file.auto_switch.rules.is_empty());
+        let file = load_file_result(&home, Some(&state)).unwrap();
+        assert!(file.accounts.is_empty());
+        let snap = refresh_local(&home, Some(&state));
+        assert!(!snap.auto_switch.enabled);
+        assert!(snap.auto_switch.rules.is_empty());
+        assert!(snap.switched.is_empty());
+
+        save_file(&home, Some(&state), &file).unwrap();
+        assert!(load_file_result(&home, Some(&state)).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 }
 
@@ -2851,7 +2822,7 @@ fn owe699_provisioning_on_by_default_and_survives_app_save() {
     std::fs::write(dir.join(ACCOUNTS_FILE), "provisioning = false\n").unwrap();
     assert!(!provisioning_enabled(&dir, Some(&dir)));
     let mut file = load_file_result(&dir, Some(&dir)).unwrap();
-    file.auto_switch.enabled = false;
+    file.active.insert("claude".into(), "claude-host".into());
     save_file(&dir, Some(&dir), &file).unwrap();
     assert!(!provisioning_enabled(&dir, Some(&dir)), "명시한 꺼짐 유지");
     std::fs::remove_dir_all(dir).unwrap();
@@ -3022,6 +2993,143 @@ fn async_login_poll_never_waits_for_outcome_writer() {
     let guard = lock_login_outcomes();
     assert_eq!(take_login_outcome("contended-poll"), None);
     drop(guard);
+}
+
+#[test]
+fn new_login_attempt_clears_stale_state_and_rejects_dying_older_generation() {
+    let id = "uc24-gen-guard-account";
+    let g1 = begin_login_attempt(id);
+    record_login_url_for_generation(id, g1, "https://claude.ai/oauth/old");
+    record_login_outcome_for_generation(id, g1, LoginOutcome::Failed(LoginFailReason::TimedOut));
+
+    // Starting a newer login attempt synchronously clears stale outcome and URL.
+    let g2 = begin_login_attempt(id);
+    assert!(g2 > g1);
+    assert_eq!(take_login_outcome(id), None);
+    assert_eq!(login_url(id), None);
+
+    // Dying older thread (g1) must not write URL or outcome into the active attempt (g2).
+    record_login_url_for_generation(id, g1, "https://claude.ai/oauth/stale-late");
+    record_login_outcome_for_generation(id, g1, LoginOutcome::Cancelled);
+    assert_eq!(login_url(id), None);
+    assert_eq!(take_login_outcome(id), None);
+
+    // Active attempt (g2) records URL; older thread (g1) still cannot overwrite it.
+    record_login_url_for_generation(id, g2, "https://claude.ai/oauth/fresh");
+    record_login_url_for_generation(id, g1, "https://claude.ai/oauth/old-overwrite");
+    record_login_outcome_for_generation(
+        id,
+        g1,
+        LoginOutcome::Failed(LoginFailReason::Unsuccessful),
+    );
+    assert_eq!(
+        login_url(id).as_deref(),
+        Some("https://claude.ai/oauth/fresh")
+    );
+    assert_eq!(take_login_outcome(id), None);
+
+    // Active attempt (g2) completion is delivered and clears its URL.
+    record_login_outcome_for_generation(id, g2, LoginOutcome::Succeeded);
+    assert_eq!(take_login_outcome(id), Some(LoginOutcome::Succeeded));
+    assert_eq!(login_url(id), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_new_login_completes_cleanup_before_recording_outcome() {
+    use krill_proto::ipc::{ClientHello, ServerHello};
+
+    let root = std::env::temp_dir().join(format!("uc46-fail-order-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let paths = Paths {
+        socket: root.join("daemon.sock"),
+        holder: root.join("unused-holder"),
+        krilld: root.join("unused-daemon"),
+    };
+    let added = request_local(
+        &home,
+        Some(&state),
+        &UsageRequest::AddAccount {
+            provider: ProviderKind::Claude,
+            label: "Cleanup Order Test".into(),
+            email: None,
+            profile_dir: String::new(),
+        },
+    )
+    .unwrap();
+    let account: AccountInfo = added
+        .accounts
+        .into_iter()
+        .find(|a| a.label == "Cleanup Order Test")
+        .unwrap();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server_home = home.clone();
+    let server_state = state.clone();
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features: krill_proto::usage::FEAT_USAGE | krill_proto::usage::FEAT_USAGE_MANAGE,
+            build: "test".into(),
+            instance_id: 1,
+        };
+        let (mut watch, _) = listener.accept().unwrap();
+        watch.write_all(&hello.encode().unwrap()).unwrap();
+        ipc::read_frame(&mut watch).unwrap().unwrap();
+        drop(watch);
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(&hello.encode().unwrap()).unwrap();
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        let client = ClientHello::decode(kind, &body).unwrap();
+        let features = ipc::negotiate(&hello, &client).unwrap().features;
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        let req = UsageRequest::decode(kind, &body).unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let snap = request_local(&server_home, Some(&server_state), &req).unwrap();
+        let reply = UsageReply::Accounts(snap).for_features(features);
+        stream.write_all(&reply.encode().unwrap()).unwrap();
+    });
+
+    let paths_bg = paths.clone();
+    let account_bg = account.clone();
+    let worker = std::thread::spawn(move || {
+        run_browser_login_with_mode(
+            &paths_bg,
+            &account_bg,
+            true,
+            std::process::Command::new("/krill-test-missing-login-cli"),
+            &std::sync::atomic::AtomicBool::new(false),
+            false,
+        );
+    });
+
+    // While cleanup_failed_login (DeleteAccount) is still in flight, outcome must NOT be published yet.
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        take_login_outcome(&account.id),
+        None,
+        "failed login outcome must not be recorded before cleanup_failed_login finishes"
+    );
+
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Failed(LoginFailReason::SpawnFailed))
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[cfg(test)]

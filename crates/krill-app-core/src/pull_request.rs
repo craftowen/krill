@@ -591,14 +591,70 @@ impl Runner for Gh {
     }
 }
 
-pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
-    let exe = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|p| p.join(name))
-                .find(|p| executable(p))
+const WINDOWS_EXE_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+fn has_windows_executable_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            WINDOWS_EXE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
         })
-        .or_else(|| fallbacks.iter().map(PathBuf::from).find(|p| executable(p)))
+}
+
+fn executable_candidates_for(dir: &Path, name: &str, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        if has_windows_executable_extension(Path::new(name)) {
+            return vec![dir.join(name)];
+        }
+        WINDOWS_EXE_EXTENSIONS
+            .iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .collect()
+    } else {
+        vec![dir.join(name)]
+    }
+}
+
+fn fallback_candidates_for(fallback: &str, windows: bool) -> Vec<PathBuf> {
+    let path = PathBuf::from(fallback);
+    if !windows || has_windows_executable_extension(&path) {
+        return vec![path];
+    }
+    WINDOWS_EXE_EXTENSIONS
+        .iter()
+        .map(|ext| PathBuf::from(format!("{fallback}.{ext}")))
+        .collect()
+}
+
+pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
+    find_executable_in_for(
+        name,
+        std::env::var_os("PATH").as_deref(),
+        fallbacks,
+        cfg!(windows),
+    )
+}
+
+fn find_executable_in_for(
+    name: &str,
+    path_env: Option<&std::ffi::OsStr>,
+    fallbacks: &[&str],
+    windows: bool,
+) -> PathBuf {
+    let exe = path_env
+        .and_then(|path| {
+            std::env::split_paths(path)
+                .flat_map(|dir| executable_candidates_for(&dir, name, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
+        .or_else(|| {
+            fallbacks
+                .iter()
+                .flat_map(|fallback| fallback_candidates_for(fallback, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
         .unwrap_or_else(|| name.into());
     std::fs::canonicalize(&exe).unwrap_or(exe)
 }
@@ -718,30 +774,66 @@ pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
 }
 
 fn executable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    executable_for(path, cfg!(windows))
 }
 
-struct Reap(Child);
+fn executable_for(path: &Path, windows: bool) -> bool {
+    if windows {
+        has_windows_executable_extension(path) && path.metadata().is_ok_and(|m| m.is_file())
+    } else {
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    }
+}
+
+struct Reap {
+    child: Child,
+    exited: bool,
+}
 impl Drop for Reap {
     fn drop(&mut self) {
-        self.0.kill().ok();
-        self.0.wait().ok();
+        if !self.exited {
+            krill_proto::os::kill_tree(&mut self.child);
+        }
     }
 }
 pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut child = Reap(
-        cmd.stdin(Stdio::null())
+    execute_with_stdin(cmd, None, timeout)
+}
+
+fn execute_with_stdin(
+    cmd: &mut Command,
+    stdin_bytes: Option<&[u8]>,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let mut child = Reap {
+        child: cmd
+            .stdin(if stdin_bytes.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?,
-    );
+        exited: false,
+    };
+    let deadline = Instant::now() + timeout;
+    let writer = if let Some(input) = stdin_bytes {
+        let stdin = child
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("missing child stdin"))?;
+        Some(crate::process_io::write(stdin, input.to_vec(), deadline)?)
+    } else {
+        None
+    };
     let stdout = child
-        .0
+        .child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing gh stdout"))?;
-    let deadline = Instant::now() + timeout;
     let reader = crate::process_io::read(stdout, MAX_OUTPUT + 1, deadline)?;
     let mut output = None;
     let status = loop {
@@ -757,7 +849,8 @@ pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8
             }
             output = Some(captured.bytes);
         }
-        if let Some(status) = child.0.try_wait()? {
+        if let Some(status) = child.child.try_wait()? {
+            child.exited = true;
             break status;
         }
         if Instant::now() >= deadline {
@@ -765,6 +858,7 @@ pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    drop(writer);
     let bytes = if let Some(output) = output {
         output
     } else {
@@ -1016,15 +1110,49 @@ pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn is_windows_batch_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+fn build_local_agent_command(name: &str, exe: &Path, folder: &Path) -> Command {
+    let mut cmd = crate::platform::background_command(exe);
+    cmd.current_dir(folder)
+        .env("CI", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // Pass prompts via stdin rather than argv: Rust on Windows rejects `\r`/`\n`
+    // arguments to `.cmd`/`.bat` npm shims (CVE-2024-24576), and large diffs can
+    // exceed command-line length limits.
+    match name {
+        "claude" => {
+            cmd.args(["-p", "--output-format", "text"]);
+        }
+        "codex" => {
+            cmd.args(["exec", "--skip-git-repo-check", "-"]);
+        }
+        _ => {
+            cmd.args(["-p", ""]);
+        }
+    }
+    cmd
+}
+
 /// Runs a non-interactive text generation prompt against a local AI CLI (`claude`, `codex`, `gemini`)
 /// or an explicit override in `KRILL_AI_CLI` (used by deterministic subprocess tests).
 pub(crate) fn run_local_agent_prompt(folder: &Path, prompt: &str) -> io::Result<String> {
     if let Some(custom) = std::env::var_os("KRILL_AI_CLI")
         && !custom.is_empty()
     {
-        let mut cmd = crate::platform::background_command(custom);
-        cmd.current_dir(folder).arg(prompt);
-        let bytes = execute(&mut cmd, AI_TIMEOUT)?;
+        let custom_path = PathBuf::from(&custom);
+        let mut cmd = crate::platform::background_command(&custom);
+        cmd.current_dir(folder);
+        let bytes = if is_windows_batch_path(&custom_path) {
+            execute_with_stdin(&mut cmd, Some(prompt.as_bytes()), AI_TIMEOUT)?
+        } else {
+            cmd.arg(prompt);
+            execute(&mut cmd, AI_TIMEOUT)?
+        };
         let out = String::from_utf8_lossy(&bytes).trim().to_owned();
         if !out.is_empty() {
             return Ok(out);
@@ -1056,22 +1184,8 @@ pub(crate) fn run_local_agent_prompt(folder: &Path, prompt: &str) -> io::Result<
         if !executable(&exe) {
             continue;
         }
-        let mut cmd = crate::platform::background_command(exe);
-        cmd.current_dir(folder)
-            .env("CI", "1")
-            .env("GIT_TERMINAL_PROMPT", "0");
-        match name {
-            "claude" => {
-                cmd.args(["-p", prompt, "--output-format", "text"]);
-            }
-            "codex" => {
-                cmd.args(["exec", "--skip-git-repo-check", prompt]);
-            }
-            _ => {
-                cmd.args(["-p", prompt]);
-            }
-        }
-        if let Ok(bytes) = execute(&mut cmd, AI_TIMEOUT) {
+        let mut cmd = build_local_agent_command(name, &exe, folder);
+        if let Ok(bytes) = execute_with_stdin(&mut cmd, Some(prompt.as_bytes()), AI_TIMEOUT) {
             let text = String::from_utf8_lossy(&bytes).trim().to_owned();
             if !text.is_empty() {
                 return Ok(text);
@@ -1577,3 +1691,91 @@ impl Render for Dialog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod local_agent_stdin_tests {
+    use super::*;
+
+    #[test]
+    fn local_agent_commands_avoid_multiline_argv_and_stdin_pipes_prompt() {
+        let dir = std::env::temp_dir();
+        for name in ["claude", "codex", "gemini"] {
+            let exe = dir.join(format!("{name}.cmd"));
+            let cmd = build_local_agent_command(name, &exe, &dir);
+            for arg in cmd.get_args() {
+                let text = arg.to_string_lossy();
+                assert!(
+                    !text.contains('\n') && !text.contains('\r'),
+                    "{name} argv must not contain CR/LF: {text:?}"
+                );
+            }
+        }
+        assert!(is_windows_batch_path(Path::new("C:\\npm\\claude.CMD")));
+        assert!(is_windows_batch_path(Path::new("gemini.bat")));
+        assert!(!is_windows_batch_path(Path::new("claude.exe")));
+
+        #[cfg(unix)]
+        {
+            let mut cmd = Command::new("/bin/cat");
+            let out = execute_with_stdin(&mut cmd, Some(b"line1\nline2\n"), Duration::from_secs(5))
+                .expect("stdin pipe should round-trip multiline prompt");
+            assert_eq!(out, b"line1\nline2\n");
+        }
+    }
+}
+
+#[cfg(test)]
+mod windows_executable_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn windows_executable_discovery_probes_extensions_and_rejects_extensionless_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pr-win-exe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon_dir = std::fs::canonicalize(&dir).unwrap();
+
+        // npm on Windows installs both an extensionless POSIX shim (`claude`) and `claude.cmd`.
+        let bare = dir.join("claude");
+        let cmd = dir.join("claude.cmd");
+        let bat = dir.join("gemini.bat");
+        let exe = dir.join("gh.exe");
+        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(&bat, b"@echo off\r\n").unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        assert!(!executable_for(&bare, true));
+        assert!(executable_for(&cmd, true));
+        assert!(executable_for(&bat, true));
+        assert!(executable_for(&exe, true));
+
+        let path_env = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(
+            find_executable_in_for("claude", Some(&path_env), &[], true),
+            canon_dir.join("claude.cmd")
+        );
+        assert_eq!(
+            find_executable_in_for("gemini", Some(&path_env), &[], true),
+            canon_dir.join("gemini.bat")
+        );
+        assert_eq!(
+            find_executable_in_for("gh", Some(&path_env), &[], true),
+            canon_dir.join("gh.exe")
+        );
+        // If only an extensionless file exists, Windows discovery must not return it as executable.
+        let bare_only = dir.join("codex");
+        std::fs::write(&bare_only, b"#!/bin/sh\n").unwrap();
+        let found = find_executable_in_for("codex", Some(&path_env), &[], true);
+        assert_eq!(found, PathBuf::from("codex"));
+        assert!(!executable_for(&found, true));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

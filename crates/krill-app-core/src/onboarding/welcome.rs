@@ -843,6 +843,10 @@ impl Wizard {
             )
     }
 
+    const fn hook_is_busy(phase: Option<&HookPhase>) -> bool {
+        matches!(phase, Some(HookPhase::Working))
+    }
+
     fn render_check_row(
         &self,
         index: usize,
@@ -875,7 +879,7 @@ impl Wizard {
             Some((Fix::AllowNotifications, _)) => self.busy.contains("notify-allow"),
             Some((Fix::ProbeFolders, _)) => self.busy.contains("folders-probe"),
             Some((Fix::Link, _)) => self.busy.contains("cli"),
-            Some((Fix::Hook(_), _)) => hook.is_some(),
+            Some((Fix::Hook(_), _)) => Self::hook_is_busy(hook.map(|(_, phase)| phase)),
             Some((Fix::Runner, _)) => self.busy.contains(&format!("fix:{}", check.id)),
             _ => false,
         };
@@ -1299,6 +1303,80 @@ mod async_tests {
             assert!(!wizard.busy.contains("notify-allow"));
             assert!(wizard.survey.is_some());
         });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hook_button_is_busy_only_while_working() {
+        assert!(!Wizard::hook_is_busy(None));
+        assert!(Wizard::hook_is_busy(Some(&HookPhase::Working)));
+        assert!(!Wizard::hook_is_busy(Some(&HookPhase::Review(
+            "+diff".to_owned()
+        ))));
+        assert!(!Wizard::hook_is_busy(Some(&HookPhase::Failed(
+            "failed".to_owned()
+        ))));
+    }
+
+    #[gpui::test]
+    fn failed_hook_install_remains_retryable_in_checks_modal(cx: &mut gpui::TestAppContext) {
+        use krill_proto::doctor::Fix as DoctorFix;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("krill-hook-retry-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        for name in ["krill", "krill-holder", "krilld"] {
+            let path = root.join("source").join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        cx.update(gpui_component::init);
+        let env = Env {
+            shell: "/bin/false".into(),
+            krill: root.join("source/krill"),
+            state: root.join("state"),
+            default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
+            home: root.join("home"),
+            state_overridden: true,
+        };
+        let (wizard, visual) = cx.add_window_view(|_, cx| Wizard::new(env, cx));
+        visual.simulate_resize(gpui::size(px(900.), px(700.)));
+        wizard.update(visual, |wizard, cx| {
+            wizard.checks = Some(vec![Check {
+                id: "hook.cursor".to_owned(),
+                level: Level::Recommended,
+                status: Status::Warn,
+                summary: "cursor hook is not installed".to_owned(),
+                detail: "receipt not found".to_owned(),
+                fix: DoctorFix {
+                    kind: FixKind::Command,
+                    value: "krill hook install cursor".to_owned(),
+                },
+            }]);
+            wizard.hooks.insert(
+                "cursor",
+                HookPhase::Failed("transient hook prepare error".to_owned()),
+            );
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("wizard-hook-error-cursor").is_some());
+        let fix_btn = visual
+            .debug_bounds("wizard-fix-hook.cursor")
+            .expect("hook install button");
+        visual.simulate_click(fix_btn.center(), gpui::Modifiers::default());
+        for _ in 0..200 {
+            visual.run_until_parked();
+            if visual.debug_bounds("wizard-hook-confirm-cursor").is_some() {
+                break;
+            }
+        }
+        assert!(
+            visual.debug_bounds("wizard-hook-confirm-cursor").is_some(),
+            "clicking Install on a Failed hook row must retry and reach Review"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

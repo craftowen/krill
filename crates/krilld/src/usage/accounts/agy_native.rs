@@ -1,37 +1,140 @@
-//! Antigravity(`agy`) 단일 `~/.gemini` 네이티브 자격증명 교체. 다른 프로바이더는 기본 로그인을 건드리지 않는다.
+//! Antigravity (`agy`) native account vault, credential backends, and account service.
 //!
-//! - Antigravity(`agy`): `--gemini_dir`로 `.gemini` 루트를 분리하지 않고 호스트 기본 `~/.gemini`를 그대로 쓰면서,
-//!   계정 전환·실행 시 선택된 계정의 `antigravity-oauth-token`을 호스트 파일과 macOS 키체인(`gemini`/`antigravity`)에
-//!   원자적으로 반영한다. 교체 전 호스트에서 갱신된 토큰은 동일 이메일의 프로필 슬롯에 먼저 되돌려 저장한다.
-//! - Claude·Codex·`OpenCode`: 실행은 계정 폴더 env(`CLAUDE_CONFIG_DIR`·`CODEX_HOME`·`XDG_DATA_HOME`)로 고르고
-//!   기본 로그인은 쓰지 않는다(Orca `ClaudeProfileRouter`·Codex 계정별 홈·`OpenCode` 데이터 계정과 같다).
-//!   덮어쓰면 기본 로그인 토큰이 사라지고 기본 카드가 활성 계정 값을 보인다.
-//! - 예전 Krill은 활성 Codex 토큰을 `~/.codex/auth.json`에 복사했다. 그때 기본 경로에서 갱신된 토큰은
-//!   같은 신원의 프로필로 한 번만 옮긴다(Orca `legacy-shared-auth-migration`).
+//! 1:1 port of Orca's `src/main/antigravity/native-*` modules (`stablyai/orca` `cb35acc25`):
+//! - `codec`: `go-keyring-base64:`/`go-keyring-encoded:`/JSON codec + Google OIDC identity projection
+//! - `backend`: macOS Keychain, Windows Credential Manager, Linux Secret Service (+ KDE `secret-tool search`),
+//!   file fallback, `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` (`agy 1.5.16+`), keyring fallback marker, CAS + readback
+//! - `store`: encrypted `<state_dir>/antigravity-accounts/vault` (AES-256-GCM + OS-protected master key, mode 0600)
+//! - `service`: `AntigravityAccountService` (`list_accounts`, `add_current_account`, `select_account`,
+//!   `remove_account`, `prepare_for_launch`, `begin_usage_read`, `finish_usage_read`, Google `userinfo` lookup)
+//! - Also preserves `migrate_codex_host_once` and compatibility shims for legacy Krill callers.
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) mod backend;
+pub(crate) mod codec;
+pub(crate) mod service;
+pub(crate) mod store;
+
+#[cfg(unix)]
 use std::io::Read as _;
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::Path;
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use krill_proto::usage::ProviderKind;
+use krill_proto::usage::{AntigravityAccountOp, AntigravityAccountState, ProviderKind};
 use zeroize::Zeroizing;
 
 use super::{AccountsFile, StoredAccount, identity_from_credentials, write_atomic_0600};
 
-const MAX_TOKEN_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "macos")]
-const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) use backend::{antigravity_token_file_path, is_antigravity_file_storage_host};
+pub(crate) use service::{
+    AntigravityAccountService, AntigravityUsageReadFinish, migrate_legacy_agy_profiles_once,
+    prepare_antigravity_account_for_launch,
+};
+use store::AntigravityAccountStore as _;
+pub(crate) use store::{StoredAntigravityAccount, vault_path};
 
-/// `agy` 호스트 토큰 파일(`~/.gemini/antigravity-cli/antigravity-oauth-token`) 및
-/// macOS 키체인 읽기·교체·삭제를 직렬화하는 전용 잠금. `SAVE_LOCK` 밖에서 잡는다.
+const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+/// Apple `/usr/bin/security -i` reads lines via a fixed 4096-byte `fgets` buffer (4095 bytes + NUL).
+/// Any command line longer than this is silently split and corrupts the keychain entry.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const MAX_SECURITY_INTERACTIVE_LINE: usize = 4095;
+#[cfg(unix)]
+pub(crate) const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Dispatch one `UsageRequest::AntigravityAccounts(op)` against the host's native Antigravity service.
+pub(crate) fn handle_op(
+    home: &Path,
+    state_dir: Option<&Path>,
+    op: &AntigravityAccountOp,
+) -> Result<AntigravityAccountState, String> {
+    migrate_legacy_agy_profiles_once(home, state_dir);
+    let svc = AntigravityAccountService::for_host(home, state_dir);
+    match op {
+        AntigravityAccountOp::List => svc.list_accounts(),
+        AntigravityAccountOp::AddCurrent => svc.add_current_account(),
+        AntigravityAccountOp::Select { account_id } => {
+            let state = svc.select_account(account_id)?;
+            evict_host_agy_caches(home);
+            Ok(state)
+        }
+        AntigravityAccountOp::Remove { account_id } => svc.remove_account(account_id),
+    }
+}
+
+/// Read-only projection of native Antigravity vault + host login state for `AccountsSnapshot`.
+/// Always queries the native credential service (even before the first saved vault account) so
+/// CLI, Desktop, and Mobile share a single native Antigravity source of truth.
+pub(crate) fn list_state_for_snapshot(
+    home: &Path,
+    state_dir: Option<&Path>,
+) -> Option<AntigravityAccountState> {
+    migrate_legacy_agy_profiles_once(home, state_dir);
+    AntigravityAccountService::for_host(home, state_dir)
+        .list_accounts()
+        .ok()
+}
+
+/// Fast active-account lookup for session launch paths (never spawns CLI probes or refreshes
+/// unrelated providers).
+pub(crate) fn active_account_for_launch(home: &Path, state_dir: Option<&Path>) -> Option<String> {
+    let path = vault_path(home, state_dir);
+    if !path.is_file() {
+        return None;
+    }
+    let vault = store::EncryptedAntigravityAccountStore::new(path)
+        .read()
+        .ok()?;
+    vault
+        .selected_account_id
+        .filter(|id| vault.accounts.iter().any(|a| a.id == *id))
+}
+
+/// Preflight native Antigravity credentials before spawning a background/bot/scheduled/resumed
+/// `agy` session. Uses a bounded backoff when the OS keyring is transiently locked after reboot.
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "called from non-test background launch paths")
+)]
+pub(crate) fn preflight_auth_for_background_launch(
+    home: &Path,
+    launch_env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    backend::preflight_auth_for_host(home, launch_env, backend::REBOOT_KEYCHAIN_BACKOFF)
+        .map_err(|err| err.message().to_owned())
+}
+
+/// Returns true if the native Antigravity vault currently has any saved account with `id`.
+pub(crate) fn vault_has_account(home: &Path, state_dir: Option<&Path>, id: &str) -> bool {
+    let path = vault_path(home, state_dir);
+    if !path.is_file() {
+        return false;
+    }
+    store::EncryptedAntigravityAccountStore::new(path)
+        .read()
+        .is_ok_and(|v| v.accounts.iter().any(|a| a.id == id))
+}
+
+fn evict_host_agy_caches(home: &Path) {
+    let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
+    crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
+    super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
+}
+
+/// `accounts.toml` 저장 시 활성 agy 계정의 자격증명을 호스트 기본 경로에 반영한다.
+#[cfg(test)]
+pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
+    sync_account(
+        home,
+        &file.accounts,
+        active_dir_for(file, ProviderKind::Antigravity),
+    );
+}
 
 fn active_dir_for(file: &AccountsFile, provider: ProviderKind) -> Option<&Path> {
     file.active
@@ -46,23 +149,17 @@ fn active_dir_for(file: &AccountsFile, provider: ProviderKind) -> Option<&Path> 
         .map(|a| Path::new(&a.profile_dir))
 }
 
-/// `accounts.toml` 저장 시 활성 agy 계정의 자격증명을 호스트 기본 경로에 반영한다.
-#[cfg(test)]
-pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
-    sync_account(
-        home,
-        &file.accounts,
-        active_dir_for(file, ProviderKind::Antigravity),
-    );
-}
-
-/// `SAVE_LOCK` 해제 뒤 최신 `accounts.toml`을 다시 읽어 활성 agy 계정을 호스트에 반영한다.
-/// 동시 저장 경쟁이 있어도 직렬화 락 안에서 최신 디스크 상태를 읽어 역전 덮어쓰기를 막는다.
+/// Legacy compatibility shim: if the active Antigravity account is in the native vault,
+/// `select_account` already synced it; otherwise preserve legacy profile sync for tests/legacy dirs.
 pub(crate) fn sync_active_from_disk(home: &Path, state_dir: Option<&Path>) {
     if home.as_os_str().is_empty() {
         return;
     }
-    let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let path = vault_path(home, state_dir);
+    if path.is_file() {
+        return;
+    }
+    let host_token_path = antigravity_token_file_path(home);
     crate::usage::direct::agy::run_account_op(|| {
         let _sync_guard = crate::session::lock(&SYNC_LOCK);
         let file = super::load_file(home, state_dir);
@@ -74,45 +171,36 @@ pub(crate) fn sync_active_from_disk(home: &Path, state_dir: Option<&Path>) {
     });
 }
 
-/// 명시된 Antigravity 계정 프로필 폴더(`dir`)의 자격증명을 호스트 `~/.gemini`로 활성화한다.
+/// Legacy compatibility shim for explicit profile dir sync.
 pub(crate) fn sync_account_dir(home: &Path, state_dir: Option<&Path>, dir: &Path) {
     sync_provider_account_dir(home, state_dir, ProviderKind::Antigravity, dir);
 }
 
-/// 명시된 프로바이더 계정 프로필 폴더(`dir`)의 자격증명을 호스트 기본 경로로 동기화한다.
+/// Legacy compatibility shim for provider profile dir sync.
 pub(crate) fn sync_provider_account_dir(
     home: &Path,
     state_dir: Option<&Path>,
     provider: ProviderKind,
     dir: &Path,
 ) {
-    if dir.as_os_str().is_empty() {
+    if dir.as_os_str().is_empty() || provider != ProviderKind::Antigravity {
         return;
     }
-    match provider {
-        ProviderKind::Antigravity => {
-            if home.as_os_str().is_empty() {
-                return;
-            }
-            let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-            if is_host_target(home, &host_token_path, dir) {
-                return;
-            }
-            crate::usage::direct::agy::run_account_op(|| {
-                let _sync_guard = crate::session::lock(&SYNC_LOCK);
-                let file = super::load_file(home, state_dir);
-                sync_account_gated(home, &host_token_path, &file.accounts, Some(dir));
-            });
-        }
-        ProviderKind::Claude
-        | ProviderKind::Codex
-        | ProviderKind::OpenCode
-        | ProviderKind::Gemini => {}
+    if home.as_os_str().is_empty() || vault_path(home, state_dir).is_file() {
+        return;
     }
+    let host_token_path = antigravity_token_file_path(home);
+    if is_host_target(home, &host_token_path, dir) {
+        return;
+    }
+    crate::usage::direct::agy::run_account_op(|| {
+        let _sync_guard = crate::session::lock(&SYNC_LOCK);
+        let file = super::load_file(home, state_dir);
+        sync_account_gated(home, &host_token_path, &file.accounts, Some(dir));
+    });
 }
 
-/// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 agy 토큰을 동일 신원의 프로필 슬롯으로 되돌린 뒤,
-/// 같은 직렬화 락 안에서 후속 검사(`after`)를 실행한다.
+/// Serializes host reconciliation with subsequent usage check (`after`).
 pub(crate) fn reconcile_host_to_profiles_then<T>(
     home: &Path,
     accounts: &[StoredAccount],
@@ -121,28 +209,58 @@ pub(crate) fn reconcile_host_to_profiles_then<T>(
     if home.as_os_str().is_empty() {
         return after();
     }
-    let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let has_legacy_agy = accounts.iter().any(|a| {
+        ProviderKind::parse(&a.provider) == Some(ProviderKind::Antigravity)
+            && !a.profile_dir.is_empty()
+    });
+    let host_token_path = antigravity_token_file_path(home);
     crate::usage::direct::agy::run_account_op(|| {
         let _sync_guard = crate::session::lock(&SYNC_LOCK);
-        sync_account_gated(home, &host_token_path, accounts, None);
+        if has_legacy_agy {
+            sync_account_gated(home, &host_token_path, accounts, None);
+        }
         after()
     })
 }
 
-fn is_host_target(home: &Path, host_token_path: &Path, dir: &Path) -> bool {
-    dir == home || dir.join(".gemini/antigravity-cli/antigravity-oauth-token") == host_token_path
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || same_file::is_same_file(a, b).unwrap_or(false)
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(ca, cb)| ca == cb)
 }
+
+fn is_host_target(home: &Path, host_token_path: &Path, dir: &Path) -> bool {
+    let host_default = super::host_default_dir(home, ProviderKind::Antigravity);
+    let host_gemini = home.join(".gemini");
+    same_path(dir, home)
+        || same_path(dir, &host_default)
+        || same_path(dir, &host_gemini)
+        || same_path(
+            &dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            host_token_path,
+        )
+        || same_path(
+            &dir.join("antigravity-cli/antigravity-oauth-token"),
+            host_token_path,
+        )
+        || same_path(&dir.join("antigravity-oauth-token"), host_token_path)
+}
+
+// ---------------------------------------------------------------------------
+// Codex legacy host-auth migration (preserved unchanged)
+// ---------------------------------------------------------------------------
 
 const CODEX_MIGRATION_MARKER: &str = "codex-host-auth-migrated-v1";
 
-/// 예전 Krill이 `~/.codex/auth.json`에 복사한 활성 토큰이 거기서 갱신됐으면 같은 신원의 프로필로 한 번 옮긴다.
-/// 계속 옮기면 같은 계정의 별도 로그인 둘이 한 refresh 토큰을 나눠 써서 한쪽이 로그아웃된다.
 pub(crate) fn migrate_codex_host_once(
     home: &Path,
     state_dir: Option<&Path>,
     accounts: &[StoredAccount],
 ) {
-    if !is_real_home(home) {
+    if !backend::is_real_home(home) {
         return;
     }
     let marker = super::config_path(home, state_dir).with_file_name(CODEX_MIGRATION_MARKER);
@@ -216,7 +334,7 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     if home.as_os_str().is_empty() {
         return;
     }
-    let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let host_token_path = antigravity_token_file_path(home);
     if target_dir.is_some_and(|dir| is_host_target(home, &host_token_path, dir)) {
         return;
     }
@@ -232,12 +350,8 @@ fn sync_account_gated(
     accounts: &[StoredAccount],
     target_dir: Option<&Path>,
 ) {
-    let real_keychain = use_real_keychain(home);
-    let mut current_keychain = if real_keychain { read_keychain() } else { None };
     let mut current_file = read_token_file(host_token_path);
-
-    // 1. 호스트에서 갱신된 토큰이 있으면 같은 이메일을 가진 프로필 슬롯에 먼저 보존한다.
-    if current_file.is_some() || current_keychain.is_some() {
+    if current_file.is_some() {
         for acc in accounts {
             if ProviderKind::parse(&acc.provider) != Some(ProviderKind::Antigravity)
                 || acc.profile_dir.is_empty()
@@ -245,15 +359,14 @@ fn sync_account_gated(
                 continue;
             }
             let prof_dir = Path::new(&acc.profile_dir);
-            if !prof_dir.is_dir() {
+            if !prof_dir.is_dir() || is_host_target(home, host_token_path, prof_dir) {
                 continue;
             }
             let prof_token_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
             let Some(prof_raw) = read_token_file(&prof_token_path) else {
                 continue;
             };
-            let host_from_file = current_file.is_some();
-            let Some(host_raw) = current_file.as_ref().or(current_keychain.as_ref()) else {
+            let Some(host_raw) = current_file.as_ref() else {
                 break;
             };
             let Some(host_id) = identity_from_credentials(ProviderKind::Antigravity, host_raw)
@@ -270,11 +383,10 @@ fn sync_account_gated(
                 continue;
             }
             let is_target = target_dir == Some(prof_dir);
-            let host_path_opt = host_from_file.then_some(host_token_path);
             if token_is_newer(
                 ProviderKind::Antigravity,
                 host_raw,
-                host_path_opt,
+                Some(host_token_path),
                 &prof_raw,
                 Some(&prof_token_path),
                 is_target,
@@ -288,86 +400,37 @@ fn sync_account_gated(
                     &prof_raw,
                     Some(&prof_token_path),
                     host_raw,
-                    host_path_opt,
+                    Some(host_token_path),
                     false,
                 )
+                && write_atomic_0600(host_token_path, &prof_raw).is_ok()
             {
-                write_atomic_0600(host_token_path, &prof_raw).ok();
-                if real_keychain {
-                    write_keychain(&prof_raw);
-                    current_keychain = Some(prof_raw.clone());
-                }
                 current_file = Some(prof_raw);
-                let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
-                crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
-                super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
+                evict_host_agy_caches(home);
             }
         }
     }
-
-    // 2. 선택된 프로필의 토큰을 호스트 파일 및 macOS 키체인에 반영한다.
-    //    대상 프로필이 미로그인 상태면 이전 계정의 호스트 토큰·키체인을 정리해 오실행을 막는다.
     let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
         return;
     };
+    if is_host_target(home, host_token_path, target) {
+        return;
+    }
     let target_token_path = target.join(".gemini/antigravity-cli/antigravity-oauth-token");
     let mut host_changed = false;
     if let Some(target_raw) = read_token_file(&target_token_path) {
-        if current_file.as_ref() != Some(&target_raw) {
-            write_atomic_0600(host_token_path, &target_raw).ok();
-            host_changed = true;
-        }
-        if real_keychain && current_keychain.as_ref() != Some(&target_raw) {
-            write_keychain(&target_raw);
-            host_changed = true;
-        }
-    } else {
-        if std::fs::symlink_metadata(host_token_path).is_ok()
-            && std::fs::remove_file(host_token_path).is_ok()
+        if current_file.as_ref() != Some(&target_raw)
+            && write_atomic_0600(host_token_path, &target_raw).is_ok()
         {
             host_changed = true;
         }
-        if real_keychain && current_keychain.is_some() && delete_keychain() {
-            host_changed = true;
-        }
+    } else if std::fs::symlink_metadata(host_token_path).is_ok()
+        && std::fs::remove_file(host_token_path).is_ok()
+    {
+        host_changed = true;
     }
     if host_changed {
-        let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
-        crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
-        super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
-    }
-}
-
-fn is_real_home(home: &Path) -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some_and(|v| !v.is_empty() && v != "0") {
-        return false;
-    }
-    let Some(real_home) = krill_proto::os::home_dir() else {
-        return false;
-    };
-    home == real_home
-        || home
-            .canonicalize()
-            .ok()
-            .zip(real_home.canonicalize().ok())
-            .is_some_and(|(a, b)| a == b)
-}
-
-fn use_real_keychain(home: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        is_real_home(home)
-            && !home
-                .join(".gemini/antigravity-cli/cache/antigravity-keyring-unavailable")
-                .exists()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = home;
-        false
+        evict_host_agy_caches(home);
     }
 }
 
@@ -523,14 +586,14 @@ fn valid_token(raw: &[u8]) -> bool {
         && serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v.is_object())
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn run_command_with_timeout(
+#[cfg(unix)]
+pub(crate) fn run_command_with_timeout(
     cmd: &mut Command,
     stdin_bytes: Option<&[u8]>,
     capture_stdout: bool,
     max_stdout: u64,
     timeout: Duration,
-) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+) -> Option<(std::process::ExitStatus, Zeroizing<Vec<u8>>)> {
     cmd.stdin(if stdin_bytes.is_some() {
         Stdio::piped()
     } else {
@@ -543,12 +606,13 @@ fn run_command_with_timeout(
     })
     .stderr(Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
     let reader = if capture_stdout {
         let stdout = child.stdout.take()?;
         let handle = std::thread::Builder::new()
-            .name("agy-keychain-read".into())
+            .name("keychain-read".into())
             .spawn(move || {
-                let mut buf = Vec::new();
+                let mut buf = Zeroizing::new(Vec::new());
                 let limit = max_stdout.saturating_add(1);
                 stdout.take(limit).read_to_end(&mut buf).ok()?;
                 (u64::try_from(buf.len()).ok()? <= max_stdout).then_some(buf)
@@ -563,21 +627,32 @@ fn run_command_with_timeout(
     } else {
         None
     };
-    if let Some(bytes) = stdin_bytes {
-        let wrote = child
-            .stdin
-            .take()
-            .is_some_and(|mut stdin| stdin.write_all(bytes).is_ok());
-        if !wrote {
+    let writer = if let Some(bytes) = stdin_bytes {
+        let Some(mut stdin) = child.stdin.take() else {
             child.kill().ok();
             child.wait().ok();
             if let Some(handle) = reader {
                 drop(handle.join());
             }
             return None;
-        }
-    }
-    let deadline = Instant::now() + timeout;
+        };
+        let payload = Zeroizing::new(bytes.to_vec());
+        let handle = std::thread::Builder::new()
+            .name("keychain-write".into())
+            .spawn(move || stdin.write_all(&payload).is_ok())
+            .ok();
+        let Some(handle) = handle else {
+            child.kill().ok();
+            child.wait().ok();
+            if let Some(handle) = reader {
+                drop(handle.join());
+            }
+            return None;
+        };
+        Some(handle)
+    } else {
+        None
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -594,472 +669,21 @@ fn run_command_with_timeout(
             }
         }
     };
+    let wrote = match writer {
+        Some(handle) => handle.join().ok().unwrap_or(false),
+        None => true,
+    };
     let stdout = match reader {
         Some(handle) => handle.join().ok().flatten(),
-        None => Some(Vec::new()),
+        None => Some(Zeroizing::new(Vec::new())),
     };
+    if !wrote {
+        return None;
+    }
     let status = status?;
     let stdout = stdout?;
     Some((status, stdout))
 }
 
-#[cfg(target_os = "macos")]
-fn read_keychain() -> Option<Zeroizing<Vec<u8>>> {
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.args([
-        "find-generic-password",
-        "-s",
-        "gemini",
-        "-a",
-        "antigravity",
-        "-w",
-    ]);
-    let (status, stdout) =
-        run_command_with_timeout(&mut cmd, None, true, MAX_TOKEN_BYTES, KEYCHAIN_TIMEOUT)?;
-    if !status.success() || u64::try_from(stdout.len()).ok()? > MAX_TOKEN_BYTES {
-        return None;
-    }
-    let text = std::str::from_utf8(&stdout).ok()?.trim();
-    let decoded = if let Some(b64) = text.strip_prefix("go-keyring-base64:") {
-        Zeroizing::new(base64_decode(b64)?)
-    } else if let Some(hex) = text.strip_prefix("go-keyring-encoded:") {
-        let (pairs, rem) = hex.as_bytes().as_chunks::<2>();
-        if !rem.is_empty() {
-            return None;
-        }
-        let bytes = pairs
-            .iter()
-            .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
-            .collect::<Option<Vec<_>>>()?;
-        Zeroizing::new(bytes)
-    } else {
-        Zeroizing::new(text.as_bytes().to_vec())
-    };
-    valid_token(&decoded).then_some(decoded)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn read_keychain() -> Option<Zeroizing<Vec<u8>>> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn write_keychain(raw: &[u8]) -> bool {
-    let encoded = format!("go-keyring-base64:{}", base64_encode(raw));
-    let line = Zeroizing::new(format!(
-        "add-generic-password -U -s \"gemini\" -a \"antigravity\" -w {encoded}\n"
-    ));
-    if line.len() > 16 * 1024 {
-        return false;
-    }
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.arg("-i");
-    run_command_with_timeout(&mut cmd, Some(line.as_bytes()), false, 0, KEYCHAIN_TIMEOUT)
-        .is_some_and(|(status, _)| status.success())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn write_keychain(_raw: &[u8]) -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn delete_keychain() -> bool {
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.args([
-        "delete-generic-password",
-        "-s",
-        "gemini",
-        "-a",
-        "antigravity",
-    ]);
-    run_command_with_timeout(&mut cmd, None, false, 0, KEYCHAIN_TIMEOUT)
-        .is_some_and(|(status, _)| status.success())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn delete_keychain() -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let char_at = |idx: u8| char::from(TABLE.get(usize::from(idx & 0x3f)).copied().unwrap_or(b'A'));
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let Some(&b0) = chunk.first() else {
-            continue;
-        };
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(char_at(b0 >> 2));
-        out.push(char_at(((b0 & 0x03) << 4) | (b1 >> 4)));
-        if chunk.len() > 1 {
-            out.push(char_at(((b1 & 0x0f) << 2) | (b2 >> 6)));
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(char_at(b2 & 0x3f));
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-#[cfg(target_os = "macos")]
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let trimmed = input.trim().trim_end_matches('=');
-    let mut decoded = Vec::with_capacity(trimmed.len() * 3 / 4);
-    let (mut bits, mut count) = (0_u32, 0_u32);
-    for byte in trimmed.bytes().filter(|b| !b.is_ascii_whitespace()) {
-        let n = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(n);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            decoded.push(u8::try_from((bits >> count) & 255).ok()?);
-        }
-    }
-    if count >= 6 || bits & ((1 << count) - 1) != 0 {
-        return None;
-    }
-    Some(decoded)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::usage::accounts::{AccountsFile, StoredAccount};
-
-    #[test]
-    fn switching_agy_account_swaps_host_token_and_preserves_refreshed_host_token() {
-        let root =
-            std::env::temp_dir().join(format!("krill-agy-native-swap-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let home = root.join("home");
-        let prof1 = root.join("prof1");
-        let prof2 = root.join("prof2");
-        for dir in [&home, &prof1, &prof2] {
-            std::fs::create_dir_all(dir.join(".gemini/antigravity-cli")).unwrap();
-        }
-        let tok1_initial = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-old"}}"#;
-        let tok1_refreshed = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-refreshed"}}"#;
-        let tok2 = br#"{"auth_method":"consumer","id_token_email":"two@example.test","token":{"access_token":"tok2"}}"#;
-        std::fs::write(
-            prof1.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            tok1_initial,
-        )
-        .unwrap();
-        std::fs::write(
-            prof2.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            tok2,
-        )
-        .unwrap();
-
-        let mut file = AccountsFile {
-            accounts: vec![
-                StoredAccount {
-                    id: "agy-1".into(),
-                    provider: "agy".into(),
-                    label: "One".into(),
-                    email: Some("one@example.test".into()),
-                    profile_dir: prof1.display().to_string(),
-                },
-                StoredAccount {
-                    id: "agy-2".into(),
-                    provider: "agy".into(),
-                    label: "Two".into(),
-                    email: Some("two@example.test".into()),
-                    profile_dir: prof2.display().to_string(),
-                },
-            ],
-            ..AccountsFile::default()
-        };
-
-        // 1. agy-1 활성화 시 호스트 토큰이 agy-1 토큰으로 채워진다.
-        file.active.insert("agy".into(), "agy-1".into());
-        sync_active(&home, &file);
-        assert_eq!(
-            std::fs::read(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
-            tok1_initial
-        );
-
-        // 2. 호스트에서 agy가 토큰을 갱신한 뒤 agy-2로 전환하면, 갱신된 토큰이 prof1에 보존되고
-        // 호스트는 agy-2가 되며 이전 계정의 호스트 미터 캐시도 즉시 비워진다.
-        let host_dir = crate::usage::accounts::host_default_dir(&home, ProviderKind::Antigravity);
-        crate::usage::meters::remember(
-            &home,
-            ProviderKind::Antigravity,
-            &host_dir,
-            krill_proto::usage::AccountMeters {
-                account_id: "agy-host".into(),
-                plan: None,
-                meters: vec![krill_proto::usage::UsageMeter {
-                    key: "gemini_weekly".into(),
-                    label: "Gemini · 7d".into(),
-                    value: None,
-                    window: None,
-                }],
-            },
-        );
-        assert!(crate::usage::meters::has_cached(
-            &home,
-            ProviderKind::Antigravity,
-            &host_dir
-        ));
-        std::fs::write(
-            home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            tok1_refreshed,
-        )
-        .unwrap();
-        file.active.insert("agy".into(), "agy-2".into());
-        sync_active(&home, &file);
-        assert!(!crate::usage::meters::has_cached(
-            &home,
-            ProviderKind::Antigravity,
-            &host_dir
-        ));
-        assert_eq!(
-            std::fs::read(prof1.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
-            tok1_refreshed
-        );
-        assert_eq!(
-            std::fs::read(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
-            tok2
-        );
-
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn switching_claude_codex_and_opencode_accounts_keeps_the_default_login() {
-        let root =
-            std::env::temp_dir().join(format!("krill-default-login-kept-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let home = root.join("home");
-        let mut cases = Vec::new();
-        for (provider, host, profile) in [
-            (
-                ProviderKind::Claude,
-                ".claude/.credentials.json",
-                ".credentials.json",
-            ),
-            (ProviderKind::Codex, ".codex/auth.json", "auth.json"),
-            (
-                ProviderKind::OpenCode,
-                ".local/share/opencode/auth.json",
-                "data/opencode/auth.json",
-            ),
-        ] {
-            let dir = root.join(provider.as_str());
-            let (host, profile) = (home.join(host), dir.join(profile));
-            for path in [&host, &profile] {
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            }
-            std::fs::write(&host, br#"{"default":"login"}"#).unwrap();
-            std::fs::write(&profile, br#"{"profile":"login"}"#).unwrap();
-            cases.push((provider, dir, host));
-        }
-        let mut file = AccountsFile::default();
-        for (provider, dir, host) in &cases {
-            sync_provider_account_dir(&home, None, *provider, dir);
-            file.accounts.push(StoredAccount {
-                id: provider.as_str().into(),
-                provider: provider.as_str().into(),
-                label: provider.as_str().into(),
-                email: None,
-                profile_dir: dir.display().to_string(),
-            });
-            file.active
-                .insert(provider.as_str().into(), provider.as_str().into());
-            assert_eq!(std::fs::read(host).unwrap(), br#"{"default":"login"}"#);
-        }
-        sync_active(&home, &file);
-        for (_, _, host) in &cases {
-            assert_eq!(std::fs::read(host).unwrap(), br#"{"default":"login"}"#);
-        }
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    fn encode_b64url(bytes: &[u8]) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let (mut bits, mut count) = (0_u32, 0_u32);
-        let mut out = String::new();
-        for &byte in bytes {
-            bits = (bits << 8) | u32::from(byte);
-            count += 8;
-            while count >= 6 {
-                count -= 6;
-                let idx = usize::try_from((bits >> count) & 63).unwrap();
-                out.push(char::from(*TABLE.get(idx).unwrap()));
-            }
-        }
-        if count > 0 {
-            let idx = usize::try_from((bits << (6 - count)) & 63).unwrap();
-            out.push(char::from(*TABLE.get(idx).unwrap()));
-        }
-        out
-    }
-
-    fn codex_jwt(payload: &serde_json::Value) -> String {
-        let encoded = encode_b64url(&serde_json::to_vec(payload).unwrap());
-        format!("eyJhbGciOiJub25lIn0.{encoded}.sig")
-    }
-
-    fn codex_auth_payload(
-        last_refresh: &str,
-        access_iat: i64,
-        access_exp: i64,
-        id_iat: i64,
-        id_exp: i64,
-    ) -> String {
-        serde_json::json!({
-            "last_refresh": last_refresh,
-            "tokens": {
-                "access_token": codex_jwt(&serde_json::json!({
-                    "iat": access_iat,
-                    "exp": access_exp,
-                })),
-                "id_token": codex_jwt(&serde_json::json!({
-                    "email": "alpha@example.test",
-                    "iat": id_iat,
-                    "exp": id_exp,
-                })),
-                "account_id": "acc-relogin",
-            }
-        })
-        .to_string()
-    }
-
-    #[test]
-    fn codex_migration_moves_only_a_newer_same_identity_default_token_and_never_writes_default() {
-        let root =
-            std::env::temp_dir().join(format!("krill-codex-host-migration-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let home = root.join("home");
-        let prof = root.join("prof");
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::create_dir_all(&prof).unwrap();
-        let older = codex_auth_payload(
-            "2026-10-28T11:02:37Z",
-            1_793_185_356,
-            1_794_049_356,
-            1_793_185_356,
-            1_793_188_956,
-        );
-        let newer = codex_auth_payload(
-            "2026-11-08T14:24:24Z",
-            1_794_147_864,
-            1_795_011_864,
-            1_794_147_864,
-            1_794_151_464,
-        );
-        let accounts = vec![StoredAccount {
-            id: "codex-alpha".into(),
-            provider: "codex".into(),
-            label: "alpha@example.test".into(),
-            email: Some("alpha@example.test".into()),
-            profile_dir: prof.display().to_string(),
-        }];
-        let read = |path: &Path| std::fs::read(path).unwrap();
-
-        // A profile relogin newer than the default copy stays, and the default is never written.
-        std::fs::write(prof.join("auth.json"), &newer).unwrap();
-        std::fs::write(home.join(".codex/auth.json"), &older).unwrap();
-        preserve_codex_host(&home, &accounts);
-        assert_eq!(read(&prof.join("auth.json")), newer.as_bytes());
-        assert_eq!(read(&home.join(".codex/auth.json")), older.as_bytes());
-
-        // A default copy refreshed after the old swap moves back to its profile.
-        std::fs::write(prof.join("auth.json"), &older).unwrap();
-        std::fs::write(home.join(".codex/auth.json"), &newer).unwrap();
-        preserve_codex_host(&home, &accounts);
-        assert_eq!(read(&prof.join("auth.json")), newer.as_bytes());
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn switching_to_unauthenticated_agy_profile_clears_host_token_and_preserves_previous() {
-        let root = std::env::temp_dir().join(format!(
-            "krill-agy-native-unauth-clear-{}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&root).ok();
-        let home = root.join("home");
-        let state = root.join("state");
-        let prof1 = root.join("prof1");
-        let prof2 = root.join("prof2");
-        for dir in [&home, &prof1, &prof2] {
-            std::fs::create_dir_all(dir.join(".gemini/antigravity-cli")).unwrap();
-        }
-        std::fs::create_dir_all(&state).unwrap();
-        let tok1_old = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-old"}}"#;
-        let tok1_refreshed = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-refreshed"}}"#;
-        std::fs::write(
-            prof1.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            tok1_old,
-        )
-        .unwrap();
-        let host_tok = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        std::fs::write(&host_tok, tok1_refreshed).unwrap();
-
-        let mut file = AccountsFile {
-            accounts: vec![
-                StoredAccount {
-                    id: "agy-1".into(),
-                    provider: "agy".into(),
-                    label: "One".into(),
-                    email: Some("one@example.test".into()),
-                    profile_dir: prof1.display().to_string(),
-                },
-                StoredAccount {
-                    id: "agy-2".into(),
-                    provider: "agy".into(),
-                    label: "Two".into(),
-                    email: None,
-                    profile_dir: prof2.display().to_string(),
-                },
-            ],
-            ..AccountsFile::default()
-        };
-        file.active.insert("agy".into(), "agy-2".into());
-        super::super::save_file(&home, Some(&state), &file).unwrap();
-
-        assert_eq!(
-            std::fs::read(prof1.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
-            tok1_refreshed,
-            "previous account's refreshed host token must be backed up before clearing"
-        );
-        assert!(
-            !host_tok.exists(),
-            "switching to an unauthenticated agy profile must clear the previous host token"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn keychain_command_timeout_kills_hanging_process() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 30"]);
-        let started = Instant::now();
-        let out = run_command_with_timeout(&mut cmd, None, true, 1024, Duration::from_millis(80));
-        assert!(out.is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "hanging helper must be killed promptly on timeout"
-        );
-    }
-}
+mod tests;

@@ -1952,3 +1952,113 @@ fn sanitize_detail_redacts_cross_platform_homes_and_caps_utf8_expansion() {
     assert!(expanded.len() <= MAX_DETAIL_LEN);
     assert!(super::types::valid_detail(&expanded));
 }
+
+#[test]
+fn record_rejects_event_exceeding_limit_after_install_hash_without_consuming_rate_slot() {
+    let state = State::new();
+    let consent = state.consent();
+
+    let mut oversized = event(Code::Panic);
+    oversized.process = Process::Holder;
+    oversized.release = format!("999999999.999999999.999999999-{}", "r".repeat(34));
+    oversized.build_id = "b".repeat(MAX_BUILD_ID);
+    oversized.source_loc = Some(format!("crates/krill-app/src/{}.rs:1", "s".repeat(174)));
+    oversized.frames = vec![format!("crates/krill-app/src/{}.rs:1", "f".repeat(174)); MAX_FRAMES];
+    let base_len = serde_json::to_vec(&oversized).unwrap().len();
+    let target_len = MAX_EVENT_BYTES.saturating_sub(10);
+    let detail_len = target_len
+        .saturating_sub(base_len)
+        .saturating_sub(12)
+        .clamp(1, MAX_DETAIL_LEN);
+    oversized.detail = Some("d".repeat(detail_len));
+
+    let raw_len = serde_json::to_vec(&oversized).unwrap().len();
+    assert!(
+        raw_len > MAX_EVENT_BYTES.saturating_sub(50) && raw_len <= MAX_EVENT_BYTES,
+        "unexpected pre-hash event size: {raw_len}"
+    );
+    oversized.validate().unwrap();
+
+    let err = record_with_consent(state.path(), oversized.clone(), &consent).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(state.entries().is_empty());
+
+    // Same fingerprint with fewer frames must still be admitted (rate slot not burned).
+    let mut retry = oversized;
+    retry.event_id = event(Code::Panic).event_id;
+    retry.frames.pop();
+    assert!(record_with_consent(state.path(), retry, &consent).unwrap());
+    let report = flush_at(&state, &consent, now_ms(), |body| ack(&sent_ids(body), &[]));
+    assert_eq!((report.accepted, report.dropped, report.pending), (1, 0, 0));
+}
+
+#[test]
+fn failed_or_full_outbox_does_not_consume_rate_limit_slot() {
+    let state = State::new();
+    let consent = state.consent();
+    queue(&state, &consent, MAX_PENDING);
+    assert_eq!(state.entries().len(), MAX_PENDING);
+
+    let mut deferred = event(Code::SchedulerFailed);
+    assert!(!record_with_consent(state.path(), deferred.clone(), &consent).unwrap());
+
+    // Drain the full outbox; the previously dropped fingerprint must still be admitted.
+    let drained = flush_at(&state, &consent, now_ms(), |body| ack(&sent_ids(body), &[]));
+    assert_eq!((drained.accepted, drained.pending), (MAX_PENDING, 0));
+    deferred.event_id = event(Code::SchedulerFailed).event_id;
+    assert!(record_with_consent(state.path(), deferred, &consent).unwrap());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Transient write_atomic failure must not burn the 1-hour rate slot.
+        let rw_state = State::new();
+        let rw_consent = rw_state.consent();
+        fs::create_dir_all(rw_state.outbox()).unwrap();
+        fs::set_permissions(rw_state.outbox(), fs::Permissions::from_mode(0o500)).unwrap();
+        let mut transient = event(Code::RecordingFailed);
+        let write_err = record_with_consent(rw_state.path(), transient.clone(), &rw_consent);
+        fs::set_permissions(rw_state.outbox(), fs::Permissions::from_mode(0o700)).ok();
+        assert!(write_err.is_err());
+        transient.event_id = event(Code::RecordingFailed).event_id;
+        assert!(record_with_consent(rw_state.path(), transient, &rw_consent).unwrap());
+
+        // Symlinked outbox rejection must not burn the 1-hour rate slot.
+        let sym_state = State::new();
+        let sym_consent = sym_state.consent();
+        let decoy = State::new();
+        std::os::unix::fs::symlink(decoy.path(), sym_state.outbox()).unwrap();
+        let mut blocked = event(Code::UpdateFailed);
+        assert!(!record_with_consent(sym_state.path(), blocked.clone(), &sym_consent).unwrap());
+        fs::remove_file(sym_state.outbox()).unwrap();
+        blocked.event_id = event(Code::UpdateFailed).event_id;
+        assert!(record_with_consent(sym_state.path(), blocked, &sym_consent).unwrap());
+    }
+}
+
+#[test]
+fn trim_frames_for_install_hash_leaves_headroom_for_hash_attachment() {
+    let state = State::new();
+    let consent = state.consent();
+    let mut ev = event(Code::Panic);
+    ev.process = Process::Holder;
+    ev.release = format!("999999999.999999999.999999999-{}", "r".repeat(34));
+    ev.build_id = "b".repeat(MAX_BUILD_ID);
+    ev.source_loc = Some(format!("crates/krill-app/src/{}.rs:1", "s".repeat(174)));
+    ev.frames = vec![format!("crates/krill-app/src/{}.rs:1", "f".repeat(174)); MAX_FRAMES];
+    let base_len = serde_json::to_vec(&ev).unwrap().len();
+    let detail_len = MAX_EVENT_BYTES
+        .saturating_sub(10)
+        .saturating_sub(base_len)
+        .saturating_sub(12)
+        .clamp(1, MAX_DETAIL_LEN);
+    ev.detail = Some("d".repeat(detail_len));
+    ev.validate().unwrap();
+
+    trim_frames_for_install_hash(&mut ev);
+    assert!(ev.frames.len() < MAX_FRAMES);
+    assert!(record_with_consent(state.path(), ev, &consent).unwrap());
+    let report = flush_at(&state, &consent, now_ms(), |body| ack(&sent_ids(body), &[]));
+    assert_eq!((report.accepted, report.dropped, report.pending), (1, 0, 0));
+}

@@ -63,6 +63,7 @@ if ($arch -eq 'ARM64') {
 } elseif ($arch -ne 'AMD64') {
     throw (Get-KrillMsg 'Windows \uB9B4\uB9AC\uC2A4 \uD328\uD0A4\uC9C0\uB294 x64 PC \uB610\uB294 Windows 11 ARM64\uAC00 \uD544\uC694\uD569\uB2C8\uB2E4.' 'Windows release packages require an x64 PC or Windows 11 on ARM64.')
 }
+$Dest = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dest)
 $required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe')
 $alreadyInstalled = Test-Path -LiteralPath $Dest
 if ($alreadyInstalled) {
@@ -339,8 +340,28 @@ if (-not $alreadyInstalled) {
 
 
         Start-KrillStep '05' ((Get-KrillMsg '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 ({0})' 'Installing app files ({0})') -f $Dest) 4
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
-        Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
+        $destFull = $Dest
+        $destParent = Split-Path -Parent $destFull
+        if ($destParent) {
+            New-Item -ItemType Directory -Force -Path $destParent | Out-Null
+        }
+        $srcDir = Join-Path $unpacked 'Krill'
+        $srcFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($srcDir)
+        $srcRoot = [IO.Path]::GetPathRoot($srcFull)
+        $destRoot = [IO.Path]::GetPathRoot($destFull)
+        if ($srcRoot -and $destRoot -and ($srcRoot -ieq $destRoot)) {
+            Move-Item -LiteralPath $srcDir -Destination $Dest
+        } else {
+            $stageBase = if ($destParent) { $destParent } else { $destRoot }
+            $stageDest = Join-Path $stageBase ('.krill-install-stage-' + [guid]::NewGuid().ToString('N'))
+            try {
+                Copy-Item -LiteralPath $srcDir -Destination $stageDest -Recurse -Force
+                Move-Item -LiteralPath $stageDest -Destination $Dest
+            } catch {
+                Remove-Item -LiteralPath $stageDest -Recurse -Force -ErrorAction SilentlyContinue
+                throw
+            }
+        }
         Complete-KrillStep '05' (Get-KrillMsg '\uC124\uCE58' 'Installed') ((Get-KrillMsg '{0} \uC124\uCE58 \uC644\uB8CC' 'Installed to {0}') -f $Dest)
     } catch {
         Fail-KrillStep $_.Exception.Message

@@ -15,7 +15,9 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{ExitCode, Stdio};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::time::Duration;
@@ -663,7 +665,7 @@ fn cli_path(exe: &Path, path: &OsString, home: Option<&Path>) -> CliPath {
 
 /// `git --version`의 첫 줄. PATH에 없거나(새 macOS의 `/usr/bin/git`은 CLT 없이는 실패한다) 실패하면 `None`.
 fn git_version() -> Option<String> {
-    let out = Command::new("git")
+    let out = krill_proto::os::background_command("git")
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())

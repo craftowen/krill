@@ -650,6 +650,7 @@ pub fn poll_composio_triggers(
                 done_means: None,
                 status: Some(BotItemStatus::Planned),
                 links: vec![link],
+                waiting_reason: None,
             },
             &BotItemActor::System {
                 reason: "composio_trigger".to_owned(),

@@ -53,12 +53,22 @@ mod closed_sessions;
 mod hibernation;
 mod hook_identity;
 mod orch_cache;
+pub(crate) mod persistence;
+pub(crate) mod prompt_delivery;
 mod schedule;
 mod session_ids;
 mod sidebar;
 #[cfg(all(test, unix))]
 mod stale_sessions_tests;
 pub mod usage_tick;
+
+struct RemoteFsConnGuard(u64);
+
+impl Drop for RemoteFsConnGuard {
+    fn drop(&mut self) {
+        crate::remote_fs::cleanup_connection(self.0);
+    }
+}
 
 /// `Terminate`가 없는 holder(v2 이하)에 닫기를 보내는 방법.
 const TERMINATE_SINCE: u16 = 3;
@@ -195,6 +205,11 @@ pub struct Registry {
     upgrading: Mutex<bool>,
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
+    /// Serializes concurrent `AgentHistory::Resume`/`ResumeVault` calls for the same conversation.
+    resuming_conversations: (
+        Mutex<HashSet<(krill_proto::agent_history::VaultAgent, String)>>,
+        std::sync::Condvar,
+    ),
     account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
     account_handoffs: Mutex<account_switch::ledger::HandoffLedger>,
     account_recovered: std::sync::atomic::AtomicBool,
@@ -293,10 +308,8 @@ impl Registry {
             git_watch: Mutex::default(),
             upgrading: Mutex::new(false),
             resuming: Mutex::default(),
-            account_work: crate::usage::accounts::switch_work::subscribe(
-                &crate::usage::accounts::default_home(),
-                dir,
-            ),
+            resuming_conversations: (Mutex::default(), std::sync::Condvar::new()),
+            account_work: Arc::new(crate::usage::accounts::switch_work::SwitchWork::default()),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
             account_processing: std::sync::atomic::AtomicBool::new(false),
@@ -460,7 +473,7 @@ impl Registry {
         .ok();
         drop(commit);
         for (id, e) in &hooked {
-            self.auto_switch_from_hook(*id, e);
+            self.discover_hook_identity(*id, e);
             self.maybe_rename_from_hook(*id, &e.payload, e.id);
             if let Some(bots) = self.bots_if_initialized() {
                 bots.on_hook_event(self, *id, e);
@@ -535,11 +548,12 @@ impl Registry {
     }
 
     /// Binds a weak self-reference so lazy background subsystems (e.g., Bots connectors) can
-    /// upgrade back to this [`Registry`], and triggers automatic Bot startup recovery if bots
-    /// already exist on disk.
+    /// upgrade back to this [`Registry`], and triggers automatic startup recovery for bots and
+    /// lost orchestration terminal workers if state exists on disk.
     pub fn bind_self_arc(self: &Arc<Self>) {
         self.self_ref.set(Arc::downgrade(self)).ok();
         self.maybe_spawn_bot_boot();
+        crate::rejoin::recovery::recover_lost_terminal_workers_on_boot(self);
     }
 
     /// Spawns background Bot startup recovery once if `bots.json` already exists in `state_dir()`.
@@ -748,18 +762,16 @@ impl Registry {
             let _commit = lock(&self.hook_commit);
             Peer::of(&s, &lock(&self.state).roots)
         };
-        // 서명 정책이 강제되면 전체 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096). 닫힌 피어의 토큰
-        // 조회도 실패하므로 먼저 읽은 토큰으로 검증하고, 못 넘기면 접속 자체를 거부한다.
-        if !mobile && peer.scope.full() {
-            let policy = scope::SigningPolicy::load(self.dir.as_deref());
-            if policy.enforced() {
-                let sign = crate::sys::peer_token(s.as_fd())
+        // 서명 정책이 강제되면 모든 로컬 피어의 코드서명을 핸드셰이크 전에 검증한다(MK-096).
+        // 계보 조회에 실패한 Scope::Restricted 피어도 강제 정책을 우회할 수 없다.
+        if !mobile
+            && self.gate_connection_signing(&mut peer, || {
+                crate::sys::peer_token(s.as_fd())
                     .ok()
-                    .map(|token| crate::sys::verify_audit_token(&token));
-                if peer.gate_signing(&policy, sign.as_ref(), &self.audit) {
-                    return Ok(());
-                }
-            }
+                    .map(|token| crate::sys::verify_audit_token(&token))
+            })
+        {
+            return Ok(());
         }
         let (client, n) = crate::ipc::handshake(&mut s, hello)?;
         if peer.scope.full()
@@ -889,7 +901,7 @@ impl Registry {
             let ack = s.write_all(&hook::ack());
             drop(s);
             if let Some(id) = session {
-                self.auto_switch_from_hook(id, &e);
+                self.discover_hook_identity(id, &e);
                 self.maybe_rename_from_hook(id, &e.payload, e.id);
                 if let Some(bots) = self.bots_if_initialized() {
                     bots.on_hook_event(self, id, &e);
@@ -979,6 +991,7 @@ impl Registry {
         let mut body = body;
         let mut clients = HashMap::new();
         let mut control_slot = None;
+        let remote_fs_conn = RemoteFsConnGuard(crate::remote_fs::next_connection_id());
         loop {
             let decoded = Request::decode(control::kind::REQUEST, &body);
             if !mobile {
@@ -1169,6 +1182,14 @@ impl Registry {
                         Reply::Bot(self.on_bot_rpc_for_peer(&peer, role == Role::Observer, req))
                     } else {
                         peer.deny("bots", &self.audit);
+                        Reply::Failed(Failure::Denied)
+                    }
+                }
+                Ok(Request::RemoteFs(req)) => {
+                    if peer.scope.full() {
+                        Reply::RemoteFs(crate::remote_fs::serve_on_conn(remote_fs_conn.0, req))
+                    } else {
+                        peer.deny("remote-fs", &self.audit);
                         Reply::Failed(Failure::Denied)
                     }
                 }
@@ -1690,7 +1711,27 @@ impl Registry {
         Ok((canonical.to_owned(), profile, agents.permission))
     }
 
+    fn gate_connection_signing(
+        &self,
+        peer: &mut Peer,
+        sign: impl FnOnce() -> Option<crate::sys::CodeSign>,
+    ) -> bool {
+        let policy = scope::SigningPolicy::load(self.dir.as_deref());
+        if !policy.enforced() {
+            return false;
+        }
+        if !peer.scope.full() {
+            peer.deny("peer-sign", &self.audit);
+            return true;
+        }
+        let sign = sign();
+        peer.gate_signing(&policy, sign.as_ref(), &self.audit)
+    }
+
     fn create(&self, peer: &Peer, mut c: Create) -> Result<Reply, Failure> {
+        if !peer.authorize("create", SessionId(0), &self.audit) {
+            return Err(Failure::Denied);
+        }
         sanitize_spawn_cwd(&mut c.cwd);
         if c.account.is_some() && !matches!(c.program, Program::Agent { .. }) {
             return Err(Failure::BadRequest);
@@ -1932,51 +1973,159 @@ impl Registry {
         let session = self
             .reserve_session_id(Some(old))
             .map_err(|error| os(&error))?;
-        let Launch { argv, env } = match stored {
+        let cwd_path = {
+            use krill_proto::os::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(&c.cwd))
+        };
+        let bots_mgr = if let Some(existing) = self.bots_if_initialized() {
+            Some(Arc::clone(existing))
+        } else if stored
+            .as_ref()
+            .is_some_and(|s| s.bot_instructions.is_some())
+            || state
+                .as_deref()
+                .is_some_and(|d| d.join("bots").join("runtime-bindings.json").is_file())
+        {
+            self.bots().ok().cloned()
+        } else {
+            None
+        };
+        let mut bot_launch = if let Some(ref bots) = bots_mgr {
+            bots.ensure_runtime_rehydrated(self);
+            match bots.prepare_resume_launch(
+                old,
+                session,
+                &cwd_path,
+                stored.as_ref().and_then(|s| s.bot_instructions.as_deref()),
+                stored
+                    .as_ref()
+                    .and_then(|s| s.launched_at)
+                    .unwrap_or(0)
+                    .saturating_mul(1000),
+            ) {
+                Ok(bl) => bl,
+                Err(err) => {
+                    tracing::warn!(
+                        session = old.0,
+                        error = %err,
+                        "bot resume launch preparation failed; falling back to stored instructions"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let revoke_bot_grant = |bl: &mut Option<crate::bots::runtime::BotAccountSwitchLaunch>| {
+            if let (Some(bots), Some(launch)) = (bots_mgr.as_ref(), bl.take()) {
+                bots.revoke_launch_token(launch.grant_token.as_ref());
+            }
+        };
+        let Launch { argv, mut env } = match stored {
             Some(s) => {
-                let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
-                let (canonical, profile) =
-                    agents.resolve(&s.profile).ok_or(Failure::UnknownAgent)?;
+                let Ok(agents) = self.agents.agents() else {
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(Failure::UnknownAgent);
+                };
+                let Some((canonical, profile)) = agents.resolve(&s.profile) else {
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(Failure::UnknownAgent);
+                };
                 let resume_id = s.session_id.or(fallback_sid);
                 // 실행 당시 계정으로 이어 간다(OWE-698). 휴면 깨우기도 이 경로다.
                 // 요청이 계정을 지정하면 그 계정으로 이어 간다(OWE-699, 다른 계정으로 이어가기).
-                let account = crate::agent::resume_target(
+                let account = match crate::agent::resume_target(
                     profile,
                     state.as_deref(),
                     c.account.as_deref(),
                     s.account.as_ref(),
                     resume_id.as_deref(),
-                )
-                .map_err(|e| os(&e))?;
-                crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
-                let (launch, session_id, account) = crate::agent::resume_in_with_bot_instructions(
-                    profile,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
+                };
+                let mut effective_profile = profile.clone();
+                if let Some(ref bl) = bot_launch {
+                    let mut overrides = krill_proto::agent::LaunchOverrides {
+                        model: bl.model.clone(),
+                        effort: bl.effort.clone(),
+                    };
+                    if canonical == "agy"
+                        && let Some(ref m) = overrides.model
+                        && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                            None,
+                            m,
+                            overrides.effort.as_deref(),
+                        )
+                    {
+                        overrides.model = Some(family);
+                        overrides.effort = Some(eff);
+                    }
+                    if !overrides.is_empty()
+                        && let Err(err) = krill_proto::agent::apply_launch_overrides(
+                            canonical,
+                            &mut effective_profile,
+                            &overrides,
+                        )
+                    {
+                        tracing::warn!(
+                            session = old.0,
+                            error = %err,
+                            "ignoring invalid bot launch override during resume"
+                        );
+                    }
+                }
+                crate::agent::pre_trust_workspace(&effective_profile, &c.cwd, account.as_ref());
+                let instructions = bot_launch
+                    .as_ref()
+                    .map(|bl| bl.instructions.as_str())
+                    .or(s.bot_instructions.as_deref());
+                let (launch, session_id, account) = match crate::agent::resume_in_with_bot_mcp(
+                    &effective_profile,
                     s.permission,
                     session,
                     state.as_deref(),
                     resume_id.as_deref(),
                     account.as_ref(),
-                    s.bot_instructions.as_deref(),
-                )
-                .map_err(|e| {
+                    bot_launch.as_ref().map(|_| cwd_path.as_path()),
+                    bot_launch.as_ref().map(|bl| &bl.mcp_cfg),
+                    instructions,
+                ) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        self.discard_settings(session);
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
+                };
+                if canonical == "agy"
+                    && account.as_ref().is_none_or(|a| a.dir.is_empty())
+                    && let Err(err) = preflight_agy_background_launch(&launch.env)
+                {
                     self.discard_settings(session);
-                    os(&e)
-                })?;
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(os(&err));
+                }
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: s.permission,
                 };
-                self.agents
+                if let Err(e) = self
+                    .agents
                     .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
-                    .and_then(|()| match s.bot_instructions.as_deref() {
+                    .and_then(|()| match instructions {
                         Some(text) => self.agents.remember_bot_instructions(session, text),
                         None => Ok(()),
                     })
-                    .map_err(|e| {
-                        self.discard_settings(session);
-                        self.agents.forget(session);
-                        os(&e)
-                    })?;
+                {
+                    self.discard_settings(session);
+                    self.agents.forget(session);
+                    revoke_bot_grant(&mut bot_launch);
+                    return Err(os(&e));
+                }
                 launch
             }
             None => match c.program {
@@ -1984,49 +2133,86 @@ impl Registry {
                 Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
                 Program::Agent { id } => {
                     let (canonical, profile, permission) =
-                        self.resolve_agent_profile_with_overrides(&id)?;
-                    let account = crate::agent::resume_target(
+                        match self.resolve_agent_profile_with_overrides(&id) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                revoke_bot_grant(&mut bot_launch);
+                                return Err(e);
+                            }
+                        };
+                    let account = match crate::agent::resume_target(
                         &profile,
                         state.as_deref(),
                         c.account.as_deref(),
                         None,
                         fallback_sid.as_deref(),
-                    )
-                    .map_err(|e| os(&e))?;
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            revoke_bot_grant(&mut bot_launch);
+                            return Err(os(&e));
+                        }
+                    };
                     crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
-                    let (launch, session_id, account) = crate::agent::resume_in(
+                    let (launch, session_id, account) = match crate::agent::resume_in_with_bot_mcp(
                         &profile,
                         permission,
                         session,
                         state.as_deref(),
                         fallback_sid.as_deref(),
                         account.as_ref(),
-                    )
-                    .map_err(|e| {
+                        bot_launch.as_ref().map(|_| cwd_path.as_path()),
+                        bot_launch.as_ref().map(|bl| &bl.mcp_cfg),
+                        bot_launch.as_ref().map(|bl| bl.instructions.as_str()),
+                    ) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            self.discard_settings(session);
+                            revoke_bot_grant(&mut bot_launch);
+                            return Err(os(&e));
+                        }
+                    };
+                    if canonical == "agy"
+                        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+                        && let Err(err) = preflight_agy_background_launch(&launch.env)
+                    {
                         self.discard_settings(session);
-                        os(&e)
-                    })?;
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&err));
+                    }
                     let metadata = control::AgentLaunch {
                         profile: canonical,
                         permission,
                     };
-                    self.agents
+                    if let Err(e) = self
+                        .agents
                         .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
-                        .map_err(|e| {
-                            self.discard_settings(session);
-                            os(&e)
-                        })?;
+                        .and_then(|()| match bot_launch.as_ref() {
+                            Some(bl) => self
+                                .agents
+                                .remember_bot_instructions(session, &bl.instructions),
+                            None => Ok(()),
+                        })
+                    {
+                        self.discard_settings(session);
+                        revoke_bot_grant(&mut bot_launch);
+                        return Err(os(&e));
+                    }
                     launch
                 }
             },
         };
+        if let Some(ref bl) = bot_launch {
+            env.extend(bl.extra_env.clone());
+        }
         if let Some(store) = &self.store {
             // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
-            store.inherit_history(session, old).map_err(|e| {
+            if let Err(e) = store.inherit_history(session, old) {
                 self.discard_settings(session);
                 self.agents.forget(session);
-                os(&e)
-            })?;
+                revoke_bot_grant(&mut bot_launch);
+                return Err(os(&e));
+            }
         }
         let (session, pid) =
             match self.spawn_holder(holder, session, argv, env, c.cwd, c.cols, c.rows) {
@@ -2035,9 +2221,25 @@ impl Registry {
                     if let Some(store) = &self.store {
                         store.discard_inherited_history(session);
                     }
+                    revoke_bot_grant(&mut bot_launch);
                     return Err(e);
                 }
             };
+        // Rebind bot ownership BEFORE `self.remove(old)` so old's removal never drops the
+        // resurrected session from `runtime-bindings.json`.
+        if let (Some(bots), Some(bl)) = (bots_mgr.as_ref(), bot_launch.take()) {
+            if let Some(rebound) = bots.rebind_session(old, session, pid, bl.grant_token.clone()) {
+                bots.revoke_launch_token(rebound.previous_token.as_ref());
+            } else {
+                bots.adopt_resumed_session(
+                    bl.bot_id,
+                    session,
+                    pid,
+                    bl.grant_token,
+                    bl.created_at_ms,
+                );
+            }
+        }
         let (has_old, exited_old) = {
             let mut st = lock(&self.state);
             st.resumed.insert(old);
@@ -2081,12 +2283,32 @@ impl Registry {
         &self,
         holder: &Holder,
         id: SessionId,
+        argv: Vec<Vec<u8>>,
+        env: Vec<(Vec<u8>, Vec<u8>)>,
+        cwd: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(SessionId, u32), Failure> {
+        self.spawn_holder_outcome(holder, id, argv, env, cwd, cols, rows)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Returns `(failure, definitively_not_spawned)` on error so callers can distinguish
+    /// a definitive `FromHolder::Failed` rejection from uncertain spawn outcomes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "holder Spawn 요청에 필요한 세션·프로세스·화면 인자를 한 번에 넘긴다"
+    )]
+    fn spawn_holder_outcome(
+        &self,
+        holder: &Holder,
+        id: SessionId,
         mut argv: Vec<Vec<u8>>,
         mut env: Vec<(Vec<u8>, Vec<u8>)>,
         mut cwd: Vec<u8>,
         cols: u16,
         rows: u16,
-    ) -> Result<(SessionId, u32), Failure> {
+    ) -> Result<(SessionId, u32), (Failure, bool)> {
         use krill_proto::os::ffi::OsStrExt as _;
         sanitize_spawn_cwd(&mut cwd);
         let wrapped = is_wrapper_argv(&argv);
@@ -2110,7 +2332,7 @@ impl Registry {
         }) else {
             self.discard_settings(id);
             self.agents.forget(id);
-            return Err(Failure::NoHolder);
+            return Err((Failure::NoHolder, false));
         };
         if matches!(
             reply,
@@ -2129,7 +2351,7 @@ impl Registry {
             }) else {
                 self.discard_settings(id);
                 self.agents.forget(id);
-                return Err(Failure::NoHolder);
+                return Err((Failure::NoHolder, false));
             };
             reply = next_reply;
         }
@@ -2156,7 +2378,7 @@ impl Registry {
                     holder.notify(|req| ToHolder::Release { req, id }).ok();
                     self.discard_settings(id);
                     self.agents.forget(id);
-                    os(&e)
+                    (os(&e), false)
                 })?;
                 if let Some(store) = &self.store {
                     store.remember_cwd(id, &initial_cwd);
@@ -2197,7 +2419,7 @@ impl Registry {
                     file!(),
                     line!(),
                 );
-                Err(Failure::from_holder_errno(errno))
+                Err((Failure::from_holder_errno(errno), true))
             }
             _ => {
                 tracing::warn!(id = id.0, wrapped, "unexpected holder spawn reply");
@@ -2215,7 +2437,7 @@ impl Registry {
                     file!(),
                     line!(),
                 );
-                Err(Failure::Os(libc::EIO))
+                Err((Failure::Os(libc::EIO), false))
             }
         }
     }
@@ -2389,7 +2611,11 @@ impl Registry {
         status.startup_stall = (wrapped
             && !exited
             && status.state == control::AgentState::Unknown
-            && status.source.is_none())
+            && status.source.is_none()
+            && status
+                .foreground
+                .as_deref()
+                .is_none_or(|fg| !krill_proto::agent::is_known_agent_process(fg)))
         .then(|| status::startup::startup_stall(root))
         .flatten();
         status.root_shell = (!exited)
@@ -2635,47 +2861,6 @@ impl Registry {
             };
             self.agents.bind_switch_identity(id, &yolo).ok();
         }
-        if !is_subagent_or_foreign
-            && let Ok(Some(stored)) = self.agents.stored(id)
-            && (stored.session_id.is_none() || stored.transcript_path.is_none())
-        {
-            let root_pid = lock(&self.state)
-                .sessions
-                .get(&id)
-                .map_or(0, |entry| entry.pid);
-            let fg_pid = (e.ppid > 1).then_some(e.ppid).or_else(|| {
-                account_switch::effective_foreground_pid(
-                    root_pid,
-                    tap.and_then(Tap::foreground),
-                    false,
-                )
-            });
-            let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
-                .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
-            if let Some(provider) = provider
-                && root_pid > 1
-            {
-                let discovered = self
-                    .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
-                    .ok()
-                    .flatten()
-                    .map(|found| (found.id, found.path))
-                    .or_else(|| {
-                        (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
-                            crate::agent_history::vault::discover_live_agy_identity(
-                                root_pid, fg_pid,
-                            )
-                            .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
-                            .map(|(_, conv_id, path)| (conv_id, path))
-                        })?
-                    });
-                if let Some((conv_id, path)) = discovered {
-                    self.agents
-                        .bind_discovered_session(id, &conv_id, Some(&path));
-                    self.agents.observe_account_resume(id, &conv_id);
-                }
-            }
-        }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         let allow_status_hook = !is_subagent_or_foreign
             || crate::agent::control::Control::is_explicit_subagent_hook(&e.payload);
@@ -2693,10 +2878,8 @@ impl Registry {
                 tap.agent_done(status.since_unix_ns);
             }
         }
-        // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다.
-        // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
-        // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
-        // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
+        // 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로 기록해
+        // UI 한도 배지·만료 시각·채팅 한도 배너에 반영한다.
         if status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload) {
             if !is_subagent_or_foreign {
                 self.agents.mark_rate_limited(id);
@@ -2726,152 +2909,69 @@ impl Registry {
         Ok(!is_subagent_or_foreign)
     }
 
-    // Account evaluation wakes the session worker. Release `state` first: the worker's
-    // final handoff holds its queue lock while retiring the old session. This also runs account
-    // CLIs and the keychain without a deadline, so callers must not hold `hook_commit` or the spool lock.
-    fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
-        #[cfg(all(test, unix))]
-        if let Some(probe) = tests::AUTO_SWITCH_PROBE.take() {
-            return probe(self);
-        }
-        self.auto_switch_from_hook_in(&crate::usage::accounts::default_home(), id, e);
+    /// Slow live-process identity discovery (open vnodes, `/bin/ps`, transcript walks).
+    /// Must run after releasing `hook_commit` / spool lock and after `hook::ack()`.
+    fn discover_hook_identity(&self, id: SessionId, e: &HookEvent) {
+        self.discover_hook_identity_in(&crate::usage::accounts::default_home(), id, e);
     }
 
-    fn auto_switch_from_hook_in(&self, home: &Path, id: SessionId, e: &HookEvent) {
-        let state_dir = self.state_dir();
-        if let Some(switched) =
-            status::auto_switch_on_rate_limit(home, state_dir.as_deref(), &e.agent, &e.payload)
-        {
-            if switched.is_empty() {
-                self.requeue_straggler_rate_limited_session(
-                    home,
-                    state_dir.as_deref(),
-                    id,
-                    &e.agent,
-                );
-            } else {
-                for s in &switched {
-                    tracing::info!(
-                        session = id.0,
-                        provider = s.provider.as_str(),
-                        from = %s.from_id,
-                        to = %s.to_id,
-                        percent = s.reason_percent,
-                        "stop failure rate limit auto-switched account"
-                    );
-                }
-            }
-        }
-    }
-
-    fn requeue_straggler_rate_limited_session(
-        &self,
-        home: &Path,
-        state_dir: Option<&Path>,
-        id: SessionId,
-        event_agent: &str,
-    ) {
-        use krill_proto::usage::{AccountStatus, AutoSwitchMetric, ConnectionStatus, ProviderKind};
-
-        let Some(provider) = ProviderKind::parse(event_agent) else {
+    fn discover_hook_identity_in(&self, home: &Path, id: SessionId, e: &HookEvent) {
+        let Ok(Some(stored)) = self.agents.stored(id) else {
             return;
         };
-        let stored = self
-            .live_agent_for_switch_in(id, home)
-            .or_else(|| self.agents.stored(id).ok().flatten());
-        if let Some(stored_provider) = stored.as_ref().and_then(|s| {
-            self.provider_for_profile(&s.profile)
-                .or_else(|| ProviderKind::parse(&s.profile))
-        }) && stored_provider != provider
-        {
+        if stored.session_id.is_some() && stored.transcript_path.is_some() {
             return;
         }
-        if lock(&self.account_handoffs)
-            .get(&id)
-            .is_some_and(|h| h.to.is_some())
-        {
-            return;
-        }
-        let session_account_id = self.resolve_session_account_id(home, provider, stored.as_ref());
-        let snapshot = crate::usage::accounts::refresh_accounts_with(home, state_dir, false);
-        let policy = &snapshot.auto_switch;
-        let rule_enabled = policy
-            .rule_for(provider, &session_account_id)
-            .map_or(policy.enabled, |rule| rule.enabled);
-        if !policy.switch_on_rate_limit || !rule_enabled {
-            return;
-        }
-        let Some(selected) = snapshot
-            .accounts
-            .iter()
-            .find(|a| a.provider == provider && a.active)
-        else {
+        let Some((root_pid, tap)) = ({
+            let st = lock(&self.state);
+            (!st.exited.contains_key(&id))
+                .then(|| {
+                    st.sessions
+                        .get(&id)
+                        .map(|entry| (entry.pid, entry.session.tap()))
+                })
+                .flatten()
+        }) else {
             return;
         };
-        if selected.id == session_account_id
-            || (!selected.host_default && !Path::new(&selected.profile_dir).is_dir())
-        {
+        if root_pid <= 1 {
             return;
         }
-        if snapshot.status_for(&selected.id).is_some_and(|s| {
-            matches!(
-                s.status,
-                AccountStatus::RateLimited | AccountStatus::NeedsLogin | AccountStatus::Error
-            )
-        }) {
+        let fg_pid = (e.ppid > 1).then_some(e.ppid).or_else(|| {
+            account_switch::effective_foreground_pid(root_pid, tap.foreground(), false)
+        });
+        let provider = krill_proto::usage::ProviderKind::parse(&stored.profile)
+            .or_else(|| krill_proto::usage::ProviderKind::parse(&e.agent));
+        let Some(provider) = provider else {
             return;
-        }
-        if snapshot.connections.supported
-            && matches!(
-                snapshot.connection_for(&selected.id),
-                ConnectionStatus::NeedsLogin | ConnectionStatus::CheckFailed
-            )
-        {
-            return;
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        };
+        let discovered = self
+            .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
             .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .unwrap_or(0);
-        if AutoSwitchMetric::Max
-            .effective_percent(&selected.usage, now)
-            .is_some_and(|pct| pct >= 100)
-        {
-            return;
-        }
-        let handoff = lock(&self.account_handoffs).get(&id).cloned();
-        let already_pending_or_active = handoff
-            .as_ref()
-            .is_some_and(|h| h.to.is_some() || (h.error.is_none() && h.account_id == selected.id))
-            || (handoff.as_ref().is_none_or(|h| h.error.is_none())
-                && lock(&self.account_work.pending)
-                    .get(&crate::usage::accounts::switch_work::SwitchScope::Session(
-                        id, provider,
-                    ))
-                    .is_some_and(|t| t.account_id == selected.id && t.not_before.is_none()));
-        if already_pending_or_active {
-            return;
-        }
-        if let Err(error) =
-            self.queue_session_account_switch_in(id, provider, &selected.id, &snapshot, home)
-        {
-            tracing::debug!(
-                session = id.0,
-                provider = provider.as_str(),
-                to = %selected.id,
-                ?error,
-                "straggler rate-limit re-queue skipped"
-            );
-        } else {
-            lock(&self.account_switch_opt_out).remove(&id);
-            tracing::info!(
-                session = id.0,
-                provider = provider.as_str(),
-                from = %session_account_id,
-                to = %selected.id,
-                "straggler rate-limited session queued to selected account"
-            );
+            .flatten()
+            .map(|found| (found.id, found.path))
+            .or_else(|| {
+                (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
+                    crate::agent_history::vault::discover_live_agy_identity(root_pid, fg_pid)
+                        .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
+                        .map(|(_, conv_id, path)| (conv_id, path))
+                })?
+            });
+        if let Some((conv_id, path)) = discovered {
+            let _commit = lock(&self.hook_commit);
+            let still_live = {
+                let st = lock(&self.state);
+                !st.exited.contains_key(&id)
+                    && st
+                        .sessions
+                        .get(&id)
+                        .is_some_and(|entry| entry.pid == root_pid)
+            };
+            if still_live {
+                self.agents
+                    .bind_discovered_session(id, &conv_id, Some(&path));
+                self.agents.observe_account_resume(id, &conv_id);
+            }
         }
     }
 
@@ -3121,6 +3221,15 @@ impl Registry {
             {
                 UsageReply::Failed(Failure::BadRequest)
             }
+            UsageRequest::AntigravityAccounts(_)
+                if features & (switch_control | krill_proto::usage::FEAT_USAGE_AGY)
+                    != (switch_control | krill_proto::usage::FEAT_USAGE_AGY) =>
+            {
+                UsageReply::Failed(Failure::BadRequest)
+            }
+            UsageRequest::AntigravityAccounts(op) => UsageReply::AntigravityAccounts(
+                accounts::agy_native::handle_op(&home, state_ref, &op),
+            ),
             // Default only: running sessions keep their account until the user picks them.
             UsageRequest::SwitchAccountOnly {
                 provider,
@@ -3134,7 +3243,7 @@ impl Registry {
                 previous_account_id,
                 target_account_id,
             } => {
-                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                let snapshot = accounts::refresh_accounts(&home, state_ref);
                 match self.inspect_session_switches_in(
                     &home,
                     provider,
@@ -3152,7 +3261,7 @@ impl Registry {
                 sessions,
                 interrupt_busy,
             } => {
-                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                let snapshot = accounts::refresh_accounts(&home, state_ref);
                 match self.queue_selected_account_switches_in(
                     &sessions,
                     provider,
@@ -3203,15 +3312,13 @@ impl Registry {
                 Ok(enabled) => UsageReply::Provisioning(enabled),
                 Err(e) => UsageReply::Failed(os(&e)),
             },
-            // 구버전 요청의 opcode는 유지한다. 사용량 자동 수집은 끌 수 없다.
-            UsageRequest::SetDirectUsage(_) => {
-                UsageReply::Accounts(accounts::refresh_accounts_with(&home, state_ref, false))
-            }
-            UsageRequest::SetAdvancedPolicy(policy) => {
-                match accounts::set_advanced_policy(&home, state_ref, &policy) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
+            // 구버전 요청의 opcode는 유지한다. 사용량 자동 수집은 끌 수 없고, 프로필 자동전환은 제거됐다.
+            UsageRequest::SetDirectUsage(_)
+            | UsageRequest::SetAdvancedPolicy(_)
+            | UsageRequest::SetAutoSwitch(_)
+            | UsageRequest::UpsertAutoSwitchRule(_)
+            | UsageRequest::RemoveAutoSwitchRule { .. } => {
+                UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
             }
             UsageRequest::Get => UsageReply::Current(accounts::primary_snapshot(&home, state_ref)),
             UsageRequest::ListAccounts => {
@@ -3225,9 +3332,9 @@ impl Registry {
                     UsageReply::Failed(Failure::BadRequest)
                 } else {
                     match self.cancel_failed_account_switch(session) {
-                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
-                            &home, state_ref, false,
-                        )),
+                        Ok(()) => {
+                            UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                        }
                         Err(error) => UsageReply::Failed(error),
                     }
                 }
@@ -3240,9 +3347,9 @@ impl Registry {
                     UsageReply::Failed(Failure::BadRequest)
                 } else {
                     match self.recover_failed_account_input(session, &account_id) {
-                        Ok(()) => UsageReply::Accounts(accounts::refresh_accounts_with(
-                            &home, state_ref, false,
-                        )),
+                        Ok(()) => {
+                            UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                        }
                         Err(error) => UsageReply::Failed(error),
                     }
                 }
@@ -3259,7 +3366,7 @@ impl Registry {
                 let required = krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
                     | krill_proto::usage::FEAT_PROVIDER_DETAILS;
                 if features & required == required {
-                    let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                    let snapshot = accounts::refresh_accounts(&home, state_ref);
                     match self.queue_session_account_switch(
                         session,
                         provider,
@@ -3304,26 +3411,6 @@ impl Registry {
                 Ok(snap) => UsageReply::Accounts(snap),
                 Err(e) => UsageReply::Failed(os(&e)),
             },
-            UsageRequest::UpsertAutoSwitchRule(rule) => {
-                match accounts::upsert_auto_switch_rule(&home, state_ref, rule) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
-            UsageRequest::RemoveAutoSwitchRule {
-                provider,
-                from_account_id,
-            } => {
-                match accounts::remove_auto_switch_rule(
-                    &home,
-                    state_ref,
-                    provider,
-                    &from_account_id,
-                ) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
             UsageRequest::ConsumeResetCredit {
                 provider,
                 account_id,
@@ -3335,12 +3422,6 @@ impl Registry {
                 },
                 Err(e) => UsageReply::Failed(e.to_failure()),
             },
-            UsageRequest::SetAutoSwitch(policy) => {
-                match accounts::set_auto_switch(&home, state_ref, &policy) {
-                    Ok(snap) => UsageReply::Accounts(snap),
-                    Err(e) => UsageReply::Failed(os(&e)),
-                }
-            }
             UsageRequest::RenameAccount {
                 provider,
                 account_id,
@@ -3616,11 +3697,29 @@ impl Registry {
             })
     }
 
+    /// Resolves a session's transcript identity (`bound`, `agent`, `session_id`, `transcript_path`)
+    /// without reading or parsing transcript content from byte offset 0.
+    pub(crate) fn resolve_chat_transcript(
+        &self,
+        id: SessionId,
+    ) -> krill_proto::agent_history::ChatPollSnapshot {
+        self.chat_poll_inner(id, 0, true)
+    }
+
     /// 세션의 에이전트 트랜스크립트를 `offset` 바이트부터 증분 정규화해 읽는다(OWE-945 / MK-242).
     pub(crate) fn chat_poll(
         &self,
         id: SessionId,
         offset: u64,
+    ) -> krill_proto::agent_history::ChatPollSnapshot {
+        self.chat_poll_inner(id, offset, false)
+    }
+
+    fn chat_poll_inner(
+        &self,
+        id: SessionId,
+        offset: u64,
+        resolve_only: bool,
     ) -> krill_proto::agent_history::ChatPollSnapshot {
         use krill_proto::os::ffi::OsStrExt as _;
         let (root_pid, raw_fg, exited) = {
@@ -3694,7 +3793,7 @@ impl Registry {
                         agent: stored
                             .as_ref()
                             .map_or_else(String::new, |s| s.profile.clone()),
-                        reset: offset > 0,
+                        reset: !resolve_only && offset > 0,
                         ..Default::default()
                     };
                 }
@@ -3731,7 +3830,7 @@ impl Registry {
                     session_id: String::new(),
                     transcript_path: String::new(),
                     next_offset: 0,
-                    reset: offset > 0,
+                    reset: !resolve_only && offset > 0,
                     bound: false,
                     items: Vec::new(),
                 };
@@ -3747,14 +3846,24 @@ impl Registry {
             (start / 1_000_000).checked_sub(11_644_473_600)
         });
         let claimed = self.agents.claimed_transcripts(id);
-        let (snapshot, resolved) = crate::agent_history::chat::poll_session_bounded(
-            self.state_dir().as_deref(),
-            stored.as_ref(),
-            &cwd,
-            offset,
-            launched_at,
-            &claimed,
-        );
+        let (snapshot, resolved) = if resolve_only {
+            crate::agent_history::chat::resolve_session_bounded(
+                self.state_dir().as_deref(),
+                stored.as_ref(),
+                &cwd,
+                launched_at,
+                &claimed,
+            )
+        } else {
+            crate::agent_history::chat::poll_session_bounded(
+                self.state_dir().as_deref(),
+                stored.as_ref(),
+                &cwd,
+                offset,
+                launched_at,
+                &claimed,
+            )
+        };
         if let Some((path, sid)) = resolved
             && stored.as_ref().is_some_and(|s| {
                 s.session_id.as_deref() == Some(&sid)
@@ -3822,7 +3931,16 @@ impl Registry {
         submit: bool,
         expected_last_input_ns: Option<u64>,
     ) -> io::Result<bool> {
-        let (_, _, _, modes) = tap.capture_shared_with_modes();
+        let (screen, _, _, modes) = tap.capture_shared_with_modes();
+        if krill_proto::screen::agy::auth_login_screen(&screen) {
+            tracing::warn!(
+                "refused automated PTY input delivery while Antigravity sign-in/OAuth screen is active"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "antigravity session requires sign-in (auth_required)",
+            ));
+        }
         let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
         let payload = if submit {
             bytes
@@ -3833,10 +3951,7 @@ impl Registry {
         } else {
             bytes
         };
-        let is_control_seq = payload.starts_with(b"\x1b")
-            || payload
-                .iter()
-                .any(|&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t');
+        let is_control_seq = is_terminal_control_seq(payload);
         let use_bracketed = bracketed
             && !payload.is_empty()
             && !is_control_seq
@@ -3870,12 +3985,7 @@ impl Registry {
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
-            let mut rest = payload;
-            while let Some(pos) = rest.windows(6).position(|w| w == b"\x1b[201~") {
-                framed.extend_from_slice(rest.get(..pos).unwrap_or_default());
-                rest = rest.get(pos + 6..).unwrap_or_default();
-            }
-            framed.extend_from_slice(rest);
+            Self::strip_bracketed_paste_end(payload, &mut framed);
             framed.extend_from_slice(b"\x1b[201~");
             if !write_checked(&framed)? {
                 return Ok(false);
@@ -3895,6 +4005,19 @@ impl Registry {
             }
         }
         Ok(true)
+    }
+
+    /// Strips `ESC [ 201 ~` (bracketed-paste end) to a fixed point in linear time so nested
+    /// sequences like `\x1b[\x1b[201~201~` cannot splice back into a literal terminator.
+    fn strip_bracketed_paste_end(payload: &[u8], out: &mut Vec<u8>) {
+        const PASTE_END: &[u8] = b"\x1b[201~";
+        let body_start = out.len();
+        for &byte in payload {
+            out.push(byte);
+            while out.len() >= body_start + PASTE_END.len() && out.ends_with(PASTE_END) {
+                out.truncate(out.len() - PASTE_END.len());
+            }
+        }
     }
 
     fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {
@@ -4160,6 +4283,15 @@ impl Registry {
         self.bots.get()
     }
 
+    /// 데몬 종료 시 대기 중인 상태·닫힘 원장·세그먼트 표식을 제한 시간 내에 안전하게 비운다.
+    pub fn flush_persistence(&self, timeout: Duration) {
+        if let Some(store) = &self.store {
+            store.retry_pending_markers();
+        }
+        self.status.shutdown(timeout);
+        self.closed_ledger.flush(timeout);
+    }
+
     /// Lazily initializes the [`crate::bots::BotsManager`] when a bot RPC or periodic bot tick needs it.
     pub(crate) fn bots(&self) -> Result<&Arc<crate::bots::BotsManager>, String> {
         if let Some(existing) = self.bots.get() {
@@ -4322,15 +4454,99 @@ impl Registry {
         lock(&self.state).sessions.get(&id).map(|e| e.pid)
     }
 
-    /// Closes/terminates a bot-managed PTY session cleanly.
+    /// Closes/terminates a bot-managed PTY session cleanly, or permanently marks a dormant
+    /// post-reboot bot session closed so it cannot be resurrected on a later restart.
     pub(crate) fn kill_bot_session(&self, id: SessionId) -> io::Result<()> {
+        if !lock(&self.state).sessions.contains_key(&id) {
+            self.close_dormant_bot_session(id);
+            return Ok(());
+        }
         let peer = Peer {
             pid: None,
             scope: Scope::Full,
         };
-        self.close(&peer, id)
-            .map(|_| ())
-            .map_err(|fail| io::Error::other(format!("failed to close bot session: {fail:?}")))
+        match self.close(&peer, id) {
+            Ok(_) => Ok(()),
+            Err(Failure::NoSession) => {
+                self.close_dormant_bot_session(id);
+                Ok(())
+            }
+            Err(fail) => Err(io::Error::other(format!(
+                "failed to close bot session: {fail:?}"
+            ))),
+        }
+    }
+
+    fn close_dormant_bot_session(&self, id: SessionId) {
+        self.closed_ledger.record_closed(id);
+        if let Some(store) = &self.store {
+            store.mark_closed(id);
+        }
+        self.discard_settings(id);
+        self.agents.forget(id);
+        self.clear_sleeping(id);
+    }
+
+    /// Returns `true` if `id` is recorded as explicitly closed.
+    pub(crate) fn is_session_closed(&self, id: SessionId) -> bool {
+        self.is_closed(id)
+    }
+
+    /// Returns `true` if `id` is not closed/resumed and still has durable launch metadata or
+    /// cold terminal history on disk that `Request::Resume` can resurrect after a reboot.
+    pub(crate) fn is_session_resumable(&self, id: SessionId) -> bool {
+        if self.is_closed(id) || lock(&self.state).resumed.contains(&id) {
+            return false;
+        }
+        if self.agents.stored(id).ok().flatten().is_some() {
+            return true;
+        }
+        if let Some(store) = &self.store
+            && store.session_dir(id).is_dir()
+        {
+            return true;
+        }
+        self.dir.as_ref().is_some_and(|d| {
+            d.join("sessions")
+                .join(format!("{}.noindex", id.0))
+                .is_dir()
+        })
+    }
+
+    /// Returns live non-exited sessions whose stored launch still carries `bot_instructions`,
+    /// enabling self-healing adoption when `runtime-bindings.json` lost their entry.
+    pub(crate) fn live_bot_launch_candidates(&self) -> Vec<(SessionId, u32, PathBuf, String, u64)> {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let live: Vec<(SessionId, u32, PathBuf)> = {
+            let st = lock(&self.state);
+            st.sessions
+                .iter()
+                .filter(|(id, entry)| !st.exited.contains_key(id) && !entry.session.is_closed())
+                .map(|(&id, entry)| (id, entry.pid, entry.cwd.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (sid, pid, live_cwd) in live {
+            let Ok(Some(stored)) = self.agents.stored(sid) else {
+                continue;
+            };
+            let Some(instructions) = stored.bot_instructions else {
+                continue;
+            };
+            let cwd = if stored.cwd.is_empty() {
+                live_cwd
+            } else {
+                PathBuf::from(std::ffi::OsStr::from_bytes(&stored.cwd))
+            };
+            out.push((
+                sid,
+                pid,
+                cwd,
+                instructions,
+                stored.launched_at.unwrap_or(0).saturating_mul(1000),
+            ));
+        }
+        out
     }
 
     /// Returns `true` if `id` is a live, non-exited session.
@@ -4343,6 +4559,170 @@ impl Registry {
                 .is_some_and(|entry| !entry.session.is_closed())
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn insert_mock_live_session_for_test(
+        &self,
+        id: SessionId,
+        cwd: PathBuf,
+    ) -> io::Result<UnixStream> {
+        let (master, peer) = UnixStream::pair()?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&self.look),
+            None,
+        )?;
+        let mut st = lock(&self.state);
+        st.exited.remove(&id);
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: std::process::id(),
+                cwd,
+                wrapped: false,
+            },
+        );
+        Ok(peer)
+    }
+
+    /// Returns the account ID recorded for `id`, if known from stored launch metadata.
+    pub(crate) fn session_account_id(&self, id: SessionId) -> Option<String> {
+        self.agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.account)
+            .map(|a| a.id)
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Returns `true` when `id` has saved, resumable agent conversation metadata on disk
+    /// (used by terminal-worker restart recovery under `resume_work_on_restart`, Orca #46643).
+    pub(crate) fn has_resumable_worker_conversation(&self, id: SessionId) -> bool {
+        let Ok(Some(stored)) = self.agents.stored(id) else {
+            return false;
+        };
+        let fallback_sid = self
+            .state_dir()
+            .as_deref()
+            .and_then(|d| crate::agent::claude::session_id(d, id));
+        let has_sid = stored
+            .session_id
+            .as_deref()
+            .or(fallback_sid.as_deref())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_sid {
+            return false;
+        }
+        self.agents
+            .agents()
+            .is_ok_and(|agents| agents.resolve(&stored.profile).is_some())
+    }
+
+    /// Attempts to resume a lost orchestration terminal worker's saved agent conversation into a
+    /// new live PTY session, preserving `KRILL_ORCH_DEPTH` / `KRILL_ORCH_MAX_DEPTH` and segment
+    /// history (Orca #46643).
+    pub(crate) fn resume_lost_worker_session(
+        &self,
+        old: SessionId,
+        dispatch: &krill_proto::orchestration::Dispatch,
+    ) -> io::Result<SessionId> {
+        let holder = self
+            .holder
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no holder"))?;
+        let stored = self
+            .agents
+            .stored(old)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing stored launch"))?;
+        let state = self.state_dir();
+        let fallback_sid = state
+            .as_deref()
+            .and_then(|d| crate::agent::claude::session_id(d, old));
+        let resume_id = stored
+            .session_id
+            .or(fallback_sid)
+            .filter(|s| !s.trim().is_empty());
+        if resume_id.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no resumable agent conversation id",
+            ));
+        }
+        let agents = self.agents.agents()?;
+        let (canonical, profile) = agents
+            .resolve(&stored.profile)
+            .ok_or_else(|| io::Error::other("unknown agent profile"))?;
+        let mut cwd = if stored.cwd.is_empty() {
+            dispatch.cwd.as_bytes().to_vec()
+        } else {
+            stored.cwd.clone()
+        };
+        sanitize_spawn_cwd(&mut cwd);
+        let session = self.reserve_session_id(Some(old))?;
+        let account = crate::agent::resume_target(
+            profile,
+            state.as_deref(),
+            None,
+            stored.account.as_ref(),
+            resume_id.as_deref(),
+        )?;
+        crate::agent::pre_trust_workspace(profile, &cwd, account.as_ref());
+        let (mut launch, session_id, account) = crate::agent::resume_in_with_bot_instructions(
+            profile,
+            stored.permission,
+            session,
+            state.as_deref(),
+            resume_id.as_deref(),
+            account.as_ref(),
+            stored.bot_instructions.as_deref(),
+        )
+        .inspect_err(|_| self.discard_settings(session))?;
+        if canonical == "agy" && account.as_ref().is_none_or(|a| a.dir.is_empty()) {
+            preflight_agy_background_launch(&launch.env)
+                .inspect_err(|_| self.discard_settings(session))?;
+        }
+        for (key, value) in [
+            ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
+            (
+                "KRILL_ORCH_MAX_DEPTH",
+                krill_proto::orchestration::MAX_WORKER_DEPTH,
+            ),
+        ] {
+            launch
+                .env
+                .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
+        }
+        let metadata = control::AgentLaunch {
+            profile: canonical.to_owned(),
+            permission: stored.permission,
+        };
+        self.agents
+            .remember_session(session, &metadata, session_id, cwd.clone(), account)
+            .inspect_err(|_| self.discard_settings(session))?;
+        if let Some(store) = &self.store {
+            store.inherit_history(session, old).inspect_err(|_| {
+                self.discard_settings(session);
+                self.agents.forget(session);
+            })?;
+        }
+        let (spawned_session, _) = self
+            .spawn_holder(holder, session, launch.argv, launch.env, cwd, 120, 36)
+            .map_err(|e| {
+                if let Some(store) = &self.store {
+                    store.discard_inherited_history(session);
+                }
+                io::Error::other(e.to_string())
+            })?;
+        lock(&self.state).resumed.insert(old);
+        self.discard_settings(old);
+        self.agents.forget(old);
+        self.clear_sleeping(old);
+        Ok(spawned_session)
+    }
+
     /// Delivers input bytes to a live bot session PTY.
     pub(crate) fn deliver_bot_input(
         &self,
@@ -4353,7 +4733,22 @@ impl Registry {
         let tap = self
             .session_tap(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bot session not live"))?;
-        Self::deliver_input_to_tap(&tap, bytes, submit)
+        if !submit {
+            return Self::deliver_input_to_tap(&tap, bytes, false);
+        }
+        let canonical = self
+            .agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .map(|stored| krill_proto::agent::canonical_id(&stored.profile).to_owned())
+            .or_else(|| {
+                let agent = self.status.get(id).agent;
+                (!agent.is_empty()).then(|| krill_proto::agent::canonical_id(&agent).to_owned())
+            });
+        prompt_delivery::deliver_and_confirm_submit(&tap, canonical.as_deref(), bytes, &|| {
+            self.status.get(id).state == control::AgentState::Working
+        })
     }
 
     /// Captures the trailing non-empty plain-text lines from a session's PTY screen (reply fallback),
@@ -4433,7 +4828,7 @@ impl Registry {
                 ));
             };
             if canonical == "agy"
-                && let Some((installed, minimum)) = crate::mobile::agy_version_problem(&exe, true)
+                && let Some((installed, minimum)) = crate::mobile::agy_version_problem(&exe, false)
             {
                 return Err(BotStartError::Refused(BotSessionRefusal::cli_too_old(
                     canonical, installed, minimum,
@@ -4461,6 +4856,20 @@ impl Registry {
             BotStartError::Refused(BotSessionRefusal::spawn_failed(canonical, err.to_string()))
         })?;
         launch.env.extend(extra_env);
+        if canonical == "agy"
+            && account.as_ref().is_none_or(|a| a.dir.is_empty())
+            && let Err(err) = preflight_agy_background_launch(&launch.env)
+        {
+            self.discard_settings(session);
+            tracing::warn!(
+                agent = canonical,
+                error = %err,
+                "refused bot agy session launch before spawn: Antigravity credentials unavailable"
+            );
+            return Err(BotStartError::Refused(BotSessionRefusal::auth_required(
+                canonical,
+            )));
+        }
         crate::agent::pre_trust_workspace(&profile, &cwd_bytes, account.as_ref());
         let metadata = control::AgentLaunch {
             profile: canonical.to_owned(),
@@ -4874,8 +5283,11 @@ impl Registry {
                 }
                 continue;
             }
-            // Avoid interpreting names as shell fragments, even for a login shell.
-            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            // Avoid interpreting names as shell fragments or raw terminal controls, even for a login shell.
+            let quote = |s: &str| {
+                let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+                format!("'{}'", clean.replace('\'', "'\\''"))
+            };
             let run_flag = run_id
                 .as_deref()
                 .map(|id| format!(" --run {}", quote(id)))
@@ -5122,14 +5534,24 @@ impl Registry {
                 })
             }
             OrchAction::SendMessage(params) => {
-                OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
-                    self.notify_orch();
-                    // Mail is committed even when a best-effort PTY pointer cannot be sent.
-                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
-                        tracing::warn!(kind = ?error.kind(), "orchestration idle mail notification failed");
-                    }
-                    OrchResponse::Messages(msgs)
-                })
+                if has_control_chars(&params.from)
+                    || has_control_chars(&params.to)
+                    || params.run_id.as_deref().is_some_and(has_control_chars)
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "orchestration message identifiers must not contain control characters",
+                    ))
+                } else {
+                    OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
+                        self.notify_orch();
+                        // Mail is committed even when a best-effort PTY pointer cannot be sent.
+                        if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                            tracing::warn!(kind = ?error.kind(), "orchestration idle mail notification failed");
+                        }
+                        OrchResponse::Messages(msgs)
+                    })
+                }
             }
             OrchAction::CheckMessages {
                 recipient,
@@ -5158,7 +5580,9 @@ impl Registry {
                     let checked = self.orchestration_snapshot().and_then(|mut snapshot| {
                         let preview = check(&mut snapshot)?;
                         if !preview.1.is_empty() || delivery_id.is_some() {
-                            OrchestrationStore::mutate(&dir, check)
+                            let result = OrchestrationStore::mutate(&dir, check)?;
+                            self.notify_orch();
+                            Ok(result)
                         } else {
                             Ok(preview)
                         }
@@ -5166,12 +5590,14 @@ impl Registry {
                     match checked {
                         Ok((delivery, messages)) => {
                             let now = Instant::now();
-                            if !messages.is_empty() || now >= deadline {
-                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
-                                    OrchResponse::Messages(messages)
-                                } else {
-                                    OrchResponse::Delivery { delivery, messages }
-                                });
+                            if delivery_id.is_some() || !messages.is_empty() || now >= deadline {
+                                break Ok(
+                                    if !v2 || (ack && delivery_id.is_none() && delivery.is_none()) {
+                                        OrchResponse::Messages(messages)
+                                    } else {
+                                        OrchResponse::Delivery { delivery, messages }
+                                    },
+                                );
                             }
                             let rem = deadline.saturating_duration_since(now);
                             if rem.is_zero() {
@@ -5280,17 +5706,28 @@ impl Registry {
                 question_id,
                 from,
                 body,
-            } => OrchestrationStore::mutate(&dir, |s| s.reply_message(&question_id, &from, &body))
-                .map(|m| {
-                    self.notify_orch();
-                    if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
-                        tracing::warn!(
-                            kind = ?error.kind(),
-                            "orchestration idle mail notification failed"
-                        );
-                    }
-                    OrchResponse::Message(m)
-                }),
+            } => {
+                if has_control_chars(&from) {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "orchestration message identifiers must not contain control characters",
+                    ))
+                } else {
+                    OrchestrationStore::mutate(&dir, |s| {
+                        s.reply_message(&question_id, &from, &body)
+                    })
+                    .map(|m| {
+                        self.notify_orch();
+                        if let Err(error) = self.notify_idle_orchestration_mail(&dir) {
+                            tracing::warn!(
+                                kind = ?error.kind(),
+                                "orchestration idle mail notification failed"
+                            );
+                        }
+                        OrchResponse::Message(m)
+                    })
+                }
+            }
             OrchAction::CreateGate {
                 from,
                 question,
@@ -5639,6 +6076,66 @@ fn resolve_bot_cli_executable(
         .and_then(|home| krill_proto::agent::which(program, home.join(".local/bin").as_os_str()))
 }
 
+/// Preflights native Antigravity credentials before spawning a background/bot/scheduled/resumed
+/// `agy` session so unauthenticated or transiently locked reboot states never enter the OAuth TUI
+/// and launch a browser window.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "matches non-test Result signature"
+    )
+)]
+pub(super) fn preflight_agy_background_launch(env: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let _ = env;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let mut launch_env: std::collections::BTreeMap<String, String> = env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
+            "SSH_CONNECTION",
+            "SSH_TTY",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            if !launch_env.contains_key(key)
+                && let Ok(val) = std::env::var(key)
+            {
+                launch_env.insert(key.to_owned(), val);
+            }
+        }
+        let home = launch_env
+            .get("HOME")
+            .or_else(|| launch_env.get("USERPROFILE"))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(krill_proto::os::home_dir)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Antigravity is not signed in (auth_required).",
+                )
+            })?;
+        crate::usage::accounts::agy_native::preflight_auth_for_background_launch(&home, &launch_env)
+            .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
+    }
+}
+
 fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {
     if let Ok(text) = std::str::from_utf8(cwd) {
         let cleaned = krill_proto::orchestration::clean_workspace_path_str(text);
@@ -5756,6 +6253,42 @@ fn fallback_spawn_on_enoent(
     changed
 }
 
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
+fn is_terminal_control_seq(payload: &[u8]) -> bool {
+    if payload.is_empty() || payload.contains(&b'\n') || payload.contains(&b'\r') {
+        return false;
+    }
+    if payload
+        .iter()
+        .all(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+    {
+        return true;
+    }
+    if payload.len() <= 16 && payload.first() == Some(&0x1b) {
+        if payload.len() <= 2 {
+            return true;
+        }
+        if payload == b"\x1b[200~" || payload == b"\x1b[201~" {
+            return false;
+        }
+        if let Some(rest) = payload.strip_prefix(b"\x1b[")
+            && let Some((&final_byte, params)) = rest.split_last()
+        {
+            return (0x40..=0x7e).contains(&final_byte)
+                && params.iter().all(|&b| (0x20..=0x3f).contains(&b));
+        }
+        if let Some(rest) = payload.strip_prefix(b"\x1bO")
+            && let [final_byte] = rest
+        {
+            return (0x40..=0x7e).contains(final_byte);
+        }
+    }
+    false
+}
+
 fn read_only(req: &Request) -> bool {
     matches!(
         req,
@@ -5782,11 +6315,6 @@ fn read_only(req: &Request) -> bool {
                 krill_proto::orchestration::OrchAction::Snapshot
                     | krill_proto::orchestration::OrchAction::SnapshotV2
                     | krill_proto::orchestration::OrchAction::SnapshotPage { .. }
-                    | krill_proto::orchestration::OrchAction::CheckMessagesLegacy {
-                        ack: false,
-                        ..
-                    }
-                    | krill_proto::orchestration::OrchAction::CheckMessages { ack: false, .. }
                     | krill_proto::orchestration::OrchAction::CheckMessagesFiltered {
                         ack: false,
                         ..
@@ -6211,6 +6739,68 @@ mod orchestration_delivery_tests {
         drop(reg);
         drop(terminal);
         std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_to_tap_refuses_agy_oauth_login_screen_with_zero_bytes_written()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+        for (idx, banner) in [
+            b"Welcome to the Antigravity CLI. You are currently not signed in.\r\n\
+              Select login method:\r\n\
+              > 1. Google OAuth\r\n\
+                2. Use a Google Cloud project\r\n"
+                .as_slice(),
+            b"Your browser should open automatically.\r\n\
+              -> Click here to authenticate\r\n\
+              Enter authorization code:\r\n"
+                .as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (master, mut terminal) = UnixStream::pair()?;
+            terminal.set_read_timeout(Some(Duration::from_millis(120)))?;
+            let session = Session::start(
+                SessionId(41_900 + idx as u64),
+                OwnedFd::from(master),
+                WinSize { cols: 80, rows: 24 },
+                Arc::clone(&look),
+                None,
+            )?;
+            let tap = session.tap();
+            terminal.write_all(banner)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !krill_proto::screen::agy::auth_login_screen(&tap.capture().0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for login banner on screen"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let err = Registry::deliver_input_to_tap(&tap, b"run bot task", true)
+                .expect_err("automated input must be refused on agy auth login screen");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("auth_required"), "err={err}");
+
+            let mut buf = [0_u8; 64];
+            let read_res = terminal.read(&mut buf);
+            assert!(
+                matches!(
+                    read_res,
+                    Err(ref e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                ),
+                "expected 0 bytes written to PTY, got {read_res:?}"
+            );
+            drop(session);
+        }
+        Ok(())
     }
 
     #[test]
@@ -6650,6 +7240,299 @@ mod orchestration_delivery_tests {
         assert_eq!(stored_log, expected_log);
 
         drop(child2);
+        drop(reg);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn observer_cannot_call_check_messages_and_acked_delivery_returns_immediately() -> io::Result<()>
+    {
+        use crate::agent::control::cache::stamp;
+        use krill_proto::orchestration::{ORCH_FILE, OrchResponse};
+        use std::io::Write as _;
+
+        // DC-18: CheckMessages / CheckMessagesLegacy persist deliveries so they are not read_only.
+        let check_v2 = OrchAction::CheckMessages {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+            run_id: None,
+            delivery_id: None,
+        };
+        let check_legacy = OrchAction::CheckMessagesLegacy {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+        };
+        let check_filtered = OrchAction::CheckMessagesFiltered {
+            recipient: Some("worker-1".into()),
+            run_id: None,
+            types: vec![],
+            unread_only: true,
+            ack: false,
+            wait_ms: 0,
+        };
+        assert!(!read_only(&Request::Orchestration(check_v2.clone())));
+        assert!(!read_only(&Request::Orchestration(check_legacy)));
+        assert!(read_only(&Request::Orchestration(check_filtered)));
+
+        let dir = std::env::temp_dir().join(format!("krill-dc18-dc19-orch-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("dc18-19", None))?;
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        reg.orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "coordinator".into(),
+                to: "worker-1".into(),
+                msg_type: MessageType::Status,
+                summary: "hi".into(),
+                body: String::new(),
+                run_id: Some(run.id.clone()),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+        let before = stamp(&dir.join(ORCH_FILE));
+
+        // Wire Role::Observer is denied CheckMessages { ack: false } without mutating orchestration.json.
+        let (mut client, server) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let reg_srv = Arc::clone(&reg);
+        let srv = std::thread::spawn(move || {
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            };
+            reg_srv.serve(server, &hello).unwrap();
+        });
+        ipc::read_frame(&mut client)?.unwrap();
+        let hello = krill_proto::daemon::client_hello(ipc::ClientRole::App, "observer-test");
+        client.write_all(&hello.encode().unwrap())?;
+        client.write_all(&roles::Request::Set(Role::Observer).encode().unwrap())?;
+        let (k, body) = ipc::read_frame(&mut client)?.unwrap();
+        assert_eq!(Ack::decode(k, &body).unwrap(), Ack::Applied);
+        client.write_all(&Request::Orchestration(check_v2.clone()).encode().unwrap())?;
+        let (k, body) = ipc::read_frame(&mut client)?.unwrap();
+        assert_eq!(
+            Reply::decode(k, &body).unwrap(),
+            Reply::Failed(Failure::Denied)
+        );
+        drop(client);
+        srv.join().unwrap();
+        assert_eq!(stamp(&dir.join(ORCH_FILE)), before);
+        assert!(OrchestrationStore::load(&dir)?.deliveries.is_empty());
+
+        // DC-19: mutating CheckMessages bumps orch_signal, and an already-acked delivery with
+        // wait_ms > 0 returns immediately instead of spinning until deadline.
+        let gen_before = *lock(&reg.orch_signal.0);
+        let Reply::Orchestration(OrchResponse::Delivery {
+            delivery: Some(batch),
+            messages,
+        }) = reg.orchestration(&peer, check_v2).unwrap()
+        else {
+            panic!("expected delivery batch");
+        };
+        assert_eq!(messages.len(), 1);
+        assert!(*lock(&reg.orch_signal.0) > gen_before);
+        // Ack the batch once, then re-ack with wait_ms = 5000.
+        let ack_action = OrchAction::CheckMessages {
+            recipient: Some("worker-1".into()),
+            types: vec![],
+            unread_only: true,
+            ack: true,
+            wait_ms: 5_000,
+            run_id: Some(run.id.clone()),
+            delivery_id: Some(batch.id.clone()),
+        };
+        reg.orchestration(&peer, ack_action.clone()).unwrap();
+        // Force the acked batch to have empty messages (as when messages are pruned or already acked)
+        // by clearing its message_ids so check_delivery returns Ok((Some(delivery), [])).
+        OrchestrationStore::mutate(&dir, |s| {
+            for d in &mut s.deliveries {
+                if d.id == batch.id {
+                    d.message_ids.clear();
+                }
+            }
+            Ok(())
+        })?;
+        let started = Instant::now();
+        let reply = reg.orchestration(&peer, ack_action).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "delivery_id check must return immediately instead of waiting for wait_ms, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            reply,
+            Reply::Orchestration(OrchResponse::Delivery {
+                delivery: Some(_),
+                messages
+            }) if messages.is_empty()
+        ));
+        drop(reg);
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn deliver_input_brackets_multiline_esc_and_sanitizes_orchestration_mail_controls()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        // DC-22a: unit assertions on is_terminal_control_seq
+        assert!(is_terminal_control_seq(b"\x03"));
+        assert!(is_terminal_control_seq(b"\x1b"));
+        assert!(is_terminal_control_seq(b"\x1b[A"));
+        assert!(is_terminal_control_seq(b"\x1b[1;5C"));
+        assert!(is_terminal_control_seq(b"\x1bOP"));
+        assert!(!is_terminal_control_seq(b""));
+        assert!(!is_terminal_control_seq(b"\x1b[200~"));
+        assert!(!is_terminal_control_seq(b"\x1b[201~"));
+        assert!(!is_terminal_control_seq(b"line1\n\x1b[31mred\x1b[0m"));
+        assert!(!is_terminal_control_seq(b"hello \x1b[201~ world"));
+
+        // Bracketed paste wraps multiline payload containing \x1b[201~ and strips the escape.
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(419),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            look,
+            None,
+        )?;
+        let tap = session.tap();
+        terminal.write_all(b"\x1b[?2004h")?;
+        tap.wait_timeout(Duration::from_secs(1), |p| p.end >= 8);
+        let tui = std::thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+            let mut buf = [0_u8; 512];
+            let n1 = terminal.read(&mut buf)?;
+            let first = buf[..n1].to_vec();
+            terminal.write_all(b"> pasted")?;
+            let n2 = terminal.read(&mut buf)?;
+            Ok((first, buf[..n2].to_vec()))
+        });
+        Registry::deliver_input_to_tap(&tap, b"line1\n\x1b[201~injected\nline2", true)?;
+        let (first, second) = tui.join().unwrap()?;
+        assert_eq!(first, b"\x1b[200~line1\ninjected\nline2\x1b[201~");
+        assert_eq!(second, b"\r");
+        drop(session);
+
+        // DC-22b: SendMessage rejects control chars in from/to/run_id, and
+        // notify_idle_orchestration_mail_for strips control chars from on-disk records.
+        let dir =
+            std::env::temp_dir().join(format!("krill-dc22-mail-controls-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let bad = reg
+            .orchestration(
+                &peer,
+                OrchAction::SendMessage(SendParams {
+                    from: "evil\x03\nworker".into(),
+                    to: "coordinator".into(),
+                    msg_type: MessageType::Status,
+                    summary: "hi".into(),
+                    body: String::new(),
+                    run_id: None,
+                    task_id: None,
+                    dispatch_id: None,
+                    outcome: None,
+                    reply_to: None,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            bad,
+            Reply::Orchestration(krill_proto::orchestration::OrchResponse::Error(_))
+        ));
+
+        // Legacy on-disk message with control chars in sender/run_id must be stripped before PTY write.
+        let id = SessionId(420);
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&reg.look),
+            None,
+        )?;
+        let root_pid = std::process::id();
+        {
+            let mut st = lock(&reg.state);
+            st.roots.insert(id, root_pid).unwrap();
+            st.sessions.insert(
+                id,
+                Entry {
+                    session,
+                    pid: root_pid,
+                    cwd: PathBuf::from("/tmp"),
+                    wrapped: false,
+                },
+            );
+        }
+        let done_ev = HookEvent {
+            id: hook::EventId {
+                pid: root_pid,
+                unix_ns: status::now_ns(),
+            },
+            agent: "claude".into(),
+            ppid: root_pid,
+            input: hook::Input::Complete,
+            payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+        };
+        reg.status.hook(&[(id, &done_ev)])?;
+        OrchestrationStore::mutate(&dir, |s| {
+            let run = s.create_run("dc22", Some(id.0))?;
+            s.send_message(&SendParams {
+                from: "w\x03\x1b\n1".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::Status,
+                summary: "hi".into(),
+                body: String::new(),
+                run_id: Some(run.id),
+                task_id: None,
+                dispatch_id: None,
+                outcome: None,
+                reply_to: None,
+            })?;
+            Ok(())
+        })?;
+        let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut buf = [0_u8; 512];
+            let n = terminal.read(&mut buf)?;
+            Ok(buf[..n].to_vec())
+        });
+        reg.notify_idle_orchestration_mail_for(&dir, Some(id))?;
+        let sent = reader.join().unwrap()?;
+        assert!(
+            !sent.contains(&0x03) && !sent.contains(&0x1b) && !sent.contains(&b'\n'),
+            "control characters leaked into PTY mail pointer: {sent:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&sent).contains("'w1'"),
+            "expected sanitized sender in pointer: {}",
+            String::from_utf8_lossy(&sent)
+        );
         drop(reg);
         std::fs::remove_dir_all(dir)
     }

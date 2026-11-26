@@ -485,6 +485,10 @@ impl SettingsView {
         let host_edit = host.clone();
         let card_state = self.ssh_remote_infos.get(&host.id);
         let (remote_text, remote_is_error) = remote_line_text(card_state);
+        let linger_fix_cmd: Option<String> = card_state.and_then(|st| match &st.probe {
+            RemoteProbeState::Ready(info) => info.linger.fix_command(),
+            _ => None,
+        });
         // OWE-897: 설치·업데이트 버튼은 프로브 완료 + 지원 플랫폼 + 구버전/미설치일 때만.
         let install_label: Option<&'static str> = card_state.and_then(|st| match &st.probe {
             RemoteProbeState::Ready(info) if info.platform.is_supported() => {
@@ -659,6 +663,62 @@ impl SettingsView {
                     })
                     .child(remote_text),
             )
+            .children(linger_fix_cmd.map(|fix_cmd| {
+                let warn_id = format!("admin-ssh-linger-warn-{}", host.id);
+                let copy_id = format!("admin-ssh-linger-copy-{}", host.id);
+                let cmd_for_copy = fix_cmd.clone();
+                div()
+                    .id(gpui::ElementId::Name(warn_id.clone().into()))
+                    .debug_selector(move || warn_id.clone())
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .bg(p.background)
+                    .border_1()
+                    .border_color(p.warning)
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.warning)
+                            .child(text::SSH_REMOTE_LINGER_WARN.get()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(crate::ui::FONT_MONO)
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.foreground)
+                                    .child(fix_cmd),
+                            )
+                            .child(
+                                layout::ghost(
+                                    gpui::ElementId::Name(copy_id.clone().into()),
+                                    text::SSH_REMOTE_LINGER_COPY.get(),
+                                )
+                                .small()
+                                .debug_selector(move || copy_id.clone())
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        cmd_for_copy.clone(),
+                                    ));
+                                }),
+                            ),
+                    )
+            }))
             .child(controls)
     }
 

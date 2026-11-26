@@ -895,6 +895,8 @@ enum Action {
         limit: Option<u32>,
         #[serde(default)]
         cursor: Option<String>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     #[serde(rename = "bots.item.create")]
     BotsItemCreate {
@@ -908,6 +910,8 @@ enum Action {
         status: Option<krill_proto::bots::BotItemStatus>,
         #[serde(default)]
         links: Vec<krill_proto::bots::BotItemLink>,
+        #[serde(default)]
+        waiting_reason: Option<String>,
     },
     #[serde(rename = "bots.item.update")]
     BotsItemUpdate {
@@ -928,6 +932,8 @@ enum Action {
         close_note: Option<String>,
         #[serde(default)]
         snoozed_until_ms: krill_proto::bots::FieldPatch<u64>,
+        #[serde(default)]
+        waiting_reason: Option<String>,
     },
     #[serde(rename = "bots.item.answer")]
     BotsItemAnswer {
@@ -1063,6 +1069,50 @@ enum Action {
     #[serde(rename = "bots.avatar.read")]
     BotsAvatarRead {
         bot_id: String,
+    },
+    #[serde(rename = "bots.avatars.read")]
+    BotsAvatarsRead {
+        bot_ids: Vec<String>,
+    },
+    #[serde(rename = "bots.hub")]
+    BotsHub {
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        capabilities: Vec<String>,
+        #[serde(default)]
+        since: Option<String>,
+    },
+    #[serde(rename = "bots.workspace")]
+    BotsWorkspace {
+        bot_id: String,
+        #[serde(default)]
+        include_closed: bool,
+        #[serde(default)]
+        include_snoozed: bool,
+        #[serde(default)]
+        include_rail: bool,
+        #[serde(default)]
+        capabilities: Vec<String>,
+        #[serde(default)]
+        since: Option<String>,
+    },
+    #[serde(rename = "bots.todo")]
+    BotsTodo {
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        include_closed: bool,
+        #[serde(default)]
+        include_snoozed: bool,
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        capabilities: Vec<String>,
+        #[serde(default)]
+        since: Option<String>,
     },
     #[serde(rename = "bots.soul.get")]
     BotsSoulGet {
@@ -1699,6 +1749,7 @@ impl Backend {
                     fs::remove_file(&path).ok();
                     return Err(invalid());
                 }
+                self.ensure_not_agy_auth_screen(session)?;
                 let send_result = if trimmed_prompt.is_some() {
                     self.input_paced(
                         session,
@@ -1721,16 +1772,17 @@ impl Backend {
                 end_offset,
             } => {
                 let registry = self.registry.upgrade().ok_or_else(invalid)?;
-                let snapshot = registry.chat_poll(SessionId(session), offset);
                 if latest {
+                    let resolved = registry.resolve_chat_transcript(SessionId(session));
                     let (snapshot, start) =
-                        crate::agent_history::chat::latest_page(snapshot, end_offset)?;
+                        crate::agent_history::chat::latest_page(resolved, end_offset)?;
                     let mut value = chat_page_value(snapshot, start)?;
                     if let Some(object) = value.as_object_mut() {
                         object.insert("has_earlier".into(), (start > 0).into());
                     }
                     return Ok(value);
                 }
+                let snapshot = registry.chat_poll(SessionId(session), offset);
                 let snapshot = if let Some(end) = end_offset {
                     crate::agent_history::chat::replay_page(snapshot, offset, end)?
                 } else {
@@ -2231,7 +2283,13 @@ impl Backend {
                 include_snoozed,
                 limit,
                 cursor,
+                capabilities,
             } => {
+                if capabilities.len() > 32 {
+                    return Err(invalid());
+                }
+                let supports_waiting =
+                    krill_proto::bots::client_supports_item_waiting(&capabilities);
                 let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
                 let status_filter = match status.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 {
@@ -2260,7 +2318,7 @@ impl Backend {
                     );
                 }
                 let req_limit = u32::try_from(bounded_limit).unwrap_or(100);
-                let page = if let Some(filter) = status_filter {
+                let mut page = if let Some(filter) = status_filter {
                     let registry = self.registry.upgrade().ok_or_else(invalid)?;
                     let mgr = registry.bots().map_err(io::Error::other)?;
                     mgr.items().list_items_page_filtered(
@@ -2284,6 +2342,9 @@ impl Backend {
                         _ => return Err(invalid()),
                     }
                 };
+                if !supports_waiting {
+                    krill_proto::bots::downgrade_items_for_legacy_client(&mut page.items);
+                }
                 let total = page.total_count;
                 let unseen = page.unseen_count;
                 let next = page.next_cursor;
@@ -2311,6 +2372,7 @@ impl Backend {
                 done_means,
                 status,
                 links,
+                waiting_reason,
             } => {
                 self.ensure_bots_active()?;
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
@@ -2332,6 +2394,9 @@ impl Backend {
                     true,
                     true,
                 )?;
+                if waiting_reason.as_ref().is_some_and(|s| s.len() > 1024) {
+                    return Err(invalid());
+                }
                 if links.len() > 32 {
                     return Err(invalid());
                 }
@@ -2345,6 +2410,7 @@ impl Backend {
                     done_means,
                     status,
                     links,
+                    waiting_reason,
                 };
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::CreateItem(Box::new(
                     params,
@@ -2365,6 +2431,7 @@ impl Backend {
                 decisions,
                 close_note,
                 snoozed_until_ms,
+                waiting_reason,
             } => {
                 self.ensure_bots_active()?;
                 let trimmed_id = validate_bot_token(&item_id, 128)?;
@@ -2401,6 +2468,9 @@ impl Backend {
                     true,
                     true,
                 )?;
+                if waiting_reason.as_ref().is_some_and(|s| s.len() > 1024) {
+                    return Err(invalid());
+                }
                 validate_bot_decisions(&decisions)?;
                 let params = krill_proto::bots::UpdateBotItemParams {
                     item_id: trimmed_id,
@@ -2412,6 +2482,7 @@ impl Backend {
                     decisions,
                     close_note,
                     snoozed_until_ms,
+                    waiting_reason,
                 };
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::UpdateItem(Box::new(
                     params,
@@ -2571,7 +2642,7 @@ impl Backend {
             }
             Action::ChatSubscribe { session, offset } => {
                 let registry = self.registry.upgrade().ok_or_else(invalid)?;
-                let snapshot = registry.chat_poll(SessionId(session), offset);
+                let snapshot = registry.resolve_chat_transcript(SessionId(session));
                 let watch_path = (!snapshot.transcript_path.is_empty())
                     .then(|| PathBuf::from(&snapshot.transcript_path));
                 let push = feed::subscribe_chat(session, offset, watch_path).unwrap_or(false);
@@ -2897,6 +2968,44 @@ impl Backend {
                     }
                 }
             }
+            Action::BotsAvatarsRead { bot_ids } => self.handle_bots_avatars_read(bot_ids),
+            Action::BotsHub {
+                limit,
+                capabilities,
+                since,
+            } => self.handle_bots_hub(limit, &capabilities, since.as_deref()),
+            Action::BotsWorkspace {
+                bot_id,
+                include_closed,
+                include_snoozed,
+                include_rail,
+                capabilities,
+                since,
+            } => self.handle_bots_workspace(
+                &bot_id,
+                include_closed,
+                include_snoozed,
+                include_rail,
+                &capabilities,
+                since.as_deref(),
+            ),
+            Action::BotsTodo {
+                status,
+                include_closed,
+                include_snoozed,
+                limit,
+                cursor,
+                capabilities,
+                since,
+            } => self.handle_bots_todo(
+                status.as_deref(),
+                include_closed,
+                include_snoozed,
+                limit,
+                cursor.as_deref(),
+                &capabilities,
+                since.as_deref(),
+            ),
             Action::BotsSoulGet { bot_id } => {
                 self.ensure_bots_active()?;
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
@@ -3112,40 +3221,431 @@ impl Backend {
                 "pending_access": 0,
             }));
         }
-        let count = match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListBots)? {
-            krill_proto::bots::BotRpcResponse::Bots(bots) => bots.len(),
-            _ => return Err(invalid()),
-        };
-        let needs_you = match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListItems {
-            bot_id: None,
-            include_closed: false,
-        })? {
-            krill_proto::bots::BotRpcResponse::Items(items) => {
-                let now_ms = unix_ms();
-                items
-                    .iter()
-                    .filter(|item| {
-                        item.status == krill_proto::bots::BotItemStatus::NeedsYou
-                            && item.snoozed_until_ms.is_none_or(|until| until <= now_ms)
-                    })
-                    .count()
-            }
-            _ => return Err(invalid()),
-        };
-        let pending_access = match self
-            .bot_rpc(krill_proto::bots::BotRpcRequest::ListAccessRequests { bot_id: None })?
-        {
-            krill_proto::bots::BotRpcResponse::AccessRequests(requests) => requests
-                .iter()
-                .filter(|req| req.status == krill_proto::bots::BotAccessRequestStatus::Pending)
-                .count(),
-            _ => return Err(invalid()),
-        };
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        let count = mgr.store().list_bots()?.len();
+        let needs_you = mgr.items().count_needs_you(unix_ms())?;
+        let pending_access = mgr
+            .store()
+            .list_access_requests(None)?
+            .iter()
+            .filter(|req| req.status == krill_proto::bots::BotAccessRequestStatus::Pending)
+            .count();
         Ok(json!({
             "count": count,
             "needs_you": needs_you,
             "pending_access": pending_access,
         }))
+    }
+
+    fn bundle_etag(data: &Value) -> io::Result<String> {
+        let bytes = serde_json::to_vec(data).map_err(io::Error::other)?;
+        Ok(
+            hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
+                .chars()
+                .take(16)
+                .collect(),
+        )
+    }
+
+    fn finish_bundle_with_etag(mut data: Value, since: Option<&str>) -> io::Result<Value> {
+        let max_wrapped = ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM);
+        // Shrink optional/large arrays first so composite bundles never overflow the 1 MiB frame limit.
+        while wrapped_ok_len(&data) >= max_wrapped {
+            let mut shrank = false;
+            if let Some(obj) = data.as_object_mut() {
+                for key in [
+                    "items",
+                    "all_items",
+                    "requests",
+                    "suggestions",
+                    "groups",
+                    "bots",
+                ] {
+                    if let Some(arr) = obj.get_mut(key).and_then(Value::as_array_mut)
+                        && arr.len() > 1
+                    {
+                        arr.pop();
+                        obj.insert("truncated".into(), Value::Bool(true));
+                        shrank = true;
+                        break;
+                    }
+                }
+                if !shrank {
+                    for key in ["items", "all_items"] {
+                        if let Some(arr) = obj.get_mut(key).and_then(Value::as_array_mut)
+                            && let Some(first) = arr.first_mut()
+                            && shrink_bot_list_entry(first)
+                        {
+                            obj.insert("truncated".into(), Value::Bool(true));
+                            shrank = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !shrank {
+                return Err(io::Error::other("response exceeds mobile frame limit"));
+            }
+        }
+        let etag = Self::bundle_etag(&data)?;
+        if since == Some(etag.as_str()) {
+            return Ok(json!({"unchanged": true, "etag": etag}));
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("etag".into(), Value::String(etag));
+        }
+        Ok(data)
+    }
+
+    fn handle_bots_avatars_read(&self, bot_ids: Vec<String>) -> io::Result<Value> {
+        const MAX_AVATAR_BATCH_IDS: usize = 32;
+        const MAX_AVATAR_BATCH_BYTES: usize = 256 * 1024;
+        if bot_ids.len() > MAX_AVATAR_BATCH_IDS {
+            return Err(invalid());
+        }
+        if self.bots_inactive()? {
+            return Ok(json!({"avatars": {}, "remaining": []}));
+        }
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        let mut seen = HashSet::new();
+        let mut avatars = serde_json::Map::new();
+        let mut remaining = Vec::new();
+        let mut used_bytes = 64usize;
+        for raw_id in bot_ids {
+            let bot_id = krill_proto::bots::BotId::new(&raw_id).map_err(|_| invalid())?;
+            let id_str = bot_id.as_str().to_owned();
+            if !seen.insert(id_str.clone()) {
+                continue;
+            }
+            match mgr.store().get_avatar(&bot_id) {
+                Ok(avatar) if !avatar.png_bytes.is_empty() => {
+                    let encoded = super::ws::base64(&avatar.png_bytes, false);
+                    let entry_bytes = encoded
+                        .len()
+                        .saturating_add(id_str.len())
+                        .saturating_add(64);
+                    if !avatars.is_empty()
+                        && used_bytes.saturating_add(entry_bytes) > MAX_AVATAR_BATCH_BYTES
+                    {
+                        remaining.push(id_str);
+                        continue;
+                    }
+                    used_bytes = used_bytes.saturating_add(entry_bytes);
+                    avatars.insert(
+                        id_str,
+                        json!({
+                            "bot_id": avatar.bot_id.as_str(),
+                            "mime": avatar.mime,
+                            "data_base64": encoded,
+                        }),
+                    );
+                }
+                Ok(_) => {
+                    avatars.insert(id_str, Value::Null);
+                }
+                Err(err) => {
+                    let lower = err.to_string().to_ascii_lowercase();
+                    if lower.contains("no such file")
+                        || lower.contains("cannot find the file")
+                        || lower.contains("os error 2")
+                        || lower.contains("bot not found")
+                    {
+                        avatars.insert(id_str, Value::Null);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(json!({
+            "avatars": avatars,
+            "remaining": remaining,
+        }))
+    }
+
+    fn handle_bots_hub(
+        &self,
+        limit: Option<usize>,
+        capabilities: &[String],
+        since: Option<&str>,
+    ) -> io::Result<Value> {
+        if capabilities.len() > 32 {
+            return Err(invalid());
+        }
+        let (_, bounded_limit) = parse_bot_page(limit, None)?;
+        let since = validate_opt_bot_token(since, 64)?;
+        if self.bots_inactive()? {
+            return Self::finish_bundle_with_etag(
+                json!({
+                    "bots": [],
+                    "bots_next_cursor": null,
+                    "items": [],
+                    "requests": [],
+                    "statuses": [],
+                    "groups": [],
+                    "sessions": [],
+                }),
+                since.as_deref(),
+            );
+        }
+        let supports_waiting = krill_proto::bots::client_supports_item_waiting(capabilities);
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        let ts = unix_ms();
+
+        let all_bots = mgr.store().list_bots()?;
+        let bots_next_cursor = (all_bots.len() > bounded_limit).then(|| bounded_limit.to_string());
+        let bots_slice: Vec<_> = all_bots.into_iter().take(bounded_limit).collect();
+
+        let mut items_page = mgr.items().list_items_page_filtered_opts(
+            None,
+            Some(crate::bots::items::BotItemsStatusFilter::Status(
+                krill_proto::bots::BotItemStatus::NeedsYou,
+            )),
+            false,
+            false,
+            Some(100),
+            None,
+            ts,
+            false,
+        )?;
+        if !supports_waiting {
+            krill_proto::bots::downgrade_items_for_legacy_client(&mut items_page.items);
+        }
+        let requests: Vec<_> = mgr
+            .store()
+            .list_access_requests(None)?
+            .into_iter()
+            .take(50)
+            .collect();
+        let statuses = mgr.connector_statuses(None);
+        let groups: Vec<_> = mgr.store().list_groups()?.into_iter().take(50).collect();
+        let sessions = mgr
+            .runtime()
+            .list_sessions_for_store(mgr.store(), &registry, None);
+
+        Self::finish_bundle_with_etag(
+            json!({
+                "bots": to_value(bots_slice)?,
+                "bots_next_cursor": bots_next_cursor,
+                "items": to_value(items_page.items)?,
+                "requests": to_value(requests)?,
+                "statuses": to_value(statuses)?,
+                "groups": to_value(groups)?,
+                "sessions": to_value(sessions)?,
+            }),
+            since.as_deref(),
+        )
+    }
+
+    fn handle_bots_workspace(
+        &self,
+        bot_id_raw: &str,
+        include_closed: bool,
+        include_snoozed: bool,
+        include_rail: bool,
+        capabilities: &[String],
+        since: Option<&str>,
+    ) -> io::Result<Value> {
+        if capabilities.len() > 32 {
+            return Err(invalid());
+        }
+        let bot_id = krill_proto::bots::BotId::new(bot_id_raw).map_err(|_| invalid())?;
+        let since = validate_opt_bot_token(since, 64)?;
+        if self.bots_inactive()? {
+            return Self::finish_bundle_with_etag(
+                json!({
+                    "bot": null,
+                    "items": [],
+                    "items_next_cursor": null,
+                    "statuses": [],
+                    "suggestions": [],
+                    "requests": [],
+                    "upcoming": null,
+                    "sessions": [],
+                }),
+                since.as_deref(),
+            );
+        }
+        let supports_waiting = krill_proto::bots::client_supports_item_waiting(capabilities);
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        let ts = unix_ms();
+
+        let all_bots = mgr.store().list_bots()?;
+        let bot = all_bots.iter().find(|b| b.id == bot_id).cloned();
+
+        let mut items_page = mgr.items().list_items_page_filtered_opts(
+            Some(&bot_id),
+            None,
+            include_closed,
+            include_snoozed,
+            Some(25),
+            None,
+            ts,
+            false,
+        )?;
+        if !supports_waiting {
+            krill_proto::bots::downgrade_items_for_legacy_client(&mut items_page.items);
+        }
+        let statuses = mgr.connector_statuses(Some(&bot_id));
+        let suggestions = if bot.is_some() {
+            crate::bots::look_around::list_suggestions(mgr.store(), Some(&bot_id), false)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let requests: Vec<_> = mgr
+            .store()
+            .list_access_requests(Some(&bot_id))?
+            .into_iter()
+            .take(50)
+            .collect();
+        let upcoming_ts = (ts / 60_000).saturating_mul(60_000);
+        let upcoming = bot
+            .as_ref()
+            .map(|b| mgr.bot_upcoming_for(&registry, b, upcoming_ts));
+        let sessions = mgr.runtime().list_sessions_for_store(
+            mgr.store(),
+            &registry,
+            (!include_rail).then_some(&bot_id),
+        );
+
+        let mut data = json!({
+            "bot": bot.as_ref().map(serde_json::to_value).transpose().map_err(|_| invalid())?,
+            "items": to_value(items_page.items)?,
+            "items_next_cursor": items_page.next_cursor,
+            "statuses": to_value(statuses)?,
+            "suggestions": to_value(suggestions)?,
+            "requests": to_value(requests)?,
+            "upcoming": upcoming.as_ref().map(serde_json::to_value).transpose().map_err(|_| invalid())?,
+            "sessions": to_value(sessions)?,
+        });
+        if include_rail && let Some(obj) = data.as_object_mut() {
+            let mut all_needs = mgr.items().list_items_page_filtered_opts(
+                None,
+                Some(crate::bots::items::BotItemsStatusFilter::Status(
+                    krill_proto::bots::BotItemStatus::NeedsYou,
+                )),
+                false,
+                false,
+                Some(100),
+                None,
+                ts,
+                false,
+            )?;
+            if !supports_waiting {
+                krill_proto::bots::downgrade_items_for_legacy_client(&mut all_needs.items);
+            }
+            let groups: Vec<_> = mgr.store().list_groups()?.into_iter().take(50).collect();
+            let rail_bots: Vec<_> = all_bots.into_iter().take(100).collect();
+            obj.insert("bots".into(), to_value(rail_bots)?);
+            obj.insert("all_items".into(), to_value(all_needs.items)?);
+            obj.insert("groups".into(), to_value(groups)?);
+        }
+        Self::finish_bundle_with_etag(data, since.as_deref())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "composite mobile todo RPC")]
+    fn handle_bots_todo(
+        &self,
+        status: Option<&str>,
+        include_closed: bool,
+        include_snoozed: bool,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+        capabilities: &[String],
+        since: Option<&str>,
+    ) -> io::Result<Value> {
+        if capabilities.len() > 32 {
+            return Err(invalid());
+        }
+        let status_filter = match status.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                Some(crate::bots::items::BotItemsStatusFilter::parse(raw).ok_or_else(invalid)?)
+            }
+            None => None,
+        };
+        let bounded_limit = match limit {
+            Some(0) => return Err(invalid()),
+            Some(n) => n.min(u32::try_from(BOT_PAGE_MAX_LIMIT).unwrap_or(100)),
+            None => 25,
+        };
+        let validated_cursor = validate_opt_bot_token(cursor, 128)?;
+        let since = validate_opt_bot_token(since, 64)?;
+        if self.bots_inactive()? {
+            return Self::finish_bundle_with_etag(
+                json!({
+                    "bots": [],
+                    "items": [],
+                    "items_next_cursor": null,
+                    "requests": [],
+                    "suggestions": [],
+                    "failed_automations": [],
+                }),
+                since.as_deref(),
+            );
+        }
+        let supports_waiting = krill_proto::bots::client_supports_item_waiting(capabilities);
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let mgr = registry.bots().map_err(io::Error::other)?;
+        let ts = unix_ms();
+
+        let all_bots: Vec<_> = mgr.store().list_bots()?.into_iter().take(100).collect();
+        let mut items_page = mgr.items().list_items_page_filtered_opts(
+            None,
+            status_filter,
+            include_closed,
+            include_snoozed,
+            Some(bounded_limit),
+            validated_cursor.as_deref(),
+            ts,
+            false,
+        )?;
+        if !supports_waiting {
+            krill_proto::bots::downgrade_items_for_legacy_client(&mut items_page.items);
+        }
+        let requests: Vec<_> = mgr
+            .store()
+            .list_access_requests(None)?
+            .into_iter()
+            .take(50)
+            .collect();
+        let suggestions = crate::bots::look_around::list_suggestions(mgr.store(), None, false)
+            .unwrap_or_default();
+        let mut failed_automations = Vec::new();
+        for bot in all_bots.iter().filter(|b| !b.schedules.is_empty()).take(16) {
+            let up = mgr.bot_upcoming_for(&registry, bot, ts);
+            for run in up.schedules {
+                if run.last_refusal.is_some() || run.last_error.is_some() {
+                    let name = bot
+                        .schedules
+                        .iter()
+                        .find(|s| s.id == run.id)
+                        .map_or_else(|| run.id.clone(), |s| s.name.clone());
+                    failed_automations.push(json!({
+                        "bot_id": bot.id.as_str(),
+                        "schedule_id": run.id,
+                        "title": name,
+                        "last_error": run.last_error,
+                        "last_refusal": run.last_refusal,
+                    }));
+                }
+            }
+        }
+        Self::finish_bundle_with_etag(
+            json!({
+                "bots": to_value(all_bots)?,
+                "items": to_value(items_page.items)?,
+                "items_next_cursor": items_page.next_cursor,
+                "requests": to_value(requests)?,
+                "suggestions": to_value(suggestions)?,
+                "failed_automations": failed_automations,
+            }),
+            since.as_deref(),
+        )
     }
     fn bots_inactive(&self) -> io::Result<bool> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
@@ -3192,7 +3692,21 @@ impl Backend {
             .upgrade()
             .is_some_and(|reg| reg.session_bracketed_paste(SessionId(session)))
     }
+    fn ensure_not_agy_auth_screen(&self, session: u64) -> io::Result<()> {
+        if let Some(reg) = self.registry.upgrade()
+            && let Some(screen) = reg.session_capture(SessionId(session))
+            && krill_proto::screen::agy::auth_login_screen(&screen)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Antigravity session requires sign-in (auth_required).",
+            ));
+        }
+        Ok(())
+    }
+
     fn send_prompt(&self, session: u64, text: &str) -> io::Result<()> {
+        self.ensure_not_agy_auth_screen(session)?;
         if text.is_empty() {
             return self.input(session, b"\r".to_vec());
         }
@@ -3229,19 +3743,22 @@ impl Backend {
         };
         let deadline = Instant::now() + Duration::from_millis(600);
         while Instant::now() < deadline {
-            if let Some(screen) = reg.session_capture(SessionId(session))
-                && let Some(qm) = krill_proto::screen::agy::queued_submission_confirmed(
-                    &screen, combined, baseline,
-                )
-            {
-                if qm.send_immediately_hint {
-                    self.input(
-                        session,
-                        krill_proto::screen::agy::SEND_IMMEDIATELY_KEY.to_vec(),
-                    )
-                    .ok();
+            if let Some(screen) = reg.session_capture(SessionId(session)) {
+                if krill_proto::screen::agy::auth_login_screen(&screen) {
+                    return;
                 }
-                return;
+                if let Some(qm) = krill_proto::screen::agy::queued_submission_confirmed(
+                    &screen, combined, baseline,
+                ) {
+                    if qm.send_immediately_hint {
+                        self.input(
+                            session,
+                            krill_proto::screen::agy::SEND_IMMEDIATELY_KEY.to_vec(),
+                        )
+                        .ok();
+                    }
+                    return;
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -3302,6 +3819,12 @@ impl Backend {
         let screen = registry
             .session_capture(id)
             .ok_or_else(|| io::Error::other("Live terminal screen is unavailable."))?;
+        if krill_proto::screen::agy::auth_login_screen(&screen) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Antigravity session requires sign-in (auth_required).",
+            ));
+        }
         let waiting_or_blocked = matches!(
             status.state,
             control::AgentState::Waiting | control::AgentState::Blocked
@@ -3809,7 +4332,7 @@ impl Backend {
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "bots":self.snapshot_bots_summary()?,
             "repositories":catalog.repositories_json_with_icons(&repo_icons),"workspaces":catalog.workspaces_json_with_icons(&workspace_titles, &ranks, &awake, &repo_icons),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true,"repo_icons":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true,"bots_item_waiting":true,"bots_bundle":true,"repo_icons":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -6659,6 +7182,7 @@ mod revision_tests {
                 done_means: None,
                 status: Some(BotItemStatus::NeedsYou),
                 links: Vec::new(),
+                waiting_reason: None,
             })),
         ) {
             BotRpcResponse::Item(i) => *i,
@@ -8071,5 +8595,317 @@ value = "{}"
             bounded["next_cursor"].is_null(),
             "next_cursor must not loop back to slice_start: {bounded}"
         );
+    }
+
+    #[test]
+    fn mobile_bots_item_waiting_capability_and_legacy_downgrade() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pwa-bot-waiting-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(Registry::new(None, Some(&dir)));
+        registry.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let mgr = registry.bots().unwrap();
+        let bot = match mgr.handle_rpc(
+            &registry,
+            krill_proto::bots::BotRpcRequest::CreateBot(Box::new(
+                krill_proto::bots::CreateBotParams {
+                    name: "Mobile Wait Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+            )),
+        ) {
+            krill_proto::bots::BotRpcResponse::Bot(b) => *b,
+            other => panic!("expected Bot, got {other:?}"),
+        };
+
+        // Snapshot advertises bots_item_waiting capability.
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["ok"], true, "{snap}");
+        assert_eq!(snap["data"]["capabilities"]["bots_item_waiting"], true);
+
+        // Create a waiting item via mobile RPC.
+        let created: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.item.create",
+                    "bot_id": bot.id.as_str(),
+                    "title": "Deploy staging",
+                    "status": "waiting",
+                    "waiting_reason": "CI on PR #42"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["item"]["status"], "waiting");
+        assert_eq!(created["data"]["item"]["waiting_reason"], "CI on PR #42");
+
+        // Legacy mobile client (omitting capabilities) receives downgraded working item.
+        let legacy_list: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.items",
+                    "bot_id": bot.id.as_str(),
+                    "include_closed": false
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(legacy_list["ok"], true, "{legacy_list}");
+        assert_eq!(legacy_list["data"]["items"][0]["status"], "working");
+        assert!(
+            legacy_list["data"]["items"][0]
+                .get("waiting_reason")
+                .is_none()
+        );
+
+        // Updated mobile PWA advertising bots.item-waiting.v1 receives Waiting intact.
+        let modern_list: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.items",
+                    "bot_id": bot.id.as_str(),
+                    "status": "waiting",
+                    "include_closed": false,
+                    "capabilities": [krill_proto::bots::BOTS_ITEM_WAITING_CAPABILITY]
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(modern_list["ok"], true, "{modern_list}");
+        assert_eq!(modern_list["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(modern_list["data"]["items"][0]["status"], "waiting");
+        assert_eq!(
+            modern_list["data"]["items"][0]["waiting_reason"],
+            "CI on PR #42"
+        );
+        assert!(modern_list["data"]["items"][0]["waiting_since_ms"].is_u64());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mobile_bots_composite_bundles_etag_and_avatar_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pwa-bot-bundles-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(Registry::new(None, Some(&dir)));
+        registry.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        // Inactive bots directory returns empty bundles + valid etag + unchanged on repeat.
+        let empty_hub: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.hub"}"#)).unwrap();
+        assert_eq!(empty_hub["ok"], true, "{empty_hub}");
+        assert_eq!(empty_hub["data"]["bots"].as_array().unwrap().len(), 0);
+        let empty_etag = empty_hub["data"]["etag"].as_str().unwrap().to_owned();
+        let empty_hub_again: Value = serde_json::from_str(
+            &backend.request(&json!({"action":"bots.hub","since":empty_etag}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(empty_hub_again["data"]["unchanged"], true);
+
+        // Create two bots (one agy, one claude), upload an avatar, create an item.
+        let mgr = registry.bots().unwrap();
+        let create = |name: &str, agent: &str| match mgr.handle_rpc(
+            &registry,
+            krill_proto::bots::BotRpcRequest::CreateBot(Box::new(
+                krill_proto::bots::CreateBotParams {
+                    name: name.to_owned(),
+                    agent_id: agent.to_owned(),
+                    description: format!("{agent} helper"),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+            )),
+        ) {
+            krill_proto::bots::BotRpcResponse::Bot(b) => *b,
+            other => panic!("expected Bot, got {other:?}"),
+        };
+        let b1 = create("Agy Helper", "agy");
+        let b2 = create("Claude Helper", "claude");
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 255, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        mgr.store().upload_avatar(&b1.id, &png, 1_000).unwrap();
+
+        let created: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.item.create",
+                    "bot_id": b1.id.as_str(),
+                    "title": "Confirm release",
+                    "status": "needs_you"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(created["ok"], true, "{created}");
+
+        // Snapshot advertises bots_bundle and accurate needs_you count via count_needs_you.
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["data"]["capabilities"]["bots_bundle"], true);
+        assert_eq!(snap["data"]["bots"]["count"], 2);
+        assert_eq!(snap["data"]["bots"]["needs_you"], 1);
+
+        // bots.hub returns bots, items, sessions, groups, statuses, requests + etag.
+        let hub: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"bots.hub","limit":50}"#)).unwrap();
+        assert_eq!(hub["ok"], true, "{hub}");
+        assert_eq!(hub["data"]["bots"].as_array().unwrap().len(), 2);
+        assert_eq!(hub["data"]["items"].as_array().unwrap().len(), 1);
+        let hub_etag = hub["data"]["etag"].as_str().unwrap().to_owned();
+        let hub_304: Value = serde_json::from_str(
+            &backend.request(&json!({"action":"bots.hub","limit":50,"since":hub_etag}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(hub_304["data"]["unchanged"], true);
+
+        // bots.workspace returns single bot + rail when requested, and honors ETag.
+        let ws: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.workspace",
+                    "bot_id": b1.id.as_str(),
+                    "include_rail": true
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(ws["ok"], true, "{ws}");
+        assert_eq!(ws["data"]["bot"]["id"], b1.id.as_str());
+        assert_eq!(ws["data"]["bot"]["agent_id"], "agy");
+        assert_eq!(ws["data"]["bots"].as_array().unwrap().len(), 2);
+        assert_eq!(ws["data"]["items"].as_array().unwrap().len(), 1);
+        let ws_etag = ws["data"]["etag"].as_str().unwrap().to_owned();
+        let ws_304: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.workspace",
+                    "bot_id": b1.id.as_str(),
+                    "include_rail": true,
+                    "since": ws_etag
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(ws_304["data"]["unchanged"], true);
+
+        // bots.workspace with include_rail: false omits rail lists for compact payloads.
+        let ws_slim: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.workspace",
+                    "bot_id": b2.id.as_str(),
+                    "include_rail": false
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(ws_slim["ok"], true, "{ws_slim}");
+        assert!(ws_slim["data"].get("bots").is_none());
+
+        // bots.todo returns filtered items + failed_automations + etag.
+        let todo: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.todo",
+                    "status": "needs_you",
+                    "limit": 25
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(todo["ok"], true, "{todo}");
+        assert_eq!(todo["data"]["items"].as_array().unwrap().len(), 1);
+        assert!(todo["data"]["failed_automations"].is_array());
+        let todo_etag = todo["data"]["etag"].as_str().unwrap().to_owned();
+        let todo_304: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.todo",
+                    "status": "needs_you",
+                    "limit": 25,
+                    "since": todo_etag
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(todo_304["data"]["unchanged"], true);
+
+        // bots.avatars.read batches existing + missing avatars cleanly.
+        let avs: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.avatars.read",
+                    "bot_ids": [b1.id.as_str(), b2.id.as_str()]
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(avs["ok"], true, "{avs}");
+        assert_eq!(avs["data"]["avatars"][b1.id.as_str()]["mime"], "image/png");
+        assert!(avs["data"]["avatars"][b2.id.as_str()].is_null());
+        assert_eq!(avs["data"]["remaining"].as_array().unwrap().len(), 0);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -639,7 +639,13 @@ fn bundled_skills_are_english() {
 fn app_ui_copy_uses_the_catalog() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut failures = Vec::new();
-    for crate_name in ["krill-ui", "krill-app-core", "krill-app"] {
+    for crate_name in [
+        "krill-ui",
+        "krill-app-core",
+        "krill-bots-ui",
+        "krill-app-shell",
+        "krill-app",
+    ] {
         check_dir(&crates.join(crate_name).join("src"), &mut failures);
     }
     assert!(

@@ -32,7 +32,7 @@ use krill_proto::bots::{
     ActsFor, BotAccessRequestStatus, BotConfig, BotConnectorStatus, BotId, BotItemActor,
     BotItemDecision, BotItemStatus, BotRpcRequest, BotRpcResponse, BotSlug, ConnectorHealthState,
     CreateBotItemParams, ExternalConversationLink, ExternalSource, FieldPatch, UpdateBotItemParams,
-    UpdateBotParams,
+    UpdateBotParams, client_supports_item_waiting, downgrade_response_for_legacy_client,
 };
 use krill_proto::hook::HookEvent;
 use krill_proto::orchestration::OrchestrationStore;
@@ -41,15 +41,15 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::bots::connectors::{
-    AccessDecision, ConnectorBridge, ConnectorManager, DispatchOutcome, InboundExternalMessage,
-    OutboundBotReply,
+    AccessDecision, ConnectorBridge, ConnectorEndpoints, ConnectorManager, DispatchOutcome,
+    ExternalResumeResult, InboundExternalMessage, OutboundBotReply,
 };
 use crate::bots::google::{GoogleEndpoints, GoogleTriggerChecker};
 use crate::bots::groups::GroupCoordinator;
 use crate::bots::items::BotItemsStore;
 use crate::bots::look_around::{LookAroundTracker, SchedulerStateStore};
 use crate::bots::memory_tidy::MemoryTidyTracker;
-use crate::bots::runtime::BotRuntime;
+use crate::bots::runtime::{BotRuntime, RestartCutTurn};
 use crate::bots::secrets::SecretVault;
 use crate::bots::store::{BotStore, MemoryUpdateError};
 use crate::bots::tool_relay::{BotToolRelay, BuiltinMcpCallContext, BuiltinMcpHandler};
@@ -81,6 +81,7 @@ pub struct BotsManager {
     active_cron_sessions: Mutex<HashMap<(BotId, String), SessionId>>,
     in_flight_composio: Mutex<HashSet<BotId>>,
     in_flight_schedules: Mutex<HashSet<(BotId, String)>>,
+    runtime_rehydrated: OnceLock<()>,
     boot_reconciled: OnceLock<()>,
     google_endpoints: GoogleEndpoints,
     tracker_endpoints: TrackerEndpoints,
@@ -152,6 +153,7 @@ impl BotsManager {
             active_cron_sessions: Mutex::new(HashMap::new()),
             in_flight_composio: Mutex::new(HashSet::new()),
             in_flight_schedules: Mutex::new(HashSet::new()),
+            runtime_rehydrated: OnceLock::new(),
             boot_reconciled: OnceLock::new(),
             google_endpoints,
             tracker_endpoints,
@@ -174,13 +176,63 @@ impl BotsManager {
         manager
     }
 
-    /// Rehydrates kept bot session bindings and starts any configured connectors/pollers once on boot.
+    /// Rehydrates persisted bot session bindings once before any bot RPC or session resume runs.
+    /// Uses `OnceLock::get_or_init` so concurrent callers block until rehydration finishes.
+    pub fn ensure_runtime_rehydrated(&self, registry: &Registry) {
+        self.runtime_rehydrated.get_or_init(|| {
+            let (_rehydrated, _cuts) = self
+                .runtime
+                .rehydrate_from_disk_with_cuts(&self.store, registry);
+        });
+    }
+
+    /// Rehydrates kept bot session bindings, starts any configured connectors/pollers once on boot,
+    /// and notifies linked external conversations of any in-flight turns cut off by restart (Orca #47898).
     pub fn boot_recover(&self, registry: &Registry) {
         if self.boot_reconciled.set(()).is_err() {
             return;
         }
-        self.runtime.rehydrate_from_disk(&self.store, registry);
+        self.ensure_runtime_rehydrated(registry);
         self.reconcile_enabled_workers();
+        let cut_turns = self.runtime.pending_unnotified_restart_cuts();
+        if !cut_turns.is_empty() {
+            self.report_pending_restart_cuts(&cut_turns);
+        }
+    }
+
+    fn report_pending_restart_cuts(&self, cuts: &[RestartCutTurn]) {
+        if cuts.is_empty() {
+            return;
+        }
+        let had_connectors = self.connectors.get().is_some();
+        let mgr = self.connector_manager();
+        if !had_connectors {
+            mgr.reload(None).ok();
+        }
+        for cut in cuts {
+            if cut.notified {
+                continue;
+            }
+            let Ok(Some(bot)) = self.store.get_bot(&cut.bot_id) else {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+                continue;
+            };
+            let Ok(Some(link)) = self.store.get_link(&cut.link_id) else {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+                continue;
+            };
+            if mgr.report_restart_cut_turn(
+                &bot,
+                &link,
+                cut.turn_seq,
+                cut.status_message_id.as_deref(),
+            ) {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+            }
+        }
     }
 
     /// Access to the persistent bot store.
@@ -213,6 +265,39 @@ impl BotsManager {
         &self.groups
     }
 
+    /// Access to the bot runtime session tracker.
+    #[must_use]
+    pub(crate) fn runtime(&self) -> &Arc<BotRuntime> {
+        &self.runtime
+    }
+
+    /// Computes upcoming schedule / Look Around metadata for `bot` without re-reading `bots.json`.
+    #[must_use]
+    pub(crate) fn bot_upcoming_for(
+        &self,
+        registry: &Registry,
+        bot: &BotConfig,
+        ts: u64,
+    ) -> krill_proto::bots::BotUpcoming {
+        let extras = self.store.settings_extras(&bot.id).unwrap_or_default();
+        krill_proto::bots::BotUpcoming {
+            items_seen_event_id: self.items.items_seen_event_id(&bot.id).unwrap_or(0),
+            ..look_around::bot_upcoming_with_extras(
+                bot,
+                extras,
+                &self.scheduler_state,
+                |id| self.schedule_running(registry, &bot.id, id),
+                ts,
+            )
+        }
+    }
+
+    /// Collects connector statuses across all active bots or one `bot_id`.
+    #[must_use]
+    pub(crate) fn connector_statuses(&self, bot_id: Option<&BotId>) -> Vec<BotConnectorStatus> {
+        self.collect_connector_statuses(bot_id)
+    }
+
     /// Lazily initializes and returns the Wave 2B [`ConnectorManager`].
     #[must_use]
     pub fn connector_manager(&self) -> &Arc<ConnectorManager> {
@@ -221,7 +306,12 @@ impl BotsManager {
                 registry: self.registry.clone(),
                 manager: self.self_weak.get().cloned().unwrap_or_default(),
             });
-            let cm = Arc::new(ConnectorManager::new(bridge));
+            let endpoints = ConnectorEndpoints {
+                github: self.tracker_endpoints.github_api_base.clone(),
+                linear: self.tracker_endpoints.linear_graphql_url.clone(),
+                ..ConnectorEndpoints::default()
+            };
+            let cm = Arc::new(ConnectorManager::with_endpoints(bridge, endpoints));
             self.runtime.attach_connectors(Arc::downgrade(&cm));
             cm
         })
@@ -324,6 +414,24 @@ impl BotsManager {
         }
     }
 
+    /// Dispatches a [`BotRpcRequest`] while enforcing backward-compatible item downgrades for
+    /// clients whose `capabilities` do not include [`krill_proto::bots::BOTS_ITEM_WAITING_CAPABILITY`].
+    #[must_use]
+    pub fn handle_rpc_for_peer_with_capabilities(
+        &self,
+        registry: &Registry,
+        peer_session: Option<SessionId>,
+        is_observer: bool,
+        capabilities: &[String],
+        req: BotRpcRequest,
+    ) -> BotRpcResponse {
+        let mut resp = self.handle_rpc_for_peer(registry, peer_session, is_observer, req);
+        if !client_supports_item_waiting(capabilities) {
+            downgrade_response_for_legacy_client(&mut resp);
+        }
+        resp
+    }
+
     /// Records a direct owner prompt submitted to a live bot session (`SendInput` / mobile `Prompt`).
     pub fn on_owner_prompt_submitted(&self, session_id: SessionId, prompt: &str) {
         self.runtime.on_owner_prompt_submitted(session_id, prompt);
@@ -384,8 +492,30 @@ impl BotsManager {
         )
     }
 
-    /// Rebinds a bot session across runtime bindings, active group turns, and cron tracking.
-    /// Returns `Some(ReboundBotSession)` if `old` was bound to a bot.
+    /// Prepares bot launch inputs when `old` is a cold/exited bot session resuming into `new`.
+    pub(crate) fn prepare_resume_launch(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+        stored_instructions: Option<&str>,
+        stored_launched_at_ms: u64,
+    ) -> Result<Option<runtime::BotAccountSwitchLaunch>, String> {
+        self.runtime.prepare_resume_launch(
+            &self.store,
+            &self.secrets,
+            &self.tool_relay,
+            &self.composio_base_url,
+            old,
+            new,
+            launch_cwd,
+            stored_instructions,
+            stored_launched_at_ms,
+        )
+    }
+
+    /// Rebinds a bot session across runtime bindings, active group turns, external links, and
+    /// cron tracking. Returns `Some(ReboundBotSession)` if `old` was bound to a bot.
     pub(crate) fn rebind_session(
         &self,
         old: SessionId,
@@ -394,6 +524,9 @@ impl BotsManager {
         new_token: Option<zeroize::Zeroizing<String>>,
     ) -> Option<runtime::ReboundBotSession> {
         let rebound = self.runtime.rebind_session(old, new, new_pid, new_token)?;
+        if let Some(ref link_id) = rebound.link_id {
+            self.store.bind_link_session(link_id, new, now_ms()).ok();
+        }
         self.groups.rebind_session(old, new);
         for sid in lock(&self.active_cron_sessions).values_mut() {
             if *sid == old {
@@ -401,6 +534,25 @@ impl BotsManager {
             }
         }
         Some(rebound)
+    }
+
+    /// Registers a resumed bot session whose prior binding was missing from disk.
+    pub(crate) fn adopt_resumed_session(
+        &self,
+        bot_id: BotId,
+        session_id: SessionId,
+        pid: u32,
+        launch_token: Option<zeroize::Zeroizing<String>>,
+        created_at_ms: u64,
+    ) {
+        self.runtime.adopt_resumed_session(
+            &self.store,
+            bot_id,
+            session_id,
+            pid,
+            launch_token,
+            created_at_ms,
+        );
     }
 
     /// Revokes an ephemeral bot tool relay launch token.
@@ -443,6 +595,26 @@ impl BotsManager {
             }
 
             self.reconcile_enabled_workers_for(&bots);
+            let pending_cuts = self.runtime.pending_unnotified_restart_cuts();
+            if !pending_cuts.is_empty() {
+                self.report_pending_restart_cuts(&pending_cuts);
+            }
+            if self.runtime.has_pending_rate_limit_pauses() {
+                let auto_continue_enabled =
+                    crate::rejoin::recovery::read_chat_auto_continue_setting(&self.state_dir);
+                if auto_continue_enabled {
+                    let home = crate::usage::accounts::default_home();
+                    let accounts_snap =
+                        crate::usage::accounts::refresh_accounts(&home, Some(&self.state_dir));
+                    self.runtime.poll_rate_limit_auto_continues(
+                        registry,
+                        &self.store,
+                        auto_continue_enabled,
+                        &accounts_snap,
+                        secs,
+                    );
+                }
+            }
 
             for bot in &bots {
                 if bot.paused {
@@ -805,6 +977,7 @@ impl BotsManager {
         if is_observer && !req.is_read_only() {
             return BotRpcResponse::Error("permission denied".to_owned());
         }
+        self.ensure_runtime_rehydrated(registry);
 
         let caller_bot = peer_session.and_then(|sid| {
             self.runtime
@@ -833,6 +1006,16 @@ impl BotsManager {
 
         let ts = now_ms();
         match req {
+            BotRpcRequest::WithCapabilities {
+                capabilities,
+                request,
+            } => {
+                let mut resp = self.dispatch_rpc(registry, peer_session, is_observer, *request);
+                if !client_supports_item_waiting(&capabilities) {
+                    downgrade_response_for_legacy_client(&mut resp);
+                }
+                resp
+            }
             BotRpcRequest::ListBots => match self.store.list_bots() {
                 Ok(bots) => BotRpcResponse::Bots(bots),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
@@ -2386,7 +2569,9 @@ impl BotsManager {
             !b.paused
                 && (b.connectors.telegram.enabled
                     || b.connectors.slack.enabled
-                    || b.connectors.discord.enabled)
+                    || b.connectors.discord.enabled
+                    || b.connectors.github.enabled
+                    || b.connectors.linear.enabled)
         });
         if any_chat_conn && self.connectors.get().is_none() {
             self.connector_manager().reload(None).ok();
@@ -2397,6 +2582,8 @@ impl BotsManager {
         if bot.connectors.telegram.enabled
             || bot.connectors.slack.enabled
             || bot.connectors.discord.enabled
+            || bot.connectors.github.enabled
+            || bot.connectors.linear.enabled
             || self.connectors.get().is_some()
         {
             self.connector_manager().reload(Some(&bot.id)).ok();
@@ -2438,6 +2625,8 @@ impl BotsManager {
             b.connectors.telegram.enabled
                 || b.connectors.slack.enabled
                 || b.connectors.discord.enabled
+                || b.connectors.github.enabled
+                || b.connectors.linear.enabled
         });
         if has_chat || self.connectors.get().is_some() {
             self.connector_manager().reload(bot_id)?;
@@ -2574,6 +2763,9 @@ fn authorize_bot_session_rpc(
 ) -> Result<(), String> {
     let deny = |why: &str| Err(format!("permission denied for bot session: {why}"));
     match req {
+        BotRpcRequest::WithCapabilities { request, .. } => {
+            authorize_bot_session_rpc(store, items, caller_bot, request)
+        }
         // Safe reads:
         BotRpcRequest::ListBots
         | BotRpcRequest::GetBot { .. }
@@ -3056,6 +3248,42 @@ impl ConnectorBridge for DaemonConnectorBridge {
             .and_then(|mgr| mgr.store.list_bots().ok())
             .unwrap_or_default()
     }
+
+    fn get_link(&self, link_id: &str) -> io::Result<Option<ExternalConversationLink>> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        mgr.store.get_link(link_id)
+    }
+
+    fn resume_failed_external_turn(
+        &self,
+        bot_id: &BotId,
+        link_id: &str,
+        turn_seq: u64,
+        _sender_id: &str,
+        _sender_name: &str,
+    ) -> io::Result<ExternalResumeResult> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        let reg = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| io::Error::other("daemon registry unavailable"))?;
+        mgr.runtime.resume_failed_external_turn(
+            &reg,
+            &mgr.store,
+            &mgr.secrets,
+            &mgr.tool_relay,
+            &mgr.composio_base_url,
+            bot_id,
+            link_id,
+            turn_seq,
+        )
+    }
 }
 
 struct DaemonBuiltinMcpHandler {
@@ -3123,6 +3351,11 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .ok_or_else(|| "missing required 'title'".to_owned())?
                     .to_owned();
                 let status = parse_optional_mcp_status(arguments)?;
+                let waiting_reason = arguments
+                    .get("waiting_reason")
+                    .or_else(|| arguments.get("note"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 let item = mgr
                     .items
                     .create_item(
@@ -3139,6 +3372,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                                 .map(ToOwned::to_owned),
                             status,
                             links: Vec::new(),
+                            waiting_reason,
                         },
                         &actor,
                         ts,
@@ -3157,6 +3391,11 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                 let item_id = qualify_bot_item_id(&ctx.bot_id, raw_item_id);
                 ensure_bot_owns_item(&mgr.items, &ctx.bot_id, &item_id)?;
                 let status = parse_optional_mcp_status(arguments)?;
+                let waiting_reason = arguments
+                    .get("waiting_reason")
+                    .or_else(|| arguments.get("note"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 let item = mgr
                     .items
                     .update_item(
@@ -3185,6 +3424,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned),
                             snoozed_until_ms: FieldPatch::Unchanged,
+                            waiting_reason,
                         },
                         &actor,
                         ts,
@@ -3462,6 +3702,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                                     decisions: Vec::new(),
                                     close_note: None,
                                     snoozed_until_ms: FieldPatch::Unchanged,
+                                    waiting_reason: None,
                                 },
                                 &actor,
                                 ts,
@@ -3503,6 +3744,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                                     .map(ToOwned::to_owned),
                                 status: Some(BotItemStatus::NeedsYou),
                                 links: Vec::new(),
+                                waiting_reason: None,
                             },
                             &actor,
                             ts,
@@ -3523,6 +3765,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                             decisions: vec![decision],
                             close_note: None,
                             snoozed_until_ms: FieldPatch::Unchanged,
+                            waiting_reason: None,
                         },
                         &actor,
                         ts,
@@ -3635,6 +3878,7 @@ fn parse_item_status(raw: &str) -> Option<BotItemStatus> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "planned" => Some(BotItemStatus::Planned),
         "working" => Some(BotItemStatus::Working),
+        "waiting" => Some(BotItemStatus::Waiting),
         "needs_you" | "needs-you" => Some(BotItemStatus::NeedsYou),
         "done" => Some(BotItemStatus::Done),
         "canceled" | "cancelled" => Some(BotItemStatus::Canceled),
@@ -3658,7 +3902,7 @@ fn parse_optional_mcp_status(arguments: &Value) -> Result<Option<BotItemStatus>,
     }
     parse_item_status(trimmed).map(Some).ok_or_else(|| {
         format!(
-            "invalid 'status' value '{trimmed}': expected one of planned, working, needs_you, needs-you, done, canceled"
+            "invalid 'status' value '{trimmed}': expected one of planned, working, waiting, needs_you, needs-you, done, canceled"
         )
     })
 }
@@ -3855,6 +4099,7 @@ mod tests {
                 done_means: None,
                 status: Some(BotItemStatus::NeedsYou),
                 links: Vec::new(),
+                waiting_reason: None,
             })),
         ) {
             BotRpcResponse::Item(i) => Some(*i),
@@ -3895,6 +4140,7 @@ mod tests {
                     decisions: Vec::new(),
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 }))
             ),
             BotRpcResponse::Item(_)
@@ -4203,6 +4449,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         mgr.on_hook_event(&reg, sid_empty, &stop_event);
@@ -4230,6 +4478,8 @@ mod tests {
                 created_at_ms: 1_500,
                 owner_turn_pending: true,
                 last_prompt: Some("Say hello".to_owned()),
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let mem_path = mgr.store().bot_home(&created).join("MEMORY.md");
@@ -4391,6 +4641,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: true,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
 
@@ -4459,6 +4711,7 @@ mod tests {
                 done_means: None,
                 status: None,
                 links: Vec::new(),
+                waiting_reason: None,
             })),
         ) {
             BotRpcResponse::Item(i) => *i,
@@ -4485,6 +4738,7 @@ mod tests {
                     done_means: None,
                     status: None,
                     links: Vec::new(),
+                    waiting_reason: None,
                 }))
             ),
             BotRpcResponse::Error(ref e) if e.contains("permission denied")
@@ -4552,6 +4806,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         // Same shape `krill bot schedules add|rm|enable|disable` sends.
@@ -4691,6 +4947,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let as_bot = |req| mgr.handle_rpc_for_peer(&reg, Some(sid), false, req);
@@ -5097,6 +5355,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         lock(&mgr.active_cron_sessions).insert((created.id.clone(), "daily".to_owned()), old_sid);
@@ -5311,6 +5571,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: true,
                 last_prompt: Some("Check inbox".to_owned()),
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         lock(&mgr.active_cron_sessions).insert((created.id.clone(), "nightly".to_owned()), sid);
@@ -5490,6 +5752,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let forgot = mgr.handle_rpc(
@@ -5701,6 +5965,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
 
@@ -5872,6 +6138,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::Planned),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &BotItemActor::Owner { device: None },
                 1_400,
@@ -6037,6 +6304,8 @@ mod tests {
                 created_at_ms: 1_020,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let forget_res = mgr.handle_rpc_for_peer(
@@ -6080,6 +6349,99 @@ mod tests {
             Some("secret-val"),
             "shared secret referenced by remaining bot must survive DeleteBot"
         );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn with_capabilities_preserves_waiting_for_modern_clients_and_downgrades_legacy() {
+        let state = temp_state("wait-caps");
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        reg.bind_self_arc();
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+        let bot = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Cap Bot".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) {
+            BotRpcResponse::Bot(b) => *b,
+            other => panic!("expected Bot, got {other:?}"),
+        };
+
+        let item = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateItem(Box::new(CreateBotItemParams {
+                bot_id: bot.id.clone(),
+                title: "Wait for CI".to_owned(),
+                description: None,
+                done_means: None,
+                status: Some(BotItemStatus::Waiting),
+                links: Vec::new(),
+                waiting_reason: Some("CI on PR #42".to_owned()),
+            })),
+        ) {
+            BotRpcResponse::Item(i) => *i,
+            other => panic!("expected Item, got {other:?}"),
+        };
+        assert_eq!(item.status, BotItemStatus::Waiting);
+        assert_eq!(item.waiting_reason.as_deref(), Some("CI on PR #42"));
+
+        // Legacy client (empty capability list) sees Working without waiting metadata.
+        let legacy = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::WithCapabilities {
+                capabilities: Vec::new(),
+                request: Box::new(BotRpcRequest::ListItems {
+                    bot_id: Some(bot.id.clone()),
+                    include_closed: false,
+                }),
+            },
+        );
+        let BotRpcResponse::Items(legacy_items) = legacy else {
+            panic!("expected Items");
+        };
+        assert_eq!(legacy_items.len(), 1);
+        assert_eq!(legacy_items[0].status, BotItemStatus::Working);
+        assert_eq!(legacy_items[0].waiting_reason, None);
+        assert_eq!(legacy_items[0].waiting_since_ms, None);
+
+        // Modern Desktop/CLI client advertising bots.item-waiting.v1 sees Waiting intact.
+        let desktop_caps: Vec<String> = krill_proto::bots::DESKTOP_BOT_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let modern = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::WithCapabilities {
+                capabilities: desktop_caps,
+                request: Box::new(BotRpcRequest::ListItems {
+                    bot_id: Some(bot.id),
+                    include_closed: false,
+                }),
+            },
+        );
+        let BotRpcResponse::Items(modern_items) = modern else {
+            panic!("expected Items");
+        };
+        assert_eq!(modern_items.len(), 1);
+        assert_eq!(modern_items[0].status, BotItemStatus::Waiting);
+        assert_eq!(
+            modern_items[0].waiting_reason.as_deref(),
+            Some("CI on PR #42")
+        );
+        assert!(modern_items[0].waiting_since_ms.is_some());
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();

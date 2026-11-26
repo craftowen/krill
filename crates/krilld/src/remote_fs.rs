@@ -1,6 +1,6 @@
 //! 원격 호스트 파일 시스템(탐색·열기·원자적 저장·Quick Open) 및 루프백 포트 포워딩 서버 핸들러.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash as _, Hasher as _};
@@ -9,12 +9,14 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::child::{
     AsFd, PipeReader, kill_and_reap, own_group, spawn, terminate_gracefully, wait_readable,
 };
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+use krill_proto::os::fs::OpenOptionsExt as _;
 use krill_proto::os::net::UnixStream;
 use krill_proto::remote_fs::{
     MAX_DIR_ENTRIES, MAX_PROBE_PATHS, MAX_QUICK_OPEN_FILES, MAX_REMOTE_CHUNK, MAX_REMOTE_PATH,
@@ -26,10 +28,90 @@ use krill_proto::remote_fs::{
 const MAX_LISTING_WIRE_BYTES: usize = 384 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 동시에 열어 둘 수 있는 다중 청크 스테이징 상한.
+const MAX_ACTIVE_STAGES: usize = 64;
+/// 완료·중단된 `(path, stage_id)` 핸들 재사용을 막기 위해 기억하는 상한.
+const MAX_RETIRED_STAGES: usize = 4096;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+type StageKey = (PathBuf, u64);
+
+struct ActiveStage {
+    conn_id: u64,
+    stage_path: PathBuf,
+    written: u64,
+}
+
+#[derive(Default)]
+struct StageRegistry {
+    active: HashMap<StageKey, ActiveStage>,
+    retired: HashSet<StageKey>,
+    retired_order: VecDeque<StageKey>,
+}
+
+impl StageRegistry {
+    fn retire(&mut self, key: StageKey) {
+        if self.retired.insert(key.clone()) {
+            self.retired_order.push_back(key);
+            while self.retired_order.len() > MAX_RETIRED_STAGES {
+                if let Some(old) = self.retired_order.pop_front() {
+                    self.retired.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn is_retired(&self, key: &StageKey) -> bool {
+        self.retired.contains(key)
+    }
+
+    fn owner_matches(owner: u64, conn_id: u64) -> bool {
+        conn_id == 0 || owner == 0 || owner == conn_id
+    }
+}
+
+static STAGES: LazyLock<Mutex<StageRegistry>> =
+    LazyLock::new(|| Mutex::new(StageRegistry::default()));
+
+/// 제어 연결이 시작될 때 고유 연결 ID를 발급한다. 연결 종료 시 [`cleanup_connection`]으로
+/// 미완료 스테이징 임시 파일을 모두 정리한다.
+#[must_use]
+pub fn next_connection_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 연결이 끊기거나 끝났을 때 해당 연결이 열어 둔 미완료 다중 청크 스테이징 파일을 모두 지우고 핸들을 폐기한다.
+pub fn cleanup_connection(conn_id: u64) {
+    if conn_id == 0 {
+        return;
+    }
+    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+    let keys: Vec<StageKey> = reg
+        .active
+        .iter()
+        .filter(|(_, stage)| stage.conn_id == conn_id)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut paths = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(stage) = reg.active.remove(&key) {
+            paths.push(stage.stage_path);
+        }
+        reg.retire(key);
+    }
+    drop(reg);
+    for path in paths {
+        fs::remove_file(path).ok();
+    }
+}
 
 pub fn serve(req: RemoteFsRequest) -> RemoteFsReply {
+    serve_on_conn(0, req)
+}
+
+pub fn serve_on_conn(conn_id: u64, req: RemoteFsRequest) -> RemoteFsReply {
     match req {
         RemoteFsRequest::ProbePaths { cwd, paths } => {
             RemoteFsReply::ProbedPaths(probe_paths(cwd.as_deref(), &paths))
@@ -57,7 +139,9 @@ pub fn serve(req: RemoteFsRequest) -> RemoteFsReply {
             commit,
         } => {
             let p = PathBuf::from(OsStr::from_bytes(&path));
-            RemoteFsReply::Written(write_atomic(&p, &bytes, expected, stage_id, offset, commit))
+            RemoteFsReply::Written(write_atomic_on_conn(
+                conn_id, &p, &bytes, expected, stage_id, offset, commit,
+            ))
         }
         RemoteFsRequest::ReadDir { repo, dir } => {
             let repo_path = PathBuf::from(OsStr::from_bytes(&repo));
@@ -88,6 +172,10 @@ pub fn serve(req: RemoteFsRequest) -> RemoteFsReply {
         }
         RemoteFsRequest::PortForward { .. } => {
             RemoteFsReply::PortForwarded(Err("port forward must be handled on stream".to_owned()))
+        }
+        RemoteFsRequest::AbortStage { path, stage_id } => {
+            let p = PathBuf::from(OsStr::from_bytes(&path));
+            RemoteFsReply::StageAborted(abort_stage_on_conn(conn_id, &p, stage_id))
         }
     }
 }
@@ -302,7 +390,44 @@ fn staging_path(path: &Path, stage_id: u64) -> PathBuf {
         ))
 }
 
+#[cfg(test)]
 fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<WireStamp>,
+    stage_id: u64,
+    offset: u64,
+    commit: bool,
+) -> WireWriteOutcome {
+    write_atomic_on_conn(0, path, bytes, expected, stage_id, offset, commit)
+}
+
+fn abort_stage_on_conn(conn_id: u64, path: &Path, stage_id: u64) -> bool {
+    if stage_id == 0 {
+        return false;
+    }
+    let key = (path.to_path_buf(), stage_id);
+    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+    let removed = match reg.active.get(&key) {
+        Some(active) if StageRegistry::owner_matches(active.conn_id, conn_id) => {
+            reg.active.remove(&key)
+        }
+        Some(_) => return false,
+        None => None,
+    };
+    reg.retire(key);
+    drop(reg);
+    if let Some(stage) = removed {
+        fs::remove_file(&stage.stage_path).ok();
+        true
+    } else {
+        let fallback = staging_path(path, stage_id);
+        fs::remove_file(&fallback).is_ok()
+    }
+}
+
+fn write_atomic_on_conn(
+    conn_id: u64,
     path: &Path,
     bytes: &[u8],
     expected: Option<WireStamp>,
@@ -314,7 +439,6 @@ fn write_atomic(
         return WireWriteOutcome::Failed("missing parent directory".to_owned());
     };
     let pid = std::process::id();
-    let stage_path = staging_path(path, stage_id);
     let current = current_stamp(path);
     if expected.is_some() && current != expected {
         return WireWriteOutcome::Conflict { current };
@@ -330,6 +454,7 @@ fn write_atomic(
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&tmp_path)?;
             if let Ok(existing) = fs::metadata(path) {
                 fs::set_permissions(&tmp_path, existing.permissions()).ok();
@@ -349,52 +474,181 @@ fn write_atomic(
             }
         }
     } else {
-        let mut owned_stage = false;
-        let res = (|| -> io::Result<WireWriteOutcome> {
-            let mut file = if offset == 0 {
-                OpenOptions::new()
+        let key = (path.to_path_buf(), stage_id);
+        let stage_path = staging_path(path, stage_id);
+        if offset == 0 {
+            let reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+            if reg.is_retired(&key) {
+                return WireWriteOutcome::Failed("staging handle already used".to_owned());
+            }
+            if reg.active.contains_key(&key) {
+                return WireWriteOutcome::Failed("staging handle already active".to_owned());
+            }
+            if reg.active.len() >= MAX_ACTIVE_STAGES {
+                return WireWriteOutcome::Failed("too many active staged writes".to_owned());
+            }
+            drop(reg);
+            let res = (|| -> io::Result<WireWriteOutcome> {
+                let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(&stage_path)?
-            } else {
-                let f = OpenOptions::new().write(true).open(&stage_path)?;
-                if f.metadata()?.len() != offset {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "staging file offset mismatch",
+                    .mode(0o600)
+                    .open(&stage_path)?;
+                file.write_all(bytes)?;
+                if !commit {
+                    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+                    if reg.is_retired(&key)
+                        || reg.active.contains_key(&key)
+                        || reg.active.len() >= MAX_ACTIVE_STAGES
+                    {
+                        drop(reg);
+                        drop(file);
+                        fs::remove_file(&stage_path).ok();
+                        return Ok(WireWriteOutcome::Failed(
+                            "staging handle was aborted or exhausted".to_owned(),
+                        ));
+                    }
+                    reg.active.insert(
+                        key.clone(),
+                        ActiveStage {
+                            conn_id,
+                            stage_path: stage_path.clone(),
+                            written: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        },
+                    );
+                    return Ok(WireWriteOutcome::StageAck);
+                }
+                if let Ok(existing) = fs::metadata(path) {
+                    fs::set_permissions(&stage_path, existing.permissions()).ok();
+                }
+                file.sync_all()?;
+                drop(file);
+                let now_stamp = current_stamp(path);
+                if expected.is_some() && now_stamp != expected {
+                    fs::remove_file(&stage_path).ok();
+                    STAGES
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .retire(key.clone());
+                    return Ok(WireWriteOutcome::Conflict { current: now_stamp });
+                }
+                fs::rename(&stage_path, path)?;
+                STAGES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retire(key.clone());
+                let meta = fs::metadata(path)?;
+                Ok(WireWriteOutcome::Saved(stamp_from_meta(&meta)))
+            })();
+            match res {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if err.kind() != io::ErrorKind::AlreadyExists {
+                        fs::remove_file(&stage_path).ok();
+                        STAGES
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .retire(key);
+                    }
+                    WireWriteOutcome::Failed(truncate_text(err.to_string()))
+                }
+            }
+        } else {
+            let active_stage_path = {
+                let reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+                if reg.is_retired(&key) {
+                    return WireWriteOutcome::Failed(
+                        "staging handle was aborted or completed".to_owned(),
+                    );
+                }
+                match reg.active.get(&key) {
+                    Some(entry) if !StageRegistry::owner_matches(entry.conn_id, conn_id) => {
+                        return WireWriteOutcome::Failed(
+                            "staging handle belongs to another connection".to_owned(),
+                        );
+                    }
+                    Some(entry) if entry.written != offset => {
+                        return WireWriteOutcome::Failed("staging file offset mismatch".to_owned());
+                    }
+                    Some(entry) => entry.stage_path.clone(),
+                    None => {
+                        return WireWriteOutcome::Failed("unknown staging handle".to_owned());
+                    }
+                }
+            };
+            let res = (|| -> io::Result<WireWriteOutcome> {
+                let mut file = OpenOptions::new().write(true).open(&active_stage_path)?;
+                if file.metadata()?.len() != offset {
+                    return Ok(WireWriteOutcome::Failed(
+                        "staging file offset mismatch".to_owned(),
                     ));
                 }
-                f
-            };
-            owned_stage = true;
-            if offset > 0 {
                 file.seek(SeekFrom::Start(offset))?;
-            }
-            file.write_all(bytes)?;
-            if !commit {
-                return Ok(WireWriteOutcome::StageAck);
-            }
-            if let Ok(existing) = fs::metadata(path) {
-                fs::set_permissions(&stage_path, existing.permissions()).ok();
-            }
-            file.sync_all()?;
-            drop(file);
-            let now_stamp = current_stamp(path);
-            if expected.is_some() && now_stamp != expected {
-                fs::remove_file(&stage_path).ok();
-                return Ok(WireWriteOutcome::Conflict { current: now_stamp });
-            }
-            fs::rename(&stage_path, path)?;
-            let meta = fs::metadata(path)?;
-            Ok(WireWriteOutcome::Saved(stamp_from_meta(&meta)))
-        })();
-        match res {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                if owned_stage {
-                    fs::remove_file(&stage_path).ok();
+                file.write_all(bytes)?;
+                let next_offset =
+                    offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                if !commit {
+                    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(entry) = reg.active.get_mut(&key)
+                        && entry.stage_path == active_stage_path
+                        && StageRegistry::owner_matches(entry.conn_id, conn_id)
+                    {
+                        entry.written = next_offset;
+                        return Ok(WireWriteOutcome::StageAck);
+                    }
+                    drop(reg);
+                    drop(file);
+                    fs::remove_file(&active_stage_path).ok();
+                    return Ok(WireWriteOutcome::Failed(
+                        "staging handle was aborted".to_owned(),
+                    ));
                 }
-                WireWriteOutcome::Failed(truncate_text(err.to_string()))
+                if let Ok(existing) = fs::metadata(path) {
+                    fs::set_permissions(&active_stage_path, existing.permissions()).ok();
+                }
+                file.sync_all()?;
+                drop(file);
+                {
+                    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+                    let valid = reg.active.get(&key).is_some_and(|e| {
+                        e.stage_path == active_stage_path
+                            && StageRegistry::owner_matches(e.conn_id, conn_id)
+                    });
+                    if !valid {
+                        drop(reg);
+                        fs::remove_file(&active_stage_path).ok();
+                        return Ok(WireWriteOutcome::Failed(
+                            "staging handle was aborted".to_owned(),
+                        ));
+                    }
+                    reg.active.remove(&key);
+                    reg.retire(key.clone());
+                }
+                let now_stamp = current_stamp(path);
+                if expected.is_some() && now_stamp != expected {
+                    fs::remove_file(&active_stage_path).ok();
+                    return Ok(WireWriteOutcome::Conflict { current: now_stamp });
+                }
+                fs::rename(&active_stage_path, path)?;
+                let meta = fs::metadata(path)?;
+                Ok(WireWriteOutcome::Saved(stamp_from_meta(&meta)))
+            })();
+            match res {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let mut reg = STAGES.lock().unwrap_or_else(PoisonError::into_inner);
+                    if reg
+                        .active
+                        .get(&key)
+                        .is_some_and(|e| e.stage_path == active_stage_path)
+                    {
+                        reg.active.remove(&key);
+                    }
+                    reg.retire(key);
+                    drop(reg);
+                    fs::remove_file(&active_stage_path).ok();
+                    WireWriteOutcome::Failed(truncate_text(err.to_string()))
+                }
             }
         }
     }
@@ -418,6 +672,15 @@ fn is_forbidden_git_or_win32_segment(part: &OsStr) -> bool {
     let trimmed = lossy.trim_end_matches(['.', ' ']);
     trimmed.eq_ignore_ascii_case(".git")
         || (cfg!(windows) && (lossy.contains(':') || lossy.ends_with(['.', ' '])))
+}
+
+fn is_allowed_canonical_target(canon_repo: &Path, canon_target: &Path) -> bool {
+    let Ok(rel) = canon_target.strip_prefix(canon_repo) else {
+        return false;
+    };
+    rel.components().all(
+        |comp| matches!(comp, Component::Normal(part) if !is_forbidden_git_or_win32_segment(part)),
+    )
 }
 
 fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>> {
@@ -445,7 +708,7 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
     }
     let canon_repo = fs::canonicalize(repo)?;
     let canon_dir = fs::canonicalize(dir)?;
-    if !canon_dir.starts_with(&canon_repo) {
+    if !is_allowed_canonical_target(&canon_repo, &canon_dir) {
         return Err(denied());
     }
     let rd = fs::read_dir(dir)?;
@@ -470,7 +733,7 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
             let is_dir = ft.is_dir()
                 || (is_symlink
                     && fs::canonicalize(&path)
-                        .is_ok_and(|t| t.starts_with(&canon_repo) && t.is_dir()));
+                        .is_ok_and(|t| is_allowed_canonical_target(&canon_repo, &t) && t.is_dir()));
             (is_dir, is_symlink)
         });
         let relative_path = path
@@ -600,6 +863,26 @@ fn drain_pipe_capped(
     }
 }
 
+const CLEARED_GIT_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
+fn git_command(program: &Path, repo: &Path) -> std::process::Command {
+    let mut cmd = krill_proto::os::background_command(program);
+    own_group(&mut cmd)
+        .current_dir(krill_proto::os::shell_path(repo))
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for var in CLEARED_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
     query_git_ignored_with(Path::new("git"), repo, relative_paths, GIT_TIMEOUT)
 }
@@ -613,21 +896,17 @@ fn query_git_ignored_with(
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return Vec::new();
     }
-    let mut cmd = krill_proto::os::background_command(program);
-    own_group(&mut cmd)
-        .current_dir(krill_proto::os::shell_path(repo))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "check-ignore",
-            "--stdin",
-            "-z",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let mut cmd = git_command(program, repo);
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "check-ignore",
+        "--stdin",
+        "-z",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     let Ok(mut child) = spawn(&mut cmd) else {
         return Vec::new();
     };
@@ -794,7 +1073,7 @@ fn ensure_worktree_create_path(
         match fs::symlink_metadata(&cur) {
             Ok(_) => {
                 let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                     return Err(denied());
                 }
             }
@@ -825,7 +1104,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -856,7 +1135,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -913,12 +1192,12 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 }
                 cur.push(part);
                 let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                     return Err(denied());
                 }
             }
             let canon_parent = parent.canonicalize().map_err(|_| denied())?;
-            if !canon_parent.starts_with(&canon_repo) {
+            if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                 return Err(denied());
             }
             target.symlink_metadata()?;
@@ -968,7 +1247,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 cur.push(part);
                 if comps.peek().is_some() {
                     let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                    if !canon_cur.starts_with(&canon_repo) {
+                    if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                         return Err(denied());
                     }
                 }
@@ -1021,23 +1300,19 @@ fn git_ls_files_with(program: &Path, root: &Path, deadline: Instant) -> Option<V
     if !root.join(".git").exists() {
         return None;
     }
-    let mut cmd = krill_proto::os::background_command(program);
-    own_group(&mut cmd)
-        .current_dir(krill_proto::os::shell_path(root))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let mut cmd = git_command(program, root);
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     let mut child = spawn(&mut cmd).ok()?;
     let stdout_raw = child.stdout.take()?;
     let mut stdout = PipeReader::new(stdout_raw).ok()?;
@@ -1234,6 +1509,167 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), b"staged-commit");
         assert!(scan_worktree_listing(&file, 20).is_err());
         assert!(scan_worktree_listing(&dir.path().join("missing"), 20).is_err());
+    }
+
+    #[test]
+    fn chunked_stage_abort_connection_cleanup_and_handle_non_reuse() {
+        let dir = TestDir::new("stage-lifecycle");
+        let target = dir.path().join("screenshot.png");
+        let target_wire = target.as_os_str().as_bytes().to_vec();
+        let conn1 = next_connection_id();
+        let conn2 = next_connection_id();
+
+        // 1. Multi-chunk transfer on conn1 -> atomic publish -> retired handle cannot be reused.
+        let r1 = serve_on_conn(
+            conn1,
+            RemoteFsRequest::WriteAtomic {
+                path: target_wire.clone(),
+                bytes: b"part-one-".to_vec(),
+                expected: None,
+                stage_id: 101,
+                offset: 0,
+                commit: false,
+            },
+        );
+        assert_eq!(r1, RemoteFsReply::Written(WireWriteOutcome::StageAck));
+        assert!(
+            !target.exists(),
+            "target must not exist before final atomic commit"
+        );
+        // Another connection must not write into conn1's active stage.
+        let wrong_conn = serve_on_conn(
+            conn2,
+            RemoteFsRequest::WriteAtomic {
+                path: target_wire.clone(),
+                bytes: b"hijack".to_vec(),
+                expected: None,
+                stage_id: 101,
+                offset: 9,
+                commit: true,
+            },
+        );
+        assert!(matches!(
+            wrong_conn,
+            RemoteFsReply::Written(WireWriteOutcome::Failed(_))
+        ));
+        let r2 = serve_on_conn(
+            conn1,
+            RemoteFsRequest::WriteAtomic {
+                path: target_wire.clone(),
+                bytes: b"part-two".to_vec(),
+                expected: None,
+                stage_id: 101,
+                offset: 9,
+                commit: true,
+            },
+        );
+        assert!(matches!(
+            r2,
+            RemoteFsReply::Written(WireWriteOutcome::Saved(stamp)) if stamp.len == 17
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"part-one-part-two");
+        assert!(!staging_path(&target, 101).exists());
+
+        // Reusing retired stage_id=101 for same path must be rejected!
+        let reused = serve_on_conn(
+            conn1,
+            RemoteFsRequest::WriteAtomic {
+                path: target_wire.clone(),
+                bytes: b"stale".to_vec(),
+                expected: None,
+                stage_id: 101,
+                offset: 0,
+                commit: true,
+            },
+        );
+        assert!(matches!(
+            reused,
+            RemoteFsReply::Written(WireWriteOutcome::Failed(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"part-one-part-two");
+
+        // 2. Explicit AbortStage removes staging file and prevents handle reuse or late chunks.
+        let abort_target = dir.path().join("aborted.png");
+        let abort_wire = abort_target.as_os_str().as_bytes().to_vec();
+        assert_eq!(
+            serve_on_conn(
+                conn1,
+                RemoteFsRequest::WriteAtomic {
+                    path: abort_wire.clone(),
+                    bytes: b"partial-data".to_vec(),
+                    expected: None,
+                    stage_id: 202,
+                    offset: 0,
+                    commit: false,
+                }
+            ),
+            RemoteFsReply::Written(WireWriteOutcome::StageAck)
+        );
+        assert!(staging_path(&abort_target, 202).exists());
+        assert_eq!(
+            serve_on_conn(
+                conn1,
+                RemoteFsRequest::AbortStage {
+                    path: abort_wire.clone(),
+                    stage_id: 202,
+                }
+            ),
+            RemoteFsReply::StageAborted(true)
+        );
+        assert!(!staging_path(&abort_target, 202).exists());
+        assert!(!abort_target.exists());
+        // Late chunk on aborted handle fails and does not recreate staging file.
+        assert!(matches!(
+            serve_on_conn(
+                conn1,
+                RemoteFsRequest::WriteAtomic {
+                    path: abort_wire.clone(),
+                    bytes: b"late".to_vec(),
+                    expected: None,
+                    stage_id: 202,
+                    offset: 12,
+                    commit: true,
+                }
+            ),
+            RemoteFsReply::Written(WireWriteOutcome::Failed(_))
+        ));
+        assert!(!staging_path(&abort_target, 202).exists());
+
+        // 3. Connection drop cleans up orphaned staging files automatically and retires handles.
+        let orphan_target = dir.path().join("orphan.png");
+        let orphan_wire = orphan_target.as_os_str().as_bytes().to_vec();
+        assert_eq!(
+            serve_on_conn(
+                conn2,
+                RemoteFsRequest::WriteAtomic {
+                    path: orphan_wire.clone(),
+                    bytes: b"inflight".to_vec(),
+                    expected: None,
+                    stage_id: 303,
+                    offset: 0,
+                    commit: false,
+                }
+            ),
+            RemoteFsReply::Written(WireWriteOutcome::StageAck)
+        );
+        assert!(staging_path(&orphan_target, 303).exists());
+        cleanup_connection(conn2);
+        assert!(!staging_path(&orphan_target, 303).exists());
+        assert!(!orphan_target.exists());
+        assert!(matches!(
+            serve_on_conn(
+                conn2,
+                RemoteFsRequest::WriteAtomic {
+                    path: orphan_wire,
+                    bytes: b"reopen".to_vec(),
+                    expected: None,
+                    stage_id: 303,
+                    offset: 0,
+                    commit: true,
+                }
+            ),
+            RemoteFsReply::Written(WireWriteOutcome::Failed(_))
+        ));
     }
 
     #[test]
@@ -1504,10 +1940,22 @@ mod tests {
             .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        let assert_reaped = |pid: i32| {
+            // SIGKILL to a process group tears down reparented grandchildren asynchronously;
+            // allow a brief kernel reap window before asserting process_name fails.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while crate::sys::process_name(pid.unsigned_abs()).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "lingering descendant pid {pid} still alive after process-group kill"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         if let Ok(pid_text) = fs::read_to_string(&pid_file_ls)
             && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
-            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+            assert_reaped(pid);
         }
 
         let pid_file_ignored = dir.path().join("ignored.pid");
@@ -1533,7 +1981,77 @@ mod tests {
         if let Ok(pid_text) = fs::read_to_string(&pid_file_ignored)
             && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
-            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+            assert_reaped(pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_repo_symlink_to_git_cannot_bypass_git_protection() {
+        let outer = TestDir::new("git-symlink");
+        let repo = outer.path().join("repo");
+        fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        let link = repo.join("git-link");
+        std::os::unix::fs::symlink(repo.join(".git"), &link).unwrap();
+
+        assert!(read_dir_listing(&repo, &link).is_err());
+        let listing = read_dir_listing(&repo, &repo).unwrap();
+        let entry = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "git-link")
+            .unwrap();
+        assert!(entry.is_symlink);
+        assert!(!entry.is_dir);
+
+        let link_wire = link.as_os_str().as_bytes().to_vec();
+        let repo_wire = repo.as_os_str().as_bytes().to_vec();
+        for op in [
+            WireExplorerOp::CreateFile {
+                parent: link_wire.clone(),
+                name: "injected".to_owned(),
+            },
+            WireExplorerOp::CreateFile {
+                parent: repo_wire.clone(),
+                name: "git-link/injected".to_owned(),
+            },
+            WireExplorerOp::CreateFolder {
+                parent: link_wire,
+                name: "injected-dir".to_owned(),
+            },
+            WireExplorerOp::CreateFolder {
+                parent: repo_wire,
+                name: "git-link/injected-dir".to_owned(),
+            },
+            WireExplorerOp::Rename {
+                path: link.join("HEAD").as_os_str().as_bytes().to_vec(),
+                new_name: "HEAD2".to_owned(),
+            },
+            WireExplorerOp::Delete {
+                path: link.join("HEAD").as_os_str().as_bytes().to_vec(),
+            },
+        ] {
+            let err = execute_explorer_op(&repo, op).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert!(repo.join(".git/HEAD").is_file());
+        assert!(!repo.join(".git/injected").exists());
+        assert!(!repo.join(".git/injected-dir").exists());
+    }
+
+    #[test]
+    fn git_command_clears_inherited_git_repository_env_vars() {
+        let cmd = git_command(Path::new("git"), Path::new("."));
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for var in CLEARED_GIT_ENV {
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == OsStr::new(var) && v.is_none()),
+                "missing env_remove for {var}"
+            );
         }
     }
 }

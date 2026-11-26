@@ -974,6 +974,7 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-avatar-img{width:100%;height:100%;object-fit:cover;display:block}
 .bot-status-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:calc(12px * var(--ui-scale,1));font-weight:600;background:var(--surface-raised);color:var(--muted-foreground)}
 .bot-status-pill.waiting{color:var(--status-waiting,#f59e0b)}
+.bot-status-pill.item-waiting{color:var(--muted-foreground)}
 .bot-status-pill.working{color:var(--status-working,#3b82f6)}
 .bot-status-pill.connected{color:var(--status-connected,#22c55e)}
 .bot-status-pill.blocked{color:var(--status-blocked,#ef4444)}
@@ -1110,7 +1111,13 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-item-head-right{display:inline-flex;align-items:center;gap:4px;flex:none}
 .bot-item-details{display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border)}
 .bot-item-card.waiting{border-left:3px solid var(--status-waiting)}
+.bot-item-card.item-waiting{border-left:3px solid var(--muted-foreground)}
 .bot-item-card.blocked{border-left:3px solid var(--status-blocked)}
+.bot-item-wait-line{margin:0;color:var(--muted-foreground);font-size:var(--font-meta);line-height:1.45;overflow-wrap:anywhere}
+.bot-wait-card{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:12px;background:var(--surface-raised);border:1px solid var(--border)}
+.bot-wait-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:calc(12px * var(--ui-scale,1));color:var(--muted-foreground)}
+.bot-wait-card-head strong{color:var(--foreground);font-weight:600}
+.bot-wait-card-body{margin:0;font-size:var(--font-meta);line-height:1.48;color:var(--foreground);overflow-wrap:anywhere}
 .bot-item-context{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border-radius:10px;background:var(--surface-base);border:1px solid var(--border);font-size:var(--font-meta);line-height:1.48;overflow-wrap:anywhere}
 .bot-item-context-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:calc(11px * var(--ui-scale,1));color:var(--text-muted)}
 .bot-item-context-text{margin:0;color:var(--muted-foreground);white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}

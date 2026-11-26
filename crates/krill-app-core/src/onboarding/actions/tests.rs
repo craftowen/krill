@@ -603,3 +603,83 @@ fn hook_plan_conflict_is_guidance_not_failure() {
         FixError::Failed(_)
     ));
 }
+
+#[test]
+fn stage_helpers_formats_path_placeholder_when_krill_has_no_parent() {
+    let (root, mut env) = fixture("helpers-no-parent");
+    env.krill = PathBuf::from("/");
+    let root_err = stage_helpers(&env).unwrap_err();
+    assert!(!root_err.contains("{path}"), "{root_err}");
+    assert!(root_err.contains('/'), "{root_err}");
+
+    env.krill = PathBuf::new();
+    let empty_err = stage_helpers(&env).unwrap_err();
+    assert!(!empty_err.contains("{path}"), "{empty_err}");
+    assert!(empty_err.contains("krill"), "{empty_err}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn non_macos_access_denied_never_publishes_macos_privacy_needs(cx: &mut gpui::TestAppContext) {
+    let path = PathBuf::from("/tmp/some-protected-file");
+    cx.update(|cx| {
+        note_access_denied_for(
+            false,
+            &path,
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+            cx,
+        );
+        note_access_denied_for(false, &path, &io::Error::from_raw_os_error(1), cx);
+        assert!(cx.try_global::<FixNeeds>().is_none());
+        assert!(cx.try_global::<AccessAttempts>().is_none());
+    });
+}
+
+#[test]
+fn managed_cli_returns_ok_when_earlier_unmanaged_path_already_links_to_ours() {
+    let (root, env) = fixture("earlier-ours");
+    let custom_bin = root.join("custom-bin");
+    std::fs::create_dir_all(&custom_bin).unwrap();
+    std::os::unix::fs::symlink(&env.krill, custom_bin.join("krill")).unwrap();
+
+    // Unmanaged dir only (~/.local/bin is not on PATH): must succeed without creating a duplicate symlink.
+    install_managed_cli_at(&env, custom_bin.as_os_str()).unwrap();
+    assert!(!env.home.join(".local/bin/krill").exists());
+
+    // Even if ~/.local/bin appears later with an unrelated file, the earlier link to our CLI wins.
+    let local_bin = env.home.join(".local/bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    std::fs::write(local_bin.join("krill"), "unrelated-later-file").unwrap();
+    let path = std::env::join_paths([&custom_bin, &local_bin]).unwrap();
+    install_managed_cli_at(&env, &path).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(local_bin.join("krill")).unwrap(),
+        "unrelated-later-file"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_hooks_install_and_uninstall_pi_when_present_on_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    assert!(action_for("hook.pi").is_some());
+    assert!(HOOK_AGENTS.contains(&(TargetAgent::Other(Agent::Pi), "pi")));
+
+    let (root, env) = fixture("pi-hook");
+    let agents = root.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let pi_bin = agents.join("pi");
+    std::fs::write(&pi_bin, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&pi_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    install_default_hooks(&env, agents.as_os_str());
+    let ext = env.home.join(".pi/agent/extensions/krill.ts");
+    assert!(hook_installed(&env.state, "pi"));
+    assert!(ext.is_file());
+
+    uninstall_default_hooks(&env, agents.as_os_str());
+    assert!(!hook_installed(&env.state, "pi"));
+    assert!(!ext.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}

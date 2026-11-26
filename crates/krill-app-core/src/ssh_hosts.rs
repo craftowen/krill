@@ -422,18 +422,9 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
     };
 
     for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(key) = parts.next() else {
+        let Some((key, rest)) = split_ssh_config_directive(raw) else {
             continue;
         };
-        let rest: Vec<&str> = parts.collect();
-        if rest.is_empty() {
-            continue;
-        }
         match key.to_ascii_lowercase().as_str() {
             "host" => {
                 flush(
@@ -444,7 +435,7 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
                     &identity,
                     &mut out,
                 );
-                current_aliases = rest.into_iter().map(str::to_owned).collect();
+                current_aliases = split_ssh_config_tokens(rest);
                 hostname = None;
                 user = None;
                 port = None;
@@ -465,10 +456,20 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
                 port = None;
                 identity = None;
             }
-            "hostname" => hostname = rest.first().map(|s| (*s).to_owned()),
-            "user" => user = rest.first().map(|s| (*s).to_owned()),
-            "port" => port = rest.first().and_then(|s| s.parse::<u16>().ok()),
-            "identityfile" => identity = Some(rest.join(" ")),
+            "hostname" => hostname = split_ssh_config_tokens(rest).into_iter().next(),
+            "user" => user = split_ssh_config_tokens(rest).into_iter().next(),
+            "port" => {
+                port = split_ssh_config_tokens(rest)
+                    .into_iter()
+                    .next()
+                    .and_then(|s| s.parse::<u16>().ok());
+            }
+            "identityfile" => {
+                let cleaned = strip_matching_quotes(rest);
+                if !cleaned.is_empty() {
+                    identity = Some(cleaned.to_owned());
+                }
+            }
             _ => {}
         }
     }
@@ -481,6 +482,85 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
         &mut out,
     );
     out
+}
+
+fn strip_ssh_config_comment(raw: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    for (idx, ch) in raw.char_indices() {
+        match in_quote {
+            Some(q) if ch == q => in_quote = None,
+            None if ch == '"' || ch == '\u{27}' => in_quote = Some(ch),
+            None if ch == '#' => return raw.get(..idx).unwrap_or(raw),
+            Some(_) | None => {}
+        }
+    }
+    raw
+}
+
+fn split_ssh_config_directive(raw: &str) -> Option<(&str, &str)> {
+    let line = strip_ssh_config_comment(raw).trim();
+    if line.is_empty() {
+        return None;
+    }
+    let idx = line.find(|c: char| c.is_whitespace() || c == '=')?;
+    let key = line.get(..idx)?;
+    let mut rest = line.get(idx..)?.trim_start();
+    if let Some(after_eq) = rest.strip_prefix('=') {
+        rest = after_eq.trim_start();
+    }
+    if key.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((key, rest))
+}
+
+fn strip_matching_quotes(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| {
+            s.strip_prefix('\u{27}')
+                .and_then(|t| t.strip_suffix('\u{27}'))
+        })
+        .unwrap_or(s)
+}
+
+fn split_ssh_config_tokens(rest: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' || ch == '\u{27}' {
+            let quote = ch;
+            chars.next();
+            let mut token = String::new();
+            for c in chars.by_ref() {
+                if c == quote {
+                    break;
+                }
+                token.push(c);
+            }
+            if !token.is_empty() {
+                tokens.push(token);
+            }
+        } else {
+            let mut token = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                token.push(c);
+                chars.next();
+            }
+            if !token.is_empty() {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
 }
 
 /// `~/.ssh/config`(또는 지정 경로)에서 호스트를 가져와 `hosts.toml`에 병합한다.
@@ -501,16 +581,21 @@ pub fn import_from_ssh_config(
         .iter()
         .map(|h| krill_hosts::ssh::machine_key(&h.destination, h.port))
         .collect();
-    for item in parsed {
+    for mut item in parsed {
         let key = krill_hosts::ssh::machine_key(&item.destination, item.port);
-        if !machines.contains(&key)
-            && !hosts
-                .iter()
-                .any(|h| h.id == item.id || h.destination == item.destination)
-        {
-            machines.push(key);
-            hosts.push(item);
+        if machines.contains(&key) || hosts.iter().any(|h| h.destination == item.destination) {
+            continue;
         }
+        let base = item.id.clone();
+        let mut id = base.clone();
+        let mut n = 2_u32;
+        while hosts.iter().any(|h| h.id == id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        item.id = id;
+        machines.push(key);
+        hosts.push(item);
     }
     save_hosts(state_dir, &hosts)?;
     Ok(hosts)
@@ -681,10 +766,7 @@ pub fn classify_ssh_error(stderr: &str) -> SshTestFailureKind {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("connection refused") {
         SshTestFailureKind::ConnectionRefused
-    } else if lower.contains("permission denied")
-        || lower.contains("publickey")
-        || lower.contains("authentication failed")
-    {
+    } else if krill_hosts::ssh::is_ssh_auth_failure(stderr) {
         SshTestFailureKind::AuthFailed
     } else {
         SshTestFailureKind::Other
@@ -1287,6 +1369,62 @@ Match host *.corp
             "deploy@10.0.0.9:2222 \u{2022} ~/.ssh/id_ed25519"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_ssh_config_handles_equals_separators_and_strips_quotes() {
+        let cfg = r#"
+Host=eq-box
+    HostName=10.0.0.10
+    User="alice"
+    Port=2222
+    IdentityFile="~/.ssh/my key"
+
+Host = spaced-eq
+    HostName = 10.0.0.11
+    Port = 2200
+    IdentityFile = '~/.ssh/single key'
+"#;
+        let hosts = parse_ssh_config(cfg);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].label, "eq-box");
+        assert_eq!(hosts[0].destination, "eq-box");
+        assert_eq!(hosts[0].port, Some(2222));
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/my key"));
+        assert_eq!(hosts[1].label, "spaced-eq");
+        assert_eq!(hosts[1].destination, "spaced-eq");
+        assert_eq!(hosts[1].port, Some(2200));
+        assert_eq!(hosts[1].identity_file.as_deref(), Some("~/.ssh/single key"));
+    }
+
+    #[test]
+    fn import_from_ssh_config_disambiguates_colliding_slugs() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-ssh-import-slugs-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-existing host occupying the base slug `ssh-foo-bar` for a different destination.
+        add_host(Some(&dir), "foo bar", "owen@10.0.0.1", None, None).unwrap();
+
+        let ssh_cfg = dir.join("ssh_config");
+        std::fs::write(
+            &ssh_cfg,
+            "Host foo_bar\n  HostName 10.0.0.2\n  Port 2201\n\nHost foo-bar\n  HostName 10.0.0.3\n  Port 2202\n",
+        )
+        .unwrap();
+
+        let imported = import_from_ssh_config(Some(&dir), Some(&ssh_cfg)).unwrap();
+        assert_eq!(imported.len(), 3);
+        let ids: Vec<&str> = imported.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["ssh-foo-bar", "ssh-foo-bar-2", "ssh-foo-bar-3"]);
+        let dests: Vec<&str> = imported.iter().map(|h| h.destination.as_str()).collect();
+        assert_eq!(dests, ["owen@10.0.0.1", "foo_bar", "foo-bar"]);
+
+        // Re-importing the same config is idempotent.
+        let again = import_from_ssh_config(Some(&dir), Some(&ssh_cfg)).unwrap();
+        assert_eq!(again.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

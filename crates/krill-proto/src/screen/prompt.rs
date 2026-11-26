@@ -62,7 +62,13 @@ struct RowInfo {
 pub fn row_plain_text(cells: &[Cell]) -> String {
     let mut out = String::with_capacity(cells.len());
     for cell in cells {
+        if cell.flags.contains(Flags::SPACER) {
+            continue;
+        }
         out.push(cell.ch);
+        for &zw in &cell.zerowidth {
+            out.push(zw);
+        }
     }
     out.trim_end().to_owned()
 }
@@ -535,6 +541,14 @@ fn build_rows(rows: &[Vec<Cell>]) -> Vec<RowInfo> {
 
 fn detect_internal(rows: &[Vec<Cell>]) -> Option<DetectedMenu> {
     let built = build_rows(rows);
+    let plain_screen = built
+        .iter()
+        .map(|row| row.plain.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if super::agy::auth_login_text(&plain_screen) {
+        return None;
+    }
     if let Some(menu) = detect_numbered_menu(&built) {
         return Some(menu);
     }
@@ -924,5 +938,84 @@ Space to toggle · Enter to submit";
         let active = rows_from_str("Allow running tests?\n❯ 1. Yes\n  2. No");
         let mismatch = verify_and_plan(&active, "unrelated prompt", &PromptReply::Choice(0), false);
         assert!(mismatch.is_err());
+    }
+
+    #[test]
+    fn detects_and_plans_wide_cjk_and_zerowidth_prompts() {
+        let wide_rows = |text: &str| -> Vec<Vec<Cell>> {
+            text.lines()
+                .map(|line| {
+                    let mut cells: Vec<Cell> = Vec::new();
+                    for ch in line.chars() {
+                        if ch == '\u{0301}' {
+                            if let Some(prev) = cells.last_mut() {
+                                prev.zerowidth.push(ch);
+                            }
+                            continue;
+                        }
+                        let wide = ('\u{AC00}'..='\u{D7AF}').contains(&ch);
+                        cells.push(Cell {
+                            ch,
+                            flags: if wide { Flags::WIDE } else { Flags::default() },
+                            ..Cell::default()
+                        });
+                        if wide {
+                            cells.push(Cell {
+                                ch: ' ',
+                                flags: Flags::SPACER,
+                                ..Cell::default()
+                            });
+                        }
+                    }
+                    cells
+                })
+                .collect()
+        };
+
+        let row = wide_rows("cafe\u{0301} 배포할까요?");
+        assert_eq!(row_plain_text(&row[0]), "cafe\u{0301} 배포할까요?");
+
+        let screen = "\
+배포할까요?
+❯ 1. 예 (cafe\u{0301})
+  2. 아니오
+Enter to select";
+        let rows = wide_rows(screen);
+        let Some(PromptKind::NumberedMenu {
+            prompt,
+            options,
+            cursor,
+            ..
+        }) = detect(&rows)
+        else {
+            panic!("expected wide-char numbered menu");
+        };
+        assert_eq!(prompt, "배포할까요?");
+        assert_eq!(cursor, 0);
+        assert_eq!(options[0].label, "예 (cafe\u{0301})");
+        assert_eq!(options[1].label, "아니오");
+
+        let steps = verify_and_plan(&rows, "배포할까요?", &PromptReply::Choice(1), false)
+            .expect("wide-char prompt should match without spurious spaces");
+        assert_eq!(steps, vec![b"\x1b[B".to_vec(), b"\r".to_vec()]);
+    }
+
+    #[test]
+    fn ignores_agy_oauth_login_method_selector() {
+        let stage1 = rows_from_str(
+            "Welcome to the Antigravity CLI. You are currently not signed in.\n\
+             Select login method:\n\
+             > 1. Google OAuth\n\
+               2. Use a Google Cloud project\n\
+             ↑/↓ Navigate · enter Select",
+        );
+        assert!(detect(&stage1).is_none());
+
+        let stage2 = rows_from_str(
+            "Your browser should open automatically.\n\
+             → Click here to authenticate\n\
+             Paste authorization code here:",
+        );
+        assert!(detect(&stage2).is_none());
     }
 }

@@ -4,7 +4,6 @@ use std::time::Instant;
 use krill_proto::hook::{Input, append_spool};
 
 use super::*;
-use crate::usage::accounts;
 
 const S1: SessionId = SessionId(1);
 
@@ -417,6 +416,39 @@ fn failed_save_preserves_spool_for_retry() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn best_effort_status_writer_survives_full_disk_and_recovers_automatically() {
+    let dir = tmp("status-recover");
+    let path = dir.join(FILE_NAME);
+    let st = Statuses::open(Some(path.clone()));
+    // Occupy destination with a non-empty directory so atomic rename fails deterministically.
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("occupied"), b"").unwrap();
+
+    // Status transitions still update live in-memory state even while disk writes fail.
+    st.exited(S1);
+    assert_eq!(st.get(S1).state, AgentState::Exited);
+
+    // Clear disk obstruction -> background StateWriter automatically retries and persists!
+    fs::remove_dir_all(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if path.is_file() {
+            let reloaded = Statuses::open(Some(path.clone())).get(S1);
+            if reloaded.state == AgentState::Exited {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background writer did not automatically recover and persist agent-state"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    st.shutdown(Duration::from_secs(1));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// 저장은 끝났지만 spool 비우기 전에 재기동하면 같은 이벤트를 읽어도 상태가 되돌아가지 않는다.
 #[test]
 fn restart_before_spool_truncation_replays_once() {
@@ -478,158 +510,6 @@ fn stop_failure_rate_limit_detects_documented_payload() {
     }
 }
 
-/// OWE-710용 임시 홈: Claude 계정 High·Low + 사용량 캐시, 활성은 High.
-fn rate_limit_home(tag: &str, high_five: u8, low_five: u8) -> (PathBuf, PathBuf) {
-    use crate::usage::CLAUDE_CACHE;
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
-    let root = std::env::temp_dir().join(format!("krilld-stop-fail-{tag}-{}", std::process::id()));
-    fs::remove_dir_all(&root).ok();
-    let home = root.join("home");
-    let state = root.join("state");
-    accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            ..AutoSwitchPolicy::default()
-        },
-    )
-    .unwrap();
-    for (label, five) in [("High", high_five), ("Low", low_five)] {
-        let profile = home.join(format!("claude-{label}"));
-        accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Claude,
-            label,
-            None,
-            &profile.display().to_string(),
-        )
-        .unwrap();
-        fs::write(
-            profile.join(CLAUDE_CACHE),
-            format!(r#"{{"five_hour":{{"utilization":{five}}}}}"#),
-        )
-        .unwrap();
-    }
-    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-high").unwrap();
-    (home, state)
-}
-
-fn active_claude(home: &Path, state: &Path) -> Option<String> {
-    accounts::load_file(home, Some(state))
-        .active
-        .get("claude")
-        .cloned()
-}
-
-const RATE_PAYLOAD: &str = r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#;
-
-#[test]
-fn stop_failure_respects_disabled_rate_limit_switch_with_threshold_cache() {
-    let (home, state) = rate_limit_home("rate-disabled", 95, 10);
-    let mut file = accounts::load_file(&home, Some(&state));
-    file.auto_switch.switch_on_rate_limit = false;
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-    let switched =
-        auto_switch_on_rate_limit(&home, Some(&state), "claude", RATE_PAYLOAD.as_bytes()).unwrap();
-    assert!(switched.is_empty());
-    assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-high"));
-    fs::remove_dir_all(home.parent().unwrap()).ok();
-}
-
-/// OWE-710: 한도 `StopFailure`가 오면 즉시 자동전환을 평가해 여유 계정으로 전환한다(다음 실행부터 적용).
-#[test]
-fn rate_limit_stop_failure_triggers_immediate_auto_switch() {
-    let (home, state) = rate_limit_home("switch", 95, 10);
-    let switched =
-        auto_switch_on_rate_limit(&home, Some(&state), "claude", RATE_PAYLOAD.as_bytes())
-            .expect("claude rate_limit evaluates");
-    assert_eq!(switched.len(), 1);
-    assert_eq!(switched[0].to_id, "claude-low");
-    assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-low"));
-    // 전환 뒤에는 같은 페이로드가 와도 왕복하지 않는다.
-    let again = auto_switch_on_rate_limit(&home, Some(&state), "claude", RATE_PAYLOAD.as_bytes())
-        .expect("claude rate_limit evaluates");
-    assert!(again.is_empty());
-    fs::remove_dir_all(home.parent().unwrap()).ok();
-}
-
-/// OWE-710: 한도 외 오류·Claude 외 에이전트·비JSON은 평가하지 않는다(활성 유지).
-#[test]
-fn non_rate_limit_stop_failure_does_not_trigger() {
-    let (home, state) = rate_limit_home("ignore", 95, 10);
-    for (agent, payload) in [
-        (
-            "claude",
-            r#"{"hook_event_name":"StopFailure","error":"server_error"}"#,
-        ),
-        ("claude", r#"{"hook_event_name":"StopFailure"}"#),
-        ("claude", r#"{"hook_event_name":"Stop"}"#),
-        ("claude", "not json"),
-        ("codex", RATE_PAYLOAD),
-        ("cursor", RATE_PAYLOAD),
-        ("", RATE_PAYLOAD),
-        // OWE-901: 에이전트·봉투가 어긋나면 평가하지 않는다.
-        ("agy", RATE_PAYLOAD),
-        (
-            "claude",
-            r#"{"hook_event_name":"Stop","error":"rate_limit"}"#,
-        ),
-    ] {
-        assert!(
-            auto_switch_on_rate_limit(&home, Some(&state), agent, payload.as_bytes()).is_none(),
-            "{agent}/{payload}"
-        );
-    }
-    assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-high"));
-    fs::remove_dir_all(home.parent().unwrap()).ok();
-}
-
-/// OWE-901용 임시 홈: agy 계정 High·Low + 사용량 파일, 활성은 High.
-fn agy_rate_limit_home(tag: &str, high_five: u8, low_five: u8) -> (PathBuf, PathBuf) {
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
-    let root = std::env::temp_dir().join(format!("krilld-agy-fail-{tag}-{}", std::process::id()));
-    fs::remove_dir_all(&root).ok();
-    let home = root.join("home");
-    let state = root.join("state");
-    accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            ..AutoSwitchPolicy::default()
-        },
-    )
-    .unwrap();
-    for (label, five) in [("High", high_five), ("Low", low_five)] {
-        let profile = home.join(format!("agy-{label}"));
-        accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Antigravity,
-            label,
-            None,
-            &profile.display().to_string(),
-        )
-        .unwrap();
-        fs::write(
-            profile.join("usage.json"),
-            format!(r#"{{"five_hour":{{"utilization":{five}}}}}"#),
-        )
-        .unwrap();
-    }
-    accounts::switch_account(&home, Some(&state), ProviderKind::Antigravity, "agy-high").unwrap();
-    (home, state)
-}
-
-fn active_agy(home: &Path, state: &Path) -> Option<String> {
-    accounts::load_file(home, Some(state))
-        .active
-        .get("agy")
-        .cloned()
-}
-
 /// OWE-901: agy 한도 봉투(`Stop`·`PostInvocation` + `error: "rate_limit"`)만 감지한다.
 #[test]
 fn agy_rate_limit_detects_only_exact_limit_envelope() {
@@ -654,59 +534,6 @@ fn agy_rate_limit_detects_only_exact_limit_envelope() {
     assert!(!stop_failure_rate_limited(
         br#"{"hook_event_name":"Stop","error":"rate_limit"}"#
     ));
-}
-
-/// OWE-901: agy 한도 봉투가 오면 즉시 자동전환을 평가해 여유 계정으로 전환한다.
-#[test]
-fn agy_limit_envelope_triggers_immediate_auto_switch() {
-    let (home, state) = agy_rate_limit_home("switch", 100, 10);
-    let payload = r#"{"hook_event_name":"Stop","error":"rate_limit"}"#;
-    let switched = auto_switch_on_rate_limit(&home, Some(&state), "agy", payload.as_bytes())
-        .expect("agy rate_limit evaluates");
-    assert_eq!(switched.len(), 1);
-    assert_eq!(switched[0].to_id, "agy-low");
-    assert_eq!(active_agy(&home, &state).as_deref(), Some("agy-low"));
-    fs::remove_dir_all(home.parent().unwrap()).ok();
-}
-/// OWE-710: 기존 정책 존중 — 자동전환 꺼짐·히스테리시스 근소 우위면 평가만 하고 전환하지 않는다.
-#[test]
-fn rate_limit_trigger_respects_existing_policy() {
-    use krill_proto::usage::AutoSwitchPolicy;
-    // 꺼짐.
-    let (home, state) = rate_limit_home("off", 95, 10);
-    accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: false,
-            threshold_percent: 90,
-            switch_on_rate_limit: true,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    // 수동 선택 복원(set_auto_switch 끝의 평가는 꺼져 있어 덮지 않는다).
-    accounts::switch_account(
-        &home,
-        Some(&state),
-        krill_proto::usage::ProviderKind::Claude,
-        "claude-high",
-    )
-    .unwrap();
-    let evaluated =
-        auto_switch_on_rate_limit(&home, Some(&state), "claude", RATE_PAYLOAD.as_bytes())
-            .expect("claude rate_limit evaluates");
-    assert!(evaluated.is_empty());
-    assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-high"));
-    fs::remove_dir_all(home.parent().unwrap()).ok();
-    // 근소 우위(5%p 미만): 왕복 방지 히스테리시스가 전환을 막는다.
-    let (home, state) = rate_limit_home("close", 95, 93);
-    let evaluated =
-        auto_switch_on_rate_limit(&home, Some(&state), "claude", RATE_PAYLOAD.as_bytes())
-            .expect("claude rate_limit evaluates");
-    assert!(evaluated.is_empty());
-    assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-high"));
-    fs::remove_dir_all(home.parent().unwrap()).ok();
 }
 
 /// OWE-872: 전경 프로세스 그룹이 루트 셸과 같거나 종료된 세션이면 `None`,

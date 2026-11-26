@@ -267,6 +267,31 @@ fn manifest_parsing_signature_downgrade_channel_rollout_and_url() {
         validate_url("file:///tmp/latest.json"),
         Err(Error::InsecureUrl(_))
     ));
+    // R2A-01: loopback HTTP authority must not be spoofed via `@` userinfo, host suffix,
+    // malformed port, backslash, whitespace, or control/bidi characters.
+    assert!(validate_url("http://127.0.0.1/latest.json").is_ok());
+    assert!(validate_url("http://[::1]:8080/latest.json").is_ok());
+    assert!(validate_url("http://[::1]/latest.json").is_ok());
+    for bad in [
+        "http://localhost:80@attacker.example/latest.json",
+        "http://127.0.0.1:8080@attacker.example/latest.json",
+        "http://[::1]:8080@attacker.example/latest.json",
+        "https://user:pass@github.com/craftowen/krill/latest.json",
+        "http://localhost.attacker.example/latest.json",
+        "http://localhost:/latest.json",
+        "http://localhost:99999/latest.json",
+        "http://127.0.0.1:abc/latest.json",
+        "http://localhost:80\\attacker.example/latest.json",
+        "https://github.com/latest.json\r\n",
+        "https://github.com/\u{202E}latest.json",
+        "https://github.com/ latest.json",
+        "https:///latest.json",
+    ] {
+        assert!(
+            matches!(validate_url(bad), Err(Error::InsecureUrl(_))),
+            "URL must be rejected: {bad:?}"
+        );
+    }
 
     // updater.toml 설정 파싱
     let pk = test_public_key(&[42; 32]);

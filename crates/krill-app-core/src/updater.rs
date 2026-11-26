@@ -622,25 +622,75 @@ impl From<io::Error> for Error {
     }
 }
 
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn is_loopback_http_authority(authority: &str) -> bool {
+    let port = if let Some(rest) = authority.strip_prefix("[::1]") {
+        if rest.is_empty() {
+            return true;
+        }
+        rest.strip_prefix(':')
+    } else if let Some(rest) = authority.strip_prefix("127.0.0.1") {
+        if rest.is_empty() {
+            return true;
+        }
+        rest.strip_prefix(':')
+    } else if let Some(rest) = authority.strip_prefix("localhost") {
+        if rest.is_empty() {
+            return true;
+        }
+        rest.strip_prefix(':')
+    } else {
+        return false;
+    };
+    port.is_some_and(|p| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+    })
+}
+
 /// HTTPS 또는 로컬 루프백(`127.0.0.1`, `localhost`, `[::1]`) HTTP만 허용한다.
 pub fn validate_url(url: &str) -> Result<(), Error> {
-    if let Some(rest) = url.strip_prefix("https://")
-        && !rest.is_empty()
-        && !rest.starts_with('/')
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || is_bidi_control(c))
     {
-        return Ok(());
+        return Err(Error::InsecureUrl(url.to_owned()));
     }
-    for prefix in [
-        "http://127.0.0.1:",
-        "http://127.0.0.1/",
-        "http://localhost:",
-        "http://localhost/",
-        "http://[::1]:",
-        "http://[::1]/",
-    ] {
-        if url.starts_with(prefix) {
+    let (is_https, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err(Error::InsecureUrl(url.to_owned()));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return Err(Error::InsecureUrl(url.to_owned()));
+    }
+    let Ok(parsed) = gpui::http_client::Url::parse(url) else {
+        return Err(Error::InsecureUrl(url.to_owned()));
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::InsecureUrl(url.to_owned()));
+    }
+    let has_valid_host = parsed
+        .host_str()
+        .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.'));
+    if !has_valid_host {
+        return Err(Error::InsecureUrl(url.to_owned()));
+    }
+    if is_https {
+        if parsed.scheme() == "https" {
             return Ok(());
         }
+    } else if parsed.scheme() == "http" && is_loopback_http_authority(authority) {
+        return Ok(());
     }
     Err(Error::InsecureUrl(url.to_owned()))
 }
@@ -1016,6 +1066,7 @@ pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
                     "--silent",
                     "--show-error",
                     "--location",
+                    "--globoff",
                     "--max-time",
                     "30",
                     "--max-filesize",
@@ -1893,6 +1944,7 @@ fn fetch_archive_with_probe(
         "--silent",
         "--show-error",
         "--location",
+        "--globoff",
         "--connect-timeout",
         "15",
         "--max-time",

@@ -22,6 +22,7 @@ use crate::ui::{DarkUiTheme, LightUiTheme};
 
 pub use crate::i18n::Language;
 
+mod antigravity;
 mod locale;
 mod location;
 mod machines;
@@ -312,9 +313,12 @@ pub struct Settings {
     /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
     #[serde(default)]
     pub running_session_switch_policy: RunningSessionSwitchPolicy,
-    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 끔).
-    #[serde(default)]
+    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 켬, Orca #47221).
+    #[serde(default = "default_true")]
     pub chat_auto_continue_after_rate_limit: bool,
+    /// 재부팅이나 데몬 크래시로 터미널 워커가 끊어졌을 때 저장된 대화를 자동 재개할지(기본 끔, Orca #46643).
+    #[serde(default)]
+    pub resume_work_on_restart: bool,
     /// 사이드바 봇 섹션 "봇 옵션"의 정렬(Orca `botSidebarView.sortBy`).
     pub bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort,
     /// 일시정지한 봇 숨기기(Orca `hidePausedBots`).
@@ -522,7 +526,8 @@ impl Default for Settings {
             show_automations_button: true,
             show_mobile_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
-            chat_auto_continue_after_rate_limit: false,
+            chat_auto_continue_after_rate_limit: true,
+            resume_work_on_restart: false,
             bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort::Manual,
             bot_sidebar_hide_paused: false,
             bot_sidebar_hide_sleeping_workers: false,
@@ -1967,10 +1972,16 @@ pub fn copy_on_select(cx: &App) -> bool {
         .is_some_and(|c| c.settings.copy_on_select)
 }
 
-/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 false.
+/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 기본값 true.
 pub fn chat_auto_continue_after_rate_limit(cx: &App) -> bool {
     cx.try_global::<Config>()
-        .is_some_and(|c| c.settings.chat_auto_continue_after_rate_limit)
+        .is_none_or(|c| c.settings.chat_auto_continue_after_rate_limit)
+}
+
+/// 재부팅·데몬 크래시 뒤 중단된 터미널 워커 대화를 자동 재개할지. `init` 전이면 기본값 false.
+pub fn resume_work_on_restart(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.resume_work_on_restart)
 }
 
 /// 사이드바 봇 섹션의 "봇 옵션". `init` 전이면 기본값.
@@ -2999,37 +3010,6 @@ fn format_reset_countdown(left_secs: u64) -> String {
     ])
 }
 
-/// 규칙의 계정 id를 라벨로 바꾼다. 목록에 없으면 id 그대로.
-fn account_label(
-    accounts: &[krill_proto::usage::AccountInfo],
-    rule: &krill_proto::usage::AutoSwitchRule,
-    id: &str,
-) -> String {
-    accounts
-        .iter()
-        .find(|a| a.provider == rule.provider && a.id == id)
-        .map_or_else(|| id.to_owned(), |a| a.label.clone())
-}
-
-/// 계정별 규칙 요약 한 줄(`Max ≥ 90% → 자동`, 꺼져 있으면 ` · 끄기`). 접힌 카드와 전역 요약이 같이 쓴다(OWE-708).
-#[must_use]
-pub fn rule_summary(
-    rule: &krill_proto::usage::AutoSwitchRule,
-    accounts: &[krill_proto::usage::AccountInfo],
-) -> String {
-    let target = rule.target_account_id.as_deref().map_or_else(
-        || text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
-        |id| account_label(accounts, rule, id),
-    );
-    let metric = rule.metric.short_label_for(rule.provider);
-    let mut out = format!("{metric} ≥ {}% → {target}", rule.threshold_percent);
-    if !rule.enabled {
-        out.push_str(" · ");
-        out.push_str(text::OFF.get());
-    }
-    out
-}
-
 /// 계정 카드의 제목·보조 줄. 시스템 기본값(호스트) 계정은 `시스템 기본값[: 이메일]`과 안내문, 저장된 계정은 이메일(없으면 라벨)과 프로필 경로.
 #[must_use]
 pub fn account_heading(acc: &krill_proto::usage::AccountInfo) -> (String, String) {
@@ -3460,6 +3440,8 @@ pub struct SettingsView {
     opencode_key_open: bool,
     opencode_api_key_pending: bool,
     opencode_api_key_error: Option<SharedString>,
+    /// Native Antigravity (`agy`) account section state (1:1 Orca `AntigravityAccountsSection`).
+    antigravity: antigravity::AntigravityPanelState,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
     ssh_duplicates: Vec<(String, String)>,
@@ -3499,10 +3481,7 @@ pub struct SettingsView {
     armed: Option<SharedString>,
     /// 무장 자동 해제 타이머. 다시 무장하면 바꿔 끼워 이전 타이머를 취소한다.
     armed_timer: Option<gpui::Task<()>>,
-    /// 계정별 자동 전환 규칙 "고급"을 펼친 프로바이더(OWE-719). 기본은 접힘.
     project_section: ProjectSection,
-    auto_switch_open: bool,
-    rule_open: Option<String>,
     meters_open: Option<String>,
     orphans_open: bool,
     /// 제거 확인 상자를 연 계정 id(OWE-719).
@@ -3967,6 +3946,7 @@ impl SettingsView {
             opencode_key_open: false,
             opencode_api_key_pending: false,
             opencode_api_key_error: None,
+            antigravity: antigravity::AntigravityPanelState::default(),
             ssh_hosts: Vec::new(),
             ssh_duplicates: Vec::new(),
             ssh_duplicates_for: None,
@@ -3998,8 +3978,6 @@ impl SettingsView {
             armed: None,
             armed_timer: None,
             project_section: ProjectSection::Project,
-            auto_switch_open: false,
-            rule_open: None,
             meters_open: None,
             orphans_open: false,
             removing: None,
@@ -4609,6 +4587,7 @@ impl SettingsView {
             self.opencode_api_key_input.as_ref(),
             self.rename.as_ref().map(|(_, input)| input),
             self.search.as_ref().map(|(input, _)| input),
+            self.shortcuts.search.as_ref().map(|(input, _)| input),
         ]
         .into_iter()
         .flatten()
@@ -4617,11 +4596,24 @@ impl SettingsView {
                 return true;
             }
         }
+        if self
+            .feedback_input
+            .as_ref()
+            .is_some_and(|input| textarea_is_composing(input, window, app))
+        {
+            return true;
+        }
+        if self.install.any_alias_input_is_composing(window, app) {
+            return true;
+        }
         for edit in self.agent_edits.values() {
             for input in [&edit.cmd, &edit.args] {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&edit.env, window, app) {
+                return true;
             }
         }
         if let Some((search, _)) = &self.agent_preset_search
@@ -4634,6 +4626,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&form.env, window, app) {
+                return true;
             }
         }
         if let Some(form) = &self.ssh_form {
@@ -4678,6 +4673,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&modal.prompt, window, app) {
+                return true;
             }
         }
         false
@@ -4752,6 +4750,7 @@ impl SettingsView {
             self.accounts_offline = false;
             self.terminal_login_provider = None;
             self.terminal_login_account = None;
+            self.antigravity.reset_for_host_switch();
             self.removing = None;
             self.rename = None;
             self.disarm(cx);
@@ -4817,72 +4816,6 @@ impl SettingsView {
 
     pub fn ssh_hosts(&self) -> &[crate::ssh_hosts::SshHost] {
         &self.ssh_hosts
-    }
-
-    pub fn set_account_rule(
-        &mut self,
-        rule: krill_proto::usage::AutoSwitchRule,
-        cx: &mut Context<Self>,
-    ) {
-        if self.account_rule_pending || self.daemon_required(cx) {
-            return;
-        }
-        if self.account_host.is_remote() {
-            self.apply_account_request(
-                krill_proto::usage::UsageRequest::UpsertAutoSwitchRule(rule),
-                cx,
-            );
-            return;
-        }
-        let dir = state_dir(cx);
-        if is_daemon_state_dir(dir.as_deref()) {
-            self.spawn_account_rule_request(
-                async move { crate::accounts::upsert_auto_switch_rule(rule) },
-                cx,
-            );
-            return;
-        }
-        self.apply_account_request(
-            krill_proto::usage::UsageRequest::UpsertAutoSwitchRule(rule),
-            cx,
-        );
-    }
-
-    pub fn clear_account_rule(
-        &mut self,
-        provider: krill_proto::usage::ProviderKind,
-        from_account_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if self.account_rule_pending || self.daemon_required(cx) {
-            return;
-        }
-        if self.account_host.is_remote() {
-            self.apply_account_request(
-                krill_proto::usage::UsageRequest::RemoveAutoSwitchRule {
-                    provider,
-                    from_account_id: from_account_id.to_owned(),
-                },
-                cx,
-            );
-            return;
-        }
-        let dir = state_dir(cx);
-        if is_daemon_state_dir(dir.as_deref()) {
-            let from_account_id = from_account_id.to_owned();
-            self.spawn_account_rule_request(
-                async move { crate::accounts::remove_auto_switch_rule(provider, &from_account_id) },
-                cx,
-            );
-            return;
-        }
-        self.apply_account_request(
-            krill_proto::usage::UsageRequest::RemoveAutoSwitchRule {
-                provider,
-                from_account_id: from_account_id.to_owned(),
-            },
-            cx,
-        );
     }
 
     /// 데몬 IPC(연결·읽기 타임아웃 포함)는 UI 스레드를 막지 않게 백그라운드에서 돌린다.
@@ -5055,6 +4988,9 @@ impl SettingsView {
     }
 
     fn refresh_accounts_async(&mut self, cx: &mut Context<Self>) {
+        if self.antigravity.state.is_none() && !self.antigravity.busy {
+            self.run_antigravity_action(antigravity::AntigravityAction::List, cx);
+        }
         if self.accounts_refresh_pending {
             return;
         }
@@ -6046,18 +5982,6 @@ impl SettingsView {
         let dir = state_dir(cx);
         // 테스트용 임시 상태 디렉터리에서는 데몬 없이 로컬 파일로 동기 처리한다.
         if !is_daemon_state_dir(dir.as_deref()) {
-            match &req {
-                krill_proto::usage::UsageRequest::SetAdvancedPolicy(policy)
-                    if self.accounts_snapshot.advanced.supported =>
-                {
-                    self.accounts_snapshot.advanced.policy.clone_from(policy);
-                    self.account_error = None;
-                    cx.defer(notify_external_change);
-                    cx.notify();
-                    return;
-                }
-                _ => {}
-            }
             let home = crate::accounts::default_home();
             let prev = self.accounts_snapshot.clone();
             let request_host = self.account_host.clone();
@@ -6468,8 +6392,15 @@ impl SettingsView {
             subs.push(cx.subscribe_in(
                 input,
                 window,
-                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
-                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                |this, input, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(
+                        event,
+                        gpui_component::input::InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                    {
                         this.submit_ssh_host_form(window, cx);
                     }
                 },
@@ -8058,245 +7989,6 @@ impl SettingsView {
             )
     }
 
-    fn render_account_rule(
-        &self,
-        acct: &krill_proto::usage::AccountInfo,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        use gpui_component::menu::DropdownMenu as _;
-        use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule};
-
-        let p = crate::ui::palette(cx);
-        let snap = &self.accounts_snapshot;
-        let existing_rule = snap.auto_switch.rule_for(acct.provider, &acct.id).cloned();
-        let enabled = existing_rule
-            .as_ref()
-            .map_or(snap.auto_switch.enabled, |r| r.enabled);
-        let rule = existing_rule.clone().unwrap_or_else(|| AutoSwitchRule {
-            provider: acct.provider,
-            from_account_id: acct.id.clone(),
-            enabled,
-            threshold_percent: snap.auto_switch.threshold_percent,
-            metric: AutoSwitchMetric::Max,
-            target_account_id: None,
-        });
-        let rule_button =
-            |id: String, label: SharedString, selected: bool, next: AutoSwitchRule| {
-                layout::segment(p, SharedString::from(id.clone()), label, selected)
-                    .disabled(self.account_rule_pending)
-                    .debug_selector(move || id.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_account_rule(next.clone(), cx);
-                    }))
-            };
-        // OWE-719: 규칙 편집기는 자동 전환 띠의 계정별 규칙 안에만 있다. 계정 이름과 현재 규칙 요약을 머리로 둔다.
-        let summary = existing_rule.as_ref().map_or_else(
-            || text::ACCOUNTS_RULE_NONE.get().to_owned(),
-            |rule| rule_summary(rule, &snap.accounts),
-        );
-        let current_id = format!("admin-rule-current-{}", acct.id);
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .min_w_0()
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(crate::ui::TEXT_SM)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(account_heading(acct).0),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(current_id.clone()))
-                    .debug_selector(move || current_id.clone())
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(summary),
-            );
-        let mut controls = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .pt_2()
-            .border_t_1()
-            .border_color(p.border)
-            .child(header);
-        let mut toggled = rule.clone();
-        toggled.enabled = !enabled;
-        let view = cx.entity();
-        controls = controls.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::ACCOUNTS_RULE_ENABLED.get()),
-                )
-                .child(
-                    layout::switch(
-                        p,
-                        format!("admin-rule-toggle-{}", acct.id),
-                        enabled,
-                        self.account_rule_pending,
-                        move |_, _, cx| {
-                            view.update(cx, |this, cx| {
-                                this.set_account_rule(toggled.clone(), cx);
-                            });
-                        },
-                    )
-                    .aria_label(format!(
-                        "{} · {}",
-                        text::ACCOUNTS_RULE_ENABLED.get(),
-                        acct.label
-                    )),
-                ),
-        );
-        let provider = acct.provider;
-        let metric_btns = AutoSwitchMetric::for_provider(provider)
-            .iter()
-            .copied()
-            .map(|metric| {
-                let mut next = rule.clone();
-                next.metric = metric;
-                rule_button(
-                    format!("admin-rule-metric-{}-{}", acct.id, metric.short_code()),
-                    metric.short_label_for(provider).into(),
-                    rule.metric == metric,
-                    next,
-                )
-            });
-        let metrics = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(crate::i18n::catalog::status::PROVIDER_RULE_METRIC.get()),
-            )
-            .child(layout::segmented_control(p, metric_btns));
-        controls = controls.child(metrics);
-        let threshold_btns = krill_proto::usage::AUTO_SWITCH_PRESETS
-            .into_iter()
-            .map(|pct| {
-                let mut next = rule.clone();
-                next.threshold_percent = pct;
-                rule_button(
-                    format!("admin-rule-threshold-{}-{pct}", acct.id),
-                    format!("{pct}%").into(),
-                    rule.threshold_percent == pct,
-                    next,
-                )
-            });
-        let thresholds = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AUTO_SWITCH_THRESHOLD.get()),
-            )
-            .child(layout::segmented_control(p, threshold_btns));
-        controls = controls.child(thresholds);
-        let target_accounts: Vec<_> = snap
-            .accounts
-            .iter()
-            .filter(|other| other.provider == acct.provider && other.id != acct.id)
-            .map(|other| (other.id.clone(), other.label.clone()))
-            .collect();
-        let target_label = target_accounts
-            .iter()
-            .find(|(id, _)| rule.target_account_id.as_ref() == Some(id))
-            .map_or_else(
-                || text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
-                |(_, label)| label.clone(),
-            );
-        let weak = cx.weak_entity();
-        let current_rule = rule.clone();
-        let target_selector = format!("admin-rule-target-{}", acct.id);
-        controls = controls.child(
-            div()
-                .min_w_0()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .child(layout::label(
-                    p,
-                    crate::i18n::catalog::status::PROVIDER_RULE_TARGET.get(),
-                    None,
-                ))
-                .child(
-                    layout::secondary(
-                        SharedString::from(format!("admin-rule-target-{}", acct.id)),
-                        target_label,
-                    )
-                    .max_w(crate::ui::SETTINGS_NAV_WIDTH)
-                    .disabled(self.account_rule_pending)
-                    .debug_selector(move || target_selector.clone())
-                    .dropdown_menu(move |mut menu, _, _| {
-                        menu = menu.scrollable(true).max_h(px(360.));
-                        let options = std::iter::once((
-                            None,
-                            text::ACCOUNTS_RULE_TARGET_AUTO.get().to_owned(),
-                        ))
-                        .chain(
-                            target_accounts
-                                .iter()
-                                .map(|(id, label)| (Some(id.clone()), label.clone())),
-                        );
-                        for (target, label) in options {
-                            let weak = weak.clone();
-                            let mut next = current_rule.clone();
-                            next.target_account_id.clone_from(&target);
-                            menu = menu.item(
-                                gpui_component::menu::PopupMenuItem::new(label)
-                                    .checked(current_rule.target_account_id == target)
-                                    .on_click(move |_, _, cx| {
-                                        weak.update(cx, |this, cx| {
-                                            this.set_account_rule(next.clone(), cx);
-                                        })
-                                        .ok();
-                                    }),
-                            );
-                        }
-                        menu
-                    }),
-                ),
-        );
-
-        if existing_rule.is_some() {
-            let id = format!("admin-rule-clear-{}", acct.id);
-            let provider = acct.provider;
-            let from_id = acct.id.clone();
-            controls = controls.child(
-                div().child(
-                    layout::ghost(
-                        SharedString::from(id.clone()),
-                        text::ACCOUNTS_RULE_CLEAR.get(),
-                    )
-                    .disabled(self.account_rule_pending)
-                    .debug_selector(move || id.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.clear_account_rule(provider, &from_id, cx);
-                    })),
-                ),
-            );
-        }
-        controls
-    }
-
     /// 이름 변경 입력과 저장·취소(OWE-705). 저장은 라벨만 바꾸고 id·프로필 폴더는 그대로다.
     fn render_rename_row(
         acc: &krill_proto::usage::AccountInfo,
@@ -9316,17 +9008,8 @@ impl SettingsView {
                     .id("admin-account-error")
                     .debug_selector(|| "admin-account-error".into())
             }))
-            .child(self.render_auto_switch_strip(cx))
             .child(Self::render_switch_policy_row(cx));
 
-        let mut host_line = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2();
         if self.account_hosts.len() > 1 {
             let current_host = self.account_host.clone();
             let host_btns = self
@@ -9353,10 +9036,11 @@ impl SettingsView {
                 })
                 .collect::<Vec<_>>();
             // 호스트 수에 상한이 없어 칸이 모자라면 선택 줄이 라벨 아래로 내려간다.
-            host_line = host_line.child(
+            root = root.child(
                 div()
                     .id("admin-accounts-host-bar")
                     .debug_selector(|| "admin-accounts-host-bar".into())
+                    .w_full()
                     .min_w_0()
                     .max_w_full()
                     .flex()
@@ -9386,23 +9070,57 @@ impl SettingsView {
                             .flex_wrap(),
                     ),
             );
-        } else {
-            host_line = host_line.justify_end();
         }
         root = root.child(
-            host_line.child(
-                self.search_focus.anchored(
-                    p,
-                    text::ACCOUNTS_SUBHEADER.get(),
-                    div()
-                        .id("admin-accounts-active-hint")
-                        .debug_selector(|| "admin-accounts-active-hint".into())
-                        .min_w_0()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::ACCOUNTS_ACTIVE_HINT.get()),
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    self.search_focus.anchored(
+                        p,
+                        text::ACCOUNTS_SUBHEADER.get(),
+                        div()
+                            .id("admin-accounts-active-hint")
+                            .debug_selector(|| "admin-accounts-active-hint".into())
+                            .min_w_0()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::ACCOUNTS_ACTIVE_HINT.get()),
+                    ),
+                )
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::secondary(
+                                "admin-accounts-refresh",
+                                text::ACCOUNTS_REFRESH.get(),
+                            )
+                            .icon(IconName::RefreshCw)
+                            .loading(self.accounts_refresh_pending)
+                            .debug_selector(|| "admin-accounts-refresh".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_accounts_manually(cx);
+                            })),
+                        )
+                        .when(self.account_host.is_local(), |c| {
+                            c.child(
+                                layout::secondary(
+                                    "admin-open-accounts-toml",
+                                    text::ACCOUNTS_OPEN_TOML.get(),
+                                )
+                                .icon(IconName::ExternalLink)
+                                .debug_selector(|| "admin-open-accounts-toml".into())
+                                .on_click(|_, _, cx| {
+                                    open_file("accounts.toml", "", cx);
+                                }),
+                            )
+                        }),
                 ),
-            ),
         );
 
         let providers = [
@@ -9459,6 +9177,17 @@ impl SettingsView {
                 if !self.not_installed_open {
                     continue;
                 }
+            }
+            // Antigravity (`agy`) uses Orca's native single-login account section 1:1
+            // (Save current / Select / Remove / Refresh usage — no isolated profile guide).
+            if provider == ProviderKind::Antigravity {
+                let section = self.render_antigravity_section(provider_installed, cx);
+                if provider_installed {
+                    root = root.child(section);
+                } else {
+                    not_installed.push(section);
+                }
+                continue;
             }
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
             accounts.sort_by_key(|a| !a.host_default);
@@ -9853,39 +9582,6 @@ impl SettingsView {
         root
     }
 
-    /// 자동 전환 띠의 접힌 한 줄 요약.
-    fn auto_switch_summary(&self) -> String {
-        let policy = &self.accounts_snapshot.auto_switch;
-        let mut parts = Vec::new();
-        if policy.enabled {
-            parts.push(
-                text::AUTO_SWITCH_SUMMARY_EARLY
-                    .format(&[("threshold", &policy.threshold_percent.to_string())]),
-            );
-            parts.push(
-                if policy.switch_on_rate_limit {
-                    text::AUTO_SWITCH_SUMMARY_LIMIT_ON
-                } else {
-                    text::AUTO_SWITCH_SUMMARY_LIMIT_OFF
-                }
-                .get()
-                .to_owned(),
-            );
-            if self.accounts_snapshot.advanced.supported {
-                let minutes = self.accounts_snapshot.advanced.policy.cooldown_secs / 60;
-                parts.push(
-                    text::AUTO_SWITCH_SUMMARY_COOLDOWN.format(&[("minutes", &minutes.to_string())]),
-                );
-            }
-        } else {
-            parts.push(text::AUTO_SWITCH_SUMMARY_OFF.get().to_owned());
-        }
-        parts.push(
-            text::AUTO_SWITCH_SUMMARY_RULES.format(&[("n", &policy.rules.len().to_string())]),
-        );
-        parts.join(", ")
-    }
-
     /// 기본 계정을 바꿀 때 실행 중 세션 처리(묻기·자동 재시작·유지) 선택기.
     fn render_switch_policy_row(cx: &mut Context<Self>) -> gpui::Div {
         use crate::i18n::catalog::session_switch as switch_text;
@@ -9925,367 +9621,6 @@ impl SettingsView {
                     )),
                 )],
         )
-    }
-
-    /// 계정 탭 맨 위의 자동 전환 띠. 접으면 요약과 스위치 한 줄, 펼치면 전역 설정과 계정별 규칙이 한곳에 있다.
-    fn render_auto_switch_strip(&self, cx: &mut Context<Self>) -> gpui::Div {
-        use gpui_component::{Icon, IconName, Sizable as _};
-        use krill_proto::usage::UsageRequest;
-        let p = crate::ui::palette(cx);
-        let policy = self.accounts_snapshot.auto_switch.clone();
-        let open = self.auto_switch_open;
-
-        let view = cx.entity();
-        let toggle_btn = layout::switch(
-            p,
-            "admin-auto-switch-toggle",
-            policy.enabled,
-            false,
-            move |enabled, _, cx| {
-                view.update(cx, |this, cx| {
-                    let mut next = this.accounts_snapshot.auto_switch.clone();
-                    if next.enabled != enabled {
-                        next.enabled = enabled;
-                        this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
-                    }
-                });
-            },
-        )
-        .aria_label(text::AUTO_SWITCH_TITLE.get());
-        let head = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .pr_2p5()
-            .child(
-                div()
-                    .id("admin-auto-switch-strip")
-                    .debug_selector(|| "admin-auto-switch-strip".into())
-                    .role(gpui::Role::Button)
-                    .aria_label(text::AUTO_SWITCH_TITLE.get())
-                    .aria_expanded(open)
-                    .tab_index(0)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.accent))
-                    .focus_visible(|d| d.bg(p.accent))
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_2()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.auto_switch_open = !this.auto_switch_open;
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .with_size(crate::ui::ICON_XS)
-                        .text_color(p.muted_foreground),
-                    )
-                    .child(self.search_focus.label(
-                        p,
-                        text::AUTO_SWITCH_TITLE.get(),
-                        self.auto_switch_summary(),
-                    )),
-            )
-            .child(layout::controls().child(toggle_btn))
-            .into_any_element();
-        if !open {
-            return crate::ui::group(p, [head]);
-        }
-
-        let setting_row = || {
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_2()
-        };
-        let view = cx.entity();
-        let rl_switch = layout::switch(
-            p,
-            "admin-rate-limit-toggle",
-            policy.switch_on_rate_limit,
-            false,
-            move |on, _, cx| {
-                view.update(cx, |this, cx| {
-                    let mut next = this.accounts_snapshot.auto_switch.clone();
-                    if next.switch_on_rate_limit != on {
-                        next.switch_on_rate_limit = on;
-                        this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
-                    }
-                });
-            },
-        )
-        .aria_label(text::AUTO_SWITCH_RATE_LIMIT.get());
-        let preset_btns = krill_proto::usage::AUTO_SWITCH_PRESETS
-            .into_iter()
-            .map(|pct| {
-                let id_str = format!("admin-threshold-{pct}");
-                let selected = policy.threshold_percent == pct;
-                let policy_cl = policy.clone();
-                layout::segment(
-                    p,
-                    gpui::ElementId::Name(id_str.clone().into()),
-                    format!("{pct}%"),
-                    selected,
-                )
-                .debug_selector(move || id_str.clone())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let mut next = policy_cl.clone();
-                    next.threshold_percent = pct;
-                    this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
-                }))
-            });
-        let mut body = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_2p5()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AUTO_SWITCH_DESC.get()),
-            )
-            .child(
-                setting_row()
-                    .child(layout::label(
-                        p,
-                        text::AUTO_SWITCH_THRESHOLD.get(),
-                        Some(text::AUTO_SWITCH_THRESHOLD_DESC.get()),
-                    ))
-                    .child(layout::controls().child(layout::segmented_control(p, preset_btns))),
-            )
-            .child(
-                setting_row()
-                    .child(layout::label(
-                        p,
-                        text::AUTO_SWITCH_RATE_LIMIT.get(),
-                        Some(text::AUTO_SWITCH_RATE_LIMIT_DESC.get()),
-                    ))
-                    .child(layout::controls().child(rl_switch)),
-            );
-
-        if self.accounts_snapshot.advanced.supported {
-            let adv = self.accounts_snapshot.advanced.policy.clone();
-            let view_predict = cx.entity();
-            let predict_switch = layout::switch(
-                p,
-                "admin-predict-exhaustion-toggle",
-                adv.predict_exhaustion,
-                false,
-                move |on, _, cx| {
-                    view_predict.update(cx, |this, cx| {
-                        let mut next = this.accounts_snapshot.advanced.policy.clone();
-                        if next.predict_exhaustion != on {
-                            next.predict_exhaustion = on;
-                            this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
-                        }
-                    });
-                },
-            )
-            .aria_label(crate::i18n::catalog::shell::ACCOUNT_PREDICT.get());
-            let view_reset = cx.entity();
-            let reset_switch = layout::switch(
-                p,
-                "admin-prefer-soonest-reset-toggle",
-                adv.prefer_soonest_reset,
-                false,
-                move |on, _, cx| {
-                    view_reset.update(cx, |this, cx| {
-                        let mut next = this.accounts_snapshot.advanced.policy.clone();
-                        if next.prefer_soonest_reset != on {
-                            next.prefer_soonest_reset = on;
-                            this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
-                        }
-                    });
-                },
-            )
-            .aria_label(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get());
-            let cooldown_btns = [0_u64, 5, 15, 30].into_iter().map(|mins| {
-                let secs = mins * 60;
-                let id_str = format!("admin-cooldown-{mins}m");
-                let selected = adv.cooldown_secs / 60 == mins;
-                let adv_cl = adv.clone();
-                layout::segment(
-                    p,
-                    gpui::ElementId::Name(id_str.clone().into()),
-                    crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_MINUTES
-                        .format(&[("minutes", &mins.to_string())]),
-                    selected,
-                )
-                .debug_selector(move || id_str.clone())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let mut next = adv_cl.clone();
-                    next.cooldown_secs = secs;
-                    this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
-                }))
-            });
-            body = body
-                .child(
-                    setting_row()
-                        .child(layout::label(
-                            p,
-                            crate::i18n::catalog::shell::ACCOUNT_PREDICT.get(),
-                            Some(crate::i18n::catalog::shell::ACCOUNT_PREDICT_DESC.get()),
-                        ))
-                        .child(layout::controls().child(predict_switch)),
-                )
-                .child(
-                    setting_row()
-                        .child(layout::label(
-                            p,
-                            crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get(),
-                            Some(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST_DESC.get()),
-                        ))
-                        .child(layout::controls().child(reset_switch)),
-                )
-                .child(
-                    setting_row()
-                        .child(layout::label(
-                            p,
-                            crate::i18n::catalog::shell::ACCOUNT_COOLDOWN.get(),
-                            Some(crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_DESC.get()),
-                        ))
-                        .child(
-                            layout::controls().child(layout::segmented_control(p, cooldown_btns)),
-                        ),
-                );
-        }
-
-        body = body.child(
-            layout::controls()
-                .justify_end()
-                .child(
-                    layout::secondary("admin-accounts-refresh", text::ACCOUNTS_REFRESH.get())
-                        .icon(IconName::RefreshCw)
-                        .loading(self.accounts_refresh_pending)
-                        .debug_selector(|| "admin-accounts-refresh".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.refresh_accounts_manually(cx);
-                        })),
-                )
-                .when(self.account_host.is_local(), |c| {
-                    c.child(
-                        layout::secondary(
-                            "admin-open-accounts-toml",
-                            text::ACCOUNTS_OPEN_TOML.get(),
-                        )
-                        .icon(IconName::ExternalLink)
-                        .debug_selector(|| "admin-open-accounts-toml".into())
-                        .on_click(|_, _, cx| {
-                            open_file("accounts.toml", "", cx);
-                        }),
-                    )
-                }),
-        );
-
-        let mut ruled: Vec<_> = self
-            .accounts_snapshot
-            .accounts
-            .iter()
-            .filter(|a| !crate::accounts::orca_managed(a))
-            .collect();
-        ruled.sort_by_key(|a| a.provider);
-        if !ruled.is_empty() {
-            body = body.child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(text::ACCOUNTS_RULES_TITLE.get()),
-            );
-            let mut rules = div().flex().flex_col();
-            for acc in ruled {
-                let rule_open = self.rule_open.as_deref() == Some(acc.id.as_str());
-                let summary = self
-                    .accounts_snapshot
-                    .auto_switch
-                    .rule_for(acc.provider, &acc.id)
-                    .map_or_else(
-                        || text::ACCOUNTS_RULE_NONE.get().to_owned(),
-                        |rule| rule_summary(rule, &self.accounts_snapshot.accounts),
-                    );
-                let row_id = format!("admin-rule-row-{}", acc.id);
-                let open_id = format!("admin-rule-open-{}", acc.id);
-                let acc_id = acc.id.clone();
-                rules = rules.child(
-                    div()
-                        .id(SharedString::from(row_id.clone()))
-                        .debug_selector(move || row_id.clone())
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .py_1p5()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .child(crate::ui::icons::provider_icon(
-                            acc.provider,
-                            crate::ui::ICON_XS,
-                            p.foreground,
-                        ))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::ui::TEXT_SM)
-                                .child(account_heading(acc).0),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex_basis(px(140.))
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(summary),
-                        )
-                        .child(
-                            layout::ghost(
-                                gpui::ElementId::Name(open_id.clone().into()),
-                                if rule_open {
-                                    text::ACCOUNTS_RULE_COLLAPSE.get()
-                                } else {
-                                    text::ACCOUNTS_RULE_EDIT.get()
-                                },
-                            )
-                            .xsmall()
-                            .debug_selector(move || open_id.clone())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.rule_open =
-                                        if this.rule_open.as_deref() == Some(acc_id.as_str()) {
-                                            None
-                                        } else {
-                                            Some(acc_id.clone())
-                                        };
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                );
-                if rule_open {
-                    rules = rules.child(self.render_account_rule(acc, cx));
-                }
-            }
-            body = body.child(rules);
-        }
-        crate::ui::group(p, [head, body.into_any_element()])
     }
 
     fn render_agents_tab(
@@ -10347,6 +9682,27 @@ impl SettingsView {
                         },
                     )
                     .aria_label(text::CHAT_AUTO_CONTINUE_TITLE.get()),
+                ),
+            );
+
+        let resume_work_on_restart_row = crate::ui::group_row()
+            .child(self.search_focus.label(
+                p,
+                text::RESUME_WORK_ON_RESTART_TITLE.get(),
+                Some(text::RESUME_WORK_ON_RESTART_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "admin-resume-work-on-restart",
+                        s.resume_work_on_restart,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| s.resume_work_on_restart = next);
+                        },
+                    )
+                    .aria_label(text::RESUME_WORK_ON_RESTART_TITLE.get()),
                 ),
             );
 
@@ -10557,6 +9913,7 @@ impl SettingsView {
                     open_toml_row,
                     default_view_mode_row,
                     chat_auto_continue_row,
+                    resume_work_on_restart_row,
                     hooks_row,
                     auto_setup_row,
                     quick_commands_row,
@@ -12285,8 +11642,15 @@ impl SettingsView {
             cx.subscribe_in(
                 input,
                 window,
-                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
-                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                |this, input, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(
+                        event,
+                        gpui_component::input::InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                    {
                         this.submit_quick_command(window, cx);
                     }
                 },
@@ -13415,9 +12779,6 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         self.set_tab(tab, cx);
-        if title == text::AUTO_SWITCH_TITLE {
-            self.auto_switch_open = true;
-        }
         if tab == AdminTab::Project {
             self.project_section = if title == text::SCHEDULES_TITLE {
                 ProjectSection::Schedules
@@ -13514,6 +12875,8 @@ impl SettingsView {
                     .ghost()
                     .xsmall()
                     .flex_none()
+                    .tooltip(crate::i18n::catalog::add_project::CLOSE.get())
+                    .accessibility_label(crate::i18n::catalog::add_project::CLOSE.get())
                     .debug_selector(|| "admin-modal-close".into())
                     .on_click(cx.listener(|_, _, window, cx| {
                         close_settings_page_for(Some(cx.entity_id()), window, cx);
@@ -14436,6 +13799,161 @@ mod host_fence_tests {
         });
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[gpui::test]
+    fn settings_ime_preedit_covers_shortcuts_search_and_all_textareas(cx: &mut TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-settings-ime-all-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+
+        // 1. Shortcuts search input: composing must be detected and Escape must not clear search.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_tab(AdminTab::Shortcuts, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let search_input = v.shortcuts.search.as_ref().unwrap().0.clone();
+                search_input.update(cx, |input, cx| {
+                    input.set_value("zoom", window, cx);
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "shortcuts.search preedit must be detected"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, cx| {
+            assert!(
+                !v.shortcuts.search_query(cx).is_empty(),
+                "IME preedit Escape in shortcuts search must not clear query"
+            );
+        });
+
+        // 2-5. All four TextareaState fields must be checked by input_is_composing.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                if let Some((search_input, _)) = &v.shortcuts.search {
+                    search_input.update(cx, |input, cx| input.unmark_text(window, cx));
+                }
+                let mk_input = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::InputState::new(window, cx))
+                };
+                let mk_textarea = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::TextareaState::new(window, cx))
+                };
+
+                // feedback_input
+                let fb = mk_textarea(window, cx);
+                v.feedback_input = Some(fb.clone());
+                fb.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "feedback_input preedit must be detected"
+                );
+                fb.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // agent_edits[*].env
+                let agent_env = mk_textarea(window, cx);
+                v.agent_edits.insert(
+                    "claude".into(),
+                    AgentEdit {
+                        cmd: mk_input(window, cx),
+                        args: mk_input(window, cx),
+                        env: agent_env.clone(),
+                        status: None,
+                    },
+                );
+                agent_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "agent_edits.env preedit must be detected"
+                );
+                agent_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // custom_agent_form.env
+                let custom_env = mk_textarea(window, cx);
+                v.custom_agent_form = Some(CustomAgentForm {
+                    id: mk_input(window, cx),
+                    name: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    env: custom_env.clone(),
+                    status: None,
+                });
+                custom_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "custom_agent_form.env preedit must be detected"
+                );
+                custom_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // schedule_modal.prompt
+                let prompt = mk_textarea(window, cx);
+                v.schedule_modal = Some(schedules::ScheduleModal {
+                    editing_id: None,
+                    id: mk_input(window, cx),
+                    cron: mk_input(window, cx),
+                    cwd: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    prompt: prompt.clone(),
+                    name: mk_input(window, cx),
+                    extra_args: mk_input(window, cx),
+                    precheck_timeout: mk_input(window, cx),
+                    base_branch: mk_input(window, cx),
+                    grace: mk_input(window, cx),
+                    agent: None,
+                    reuse_session: false,
+                    preset: krill_proto::schedule::classify_schedule("0 9 * * *").preset,
+                    subscriptions: Vec::new(),
+                    precheck: mk_input(window, cx),
+                    workspace_mode: krill_proto::schedule::WorkspaceMode::Reuse,
+                    enabled: true,
+                    error: None,
+                });
+                prompt.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "schedule_modal.prompt preedit must be detected"
+                );
+                prompt.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
 mod updates;
 
@@ -14464,6 +13982,18 @@ pub fn usage_tone(pct: u8) -> UsageTone {
     } else {
         UsageTone::Normal
     }
+}
+
+fn textarea_is_composing(
+    input: &gpui::Entity<gpui_component::input::TextareaState>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> bool {
+    use gpui::Focusable as _;
+    input.update(cx, |input, cx| {
+        input.focus_handle(cx).is_focused(window)
+            && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+    })
 }
 
 fn accept_account_mutation_reply(

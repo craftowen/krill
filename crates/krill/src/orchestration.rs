@@ -1830,7 +1830,7 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         0
     };
     let deadline = Duration::from_millis(wait_ms);
-    let (delivery, messages) = if ack_ids_flag {
+    let (delivery, messages, bare_unread_ack_reply) = if ack_ids_flag {
         let messages = match ctx.try_ipc(
             &OrchAction::AckMessageIds {
                 recipient: to.clone(),
@@ -1854,7 +1854,7 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 )
             })?,
         };
-        (None, messages)
+        (None, messages, false)
     } else {
         match ctx.try_ipc(
             &OrchAction::CheckMessages {
@@ -1868,13 +1868,15 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             },
             deadline,
         )? {
-            Some(OrchResponse::Delivery { delivery, messages }) => (delivery, messages),
-            Some(OrchResponse::Messages(messages)) => (None, messages),
+            Some(OrchResponse::Delivery { delivery, messages }) => (delivery, messages, false),
+            Some(OrchResponse::Messages(messages)) => {
+                (None, messages, ack && delivery_id.is_none() && unread_only)
+            }
             Some(OrchResponse::Error(e)) => return Err(bad_arg(e)),
             Some(_) => return Err(io::Error::other("unexpected mailbox reply")),
             None => {
                 let start = Instant::now();
-                loop {
+                let (delivery, messages) = loop {
                     let checked = OrchestrationStore::mutate(ctx.state_dir, |s| {
                         s.check_delivery(
                             to.as_deref(),
@@ -1889,16 +1891,19 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                         break checked;
                     }
                     std::thread::sleep(Duration::from_millis(80));
-                }
+                };
+                (delivery, messages, false)
             }
         }
     };
     // Only mail this call acknowledged: a bare `--ack` with nothing new returns acked history.
-    let acked: &[OrchMessage] = if ack_ids_flag || (ack && delivery.is_some()) {
-        &messages
-    } else {
-        &[]
-    };
+    let acked = select_acked_for_auto_release(
+        ack_ids_flag,
+        ack,
+        delivery.as_ref(),
+        bare_unread_ack_reply,
+        &messages,
+    );
     let auto_released = auto_release_acked_workers(ctx, acked);
     if json {
         if ack_ids_flag || (ack && delivery_id.is_none()) {
@@ -1912,11 +1917,8 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             print_json(&out)?;
         }
     } else {
-        if let Some(delivery) = delivery {
-            println!(
-                "Delivery: {} (ack with check --ack {})",
-                delivery.id, delivery.id
-            );
+        if let Some(banner) = format_unacked_delivery_banner(delivery.as_ref()) {
+            println!("{banner}");
         }
         println!("ID\tFROM\tTO\tTYPE\tACK\tSUMMARY");
         for m in messages {
@@ -2467,6 +2469,34 @@ fn auto_release_targets<'a>(
                 })
         })
         .collect()
+}
+
+/// Formats the unacknowledged delivery reminder line, omitting it once the delivery is already acked.
+fn format_unacked_delivery_banner(
+    delivery: Option<&krill_proto::orchestration::OrchestrationDelivery>,
+) -> Option<String> {
+    let delivery = delivery.filter(|d| !d.acked)?;
+    Some(format!(
+        "Delivery: {} (ack with check --ack {})",
+        delivery.id, delivery.id
+    ))
+}
+
+/// Selects only messages acknowledged by this `check` call for worker auto-release.
+/// Live/older daemons return `OrchResponse::Messages` (stripping `delivery`) on bare `--ack`,
+/// where `--unread --ack` guarantees every returned message was just acknowledged.
+fn select_acked_for_auto_release<'a>(
+    ack_ids_flag: bool,
+    ack: bool,
+    delivery: Option<&krill_proto::orchestration::OrchestrationDelivery>,
+    bare_unread_ack_reply: bool,
+    messages: &'a [OrchMessage],
+) -> &'a [OrchMessage] {
+    if ack_ids_flag || (ack && (delivery.is_some() || bare_unread_ack_reply)) {
+        messages
+    } else {
+        &[]
+    }
 }
 
 /// Best effort: a failed release leaves the mail acknowledged and the worker for `worker-list`.
@@ -4988,6 +5018,47 @@ mod delivery_and_launch_cli_tests {
             m.msg_type = MessageType::Status;
         }
         assert!(targets(&not_done).is_empty());
+        let sample_delivery = krill_proto::orchestration::OrchestrationDelivery {
+            id: "delivery-1".to_owned(),
+            to: "coordinator".to_owned(),
+            run_id: Some(run.id.clone()),
+            message_ids: done.iter().map(|m| m.id.clone()).collect(),
+            created_at_ms: 1,
+            acked: true,
+        };
+        assert_eq!(
+            select_acked_for_auto_release(false, true, None, true, &done).len(),
+            done.len(),
+            "live bare --unread --ack receiving OrchResponse::Messages must auto-release"
+        );
+        assert!(
+            select_acked_for_auto_release(false, true, None, false, &done).is_empty(),
+            "bare --all --ack without delivery metadata must not treat history as newly acked"
+        );
+        assert_eq!(
+            select_acked_for_auto_release(false, true, Some(&sample_delivery), false, &done).len(),
+            done.len(),
+            "OrchResponse::Delivery with Some(delivery) under --ack must auto-release"
+        );
+        assert!(
+            select_acked_for_auto_release(false, false, Some(&sample_delivery), false, &done)
+                .is_empty(),
+            "--peek must never auto-release"
+        );
+        assert_eq!(
+            select_acked_for_auto_release(true, false, None, false, &done).len(),
+            done.len(),
+            "--ack-ids must auto-release"
+        );
+        // R2P-05: an already-acked delivery returned on bare `--ack` must not print an unacked reminder.
+        assert_eq!(format_unacked_delivery_banner(Some(&sample_delivery)), None);
+        assert_eq!(format_unacked_delivery_banner(None), None);
+        let mut unacked_delivery = sample_delivery;
+        unacked_delivery.acked = false;
+        assert_eq!(
+            format_unacked_delivery_banner(Some(&unacked_delivery)).as_deref(),
+            Some("Delivery: delivery-1 (ack with check --ack delivery-1)")
+        );
         Ok(())
     }
 }

@@ -136,6 +136,19 @@ class ProofTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError, "candidate push"):
             fixture.evidence().reusable(fixture.filename, SHA)
 
+    def test_audit_windows_and_every_ci_shard_must_succeed(self):
+        for filename, dropped in (
+            ("release.yml", "audit-windows"),
+            ("ci-macos.yml", "clippy (macos-15)"),
+            ("ci-macos.yml", "nextest (macos-15, daemon)"),
+            ("ci-windows.yml", "nextest (MSVC, core)"),
+        ):
+            with self.subTest(filename=filename, dropped=dropped):
+                fixture = Fixture(filename)
+                fixture.jobs = [job for job in fixture.jobs if job["name"] != dropped]
+                with self.assertRaisesRegex(EvidenceError, "required validation jobs"):
+                    fixture.evidence().proof(filename, SHA, CANDIDATE_BRANCH)
+
     def test_native_build_cannot_publish_during_candidate_verification(self):
         fixture = Fixture("release.yml")
         fixture.jobs[-1]["conclusion"] = "success"
@@ -187,22 +200,23 @@ class MacosGateTests(unittest.TestCase):
     def accepted(self, **overrides):
         env = dict(os.environ, CHANGES="success", PROOF="success", REUSED="false",
                    RUST_CHANGED="true", DEV_PUSH="false", DEV_SMOKE="skipped",
-                   CHECK="success", PACKAGING="success")
+                   CLIPPY="success", TEST="success", PACKAGING="success")
         env.update(overrides)
         result = subprocess.run(["bash", "-e", "-c", self.script],
                                 env=env, capture_output=True, text=True, timeout=5)
         return result.returncode == 0
 
-    def test_both_jobs_must_succeed_or_both_be_deliberately_skipped(self):
+    def test_all_jobs_must_succeed_or_all_be_deliberately_skipped(self):
         states = ("success", "failure", "cancelled", "skipped")
         for reused, changed in (("false", "true"), ("false", "false"), ("true", "true"), ("true", "false")):
             expected = "success" if (reused, changed) == ("false", "true") else "skipped"
-            for check in states:
-                for packaging in states:
-                    with self.subTest(reused=reused, changed=changed, check=check, packaging=packaging):
-                        self.assertEqual(self.accepted(REUSED=reused, RUST_CHANGED=changed,
-                                                       CHECK=check, PACKAGING=packaging),
-                                         check == packaging == expected)
+            for clippy in states:
+                for test in states:
+                    for packaging in states:
+                        with self.subTest(reused=reused, changed=changed, clippy=clippy, test=test, packaging=packaging):
+                            self.assertEqual(self.accepted(REUSED=reused, RUST_CHANGED=changed,
+                                                           CLIPPY=clippy, TEST=test, PACKAGING=packaging),
+                                             clippy == test == packaging == expected)
 
     def test_dev_push_requires_smoke_when_rust_changed_and_skips_full_jobs(self):
         states = ("success", "failure", "cancelled", "skipped")
@@ -212,14 +226,14 @@ class MacosGateTests(unittest.TestCase):
                 with self.subTest(changed=changed, smoke=smoke):
                     self.assertEqual(
                         self.accepted(DEV_PUSH="true", REUSED="false", RUST_CHANGED=changed,
-                                      DEV_SMOKE=smoke, CHECK="skipped", PACKAGING="skipped"),
+                                      DEV_SMOKE=smoke, CLIPPY="skipped", TEST="skipped", PACKAGING="skipped"),
                         smoke == expected_smoke,
                     )
         # dev_push can never be combined with reuse=true or non-skipped full jobs.
         self.assertFalse(self.accepted(DEV_PUSH="true", REUSED="true", RUST_CHANGED="true",
-                                       DEV_SMOKE="skipped", CHECK="skipped", PACKAGING="skipped"))
+                                       DEV_SMOKE="skipped", CLIPPY="skipped", TEST="skipped", PACKAGING="skipped"))
         self.assertFalse(self.accepted(DEV_PUSH="true", REUSED="false", RUST_CHANGED="true",
-                                       DEV_SMOKE="success", CHECK="success", PACKAGING="skipped"))
+                                       DEV_SMOKE="success", CLIPPY="success", TEST="skipped", PACKAGING="skipped"))
 
     def test_failed_prerequisites_cannot_pass_through_a_docs_or_reuse_skip(self):
         for prerequisite in ("CHANGES", "PROOF"):
@@ -227,13 +241,13 @@ class MacosGateTests(unittest.TestCase):
                 for reused in ("false", "true"):
                     with self.subTest(prerequisite=prerequisite, result=result, reused=reused):
                         self.assertFalse(self.accepted(**{prerequisite: result}, REUSED=reused,
-                                                       RUST_CHANGED="false", CHECK="skipped", PACKAGING="skipped"))
+                                                       RUST_CHANGED="false", CLIPPY="skipped", TEST="skipped", PACKAGING="skipped"))
 
     def test_missing_or_unknown_decision_outputs_are_rejected(self):
         for output in ("REUSED", "RUST_CHANGED", "DEV_PUSH"):
             for value in ("", "unknown"):
                 with self.subTest(output=output, value=value):
-                    self.assertFalse(self.accepted(**{output: value}, CHECK="skipped", PACKAGING="skipped"))
+                    self.assertFalse(self.accepted(**{output: value}, CLIPPY="skipped", TEST="skipped", PACKAGING="skipped"))
 
 
 class WindowsGateTests(unittest.TestCase):

@@ -4,109 +4,61 @@ use std::fs;
 
 use krill_proto::agent::Permission;
 
-thread_local! {
-    /// Stands in for the rate-limit account refresh, which can block on `security` indefinitely.
-    pub(super) static AUTO_SWITCH_PROBE: std::cell::Cell<Option<fn(&Registry)>> =
-        const { std::cell::Cell::new(None) };
-}
-
 #[test]
-fn hook_account_refresh_runs_without_blocking_other_daemon_work() {
-    fn other_work_proceeds(reg: &Registry) {
-        assert!(
-            reg.hook_commit.try_lock().is_ok(),
-            "account refresh held hook_commit, stalling Spawn, exits, and new connections"
-        );
-        let spool = reg.spool.as_ref().unwrap();
-        let next = HookEvent {
-            id: hook::EventId {
-                pid: 1,
-                unix_ns: 99,
-            },
-            agent: "claude".into(),
-            ppid: 0,
-            input: hook::Input::Complete,
-            payload: b"{}".to_vec(),
-        };
-        hook::append_spool(
-            spool,
-            &next.encode().unwrap(),
-            Instant::now() + Duration::from_millis(50),
-        )
-        .expect("account refresh held the spool lock, blocking `krill hook` appends");
-    }
+fn legacy_auto_switch_ipc_requests_are_safe_no_ops() {
+    use krill_proto::usage::{
+        AdvancedPolicy, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule, ProviderKind,
+        UsageReply, UsageRequest,
+    };
 
-    let dir = std::env::temp_dir().join(format!("hook-refresh-unlocked-{}", std::process::id()));
-    fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).unwrap();
-    let reg = Registry::new(None, Some(&dir));
-    let id = SessionId(77);
-    let root_pid = std::process::id();
-    let (master, _user) = UnixStream::pair().unwrap();
-    let session = Session::start(
-        id,
-        OwnedFd::from(master),
-        WinSize { cols: 80, rows: 24 },
-        Arc::clone(&reg.look),
-        None,
-    )
-    .unwrap();
-    {
-        let mut st = lock(&reg.state);
-        st.roots.insert(id, root_pid).unwrap();
-        st.sessions.insert(
-            id,
-            Entry {
-                session,
-                pid: root_pid,
-                cwd: dir.clone(),
-                wrapped: false,
-            },
-        );
-    }
-    let event = |unix_ns| HookEvent {
-        id: hook::EventId {
-            pid: root_pid,
-            unix_ns,
+    let root = std::env::temp_dir().join(format!("legacy-autoswitch-ipc-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("accounts.toml");
+    let raw = "[auto_switch]\nenabled = true\nthreshold_percent = 70\n";
+    fs::write(&path, raw).unwrap();
+    let reg = Registry::new(None, Some(&root));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let requests = [
+        UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
+            enabled: true,
+            threshold_percent: 50,
+            switch_on_rate_limit: true,
+            rules: Vec::new(),
+        }),
+        UsageRequest::UpsertAutoSwitchRule(AutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "claude-host".into(),
+            enabled: true,
+            threshold_percent: 60,
+            metric: AutoSwitchMetric::FiveHour,
+            target_account_id: None,
+        }),
+        UsageRequest::RemoveAutoSwitchRule {
+            provider: ProviderKind::Claude,
+            from_account_id: "claude-host".into(),
         },
-        agent: "claude".into(),
-        ppid: root_pid,
-        input: hook::Input::Complete,
-        payload: br#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#.to_vec(),
-    };
-
-    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
-    let (mut client, server) = UnixStream::pair().unwrap();
-    let hello = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "test");
-    client.write_all(&hello.encode().unwrap()).unwrap();
-    client.write_all(&event(1).encode().unwrap()).unwrap();
-    let server_hello = ServerHello {
-        proto_min: ipc::PROTO_MIN,
-        proto_max: ipc::PROTO_MAX,
-        features: ipc::FEATURES,
-        build: "test".into(),
-        instance_id: 1,
-    };
-    reg.serve(server, &server_hello).unwrap();
-    assert!(
-        AUTO_SWITCH_PROBE.take().is_none(),
-        "socket hook skipped the refresh"
-    );
-
-    AUTO_SWITCH_PROBE.set(Some(other_work_proceeds));
-    hook::append_spool(
-        reg.spool.as_ref().unwrap(),
-        &event(2).encode().unwrap(),
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap();
-    reg.drain_spool();
-    assert!(
-        AUTO_SWITCH_PROBE.take().is_none(),
-        "spooled hook skipped the refresh"
-    );
+        UsageRequest::SetAdvancedPolicy(AdvancedPolicy {
+            predict_exhaustion: true,
+            prefer_soonest_reset: true,
+            cooldown_secs: 600,
+        }),
+    ];
+    for req in requests {
+        let reply = reg.on_usage(&peer, Role::Interactive, req);
+        let UsageReply::Accounts(snapshot) = reply else {
+            panic!("expected accounts snapshot, got {reply:?}");
+        };
+        assert!(!snapshot.auto_switch.enabled);
+        assert!(snapshot.auto_switch.rules.is_empty());
+        assert!(snapshot.switched.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+    }
     drop(reg);
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1768,9 +1720,14 @@ fn orchestration_ipc_wakes_check_messages_and_enforces_worker_depth() {
         elapsed < Duration::from_secs(2),
         "condvar wakeup took too long: {elapsed:?}"
     );
-    let Reply::Orchestration(OrchResponse::Messages(msgs)) = wait_reply else {
-        panic!("expected Messages response");
+    let Reply::Orchestration(OrchResponse::Delivery {
+        delivery: Some(delivery),
+        messages: msgs,
+    }) = wait_reply
+    else {
+        panic!("expected Delivery response with acked batch, got {wait_reply:?}");
     };
+    assert!(delivery.acked);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].summary, "done");
 
@@ -4169,4 +4126,503 @@ fn bots_watcher_mask_observer_audit_oversized_and_auto_boot() {
         b.shutdown();
     }
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resuming_dormant_bot_session_after_reboot_rebinds_and_preserves_bot_identity() {
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse, CreateBotParams, ExternalSource};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("bot-reboot-resume-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let bots_root = dir.join("bots");
+    fs::create_dir_all(&bots_root).unwrap();
+    fs::create_dir_all(dir.join("agent-launches")).unwrap();
+
+    // 1. Create a bot and persist a pre-reboot runtime binding + external link + launch file.
+    let store = crate::bots::store::BotStore::new(bots_root.clone());
+    let bot = store
+        .create_bot(
+            CreateBotParams {
+                name: "크릴".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: "Reboot test bot".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let bot_home = store.bot_home(&bot);
+    fs::create_dir_all(&bot_home).unwrap();
+    let old_sid = SessionId(41_800);
+    let link = store
+        .lookup_or_create_link(
+            &bot.id,
+            ExternalSource::Slack,
+            Some("T1"),
+            "C1",
+            Some("ts1"),
+            krill_proto::bots::ActsFor::Owner,
+            1_700_000_000_500,
+        )
+        .unwrap();
+    store
+        .bind_link_session(&link.id, old_sid, 1_700_000_000_600)
+        .unwrap();
+
+    fs::write(
+        dir.join(format!("agent-launches/{}.json", old_sid.0)),
+        serde_json::json!({
+            "profile": "claude",
+            "permission": "yolo",
+            "session_id": "22222222-2222-2222-2222-222222222222",
+            "cwd": bot_home.as_os_str().as_bytes(),
+            "hibernation_blocked": false,
+            "bot_instructions": "You are 크릴, a bot that runs in Krill.",
+            "launched_at": 1_700_000_001_u64
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    fs::write(
+        bots_root.join("runtime-bindings.json"),
+        serde_json::json!([{
+            "session_id": old_sid.0,
+            "bot_id": bot.id.as_str(),
+            "link_id": link.id,
+            "chat_offset": 7,
+            "pid": 54321,
+            "label": "크릴",
+            "created_at_ms": 1_700_000_001_000_u64,
+            "owner_turn_pending": true,
+            "last_prompt": "before reboot",
+            "group_key": null,
+            "turn_seq": 3,
+            "active_turn_seq": 3
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    // 2. Cold post-reboot Registry with fake holder (0 kept live PTYs).
+    let (reg, _, _guard) = fake_holder_registry(Some(&dir));
+    reg.bind_self_arc();
+
+    // Even before Request::Resume runs, ListBotSessions must preserve the dormant session.
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let listed = reg.handle(
+        &full,
+        Request::Bot(BotRpcRequest::ListBotSessions {
+            bot_id: Some(bot.id.clone()),
+        }),
+        &mut HashMap::new(),
+    );
+    let Reply::Bot(BotRpcResponse::BotSessions(before_sessions)) = listed else {
+        panic!("expected BotSessions before resume, got {listed:?}");
+    };
+    assert_eq!(before_sessions.len(), 1);
+    assert_eq!(before_sessions[0].session_id, old_sid);
+    assert!(!before_sessions[0].live);
+    assert!(!before_sessions[0].working);
+
+    // 3. Desktop app resumes the cold pane via Request::Resume.
+    let create = Create {
+        account: None,
+        program: Program::Login,
+        cwd: bot_home.as_os_str().as_bytes().to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    let resumed = reg.handle(
+        &full,
+        Request::Resume {
+            session: old_sid,
+            create,
+        },
+        &mut HashMap::new(),
+    );
+    let Reply::Resumed {
+        session: new_sid, ..
+    } = resumed
+    else {
+        panic!("expected Resumed reply, got {resumed:?}");
+    };
+    assert_ne!(new_sid, old_sid);
+
+    // 4. BotRuntime & runtime-bindings.json must now point to new_sid (live: true), and the
+    //    external conversation link must be updated to new_sid.
+    let listed_after = reg.handle(
+        &full,
+        Request::Bot(BotRpcRequest::ListBotSessions {
+            bot_id: Some(bot.id.clone()),
+        }),
+        &mut HashMap::new(),
+    );
+    let Reply::Bot(BotRpcResponse::BotSessions(after_sessions)) = listed_after else {
+        panic!("expected BotSessions after resume, got {listed_after:?}");
+    };
+    assert_eq!(after_sessions.len(), 1);
+    assert_eq!(after_sessions[0].session_id, new_sid);
+    assert!(after_sessions[0].live);
+    assert_eq!(
+        after_sessions[0].link_id.as_deref(),
+        Some(link.id.as_str()),
+        "external link_id must survive reboot resume"
+    );
+
+    let bindings_raw = fs::read_to_string(bots_root.join("runtime-bindings.json")).unwrap();
+    assert!(
+        bindings_raw.contains(&new_sid.0.to_string()),
+        "runtime-bindings.json must persist rebound new_sid: {bindings_raw}"
+    );
+    assert!(
+        !bindings_raw.contains(&old_sid.0.to_string()),
+        "runtime-bindings.json must retire old_sid after rebind: {bindings_raw}"
+    );
+
+    let updated_link = store.get_link(&link.id).unwrap().unwrap();
+    assert_eq!(updated_link.session_id, Some(new_sid));
+
+    // 5. Verify self-healing adoption: wipe runtime-bindings.json and simulate krilld restart
+    //    where the live session's agent-launch still carries bot_instructions.
+    fs::write(bots_root.join("runtime-bindings.json"), b"[]").unwrap();
+    let fresh_rt = crate::bots::runtime::BotRuntime::with_root(bots_root.clone());
+    let adopted = fresh_rt.rehydrate_from_disk(&store, &reg);
+    assert_eq!(
+        adopted, 1,
+        "orphaned live bot session must self-heal on rehydrate"
+    );
+    assert_eq!(fresh_rt.bot_for_session(new_sid), Some(bot.id.clone()));
+
+    if let Some(b) = reg.bots_if_initialized() {
+        b.shutdown();
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn restricted_peer_cannot_create_sessions_or_bypass_enforced_signing_policy() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-dc15-restricted-create-sign-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(scope::SIGNING_POLICY_FILE),
+        "require_signed = true\n",
+    )
+    .unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let mut clients = HashMap::new();
+    let mut restricted = Peer {
+        pid: Some(4242),
+        scope: Scope::Restricted,
+    };
+
+    for program in [
+        Program::Login,
+        Program::Custom {
+            program: b"/bin/sh".to_vec(),
+            args: vec![b"-c".to_vec(), b"true".to_vec()],
+        },
+        Program::Agent {
+            id: "claude".into(),
+        },
+        Program::Agent {
+            id: "fork:s1".into(),
+        },
+    ] {
+        let req = Request::Create(Create {
+            program,
+            cwd: b"/tmp".to_vec(),
+            cols: 80,
+            rows: 24,
+            account: None,
+        });
+        assert_eq!(
+            reg.handle(&restricted, req, &mut clients),
+            Reply::Failed(Failure::Denied)
+        );
+    }
+
+    assert!(
+        reg.gate_connection_signing(&mut restricted, || None),
+        "Scope::Restricted must be rejected when peer-signing.toml is enforced"
+    );
+
+    let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
+    assert!(
+        audit.contains("deny op=create target=0 peer_pid=4242 scope=restricted"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("deny op=peer-sign target=0 peer_pid=4242 scope=restricted"),
+        "{audit}"
+    );
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discover_hook_identity_skips_exited_sessions_without_resurrecting_binding() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-dc21-hook-discovery-exited-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(701);
+    reg.agents
+        .remember_session(
+            id,
+            &control::AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            None,
+            b"/tmp".to_vec(),
+            None,
+        )
+        .unwrap();
+    let (master, _peer_end) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    {
+        let mut st = lock(&reg.state);
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: std::process::id(),
+                cwd: PathBuf::from("/tmp"),
+                wrapped: false,
+            },
+        );
+        st.exited.insert(id, 0);
+    }
+    let event = HookEvent {
+        id: hook::EventId {
+            pid: std::process::id(),
+            unix_ns: status::now_ns(),
+        },
+        agent: "claude".into(),
+        ppid: std::process::id(),
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+    };
+    reg.discover_hook_identity_in(&home, id, &event);
+    let stored = reg.agents.stored(id).unwrap().unwrap();
+    assert_eq!(stored.session_id, None);
+    assert_eq!(stored.transcript_path, None);
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_messages_v2_all_ack_returns_delivery_for_newly_acked_and_messages_for_history() {
+    use krill_proto::orchestration::{
+        MessageType, OrchAction, OrchResponse, OrchestrationStore, SendParams,
+    };
+
+    let dir = std::env::temp_dir().join(format!("krill-r2d02-all-ack-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let run = OrchestrationStore::mutate(&dir, |s| s.create_run("r2d02", None)).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    let Reply::Orchestration(OrchResponse::Dispatch(disp1)) = reg
+        .orchestration(
+            &peer,
+            OrchAction::StartWorker {
+                run_id: run.id.clone(),
+                task_id: None,
+                worker_name: "worker-1".into(),
+                agent: "claude".into(),
+                session_id: Some(101),
+                cwd: "/tmp".into(),
+                prompt: "work-1".into(),
+                depth: 1,
+                max_depth: 2,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected Dispatch response for worker-1");
+    };
+    let Reply::Orchestration(OrchResponse::Dispatch(disp2)) = reg
+        .orchestration(
+            &peer,
+            OrchAction::StartWorker {
+                run_id: run.id.clone(),
+                task_id: None,
+                worker_name: "worker-2".into(),
+                agent: "claude".into(),
+                session_id: Some(102),
+                cwd: "/tmp".into(),
+                prompt: "work-2".into(),
+                depth: 1,
+                max_depth: 2,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected Dispatch response for worker-2");
+    };
+
+    let sent = reg
+        .orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "worker-1".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: None,
+                dispatch_id: Some(disp1.id),
+                run_id: Some(run.id.clone()),
+                summary: "finished".into(),
+                body: "ok".into(),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(sent, Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1),
+        "expected SendMessage to succeed, got {sent:?}"
+    );
+
+    // First --all --ack acknowledges the unread message and must preserve Some(delivery).
+    let first = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: false,
+                ack: true,
+                wait_ms: 0,
+                run_id: None,
+                delivery_id: None,
+            },
+        )
+        .unwrap();
+    let Reply::Orchestration(OrchResponse::Delivery {
+        delivery: Some(delivery),
+        messages,
+    }) = first
+    else {
+        panic!("expected Delivery with Some(delivery) for newly acked --all --ack, got {first:?}");
+    };
+    assert!(delivery.acked);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].summary, "finished");
+
+    // Second --all --ack returns only already-acked history (delivery = None) as Messages.
+    let second = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: false,
+                ack: true,
+                wait_ms: 0,
+                run_id: None,
+                delivery_id: None,
+            },
+        )
+        .unwrap();
+    let Reply::Orchestration(OrchResponse::Messages(history)) = second else {
+        panic!("expected Messages for already-acked history with delivery=None, got {second:?}");
+    };
+    assert_eq!(history.len(), 1);
+
+    // Legacy CheckMessagesLegacy always returns Messages even when unread mail is delivered.
+    let legacy_sent = reg
+        .orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "worker-2".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: None,
+                dispatch_id: Some(disp2.id),
+                run_id: Some(run.id),
+                summary: "legacy".into(),
+                body: "ok".into(),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(legacy_sent, Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1),
+        "expected legacy SendMessage to succeed, got {legacy_sent:?}"
+    );
+    let legacy = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessagesLegacy {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: true,
+                ack: true,
+                wait_ms: 0,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        legacy,
+        Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1
+    ));
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn strip_bracketed_paste_end_removes_nested_escape_sequences_to_fixed_point() {
+    for payload in [
+        b"hello \x1b[201~world".as_slice(),
+        b"\x1b[\x1b[201~201~\r/cmd",
+        b"\x1b[\x1b[\x1b[201~201~201~injected",
+        b"a\x1b[2\x1b[201~01~b",
+    ] {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"\x1b[200~");
+        Registry::strip_bracketed_paste_end(payload, &mut framed);
+        let body = &framed[6..];
+        assert!(
+            !body.windows(6).any(|w| w == b"\x1b[201~"),
+            "stripped paste body still contains ESC[201~: {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    let mut nested = Vec::new();
+    Registry::strip_bracketed_paste_end(b"\x1b[\x1b[201~201~\r/cmd", &mut nested);
+    assert_eq!(nested, b"\r/cmd");
 }

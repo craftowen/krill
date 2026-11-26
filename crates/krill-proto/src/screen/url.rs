@@ -726,7 +726,7 @@ fn normalize_osc8_links(rows: &mut [Vec<Cell>], links: &mut [Vec<Link>]) {
             let Some(clean_uri) = tail_matches_uri(&uri, &clean_text, &tail_text) else {
                 continue;
             };
-            let Some(last_kept) = clean_slice.last() else {
+            let Some(last_kept) = clean_slice.iter().rev().find(|c| c.width > 0) else {
                 continue;
             };
             let kept_end_line = last_kept.line;
@@ -901,7 +901,7 @@ fn normalize_unstyled_runs(rows: &mut [Vec<Cell>], links: &[Vec<Link>]) {
             if !has_valid_authority(&clean_text) {
                 continue;
             }
-            let Some(last_kept) = clean_slice.last() else {
+            let Some(last_kept) = clean_slice.iter().rev().find(|c| c.width > 0) else {
                 continue;
             };
             let kept_end_line = last_kept.line;
@@ -1417,6 +1417,92 @@ mod tests {
         }
         let end_col = 2usize.saturating_add(usize::from(c1));
         for c in r1_row.get(10..end_col).unwrap() {
+            assert!(!c.flags.contains(Flags::LINK));
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_final_cell_with_combining_or_zerowidth_marks() {
+        let blue = Color::Indexed(4);
+        let make_url_cells = |flags: Flags, fg: Color| -> Vec<Cell> {
+            let mut cells = row_from_str("https://example.com/cafe", flags, fg);
+            cells.last_mut().unwrap().zerowidth.push('\u{0301}');
+            cells.extend(row_from_str(")하면", flags, fg));
+            cells
+        };
+
+        // OSC 8 URL ending with combining mark (`e` + U+0301) followed by `)하면`.
+        let mut row = row_from_str("(", Flags::default(), Color::Default);
+        let start = u16::try_from(row.len()).unwrap();
+        let linked = make_url_cells(Flags::LINK | Flags::UNDERLINE, blue);
+        let link_cols = u16::try_from(linked.len()).unwrap();
+        row.extend(linked);
+        let mut rows = vec![row];
+        let mut links = vec![vec![Link {
+            column: start,
+            cols: link_cols,
+            uri: "https://example.com/cafe\u{0301})하면".into(),
+        }]];
+        normalize_screen_links(&mut rows, &mut links);
+        assert_eq!(links[0][0].cols, 24);
+        assert_eq!(links[0][0].uri, "https://example.com/cafe\u{0301}");
+        let kept_end = usize::from(start) + 24;
+        let orig_end = usize::from(start + link_cols);
+        for c in &rows[0][usize::from(start)..kept_end] {
+            assert!(c.flags.contains(Flags::LINK));
+            assert!(c.flags.contains(Flags::UNDERLINE));
+            assert_eq!(c.fg, blue);
+        }
+        for c in &rows[0][kept_end..orig_end] {
+            assert!(!c.flags.contains(Flags::LINK));
+            assert!(!c.flags.contains(Flags::UNDERLINE));
+            assert_eq!(c.fg, Color::Default);
+        }
+
+        // SGR-4 bare URL ending with combining mark followed by `)하면`.
+        let mut row = row_from_str("(", Flags::default(), Color::Default);
+        let start = row.len();
+        row.extend(make_url_cells(Flags::UNDERLINE, blue));
+        let end = row.len();
+        let mut rows = vec![row];
+        let mut links = vec![Vec::new()];
+        normalize_screen_links(&mut rows, &mut links);
+        let kept_end = start + 24;
+        for c in &rows[0][start..kept_end] {
+            assert!(c.flags.contains(Flags::UNDERLINE));
+            assert_eq!(c.fg, blue);
+        }
+        for c in &rows[0][kept_end..end] {
+            assert!(!c.flags.contains(Flags::UNDERLINE));
+            assert_eq!(c.fg, Color::Default);
+        }
+
+        // Wide char with zerowidth variation selector before `)하면`.
+        let mut row = row_from_str("(", Flags::default(), Color::Default);
+        let start = u16::try_from(row.len()).unwrap();
+        let mut linked = row_from_str("https://example.com/한", Flags::LINK, blue);
+        // Attach U+FE0F to the wide base cell (second-to-last, before its SPACER).
+        let base_idx = linked.len() - 2;
+        linked[base_idx].zerowidth.push('\u{fe0f}');
+        let wide_url_cols = u16::try_from(linked.len()).unwrap();
+        linked.extend(row_from_str(")하면", Flags::LINK, blue));
+        let link_cols = u16::try_from(linked.len()).unwrap();
+        row.extend(linked);
+        let mut rows = vec![row];
+        let mut links = vec![vec![Link {
+            column: start,
+            cols: link_cols,
+            uri: "https://example.com/한\u{fe0f})하면".into(),
+        }]];
+        normalize_screen_links(&mut rows, &mut links);
+        assert_eq!(links[0][0].cols, wide_url_cols);
+        assert_eq!(links[0][0].uri, "https://example.com/한\u{fe0f}");
+        let kept_end = usize::from(start + wide_url_cols);
+        let orig_end = usize::from(start + link_cols);
+        for c in &rows[0][usize::from(start)..kept_end] {
+            assert!(c.flags.contains(Flags::LINK));
+        }
+        for c in &rows[0][kept_end..orig_end] {
             assert!(!c.flags.contains(Flags::LINK));
         }
     }

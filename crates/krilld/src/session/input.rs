@@ -2,6 +2,7 @@
 
 use crate::os::OwnedFd;
 use std::sync::TryLockError;
+use std::time::Instant;
 
 use super::{BorrowedFd, Duration, MutexGuard, Tap, io, thread};
 use crate::os::AsFd as _;
@@ -12,6 +13,9 @@ use rustix::io::{Errno, write};
 
 const START: &[u8] = b"\x1b[200~";
 const END: &[u8] = b"\x1b[201~";
+/// Split-frame grace window for a partial bracketed-paste `START` prefix (`0x1b`, `\x1b[`, ...).
+/// Beyond this window, a standalone `Esc` keypress must not block interrupts or guarded commands.
+const PARTIAL_START_GRACE: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const WAIT: Timespec = Timespec {
     tv_sec: 0,
@@ -22,6 +26,7 @@ const WAIT: Timespec = Timespec {
 pub(super) struct State {
     paste: bool,
     matched: usize,
+    matched_at: Option<Instant>,
     owner: Option<thread::ThreadId>,
     peer: Option<OwnedFd>,
 }
@@ -35,7 +40,24 @@ impl State {
                 .is_some_and(|fd| disconnected(fd.as_fd()).unwrap_or(false))
     }
 
+    fn expire_stale_start_prefix(&mut self) {
+        if !self.paste
+            && self.matched > 0
+            && self
+                .matched_at
+                .is_none_or(|at| at.elapsed() >= PARTIAL_START_GRACE)
+        {
+            self.matched = 0;
+            self.matched_at = None;
+            self.owner = None;
+            self.peer = None;
+        }
+    }
+
     fn record(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         for &byte in bytes {
             let marker = if self.paste { END } else { START };
             if marker.get(self.matched) == Some(&byte) {
@@ -48,6 +70,7 @@ impl State {
                 self.matched = usize::from(byte == 0x1b);
             }
         }
+        self.matched_at = (!self.paste && self.matched > 0).then(Instant::now);
     }
 
     fn finish(&mut self, tap: &Tap) -> io::Result<()> {
@@ -59,6 +82,7 @@ impl State {
         };
         self.paste = false;
         self.matched = 0;
+        self.matched_at = None;
         self.owner = None;
         self.peer = None;
         result
@@ -231,6 +255,7 @@ fn write_command(
         .lock()
         .map_err(|_| io::Error::other("Terminal client state unavailable"))?;
     let mut live = tap.0.live();
+    state.expire_stale_start_prefix();
     if clients.sleeping
         || state.paste
         || state.matched != 0
@@ -260,6 +285,7 @@ fn write_command(
         Ok(written) => written,
         Err(err) => {
             state.matched = 0;
+            state.matched_at = None;
             state.owner = None;
             return Err(err);
         }
@@ -307,7 +333,7 @@ pub(super) fn guarded_enter(
     tap: &Tap,
     accepts: impl Fn(&krill_proto::screen::Screen) -> bool,
 ) -> io::Result<bool> {
-    let state = tap
+    let mut state = tap
         .0
         .input
         .try_lock()
@@ -318,6 +344,7 @@ pub(super) fn guarded_enter(
         .lock()
         .map_err(|_| io::Error::other("Terminal client state unavailable"))?;
     let mut live = tap.0.live();
+    state.expire_stale_start_prefix();
     if clients.sleeping || state.paste || state.matched != 0 || !accepts(&live.engine.screen()) {
         return Ok(false);
     }
@@ -382,8 +409,10 @@ pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>)
     if state.orphaned(owner) {
         state.finish(tap)?;
         state.matched = 0;
+        state.matched_at = None;
         state.peer = None;
     }
+    state.expire_stale_start_prefix();
     if !state.paste && state.matched == 0 {
         state.owner = Some(owner);
         state.peer = None;
@@ -459,8 +488,10 @@ pub(super) fn write_interrupt(tap: &Tap, still_working: impl FnOnce() -> bool) -
     if state.orphaned(owner) {
         state.finish(tap)?;
         state.matched = 0;
+        state.matched_at = None;
         state.peer = None;
     }
+    state.expire_stale_start_prefix();
     if state.paste || state.matched != 0 || !still_working() {
         return Ok(false);
     }
@@ -497,6 +528,7 @@ pub(super) fn finish_input(tap: &Tap) {
     if state.owner == Some(thread::current().id()) {
         state.finish(tap).ok();
         state.matched = 0;
+        state.matched_at = None;
         state.owner = None;
         state.peer = None;
     }

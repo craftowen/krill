@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.3.26"
+version = "0.3.29"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -18,6 +18,8 @@ krill-proto = { path = "crates/krill-proto" }
 krill-version = { path = "crates/krill-version" }
 krill-ui = { path = "crates/krill-ui" }
 krill-app-core = { path = "crates/krill-app-core" }
+krill-bots-ui = { path = "crates/krill-bots-ui" }
+krill-app-shell = { path = "crates/krill-app-shell" }
 krill-term = { path = "crates/krill-term" }
 krill-holder = { path = "crates/krill-holder" }
 krill-log = { path = "crates/krill-log" }
@@ -195,7 +197,8 @@ opt-level = 2
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# ThinLTO preserves cross-CGU optimization while unlocking parallel LLVM codegen across cores.
+codegen-units = 16
 debug = "line-tables-only"
 split-debuginfo = "packed"
 overflow-checks = true

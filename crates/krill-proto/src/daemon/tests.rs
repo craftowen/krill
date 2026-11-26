@@ -1126,3 +1126,61 @@ fn paused_watch_reader_still_times_out_when_daemon_is_hung() {
     .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 }
+
+#[test]
+fn partial_pong_frame_timeout_does_not_retry_mid_frame() {
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let (partial_sent_tx, partial_sent_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let answer = thread::spawn(move || {
+        let (kind, body) = ipc::read_frame(&mut server).unwrap().unwrap();
+        let nonce = ping_nonce(kind, &body).unwrap();
+        let frame = pong(nonce).unwrap();
+        server.write_all(&frame[..2]).unwrap();
+        partial_sent_tx.send(()).unwrap();
+        done_rx.recv().ok();
+    });
+
+    let mut reads = 0u32;
+    let err = watch_for_with(
+        &mut client,
+        Duration::from_millis(50),
+        Duration::from_millis(80),
+        || {
+            reads = reads.saturating_add(1);
+            if reads == 1 {
+                partial_sent_rx.recv().unwrap();
+            }
+        },
+    )
+    .unwrap_err();
+    done_tx.send(()).ok();
+    answer.join().unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        reads, 1,
+        "timed-out partial frame must abort immediately instead of retrying mid-frame"
+    );
+}
+
+#[test]
+fn sibling_exe_from_strips_windows_verbatim_prefix_and_finds_siblings() {
+    let d = dir("sibling-exe");
+    std::fs::create_dir_all(&d).unwrap();
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let app = d.join(format!("krill-app{suffix}"));
+    let cli = d.join(format!("krill{suffix}"));
+    std::fs::write(&app, b"").unwrap();
+    std::fs::write(&cli, b"").unwrap();
+
+    let canonical_app = std::fs::canonicalize(&app).unwrap();
+    let found = sibling_exe_from(&canonical_app, "krill").unwrap();
+    assert_eq!(found, crate::os::canonicalize(&cli).unwrap());
+    #[cfg(windows)]
+    assert!(
+        !found.to_string_lossy().starts_with(r"\\?\"),
+        "Windows sibling_exe must strip verbatim prefix: {}",
+        found.display()
+    );
+    std::fs::remove_dir_all(&d).ok();
+}

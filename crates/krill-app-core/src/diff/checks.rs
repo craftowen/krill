@@ -344,7 +344,11 @@ impl Panel {
     }
 
     pub fn toggle_pr_draft(&mut self, cx: &mut Context<Self>) {
-        if self.checks.loading || self.checks.merging || self.remote_host() {
+        if self.checks.loading
+            || self.checks.merging
+            || self.checks.pending_merge.is_some()
+            || self.remote_host()
+        {
             return;
         }
         let Some(pr) = &self.checks.inspection else {
@@ -356,31 +360,50 @@ impl Panel {
             _ => return,
         };
         self.checks.loading = true;
+        self.checks.merging = true;
         self.checks.fix_status = None;
+        self.checks.action_error = None;
         let repo = self.repo.clone();
+        let bg_repo = repo.clone();
+        let generation = self.checks.generation;
         let branch_override = self.checks.branch_override.clone();
         let service = Arc::clone(&self.editing.pr_service);
-        self.checks.task = Some(cx.spawn(async move |this, cx| {
+        self.checks.merge_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let (branch, _) =
-                        resolve_branch_and_empty_state(&repo, branch_override.as_deref());
+                        resolve_branch_and_empty_state(&bg_repo, branch_override.as_deref());
                     let Some(branch) = branch else {
                         return Err(text::GH_FAILED.get());
                     };
-                    service.set_draft(&repo, &branch, to_draft)
+                    service.set_draft(&bg_repo, &branch, to_draft)
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // The retained mutation task owns the busy state even across hide or repo switch.
                 this.checks.loading = false;
-                match result {
-                    Ok(()) => {
-                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                this.checks.merging = false;
+                if this.repo != repo || this.checks.generation != generation {
+                    if this.visible && this.tab == PanelTab::Checks {
                         this.refresh_checks(cx);
                     }
-                    Err(_) => {
-                        this.checks.fix_status = Some(text::ACTION_FAILED);
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.checks.action_error = None;
+                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                        if this.visible && this.tab == PanelTab::Checks {
+                            this.refresh_checks(cx);
+                        } else {
+                            this.checks.inspection = None;
+                        }
+                    }
+                    Err(reason) => {
+                        this.checks.action_error =
+                            Some(text::ACTION_FAILED.format(&[("reason", reason)]));
                     }
                 }
                 cx.notify();
@@ -408,11 +431,10 @@ impl Panel {
     }
 
     pub(super) fn open_external_url(url: &str, cx: &mut Context<Self>) {
-        let url = url.trim();
-        if url.is_empty() {
+        let Some(clean) = sanitized_external_url(url) else {
             return;
-        }
-        cx.open_url(url);
+        };
+        cx.open_url(&clean);
     }
 
     pub(super) fn open_review_comment_location(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -422,14 +444,8 @@ impl Panel {
         let Some(comment) = pr.review_comments.get(idx) else {
             return;
         };
-        let rel = comment.path.trim();
-        if rel.is_empty() {
+        let Some(path) = resolve_review_comment_path(&self.repo, &comment.path) else {
             return;
-        }
-        let path = if Path::new(rel).is_absolute() {
-            std::path::PathBuf::from(rel)
-        } else {
-            self.repo.join(rel)
         };
         let line = comment.display_line().unwrap_or(1).max(1);
         cx.emit(super::OpenFileAt {
@@ -1447,5 +1463,243 @@ impl Panel {
             .child(footer)
             .children(self.render_merge_confirmation(window, cx))
             .into_any_element()
+    }
+}
+
+fn resolve_review_comment_path(repo: &Path, raw: &str) -> Option<std::path::PathBuf> {
+    let rel = raw.trim();
+    if rel.is_empty()
+        || rel.contains('\0')
+        || rel.starts_with('/')
+        || rel.starts_with('\\')
+        || Path::new(rel).is_absolute()
+    {
+        return None;
+    }
+    // Reject Windows drive-prefixed paths (e.g. `C:\foo` or `C:foo`) even on Unix hosts.
+    if rel.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && rel.as_bytes().get(1) == Some(&b':')
+    {
+        return None;
+    }
+    let mut clean_rel = std::path::PathBuf::new();
+    for component in Path::new(rel).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                if part.to_str().is_some_and(|s| s.contains('\\')) {
+                    return None;
+                }
+                clean_rel.push(part);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    if clean_rel.as_os_str().is_empty() {
+        return None;
+    }
+    let joined = repo.join(&clean_rel);
+    if let Ok(repo_canon) = krill_proto::os::canonicalize(repo) {
+        if joined.symlink_metadata().is_ok() {
+            let joined_canon = krill_proto::os::canonicalize(&joined).ok()?;
+            if !joined_canon.starts_with(&repo_canon) || joined_canon == repo_canon {
+                return None;
+            }
+        } else {
+            for ancestor in joined.ancestors().skip(1) {
+                if ancestor.symlink_metadata().is_ok() {
+                    let anc_canon = krill_proto::os::canonicalize(ancestor).ok()?;
+                    if !anc_canon.starts_with(&repo_canon) {
+                        return None;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Some(joined)
+}
+
+fn sanitized_external_url(url: &str) -> Option<String> {
+    let clean = crate::terminal::path_link::sanitize_external_url(url)?;
+    let is_http = clean
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || clean
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    is_http.then_some(clean)
+}
+
+#[cfg(test)]
+mod checks_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_review_comment_path_rejects_traversal_absolute_and_escaping_symlinks() {
+        let base =
+            std::env::temp_dir().join(format!("krill-review-path-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+
+        assert_eq!(
+            resolve_review_comment_path(&repo, "src/main.rs"),
+            Some(repo.join("src/main.rs"))
+        );
+        assert_eq!(
+            resolve_review_comment_path(&repo, "./src/deleted.rs"),
+            Some(repo.join("src/deleted.rs"))
+        );
+        for blocked in [
+            "",
+            "   ",
+            ".",
+            "/etc/passwd",
+            "../../outside/secret.txt",
+            "src/../../outside/secret.txt",
+            "C:\\Windows\\win.ini",
+            "\\etc\\passwd",
+            "src\\..\\secret.txt",
+            "src/main.rs\0.txt",
+        ] {
+            assert_eq!(
+                resolve_review_comment_path(&repo, blocked),
+                None,
+                "blocked review path must be rejected: {blocked:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.txt"), repo.join("escape_file"))
+                .unwrap();
+            std::os::unix::fs::symlink(&outside, repo.join("escape_dir")).unwrap();
+            assert_eq!(resolve_review_comment_path(&repo, "escape_file"), None);
+            assert_eq!(
+                resolve_review_comment_path(&repo, "escape_dir/secret.txt"),
+                None
+            );
+            assert_eq!(
+                resolve_review_comment_path(&repo, "escape_dir/nonexistent.txt"),
+                None
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    use crate::pull_request::{Action, Runner, Service};
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    struct DraftRunner {
+        fail: Mutex<bool>,
+    }
+
+    impl Runner for DraftRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::Open)
+        }
+
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            Ok(PrInspection {
+                status: Status::Draft,
+                number: Some(7),
+                title: "Draft toggle".into(),
+                url: "https://github.com/acme/krill/pull/7".into(),
+                ..PrInspection::default()
+            })
+        }
+
+        fn set_pr_draft(&self, _: &Path, _: &str, _: bool) -> io::Result<()> {
+            if *self.fail.lock().unwrap() {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn toggle_pr_draft_formats_action_error_and_clears_on_retry(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| crate::i18n::set_language(crate::i18n::Language::En, cx));
+        let runner = Arc::new(DraftRunner {
+            fail: Mutex::new(true),
+        });
+        let service = Arc::new(Service::new(runner.clone()));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = Panel::unconnected(PathBuf::from("/fake/worktree"), cx);
+            panel.set_pr_service(service);
+            panel.set_checks_branch("feature/draft");
+            panel.checks.inspection = Some(PrInspection {
+                status: Status::Open,
+                number: Some(7),
+                title: "Draft toggle".into(),
+                url: "https://github.com/acme/krill/pull/7".into(),
+                ..PrInspection::default()
+            });
+            panel.tab = PanelTab::Checks;
+            panel
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| view.update(cx, Panel::toggle_pr_draft));
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.checks.fix_status.is_none());
+            let err = panel.checks.action_error.as_deref().unwrap();
+            assert!(
+                !err.contains("{reason}"),
+                "placeholder must be formatted: {err}"
+            );
+            assert!(err.contains(text::TIMED_OUT.get()), "{err}");
+        });
+
+        *runner.fail.lock().unwrap() = false;
+        cx.update(|_, cx| view.update(cx, Panel::toggle_pr_draft));
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.checks.action_error.is_none(),
+                "starting a retry must clear the stale action error immediately"
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.checks.action_error.is_none());
+            assert_eq!(panel.checks.fix_status, Some(text::ACTION_SUCCESS));
+        });
+    }
+
+    #[test]
+    fn sanitized_external_url_allows_only_safe_http_urls() {
+        assert_eq!(
+            sanitized_external_url("  https://github.com/acme/krill/pull/42  ").as_deref(),
+            Some("https://github.com/acme/krill/pull/42")
+        );
+        assert_eq!(
+            sanitized_external_url("http://example.com/checks/1").as_deref(),
+            Some("http://example.com/checks/1")
+        );
+        for blocked in [
+            "",
+            "   ",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>alert(1)</script>",
+            "mailto:attacker@example.com",
+            "https://github.com/acme/krill\nnewline",
+            "https://github.com/acme/\u{202E}krill",
+        ] {
+            assert_eq!(sanitized_external_url(blocked), None, "{blocked:?}");
+        }
     }
 }

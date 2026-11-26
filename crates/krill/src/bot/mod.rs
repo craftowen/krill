@@ -66,11 +66,11 @@ Soul, Memory & Tidy:
   tidy [<bot>] [run | status | undo [<tidy-id>]] [--json]
 
 Items Inbox:
-  items [<bot>] [ls [--status planned|working|needs_you|done|canceled] [--all]
+  items [<bot>] [ls [--status planned|working|waiting|needs_you|done|canceled] [--all]
                     [--include-snoozed] [--limit <N>] [--cursor <c> | --page <N>]
                  | show <item-id>
-                 | add <title> [--body <text>] [--done-means <text>] [--status <st>] [--link <kind:target>...]
-                 | update <item-id> [--status <st>] [--title <t>] [--body <b>] [--done-means <d>]
+                 | add <title> [--body <text>] [--done-means <text>] [--status <st>] [--note <text>] [--link <kind:target>...]
+                 | update <item-id> [--status <st>] [--note <text>] [--title <t>] [--body <b>] [--done-means <d>]
                           [--comment <c>] [--close-note <n>] [--snooze <until>|--unsnooze]
                           [--ask <q> | --question <q> [--option <opt>... [--recommended <idx>]]]
                  | answer <item-id> [--text <str> | --option <idx>] [--decision-id <id>] [--request-id <id>]
@@ -211,9 +211,9 @@ pub(crate) fn format_session_refusal(
     refusal.message_en(host.or(Some("this computer")))
 }
 
-impl BotClient for DaemonBotClient {
-    fn call(&mut self, request: BotRpcRequest) -> Result<BotRpcResponse, CliError> {
-        let encoded = Request::Bot(request)
+impl DaemonBotClient {
+    fn send_once(&mut self, request: &BotRpcRequest) -> Result<BotRpcResponse, CliError> {
+        let encoded = Request::Bot(request.clone())
             .encode()
             .map_err(|e| CliError::fail(format!("encode bot request: {e}")))?;
         let conn = self.ensure_connected()?;
@@ -243,6 +243,29 @@ impl BotClient for DaemonBotClient {
             Reply::Failed(failure) => Err(CliError::fail(failure.to_string())),
             _ => Err(CliError::fail("unexpected non-bot reply from krilld")),
         }
+    }
+}
+
+impl BotClient for DaemonBotClient {
+    fn call(&mut self, request: BotRpcRequest) -> Result<BotRpcResponse, CliError> {
+        if matches!(
+            request,
+            BotRpcRequest::ListItems { .. }
+                | BotRpcRequest::ListItemsPage { .. }
+                | BotRpcRequest::GetBotItem { .. }
+        ) {
+            let wrapped = BotRpcRequest::WithCapabilities {
+                capabilities: krill_proto::bots::DESKTOP_BOT_CAPABILITIES
+                    .iter()
+                    .map(|cap| (*cap).to_owned())
+                    .collect(),
+                request: Box::new(request.clone()),
+            };
+            if let Ok(resp) = self.send_once(&wrapped) {
+                return Ok(resp);
+            }
+        }
+        self.send_once(&request)
     }
 }
 

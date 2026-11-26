@@ -90,7 +90,7 @@ pub(super) fn post(
 ) -> io::Result<(u16, serde_json::Value)> {
     use std::fmt::Write as _;
     use std::io::{Read as _, Write as _};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     let url = format!("{origin}{path}");
     let parsed = origin
         .strip_prefix("https://")
@@ -115,12 +115,7 @@ pub(super) fn post(
         )
         .map_err(io::Error::other)?;
     }
-    let mut command = Command::new("curl");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000);
-    }
+    let mut command = krill_proto::os::background_command("curl");
     let mut child = command
         .args([
             "--disable",

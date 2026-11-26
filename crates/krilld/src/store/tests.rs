@@ -1420,3 +1420,107 @@ fn paused_clear_scrollback_breaks_archive_history_chain_and_cold_clear_recognize
     assert_eq!(store.archive(resumed2).unwrap().len(), 0);
     fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn reclaim_empty_segment_recovers_truncated_trailing_segment_after_paused_restart() {
+    use super::Piece;
+
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("zero-bytes", Vec::new()),
+        ("truncated-header", b"MKSG\x01\x00".to_vec()),
+        ("corrupt-header", vec![0_u8; segment::HEADER_LEN]),
+    ];
+    for (tag, bad_bytes) in cases {
+        let root = tmp(&format!("dc11-{tag}"));
+        let id = SessionId(31);
+        {
+            let store = Store::open(&root, Limits::default()).unwrap();
+            let mut rec = store.recorder(id, SIZE).unwrap();
+            rec.append(b"before-crash");
+            rec.seal();
+        }
+        let trailing = root
+            .join("sessions")
+            .join("31.noindex")
+            .join("seg-00000000000000000012.krs");
+        fs::write(&trailing, &bad_bytes).unwrap();
+        fs::write(root.join("settings.toml"), "recording_paused = true\n").unwrap();
+
+        {
+            let store = Store::open(&root, Limits::default()).unwrap();
+            let mut rec = store.recorder(id, SIZE).unwrap();
+            assert_eq!(rec.seq(), 12);
+            assert!(trailing.exists(), "paused open must not mutate disk");
+            store.set_paused(false);
+            rec.append(b"after");
+            rec.seal();
+        }
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let mut datas = Vec::new();
+        store
+            .raw(id, 0, u64::MAX, |piece| {
+                if let Piece::Data { bytes, .. } = piece {
+                    datas.extend_from_slice(&bytes);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(datas, b"before-crashafter", "case {tag}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Valid v2 header with truncated salt (< HEADER_LEN + SALT_LEN) is reclaimable; full header+salt is not.
+    let v2_root = tmp("dc11-v2-salt");
+    fs::create_dir_all(&v2_root).unwrap();
+    let v2_header = Header {
+        base: Base::Continue,
+        encrypted: true,
+        session: SessionId(31),
+        start_seq: 12,
+        size: SIZE,
+    }
+    .encode_with_keyframe(segment::KEYFRAME_NONE);
+    let short_salt = v2_root.join("short-salt.krs");
+    let mut short_bytes = v2_header.to_vec();
+    short_bytes.extend_from_slice(&[0xAB; 8]);
+    fs::write(&short_salt, &short_bytes).unwrap();
+    assert!(segment::is_reclaimable_unreadable(&short_salt));
+    let full_salt = v2_root.join("full-salt.krs");
+    let mut full_bytes = v2_header.to_vec();
+    full_bytes.extend_from_slice(&[0xAB; super::crypto::SALT_LEN]);
+    fs::write(&full_salt, &full_bytes).unwrap();
+    assert!(!segment::is_reclaimable_unreadable(&full_salt));
+    fs::remove_dir_all(&v2_root).ok();
+
+    // Valid future-version header (valid magic + valid CRC) must never be reclaimed.
+    let root = tmp("dc11-future");
+    let id = SessionId(32);
+    {
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let mut rec = store.recorder(id, SIZE).unwrap();
+        rec.append(b"before-crash");
+        rec.seal();
+    }
+    let mut future = Vec::with_capacity(segment::HEADER_LEN);
+    future.extend_from_slice(&segment::MAGIC);
+    future.extend_from_slice(&99_u16.to_le_bytes());
+    future.push(Base::Continue as u8);
+    future.push(segment::KEYFRAME_NONE);
+    future.extend_from_slice(&id.0.to_le_bytes());
+    future.extend_from_slice(&12_u64.to_le_bytes());
+    future.extend_from_slice(&SIZE.cols.to_le_bytes());
+    future.extend_from_slice(&SIZE.rows.to_le_bytes());
+    future.extend_from_slice(&crc32fast::hash(&future).to_le_bytes());
+    let trailing = root
+        .join("sessions")
+        .join("32.noindex")
+        .join("seg-00000000000000000012.krs");
+    fs::write(&trailing, &future).unwrap();
+    fs::write(root.join("settings.toml"), "recording_paused = true\n").unwrap();
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, SIZE).unwrap();
+    store.set_paused(false);
+    rec.append(b"after");
+    assert_eq!(fs::read(&trailing).unwrap(), future);
+    fs::remove_dir_all(&root).ok();
+}

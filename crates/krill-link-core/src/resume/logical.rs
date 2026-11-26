@@ -338,19 +338,21 @@ impl Logical {
                     }
                 }
                 Incoming::Fin(offset) => {
-                    self.with(|l| {
+                    let already_fin = self.with(|l| {
                         if offset == l.rx_committed {
-                            Ok(())
+                            Ok(l.rx_fin)
                         } else {
                             Err(Error::Protocol("invalid final offset"))
                         }
                     })?;
-                    unix.shutdown().await.map_err(Error::Io)?;
-                    self.with(|l| {
-                        l.rx_fin = true;
-                        Ok(())
-                    })?;
-                    self.changed.notify_waiters();
+                    if !already_fin {
+                        unix.shutdown().await.map_err(Error::Io)?;
+                        self.with(|l| {
+                            l.rx_fin = true;
+                            Ok(())
+                        })?;
+                        self.changed.notify_waiters();
+                    }
                 }
             }
         }
@@ -420,8 +422,15 @@ impl Logical {
         let mut tick = tokio::time::interval(ACK_DELAY);
         loop {
             let notified = self.changed.notified();
-            let (ack, fin, tx_fin, tx_next) =
-                self.with(|l| Ok((l.rx_committed, l.rx_fin, l.tx_fin, l.tx_next)))?;
+            let (ack, fin, tx_fin, tx_fin_acked, tx_next) = self.with(|l| {
+                Ok((
+                    l.rx_committed,
+                    l.rx_fin,
+                    l.tx_fin,
+                    l.tx_fin_acked,
+                    l.tx_next,
+                ))
+            })?;
             if previous_ack != Some((ack, fin))
                 && (fin
                     || previous_ack.is_none()
@@ -479,7 +488,7 @@ impl Logical {
                 cursor = end;
                 continue;
             }
-            if tx_fin && cursor == tx_next && !fin_sent {
+            if tx_fin && !tx_fin_acked && cursor == tx_next && !fin_sent {
                 send.write_all(
                     &Header {
                         kind: Kind::Fin,
@@ -506,9 +515,32 @@ enum Incoming {
 
 fn read_error(error: iroh::endpoint::ReadExactError) -> Error {
     match error {
-        iroh::endpoint::ReadExactError::ReadError(iroh::endpoint::ReadError::ConnectionLost(e)) => {
-            Error::Transport(e.to_string())
+        iroh::endpoint::ReadExactError::ReadError(e) => Error::Transport(e.to_string()),
+        iroh::endpoint::ReadExactError::FinishedEarly(_) => {
+            Error::Transport("peer closed transport stream".to_owned())
         }
-        _ => Error::Protocol("peer closed logical stream"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_reset_and_early_fin_are_transport_errors_not_fatal_protocol_errors() {
+        use iroh::endpoint::{ConnectionError, ReadError, ReadExactError, VarInt};
+
+        for err in [
+            ReadExactError::ReadError(ReadError::ConnectionLost(ConnectionError::TimedOut)),
+            ReadExactError::ReadError(ReadError::Reset(VarInt::from_u32(0))),
+            ReadExactError::ReadError(ReadError::ClosedStream),
+            ReadExactError::FinishedEarly(0),
+            ReadExactError::FinishedEarly(5),
+        ] {
+            assert!(
+                matches!(read_error(err), Error::Transport(_)),
+                "transport stream close/reset must allow generation takeover"
+            );
+        }
     }
 }

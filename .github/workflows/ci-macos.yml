@@ -160,18 +160,12 @@ jobs:
           python3 packaging/macos/test_pipeline.py
           python3 packaging/homebrew/test_release.py
 
-  check:
-    name: clippy · nextest (${{ matrix.os }})
+  clippy:
+    name: clippy (macos-15)
     needs: [changes, reuse]
     if: (github.event_name != 'push' || github.ref != 'refs/heads/dev') && needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
-    # 테스트 프로필 최적화 수준([profile.test] + [profile.test.package."*"] + krilld/krill-term)은
-    # 루트 Cargo.toml이 단일 진실원천이다. env로 CARGO_PROFILE_TEST_OPT_LEVEL을 덮어쓰지 않는다.
+    runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -182,11 +176,6 @@ jobs:
         with:
           toolchain: "1.98"
           components: rustfmt, clippy
-
-      - name: nextest
-        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
-        with:
-          tool: cargo-nextest,cargo-deny
 
       - name: Stage cacheable vendored dependencies
         id: vendor
@@ -200,23 +189,75 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
-          shared-key: ci-${{ matrix.os }}
+          shared-key: ci-macos-15
           cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
-          cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+          save-if: 'false'
 
       - name: Verify restored vendor and external configuration
         run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
+      - name: Verify CI shard coverage
+        run: python3 packaging/ci_shards.py verify
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        timeout-minutes: 60
+        timeout-minutes: 45
+
+  # 동시 macOS 러너 5대 무료 한도 준수: clippy(1) + nextest 3샤드(gui·daemon·core) + packaging(1) = 5대.
+  # 캐시 10 GiB 한도 보호: 전체 외부·vendor 의존성을 포함하는 gui 샤드만 캐시를 저장하고 나머지는 읽기 전용으로 쓴다.
+  test:
+    name: nextest (macos-15, ${{ matrix.shard }})
+    needs: [changes, reuse]
+    if: (github.event_name != 'push' || github.ref != 'refs/heads/dev') && needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [gui, daemon, core]
+    runs-on: macos-15
+    timeout-minutes: 90
+    # 테스트 프로필 최적화 수준([profile.test] + [profile.test.package."*"] + krilld/krill-term)은
+    # 루트 Cargo.toml이 단일 진실원천이다. env로 CARGO_PROFILE_TEST_OPT_LEVEL을 덮어쓰지 않는다.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 1.98
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.98"
+
+      - name: nextest
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: cargo-nextest
+
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        run: |
+          python3 packaging/vendor_cache.py stage --case producer \
+            --cargo-home "$CARGO_HOME" --vendor-root /tmp/krill-ci-vendor \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Restore Rust dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
+          shared-key: ci-macos-15
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
+          cache-bin: 'false'
+          cache-on-failure: true
+          save-if: ${{ matrix.shard == 'gui' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
+      - name: Verify restored vendor and external configuration
+        run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
       - name: nextest
         # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
-        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings
-        timeout-minutes: 120
+        run: python3 packaging/ci_shards.py run ${{ matrix.shard }} --timings
+        timeout-minutes: 75
 
       - name: FLAKY report (unknown flaky passes fail)
         if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
@@ -226,7 +267,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ci-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          name: ci-macos-15-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
             target/cargo-timings/
@@ -236,7 +277,7 @@ jobs:
   # 새 캐시 저장 후 구버전 중복 캐시를 정리해 저장소 10 GiB 한도 초과로 인한 축출을 막는다.
   prune-caches:
     name: prune stale caches
-    needs: [check, dev-smoke]
+    needs: [test, dev-smoke]
     if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/release/nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -256,7 +297,7 @@ jobs:
   # required check용 고정 이름 잡. macOS 잡들의 성공 또는 의도된 생략만 허용한다.
   ci-macos:
     name: ci-macos
-    needs: [changes, check, packaging, dev-smoke, reuse]
+    needs: [changes, clippy, test, packaging, dev-smoke, reuse]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -264,7 +305,8 @@ jobs:
       - name: 결과 집계
         env:
           CHANGES: ${{ needs.changes.result }}
-          CHECK: ${{ needs.check.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
           PACKAGING: ${{ needs.packaging.result }}
           DEV_SMOKE: ${{ needs.dev-smoke.result }}
           DEV_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
@@ -272,23 +314,26 @@ jobs:
           REUSED: ${{ needs.reuse.outputs.reuse }}
           RUST_CHANGED: ${{ needs.changes.outputs.rust }}
         run: |
-          echo "changes=$CHANGES check=$CHECK packaging=$PACKAGING dev_smoke=$DEV_SMOKE dev_push=$DEV_PUSH proof=$PROOF reuse=$REUSED rust=$RUST_CHANGED"
+          echo "changes=$CHANGES clippy=$CLIPPY test=$TEST packaging=$PACKAGING dev_smoke=$DEV_SMOKE dev_push=$DEV_PUSH proof=$PROOF reuse=$REUSED rust=$RUST_CHANGED"
           [ "$CHANGES" = success ]
           [ "$PROOF" = success ]
           case "$DEV_PUSH:$REUSED:$RUST_CHANGED" in
             true:false:true)
               [ "$DEV_SMOKE" = success ]
-              [ "$CHECK" = skipped ]
+              [ "$CLIPPY" = skipped ]
+              [ "$TEST" = skipped ]
               [ "$PACKAGING" = skipped ]
               ;;
             true:false:false|false:true:true|false:true:false|false:false:false)
               [ "$DEV_SMOKE" = skipped ]
-              [ "$CHECK" = skipped ]
+              [ "$CLIPPY" = skipped ]
+              [ "$TEST" = skipped ]
               [ "$PACKAGING" = skipped ]
               ;;
             false:false:true)
               [ "$DEV_SMOKE" = skipped ]
-              [ "$CHECK" = success ]
+              [ "$CLIPPY" = success ]
+              [ "$TEST" = success ]
               [ "$PACKAGING" = success ]
               ;;
             *) exit 1 ;;

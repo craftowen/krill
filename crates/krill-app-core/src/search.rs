@@ -237,13 +237,13 @@ impl Render for Bar {
                 cx.stop_propagation();
                 bar.step(Direction::Next, cx);
             }))
-            .capture_action(cx.listener(|bar, _: &Enter, window, cx| {
-                if bar.input_is_composing(window, cx) {
+            .capture_action(cx.listener(|bar, action: &Enter, window, cx| {
+                if action.secondary || bar.input_is_composing(window, cx) {
                     return;
                 }
                 cx.stop_propagation();
                 // OWE-868: ⇧Enter는 이전 찾기(표준 단축키). Enter·↓는 다음, ↑는 이전이다.
-                if window.modifiers().shift {
+                if action.shift || window.modifiers().shift {
                     bar.step(Direction::Previous, cx);
                 } else {
                     bar.step(Direction::Next, cx);

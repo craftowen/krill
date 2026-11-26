@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.3.26"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "krill-hosts",
@@ -3809,36 +3809,29 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.3.26"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
- "image",
  "krill-app-core",
+ "krill-app-shell",
+ "krill-bots-ui",
  "krill-hosts",
  "krill-link",
- "krill-log",
  "krill-proto",
  "krill-term",
- "krill-ui",
  "krill-version",
  "krilld",
- "postcard",
  "proptest",
- "regex",
  "ring",
  "rustix",
  "rustix-openpty",
  "serde",
  "serde_json",
- "sha2 0.11.1",
- "sysinfo",
- "tokio",
  "toml 1.1.8+spec-1.1.0",
- "tracing",
 ]
 
 [[package]]
@@ -3876,8 +3869,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "krill-app-shell"
+version = "0.0.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "krill-app-core",
+ "krill-bots-ui",
+ "krill-hosts",
+ "krill-link-core",
+ "krill-log",
+ "krill-proto",
+ "krill-term",
+ "krill-ui",
+ "krilld",
+ "postcard",
+ "proptest",
+ "rustix",
+ "rustix-openpty",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "krill-bots-ui"
+version = "0.0.0"
+dependencies = [
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "krill-app-core",
+ "krill-proto",
+ "krill-ui",
+ "regex",
+ "rustix",
+ "serde_json",
+]
+
+[[package]]
 name = "krill-holder"
-version = "0.3.26"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "krill-log",
@@ -3902,7 +3942,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.3.26"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "iroh",
@@ -4008,11 +4048,11 @@ dependencies = [
 
 [[package]]
 name = "krill-version"
-version = "0.3.26"
+version = "0.3.29"
 
 [[package]]
 name = "krilld"
-version = "0.3.26"
+version = "0.3.29"
 dependencies = [
  "aes",
  "alacritty_terminal",

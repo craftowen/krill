@@ -3,6 +3,21 @@
 use super::{Failure, Launch, Path, Peer, Registry, Reply, control, lock, os};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, Response, VaultAgent, VaultTarget};
+use std::collections::HashSet;
+use std::sync::{Condvar, Mutex, PoisonError};
+
+struct ConversationResumeGuard<'a> {
+    gate: &'a (Mutex<HashSet<(VaultAgent, String)>>, Condvar),
+    key: (VaultAgent, String),
+}
+
+impl Drop for ConversationResumeGuard<'_> {
+    fn drop(&mut self) {
+        let (mtx, cvar) = self.gate;
+        lock(mtx).remove(&self.key);
+        cvar.notify_all();
+    }
+}
 
 impl Registry {
     pub(super) fn agent_history(&self, peer: &Peer, action: Action) -> Result<Reply, Failure> {
@@ -39,6 +54,21 @@ impl Registry {
                     return Err(Failure::BadRequest);
                 }
                 target
+            }
+        };
+        // Serialize concurrent Resume/ResumeVault for the same conversation so two agents
+        // never spawn as simultaneous writers to the same transcript or SQLite DB.
+        let _claim = {
+            let key = (target.agent, target.id.clone());
+            let (mtx, cvar) = &self.resuming_conversations;
+            let mut active = lock(mtx);
+            while active.contains(&key) {
+                active = cvar.wait(active).unwrap_or_else(PoisonError::into_inner);
+            }
+            active.insert(key.clone());
+            ConversationResumeGuard {
+                gate: &self.resuming_conversations,
+                key,
             }
         };
         let live: Vec<SessionId> = {
@@ -432,6 +462,133 @@ mod tests {
         assert_eq!(recorded_acc.env_key, "ANTIGRAVITY_CLI_HOME");
         assert_eq!(recorded_acc.dir, agy_profile.display().to_string());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_resume_vault_for_same_conversation_spawns_only_once() {
+        use crate::holder::Holder;
+        use crate::holder::link::Link;
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dc23-concurrent-resume-vault-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let ws = dir.join("workspace");
+        let agy_profile = dir.join("profiles/agy/work-slot");
+        let conv_id = "66666666-2222-4333-8444-555555555555";
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(
+            agy_profile
+                .join(".gemini/antigravity-cli/brain")
+                .join(conv_id),
+        )
+        .unwrap();
+
+        let (krilld_end, holder_end) = UnixStream::pair().unwrap();
+        holder_end
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for m in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+        let reg = Arc::new(Registry::new(Some((holder, Vec::new())), Some(&dir)));
+        let reg_reader = Arc::clone(&reg);
+        let reader_worker = std::thread::spawn(move || {
+            reg_reader.holder.as_ref().unwrap().run(link, |_, _| {});
+        });
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let spawn_count_holder = Arc::clone(&spawn_count);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_holder = Arc::clone(&done);
+        let holder_worker = std::thread::spawn(move || {
+            let mut keep_ptys = Vec::new();
+            while !done_holder.load(Ordering::Acquire) {
+                match holder_link.recv() {
+                    Ok(Some(pkt)) => {
+                        if let Ok(ToHolder::Spawn { req, id, .. }) = ToHolder::decode(pkt.frame()) {
+                            spawn_count_holder.fetch_add(1, Ordering::SeqCst);
+                            // Hold the first spawn open so the concurrent caller definitely races on the claim.
+                            std::thread::sleep(Duration::from_millis(120));
+                            let (master, pty) = UnixStream::pair().unwrap();
+                            keep_ptys.push(pty);
+                            holder_link
+                                .send(
+                                    &FromHolder::Spawned { req, id, pid: 901 }.encode().unwrap(),
+                                    &[master.as_fd()],
+                                )
+                                .unwrap();
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            keep_ptys
+        });
+
+        let start = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let reg = Arc::clone(&reg);
+                let start = Arc::clone(&start);
+                let ws_str = ws.display().to_string();
+                std::thread::spawn(move || {
+                    let full = Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    };
+                    start.wait();
+                    reg.agent_history(
+                        &full,
+                        Action::ResumeVault(VaultTarget {
+                            agent: VaultAgent::Agy,
+                            id: conv_id.into(),
+                            cwd: ws_str,
+                            modified: 1,
+                        }),
+                    )
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap().unwrap());
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results[1]);
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "concurrent ResumeVault calls must spawn at most one live writer"
+        );
+
+        done.store(true, Ordering::Release);
+        let _ptys = holder_worker.join().unwrap();
+        reader_worker.join().unwrap();
+        drop(reg);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

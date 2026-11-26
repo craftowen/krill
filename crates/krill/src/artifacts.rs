@@ -17,7 +17,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Read as _;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 
 use krill_proto::artifacts::{
     self as schema, Archetype, ArtifactTheme, ErrorDetail, ErrorOutput, LinkStatus,
@@ -979,7 +979,7 @@ fn request_with_idempotency(
             .open(&header_file)?;
         f.write_all(headers.as_bytes())?;
         drop(f);
-        let mut cmd = Command::new(&ctx.curl);
+        let mut cmd = krill_proto::os::background_command(&ctx.curl);
         cmd.args([
             "-sS",
             "--max-time",

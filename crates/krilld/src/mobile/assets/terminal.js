@@ -9,13 +9,19 @@
     doc?.addEventListener?.(
       type,
       (e) => {
-        if (e.touches.length > 1) e.preventDefault();
+        if (e.touches.length > 1 && e.cancelable) e.preventDefault();
       },
       options,
     );
 
   for (const type of ["gesturestart", "gesturechange"])
-    doc?.addEventListener?.(type, (e) => e.preventDefault(), options);
+    doc?.addEventListener?.(
+      type,
+      (e) => {
+        if (e.cancelable) e.preventDefault();
+      },
+      options,
+    );
 })();
 
 globalThis.MkKeyboard = (() => {
@@ -301,7 +307,27 @@ globalThis.MkTerminalCodec = (() => {
     r.end();
     return reply;
   }
-  return { v, text, frame, reader, update, history };
+  function historyView(bytes) {
+    const r = reader(bytes),
+      req = r.n(0xffffffff),
+      view = r.u(),
+      session = r.u(),
+      epoch = [r.u(), r.u(), r.u()],
+      status = r.n(3);
+    if (r.bool()) {
+      r.u();
+      if (r.n(1) === 1) r.n(0xffffffff);
+      r.u();
+      r.u();
+      for (let i = 0; i < 32; i++) r.byte();
+    }
+    const skip = Number(r.u()),
+      total = Number(r.u()),
+      complete = r.bool(),
+      rows = Array.from({ length: r.n(1000) }, () => cells(r));
+    return { req, view, session, epoch, status, skip, total, complete, rows };
+  }
+  return { v, text, frame, reader, update, history, historyView };
 })();
 
 (() => {
@@ -713,6 +739,10 @@ globalThis.MkTerminalCodec = (() => {
       this.inputId = 0;
       this.historyId = 0;
       this.historyVersion = 0;
+      this.historyViewSupported = false;
+      this.resyncErrors = 0;
+      this.lastScrollTop = 0;
+      this.programmaticScroll = false;
       this.pan = null;
       this.pinch = null;
       this.pinchTimer = null;
@@ -751,12 +781,19 @@ globalThis.MkTerminalCodec = (() => {
     }
     guard(action) {
       const generation = this.generation;
+      const fail = (e) => {
+        if (this.disposed || generation !== this.generation) return;
+        if (e?.disconnected) {
+          if (!["disconnected", "ended", "denied"].includes(this.phase))
+            this.disconnect("disconnected", "Disconnected");
+          return;
+        }
+        this.error(e);
+      };
       try {
-        Promise.resolve(action()).catch((e) => {
-          if (!this.disposed && generation === this.generation) this.error(e);
-        });
+        Promise.resolve(action()).catch(fail);
       } catch (e) {
-        if (generation === this.generation) this.error(e);
+        fail(e);
       }
     }
     status(phase, message, error) {
@@ -1013,7 +1050,6 @@ globalThis.MkTerminalCodec = (() => {
       accessory.append(this.capture);
       this.dock.append(this.question, accessory, inputRow);
       this.root.append(this.frame, this.dock);
-      let lastTop = 0;
       this.listen(this.historyButton, "click", () =>
         this.guard(() => this.loadHistory()),
       );
@@ -1022,25 +1058,44 @@ globalThis.MkTerminalCodec = (() => {
         "scroll",
         () => {
           // 맨 아래에서는 화면 위 틈으로 스크롤백 끝줄이 비친다. 그 줄은 위로 스크롤해야 갱신되어 옛 내용이 남는다.
-          this.root.dataset.liveBottom = String(this.atBottom(1));
-          const top = this.port.scrollTop,
-            up = top < lastTop && !this.alt,
+          const bottom = this.atBottom(2);
+          this.root.dataset.liveBottom = String(bottom);
+          const top = this.port.scrollTop;
+          if (this.programmaticScroll) {
+            this.lastScrollTop = top;
+            return;
+          }
+          const delta = top - this.lastScrollTop,
+            up = delta < -0.5 && !this.alt,
+            down = delta > 0.5 && !this.alt,
             refresh =
               up &&
               this.stick &&
               this.historyLoadedVersion !== this.historyVersion;
-          if (top > lastTop && this.nearWindowBottom()) {
-            lastTop = top;
-            this.returnToLive();
-            return;
+          if (down && this.historyWindowed) {
+            this.lastScrollTop = top;
+            if (this.historyViewActive) {
+              if (
+                this.port.scrollHeight - top - this.port.clientHeight <
+                this.historyThreshold()
+              )
+                this.guard(() => this.loadNewerHistory());
+              this.syncLatest();
+              this.syncQuestion();
+              return;
+            }
+            if (this.nearWindowBottom()) {
+              this.returnToLive();
+              return;
+            }
           }
           const now = this.now(),
             elapsed = now - (this.historyScrollAt ?? now);
           this.historyVelocity =
-            up && elapsed > 0 ? (lastTop - top) / elapsed : 0;
+            up && elapsed > 0 ? -delta / elapsed : 0;
           this.historyScrollAt = now;
-          lastTop = top;
-          this.stick = this.atBottom(1);
+          this.lastScrollTop = top;
+          this.stick = bottom;
           this.syncLatest();
           this.syncQuestion();
           if (refresh || (up && top < this.historyThreshold()))
@@ -1084,9 +1139,21 @@ globalThis.MkTerminalCodec = (() => {
             e.preventDefault();
             return;
           }
-          if (e.deltaY > 0 && this.nearWindowBottom()) {
-            this.returnToLive();
-            return;
+          if (e.deltaY > 0 && this.historyWindowed) {
+            if (this.historyViewActive) {
+              if (
+                this.port.scrollHeight -
+                  this.port.scrollTop -
+                  this.port.clientHeight <
+                this.historyThreshold()
+              )
+                this.guard(() => this.loadNewerHistory());
+              return;
+            }
+            if (this.nearWindowBottom()) {
+              this.returnToLive();
+              return;
+            }
           }
           if (
             !this.alt &&
@@ -1195,13 +1262,19 @@ globalThis.MkTerminalCodec = (() => {
           const pan = this.pan,
             pinch = this.pinch;
           if (pinch && e.touches.length === 2) {
-            e.preventDefault();
+            if (e.cancelable) e.preventDefault();
+            const d = distance(e.touches);
+            if (!(pinch.distance > 0)) {
+              if (d > 0) pinch.distance = d;
+              return;
+            }
+            if (!(d > 0)) return;
             const mid = midpoint(e.touches);
             pinch.midX = mid.x;
             pinch.midY = mid.y;
             this.previewScale = Math.max(
               0.5,
-              Math.min(2, (pinch.scale * distance(e.touches)) / pinch.distance),
+              Math.min(2, (pinch.scale * d) / pinch.distance),
             );
             for (const el of [this.canvas, this.textLayer]) {
               el.style.transformOrigin = "top left";
@@ -1252,32 +1325,47 @@ globalThis.MkTerminalCodec = (() => {
               this.port.scrollHeight > this.port.clientHeight
             ) {
               if (e.cancelable) e.preventDefault();
-              this.port.scrollTop = Math.max(
-                0,
-                Math.min(
-                  this.port.scrollHeight - this.port.clientHeight,
-                  (this.port.scrollTop || 0) - stepY,
+              this.setScrollTop(
+                Math.max(
+                  0,
+                  Math.min(
+                    this.port.scrollHeight - this.port.clientHeight,
+                    (this.port.scrollTop || 0) - stepY,
+                  ),
                 ),
               );
             }
-            if (dy < -6 && !pan.pulled && this.nearWindowBottom()) {
-              pan.pulled = true;
-              this.returnToLive();
+            if (dy < -6 && !pan.pulled && this.historyWindowed) {
+              if (this.historyViewActive) {
+                if (
+                  this.port.scrollHeight -
+                    this.port.scrollTop -
+                    this.port.clientHeight <
+                  this.historyThreshold()
+                ) {
+                  pan.pulled = true;
+                  this.guard(() => this.loadNewerHistory());
+                }
+              } else if (this.nearWindowBottom()) {
+                pan.pulled = true;
+                this.returnToLive();
+              }
             } else if (
               dy > 6 &&
               !pan.pulled &&
-              this.canScrollHistory(pan.live) &&
-              (pan.live || this.port.scrollTop < this.historyThreshold())
+              this.canScrollHistory(pan.live)
             ) {
-              pan.pulled = true;
-              this.stick = false;
-              this.latestButton.hidden = false;
-              this.guard(() =>
-                this.loadHistory(
-                  false,
-                  pan.live && this.historyLoadedVersion !== this.historyVersion,
-                ),
-              );
+              const stale =
+                  pan.live &&
+                  this.historyLoadedVersion !== this.historyVersion,
+                needInitial = !this.historyRows.length && !this.historyEnd,
+                nearTop = this.port.scrollTop < this.historyThreshold();
+              if (stale || needInitial || nearTop) {
+                pan.pulled = true;
+                this.stick = false;
+                this.latestButton.hidden = false;
+                this.guard(() => this.loadHistory(false, stale));
+              }
             }
           }
         },
@@ -1297,10 +1385,10 @@ globalThis.MkTerminalCodec = (() => {
         this.pinch = null;
         this.canvas.style.transform = this.textLayer.style.transform = "";
         this.setFontScale(this.previewScale || this.fontScale);
-        const ratio = this.fontScale / prevScale;
-        if (ratio !== 1) {
+        const ratio = prevScale > 0 ? this.fontScale / prevScale : 1;
+        if (Number.isFinite(ratio) && ratio > 0 && ratio !== 1) {
           this.port.scrollLeft = Math.max(0, (left + midX) * ratio - midX);
-          this.port.scrollTop = Math.max(0, (top + midY) * ratio - midY);
+          this.setScrollTop(Math.max(0, (top + midY) * ratio - midY));
           this.stick = false;
         }
         clearTimeout(this.pinchTimer);
@@ -1763,12 +1851,12 @@ globalThis.MkTerminalCodec = (() => {
         s = this.port.scrollTop || 0;
       if (dir > 0 ? s > lo + 0.5 : s < hi - 0.5) {
         if (g.touch || (this.alt && this.fit && this.historyElement.hidden)) {
-          this.port.scrollTop = Math.max(lo, Math.min(hi, s - d));
+          this.setScrollTop(Math.max(lo, Math.min(hi, s - d)));
           d -= s - this.port.scrollTop;
           if (Math.abs(d) < 0.5) return true;
         } else return null;
       }
-      if (s < lo - 0.5) this.port.scrollTop = lo;
+      if (s < lo - 0.5) this.setScrollTop(lo);
       const step = this.wheelStep();
       g.rem += d;
       let n = Math.trunc(g.rem / step);
@@ -1826,7 +1914,10 @@ globalThis.MkTerminalCodec = (() => {
           C.concat(T.v(++this.inputId), T.v(bytes.length), bytes),
         );
       } catch (e) {
-        this.error(e);
+        if (e?.disconnected) {
+          if (!["disconnected", "ended", "denied"].includes(this.phase))
+            this.disconnect("disconnected", "Disconnected");
+        } else this.error(e);
         return false;
       }
       return true;
@@ -1926,7 +2017,7 @@ globalThis.MkTerminalCodec = (() => {
         }
         this.historyElement.hidden = this.historyControls.hidden = true;
         this.canvas.hidden = this.textLayer.hidden = false;
-        this.port.scrollTop = 0;
+        this.setScrollTop(0);
         this.stick = true;
         this.latestButton.hidden = true;
         return;
@@ -2810,10 +2901,14 @@ globalThis.MkTerminalCodec = (() => {
         if (this.disposed) return;
         this.keyboardInset = inset;
         const open = inset > 80;
-        if (open && this.root.dataset.keyboardOpen !== "true")
-          (globalThis.requestAnimationFrame || setTimeout)(() =>
-            this.revealCursor(),
-          );
+        if (
+          open &&
+          this.root.dataset.keyboardOpen !== "true" &&
+          (this.stick || this.hasKeyboardFocus())
+        )
+          (globalThis.requestAnimationFrame || setTimeout)(() => {
+            if (this.stick || this.hasKeyboardFocus()) this.revealCursor();
+          });
         this.root.dataset.keyboardOpen = String(open);
         this.updateLiveInput();
         this.queueFit();
@@ -2926,8 +3021,19 @@ globalThis.MkTerminalCodec = (() => {
           this.ready &&
           !this.fitPending &&
           !this.disposed
-        )
-          this.guard(() => this.resize());
+        ) {
+          const generation = this.generation;
+          Promise.resolve(this.resize()).catch((e) => {
+            if (
+              this.disposed ||
+              generation !== this.generation ||
+              e?.disconnected ||
+              e?.message === "Terminal resize rejected"
+            )
+              return;
+            this.error(e);
+          });
+        }
       }, 150);
     }
 
@@ -2951,6 +3057,54 @@ globalThis.MkTerminalCodec = (() => {
             top >= p.scrollTop &&
             top + this.cellHeight <= p.scrollTop + p.clientHeight));
     }
+    setScrollTop(next) {
+      if (!Number.isFinite(next)) return;
+      this.programmaticScroll = true;
+      try {
+        this.port.scrollTop = next;
+        this.lastScrollTop = this.port.scrollTop;
+      } finally {
+        this.programmaticScroll = false;
+      }
+    }
+    captureHistoryAnchor() {
+      const children = this.historyElement?.children;
+      if (!children?.length || typeof this.port.getBoundingClientRect !== "function")
+        return null;
+      const pr = this.port.getBoundingClientRect();
+      if (!Number.isFinite(pr?.top)) return null;
+      let lo = 0,
+        hi = children.length - 1,
+        best = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1,
+          r = children[mid]?.getBoundingClientRect?.();
+        if (!r || !Number.isFinite(r.bottom)) break;
+        if (r.bottom > pr.top + 1) {
+          best = mid;
+          hi = mid - 1;
+        } else lo = mid + 1;
+      }
+      const node = children[best],
+        rect = node?.getBoundingClientRect?.();
+      return node && rect && Number.isFinite(rect.top)
+        ? { node, top: rect.top }
+        : null;
+    }
+    restoreHistoryAnchor(anchor, fallbackDelta = 0) {
+      let delta = null;
+      if (
+        anchor?.node &&
+        anchor.node.isConnected !== false &&
+        typeof anchor.node.getBoundingClientRect === "function"
+      ) {
+        const after = anchor.node.getBoundingClientRect()?.top;
+        if (Number.isFinite(after) && Number.isFinite(anchor.top))
+          delta = after - anchor.top;
+      }
+      if (delta === null && Number.isFinite(fallbackDelta)) delta = fallbackDelta;
+      if (delta) this.setScrollTop((this.port.scrollTop || 0) + delta);
+    }
     returnToLive() {
       if (this.historyWindowed) {
         this.resetHistory();
@@ -2959,7 +3113,7 @@ globalThis.MkTerminalCodec = (() => {
       this.scrollBottom();
     }
     scrollBottom() {
-      this.port.scrollTop = this.port.scrollHeight;
+      this.setScrollTop(this.port.scrollHeight);
       this.stick = true;
       this.root.dataset.liveBottom = "true";
       this.latestButton.hidden = true;
@@ -3031,7 +3185,7 @@ globalThis.MkTerminalCodec = (() => {
               C.concat(
                 T.v(1),
                 T.v(1),
-                T.v((1n << 56n) | 1n | 4n | 4096n | 8192n),
+                T.v((1n << 56n) | (1n << 24n) | 1n | 4n | 4096n | 8192n),
                 T.v(0),
                 T.text("krill-mobile-grid"),
               ),
@@ -3056,7 +3210,9 @@ globalThis.MkTerminalCodec = (() => {
             const hello = T.reader(bytes.slice(5));
             hello.n();
             hello.n();
-            this.modesSupported = !!(hello.u() & 8192n);
+            const feats = hello.u();
+            this.modesSupported = !!(feats & 8192n);
+            this.historyViewSupported = !!(feats & (1n << 24n));
             phase = 3;
             return;
           }
@@ -3079,6 +3235,7 @@ globalThis.MkTerminalCodec = (() => {
                 if (!result.done) this.syncQuestion();
                 for (const y of result.dirty) this.dirty.add(y);
                 if (result.done) {
+                  this.resyncErrors = 0;
                   this.screenComplete = true;
                   this.historyVersion = (this.historyVersion || 0) + 1;
                   clearTimeout(this.connectionTimer);
@@ -3109,13 +3266,20 @@ globalThis.MkTerminalCodec = (() => {
                   this.syncQuestion();
                 }
               } catch (error) {
-                this.send(0x11);
+                try {
+                  this.send(0x11);
+                } catch {}
+                if (this.ready && (this.resyncErrors = (this.resyncErrors || 0) + 1) <= 3)
+                  break;
                 throw error;
               }
               break;
             }
             case 0x26:
               this.receiveHistory(T.history(body));
+              break;
+            case 0x2d:
+              this.receiveHistoryView(T.historyView(body));
               break;
             case 0x27: {
               const id = r.n(),
@@ -3208,8 +3372,11 @@ globalThis.MkTerminalCodec = (() => {
       }
     }
     send(kind, body) {
-      if (!this.socket || this.socket.readyState !== 1 || !this.channel)
-        throw Error("Terminal disconnected");
+      if (!this.socket || this.socket.readyState !== 1 || !this.channel) {
+        const err = Error("Terminal disconnected");
+        err.disconnected = true;
+        throw err;
+      }
       this.socket.send(this.channel.seal(T.frame(kind, body)));
     }
 
@@ -3228,7 +3395,7 @@ globalThis.MkTerminalCodec = (() => {
         top = origin + c.line * this.cellHeight,
         bottom = origin + (last + 1) * this.cellHeight;
       if (top < p.scrollTop || bottom > p.scrollTop + p.clientHeight)
-        p.scrollTop = Math.min(top, bottom - p.clientHeight);
+        this.setScrollTop(Math.min(top, bottom - p.clientHeight));
     }
     input(text, { reveal = true, question = false } = {}) {
       if (this.disposed || this.retired || !this.ready)
@@ -3478,6 +3645,11 @@ globalThis.MkTerminalCodec = (() => {
       this.historySkip = 0;
       this.historyTotal = null;
       this.historyHotTotal = null;
+      this.historyViewActive = false;
+      this.historyViewToken = 0n;
+      this.historyWindowStart = 0;
+      this.historyWindowEnd = 0;
+      this.historySeam = null;
       this.historyPending = null;
       this.historyQueued = null;
       this.historyNeedsInitialLoad = true;
@@ -3517,10 +3689,52 @@ globalThis.MkTerminalCodec = (() => {
 
       if (refresh) {
         this.historyReplacing = true;
+        this.historyViewActive = false;
+        this.historyViewToken = 0n;
+        this.historyWindowStart = 0;
+        this.historyWindowEnd = 0;
+        this.historySeam = null;
         count = Math.min(1000, Math.max(count, this.historyRows.length));
       }
-      const req = ++this.historyId,
-        source = refresh ? null : this.historySource,
+      const req = ++this.historyId;
+      this.historyButton.disabled = true;
+      this.historyStatus.textContent = translate("Loading earlier output…");
+      // Keep idle/live-bottom warming on stateless 0x12 reads (0 daemon RAM retained);
+      // lazily upgrade to frozen deduplicated 0x18 HistoryView once the user actually scrolls up into cold pages.
+      const useView =
+        this.historyViewSupported &&
+        !refresh &&
+        (!this.stick || reveal === true) &&
+        (this.historyViewActive || this.historySource !== null);
+      if (useView) {
+        const opening = !this.historyViewActive,
+          view = opening ? 0n : this.historyViewToken || 0n,
+          skip = opening ? this.historyRows.length : this.historyWindowEnd || 0;
+        this.historyPending = {
+          req,
+          view,
+          skip,
+          count,
+          opening,
+          direction: "older",
+          refresh: false,
+          reveal: this.historyReveal,
+          replace: this.historyReplacing,
+          started: this.now(),
+          version: this.historyVersion || 0,
+        };
+        try {
+          this.send(
+            0x18,
+            C.concat(T.v(req), T.v(view), T.v(skip), T.v(count)),
+          );
+        } catch (e) {
+          this.clearPendingHistory();
+          throw e;
+        }
+        return;
+      }
+      const source = refresh ? null : this.historySource,
         skip = refresh ? 0 : this.historySkip;
       this.historyPending = {
         req,
@@ -3532,8 +3746,6 @@ globalThis.MkTerminalCodec = (() => {
         started: this.now(),
         version: this.historyVersion || 0,
       };
-      this.historyButton.disabled = true;
-      this.historyStatus.textContent = translate("Loading earlier output…");
       try {
         this.send(
           0x12,
@@ -3548,6 +3760,157 @@ globalThis.MkTerminalCodec = (() => {
         this.clearPendingHistory();
         throw e;
       }
+    }
+
+    loadNewerHistory(count = 300) {
+      if (
+        !this.historyViewActive ||
+        !this.ready ||
+        this.disposed ||
+        this.alt ||
+        !(this.historyWindowStart > 0)
+      )
+        return;
+      this.expireStaleHistory();
+      if (this.historyPending) return;
+      const seam = this.historySeam,
+        base =
+          seam &&
+          seam.coldStart > seam.hotEnd &&
+          this.historyWindowStart === seam.coldStart
+            ? seam.hotEnd
+            : this.historyWindowStart,
+        floor =
+          seam &&
+          seam.coldStart > seam.hotEnd &&
+          this.historyWindowStart > seam.coldStart
+            ? seam.coldStart
+            : 0,
+        want = Math.min(count, base - floor),
+        skip = base - want,
+        req = ++this.historyId,
+        view = this.historyViewToken || 0n;
+      this.historyPending = {
+        req,
+        view,
+        skip,
+        count: want,
+        targetEnd: base,
+        direction: "newer",
+        refresh: false,
+        reveal: false,
+        replace: false,
+        started: this.now(),
+        version: this.historyLoadedVersion,
+      };
+      try {
+        this.send(0x18, C.concat(T.v(req), T.v(view), T.v(skip), T.v(want)));
+      } catch (e) {
+        this.clearPendingHistory();
+        throw e;
+      }
+    }
+
+    logicalLines(rows) {
+      const textOf = (row) =>
+        row
+          .map((c) => (c.flags & 16 ? "" : c.flags & 256 ? " " : c.text))
+          .join("");
+      const out = [];
+      for (let i = 0; i < rows.length; ) {
+        const start = i;
+        let text = textOf(rows[i]);
+        while (
+          i + 1 < rows.length &&
+          rows[i].length > 0 &&
+          (rows[i][rows[i].length - 1].flags & 1024) !== 0
+        ) {
+          i++;
+          text += textOf(rows[i]);
+        }
+        const tailWrapped =
+          rows[i].length > 0 && (rows[i][rows[i].length - 1].flags & 1024) !== 0;
+        out.push({ text: text.trimEnd(), start, end: i + 1, tailWrapped });
+        i++;
+      }
+      return out;
+    }
+
+    stripReflowedSeam(olderChron, replySkip, replyLen) {
+      const seam = this.historySeam;
+      if (!seam || seam.resolved || !olderChron.length || !seam.hotLines.length)
+        return olderChron;
+      const cold = this.logicalLines(olderChron),
+        hot = seam.hotLines,
+        limit = seam.cursor;
+      if (!cold.length || limit <= 0) {
+        seam.resolved = true;
+        return olderChron;
+      }
+      const lineMatch = (hotLine, coldLine, ci, hi) =>
+        hotLine.text === coldLine.text ||
+        (coldLine.tailWrapped &&
+          ci === cold.length - 1 &&
+          hotLine.text.startsWith(coldLine.text)) ||
+        (ci === 0 &&
+          coldLine.text.length >= 4 &&
+          (hotLine.text.endsWith(coldLine.text) ||
+            hotLine.text.startsWith(coldLine.text))) ||
+        (hi === 0 &&
+          hotLine.text.length >= 4 &&
+          coldLine.text.endsWith(hotLine.text));
+      let anchorH = -1,
+        anchorC = -1;
+      const maxProbe = seam.matched ? 1 : Math.min(cold.length, 64);
+      for (let off = 0; off < maxProbe && anchorH < 0; off++) {
+        const startC = cold.length - 1 - off,
+          probe = cold[startC];
+        if (!probe.text && cold.length > 1) continue;
+        for (let h = limit - 1; h >= 0; h--) {
+          if (!lineMatch(hot[h], probe, startC, h)) continue;
+          let ok = true,
+            checked = 1;
+          for (let k = 1; k < Math.min(6, startC + 1, h + 1); k++) {
+            const ci = startC - k,
+              hi = h - k;
+            if (!lineMatch(hot[hi], cold[ci], ci, hi)) {
+              ok = false;
+              break;
+            }
+            checked++;
+          }
+          if (ok && (checked >= 2 || probe.text.length >= 12 || startC === 0)) {
+            anchorH = h;
+            anchorC = startC;
+            break;
+          }
+        }
+      }
+      if (anchorH < 0) {
+        seam.resolved = true;
+        return olderChron;
+      }
+      seam.matched = true;
+      let c = anchorC,
+        h = anchorH;
+      while (c >= 0 && h >= 0) {
+        if (!lineMatch(hot[h], cold[c], c, h)) break;
+        c--;
+        h--;
+      }
+      const firstMatchedIdx = c + 1;
+      if (firstMatchedIdx >= cold.length) {
+        seam.resolved = true;
+        return olderChron;
+      }
+      const cutRow = cold[firstMatchedIdx].start;
+      seam.coldStart = replySkip + (replyLen - cutRow);
+      seam.cursor =
+        c < 0 && h + 1 >= 0 && hot[h + 1] && cold[0].text !== hot[h + 1].text
+          ? h + 2
+          : Math.max(0, h + 1);
+      if (cutRow > 0 || seam.cursor === 0) seam.resolved = true;
+      return olderChron.slice(0, cutRow);
     }
 
     historyRow(row, styled = true) {
@@ -3602,6 +3965,290 @@ globalThis.MkTerminalCodec = (() => {
       flush();
       return out;
     }
+
+    receiveHistoryView(reply) {
+      const pending = this.historyPending;
+      if (!pending || reply.req !== pending.req) return;
+      if (this.alt && !pending.reveal) {
+        this.historyPending = null;
+        this.historyReplacing = false;
+        return;
+      }
+      this.historyPending = null;
+      this.historyRtt = this.now() - pending.started;
+      this.historyReplacing = false;
+      if (reply.status !== 0) {
+        if (reply.status === 2) {
+          this.resetHistory();
+          if (!this.alt) this.guard(() => this.loadHistory(pending.reveal));
+          return;
+        }
+        if (pending.direction === "older") this.historyEnd = true;
+        this.historyButton.disabled = this.historyEnd;
+        this.historyStatus.textContent = translate(
+          this.historyEnd
+            ? "Beginning of saved output"
+            : "Scroll up for earlier output",
+        );
+        this.syncLatest();
+        return;
+      }
+      this.historyViewActive = true;
+      this.historyViewToken = reply.view;
+      if (pending.opening) {
+        this.historyWindowStart = 0;
+        this.historyWindowEnd = pending.skip;
+        const hotLines = [
+          ...this.logicalLines(this.historyRows),
+          ...this.logicalLines(this.model.rows || []),
+        ];
+        this.historySeam = {
+          hotEnd: pending.skip,
+          coldStart: pending.skip,
+          resolved: hotLines.length === 0,
+          matched: false,
+          hotLines,
+          cursor: hotLines.length,
+        };
+      }
+      const reveal = this.historyReveal,
+        following = this.stick,
+        makeLine = (row) => {
+          const line = make("span", "terminal-history-row");
+          line.append(...this.historyRow(row), "\n");
+          return line;
+        };
+      if (pending.direction === "newer") {
+        const targetEnd = pending.targetEnd ?? this.historyWindowStart,
+          replyEnd = reply.skip + reply.rows.length;
+        if (reply.rows.length > 0 && replyEnd < targetEnd) {
+          const gapCount = Math.min(300, targetEnd - replyEnd),
+            req = ++this.historyId;
+          this.historyPending = {
+            req,
+            view: this.historyViewToken,
+            skip: replyEnd,
+            count: gapCount,
+            targetEnd,
+            direction: "newer",
+            refresh: false,
+            reveal: false,
+            replace: false,
+            started: this.now(),
+            version: this.historyLoadedVersion,
+          };
+          this.guard(() =>
+            this.send(
+              0x18,
+              C.concat(
+                T.v(req),
+                T.v(this.historyViewToken),
+                T.v(replyEnd),
+                T.v(gapCount),
+              ),
+            ),
+          );
+          return;
+        }
+        const take = Math.min(
+          reply.rows.length,
+          Math.max(0, targetEnd - reply.skip),
+        );
+        if (take > 0) {
+          const newerChron = reply.rows.slice(0, take).reverse(),
+            anchor = this.captureHistoryAnchor(),
+            combined = [...this.historyRows, ...newerChron],
+            overflow = Math.max(0, combined.length - 1000);
+          this.historyRows = combined.slice(overflow);
+          this.historyWindowStart = reply.skip;
+          const seam = this.historySeam;
+          let nextEnd = this.historyWindowEnd - overflow;
+          if (
+            seam &&
+            seam.coldStart > seam.hotEnd &&
+            this.historyWindowEnd > seam.coldStart &&
+            nextEnd < seam.coldStart
+          ) {
+            nextEnd = seam.hotEnd - (seam.coldStart - nextEnd);
+          }
+          this.historyWindowEnd = Math.max(this.historyWindowStart, nextEnd);
+          if (overflow > 0) this.historyEnd = false;
+          this.historyWindowed = this.historyWindowStart > 0;
+          this.canvas.hidden = this.textLayer.hidden = this.historyWindowed;
+          for (let i = 0; i < overflow; i++)
+            this.historyElement.children[0]?.remove();
+          this.historyElement.append(...newerChron.map(makeLine));
+          this.restoreHistoryAnchor(
+            anchor,
+            -overflow * (this.cellHeight || 18),
+          );
+        }
+        this.historyButton.disabled = this.historyEnd;
+        this.historyStatus.textContent = translate(
+          this.historyEnd
+            ? "Beginning of saved output"
+            : "Scroll up for earlier output",
+        );
+        this.syncLatest();
+        if (
+          this.historyWindowStart > 0 &&
+          this.port.scrollHeight - this.port.scrollTop - this.port.clientHeight <
+            this.historyThreshold()
+        )
+          this.guard(() => this.loadNewerHistory());
+        return;
+      }
+
+      this.historyLoadedVersion = pending.version;
+      if (reveal && this.alt) this.historyElement.hidden = false;
+      if (pending.replace) {
+        const freshChron = reply.rows.slice().reverse(),
+          prev = {
+            source: null,
+            skip: this.historyWindowEnd,
+            end: this.historyEnd,
+            total: this.historyTotal,
+            viewMode: true,
+          };
+        this.historyTotal = reply.total;
+        if (
+          !reveal &&
+          this.mergeRefresh({ ...reply, rows: freshChron }, following, prev)
+        ) {
+          this.historyWindowStart = 0;
+          this.historyWindowEnd = this.historyRows.length;
+          this.historyEnd =
+            reply.complete && this.historyWindowEnd >= reply.total;
+        } else {
+          const prevCanvasTop = this.canvas.offsetTop ?? this.port.scrollHeight,
+            prevTop = this.port.scrollTop || 0,
+            distFromCanvas = prevCanvasTop - prevTop;
+          this.historyWindowStart = 0;
+          this.historyWindowEnd = freshChron.length;
+          this.historyWindowed = false;
+          this.historyEnd =
+            reply.complete && this.historyWindowEnd >= reply.total;
+          this.historyRows = freshChron.slice(0, 1000);
+          this.historyElement.hidden = this.alt && !reveal;
+          this.historyControls.hidden =
+            (this.alt && !reveal) || !this.historyRows.length;
+          this.canvas.hidden = this.textLayer.hidden = false;
+          this.historyElement.replaceChildren(...this.historyRows.map(makeLine));
+          if (following && !reveal) this.scrollBottom();
+          else {
+            const delta =
+              (this.canvas.offsetTop ?? this.port.scrollHeight) - prevCanvasTop;
+            if (delta) {
+              const maxTop = Math.max(
+                0,
+                (this.port.scrollHeight || 0) - (this.port.clientHeight || 0),
+              );
+              this.setScrollTop(Math.max(0, Math.min(maxTop, prevTop + delta)));
+            }
+          }
+        }
+      } else {
+        const overlap = Math.max(0, pending.skip - reply.skip),
+          freshNewestFirst =
+            overlap < reply.rows.length ? reply.rows.slice(overlap) : [];
+        let olderChron = freshNewestFirst.reverse();
+        if (olderChron.length && this.historySeam && !this.historySeam.resolved) {
+          olderChron = this.stripReflowedSeam(
+            olderChron,
+            reply.skip,
+            reply.rows.length,
+          );
+        }
+        if (reply.skip === 0) this.historyTotal = reply.total;
+        this.historyWindowEnd = Math.max(
+          this.historyWindowEnd,
+          reply.skip + reply.rows.length,
+        );
+        this.historyEnd =
+          (reply.complete && this.historyWindowEnd >= reply.total) ||
+          (!olderChron.length &&
+            (!this.historySeam || this.historySeam.resolved) &&
+            (reply.complete || !reply.rows.length));
+        if (!olderChron.length && !this.historyEnd && reply.rows.length > 0) {
+          this.guard(() => this.loadHistory(reveal));
+          return;
+        }
+        if (olderChron.length) {
+          const before = this.canvas.offsetTop ?? this.port.scrollHeight,
+            anchor = this.captureHistoryAnchor(),
+            combined = [...olderChron, ...this.historyRows],
+            overflow = Math.max(0, combined.length - 1000);
+          this.historyRows = combined.slice(0, 1000);
+          const prevStart = this.historyWindowStart;
+          let nextStart = prevStart + overflow;
+          const seam = this.historySeam;
+          if (
+            seam &&
+            seam.coldStart > seam.hotEnd &&
+            prevStart <= seam.hotEnd &&
+            nextStart > seam.hotEnd
+          ) {
+            nextStart = seam.coldStart + (nextStart - seam.hotEnd);
+          }
+          this.historyWindowStart = nextStart;
+          this.historyWindowed = this.historyWindowStart > 0;
+          this.historyElement.hidden = this.alt && !reveal;
+          this.historyControls.hidden =
+            (this.alt && !reveal) || !this.historyRows.length;
+          this.canvas.hidden = this.textLayer.hidden = this.historyWindowed;
+          if (this.historyWindowed) this.stick = false;
+          this.historyElement.prepend(...olderChron.map(makeLine));
+          for (let i = 0; i < overflow; i++)
+            this.historyElement.children[
+              this.historyElement.children.length - 1
+            ]?.remove();
+          if (following && !reveal && !this.historyWindowed) this.scrollBottom();
+          else {
+            const fallback = this.historyWindowed
+              ? olderChron.length * (this.cellHeight || 18)
+              : (this.canvas.offsetTop ?? this.port.scrollHeight) - before;
+            this.restoreHistoryAnchor(anchor, fallback);
+          }
+        }
+      }
+      this.historyButton.disabled = this.historyEnd;
+      this.historyStatus.textContent = translate(
+        this.historyEnd
+          ? "Beginning of saved output"
+          : "Scroll up for earlier output",
+      );
+      if (this.historyReveal) {
+        this.historyReveal = false;
+        this.setScrollTop(0);
+        this.stick = false;
+      }
+      this.syncLatest();
+
+      const queued = this.historyQueued;
+      this.historyQueued = null;
+      if (
+        queued &&
+        (queued.reveal ||
+          (queued.refresh &&
+            this.historyLoadedVersion !== (this.historyVersion || 0)))
+      )
+        this.guard(() =>
+          this.loadHistory(
+            queued.reveal,
+            queued.refresh &&
+              this.historyLoadedVersion !== (this.historyVersion || 0),
+          ),
+        );
+      else if (
+        !reveal &&
+        !this.stick &&
+        !this.historyEnd &&
+        this.port.scrollTop < this.historyThreshold()
+      )
+        this.guard(() => this.loadHistory());
+      else this.warmHistory();
+    }
+
     receiveHistory(reply) {
       const pending = this.historyPending;
       if (!pending || reply.req !== pending.req) return;
@@ -3637,40 +4284,43 @@ globalThis.MkTerminalCodec = (() => {
         return this.loadHistory(this.historyReveal);
 
       let rows = reply.rows;
-      if (pending.source === null) {
-        if (!pending.replace && pending.skip > 0 && this.historyRows.length) {
-          const incoming = rows.map((row) => JSON.stringify(row)),
-            existing = this.historyRows
-              .slice(0, rows.length)
-              .map((row) => JSON.stringify(row)),
-            growth = Math.max(
-              0,
-              reply.total - (this.historyHotTotal ?? reply.total),
-            );
-          for (
-            let overlap = Math.min(rows.length, existing.length);
-            overlap > 0;
-            overlap--
+      if (
+        !pending.replace &&
+        this.historyRows.length &&
+        ((pending.source === null && pending.skip > 0) ||
+          (pending.source !== null && prev.source === null))
+      ) {
+        const incoming = rows.map((row) => JSON.stringify(row)),
+          existing = this.historyRows
+            .slice(0, rows.length)
+            .map((row) => JSON.stringify(row)),
+          growth =
+            pending.source === null
+              ? Math.max(0, reply.total - (this.historyHotTotal ?? reply.total))
+              : 0;
+        for (
+          let overlap = Math.min(rows.length, existing.length);
+          overlap > 0;
+          overlap--
+        ) {
+          const start = rows.length - overlap;
+          if (
+            incoming[start] !== existing[0] ||
+            !existing
+              .slice(0, overlap)
+              .every((row, index) => row === incoming[start + index])
+          )
+            continue;
+          if (
+            growth >= overlap ||
+            new Set(existing.slice(0, overlap)).size > 1
           ) {
-            const start = rows.length - overlap;
-            if (
-              incoming[start] !== existing[0] ||
-              !existing
-                .slice(0, overlap)
-                .every((row, index) => row === incoming[start + index])
-            )
-              continue;
-            if (
-              growth >= overlap ||
-              new Set(existing.slice(0, overlap)).size > 1
-            ) {
-              rows = rows.slice(0, start);
-              break;
-            }
+            rows = rows.slice(0, start);
+            break;
           }
         }
-        this.historyHotTotal = reply.total;
       }
+      if (pending.source === null) this.historyHotTotal = reply.total;
       this.historyReplacing = false;
       const reveal = this.historyReveal,
         following = this.stick;
@@ -3681,8 +4331,9 @@ globalThis.MkTerminalCodec = (() => {
         !this.mergeRefresh({ ...reply, rows }, following, prev)
       ) {
         const before = this.canvas.offsetTop ?? this.port.scrollHeight,
-          anchor =
-            this.historyElement.children[0]?.getBoundingClientRect?.().top,
+          prevTop = this.port.scrollTop || 0,
+          distFromCanvas = before - prevTop,
+          anchor = !pending.replace ? this.captureHistoryAnchor() : null,
           oldRows = pending.replace ? [] : this.historyRows,
           combined = [...rows, ...oldRows];
 
@@ -3708,19 +4359,21 @@ globalThis.MkTerminalCodec = (() => {
           ].remove();
         if (following && !this.historyReveal && !this.historyWindowed)
           this.scrollBottom();
-        else {
-          const moved =
-              !pending.replace && anchor != null
-                ? this.historyElement.children[
-                    rows.length
-                  ]?.getBoundingClientRect?.().top - anchor
-                : null,
-            delta =
-              moved ??
-              (this.historyWindowed
-                ? rows.length * this.cellHeight
-                : (this.canvas.offsetTop ?? this.port.scrollHeight) - before);
-          if (delta) this.port.scrollTop += delta;
+        else if (pending.replace && !this.historyWindowed) {
+          const delta =
+            (this.canvas.offsetTop ?? this.port.scrollHeight) - before;
+          if (delta) {
+            const maxTop = Math.max(
+              0,
+              (this.port.scrollHeight || 0) - (this.port.clientHeight || 0),
+            );
+            this.setScrollTop(Math.max(0, Math.min(maxTop, prevTop + delta)));
+          }
+        } else {
+          const fallback = this.historyWindowed
+            ? rows.length * (this.cellHeight || 18)
+            : (this.canvas.offsetTop ?? this.port.scrollHeight) - before;
+          this.restoreHistoryAnchor(anchor, fallback);
         }
       }
       this.historyButton.disabled = this.historyEnd;
@@ -3731,7 +4384,7 @@ globalThis.MkTerminalCodec = (() => {
       );
       if (this.historyReveal) {
         this.historyReveal = false;
-        this.port.scrollTop = 0;
+        this.setScrollTop(0);
         this.stick = false;
       }
       this.syncLatest();
@@ -3807,8 +4460,9 @@ globalThis.MkTerminalCodec = (() => {
         drop = Math.max(0, a.length + missing + added.length - 1000),
         keepsOld = extra > drop;
 
-      if (keepsOld && drop && prev.source !== null) return false;
-      if (keepsOld) {
+      if (keepsOld && drop && !prev.viewMode && prev.source !== null)
+        return false;
+      if (keepsOld && !prev.viewMode) {
         this.historySource = prev.source;
         this.historySkip =
           prev.source === null ? prev.skip + added.length - drop : prev.skip;
@@ -3846,7 +4500,7 @@ globalThis.MkTerminalCodec = (() => {
             : mark?.offsetTop != null && a0 != null
               ? mark.offsetTop - a0
               : (missing - drop) * h;
-        if (delta) this.port.scrollTop = top + delta;
+        if (delta) this.setScrollTop(top + delta);
       }
       return true;
     }
@@ -4094,6 +4748,8 @@ globalThis.MkTerminalCodec = (() => {
       this.fit = false;
       this.termModes = null;
       this.modesSupported = false;
+      this.historyViewSupported = false;
+      this.resyncErrors = 0;
       this.applyModes();
       this.recoverButton.hidden = true;
       delete this.root.dataset.fit;
@@ -4115,7 +4771,9 @@ globalThis.MkTerminalCodec = (() => {
       this.pendingInputs.clear();
       for (const pending of this.pendingRoles.splice(0)) {
         pending.timer.clear();
-        pending.reject(Error("Terminal disconnected"));
+        const err = Error("Terminal disconnected");
+        err.disconnected = true;
+        pending.reject(err);
       }
       this.channel = null;
       this.socket?.close();

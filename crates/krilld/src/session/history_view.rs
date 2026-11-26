@@ -33,7 +33,7 @@ impl Tap {
     ) -> std::io::Result<HistorySnapshot> {
         let (stamp, seq, rows, screen) = {
             let _access = self.access_history(cancelled)?;
-            let live = lock(&self.0.live);
+            let live = self.0.live();
             let rows = live.engine.snapshot_hot_rows();
             let screen = HistoryScreen::from_screen(&live.engine.screen());
             let (epoch, seq) = (live.history_epoch, live.seq);
@@ -82,7 +82,7 @@ impl Tap {
         send: impl FnOnce(&[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let _access = self.access_history(cancelled)?;
-        let current = lock(&self.0.live).history_epoch;
+        let current = self.0.live().history_epoch;
         let publish = |generation, cleared| {
             if reply.epoch != [current, generation, cleared] {
                 reply.status = HistoryViewStatus::Invalidated;

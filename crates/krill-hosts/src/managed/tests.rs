@@ -217,6 +217,13 @@ fn parse_probe_covers_installed_unmanaged_missing_and_socket() {
         )
         .is_err()
     );
+    for padded in [
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home= /Users/alice\nkrill-version=missing\n",
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=\t/Users/alice\nkrill-version=missing\n",
+        "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=/Users/alice \nkrill-version=missing\n",
+    ] {
+        assert!(parse_probe(padded).is_err(), "padded={padded:?}");
+    }
 }
 
 #[test]
@@ -230,6 +237,7 @@ fn version_status_compares_against_local_build() {
         home: "/Users/r".into(),
         version: RemoteVersion::Known(v.into()),
         socket_bundle: None,
+        linger: LingerStatus::NotApplicable,
     };
     assert_eq!(
         known("0.1.5").version_status("0.1.5"),
@@ -267,6 +275,10 @@ fn install_spec_rejects_bad_home_and_version() {
     assert!(InstallSpec::new("/Users/r", "").is_err());
     assert!(InstallSpec::new("/Users/r", "0.1.5; rm -rf /").is_err());
     assert!(InstallSpec::new("/Users/r", "$(evil)").is_err());
+    assert!(InstallSpec::new(" /Users/r", "0.1.5").is_err());
+    assert!(InstallSpec::new("\t/Users/r", "0.1.5").is_err());
+    assert!(InstallSpec::new("/Users/r\n", "0.1.5").is_err());
+    assert!(InstallSpec::new("/Users/r ", "0.1.5").is_err());
 }
 
 #[test]
@@ -794,4 +806,103 @@ fn classify_remote_error_prioritizes_ssh_auth_over_generic_permission_denied() {
     };
     let err = ssh_failed(&test_opts(), "mkdir", &fake_out);
     assert_eq!(err.kind, InstallFailureKind::Auth);
+}
+
+#[test]
+fn linux_linger_parser_and_fix_command_cover_all_cases() {
+    // systemd Linux with linger=no -> Disabled with exact copyable command
+    let disabled = parse_linger_status(&RemoteOs::Linux, Some("no"), Some("ubuntu"));
+    assert_eq!(
+        disabled,
+        LingerStatus::Disabled {
+            user: "ubuntu".into()
+        }
+    );
+    assert!(disabled.is_disabled());
+    assert_eq!(
+        disabled.fix_command().as_deref(),
+        Some("sudo loginctl enable-linger ubuntu")
+    );
+
+    // systemd Linux with linger=yes -> Enabled (no warning / no fix command)
+    let enabled = parse_linger_status(&RemoteOs::Linux, Some("yes\n"), Some("ubuntu"));
+    assert_eq!(enabled, LingerStatus::Enabled);
+    assert!(!enabled.is_disabled());
+    assert_eq!(enabled.fix_command(), None);
+
+    // Non-systemd Linux / missing loginctl -> NotApplicable
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Linux, Some("unavailable"), Some("ubuntu")),
+        LingerStatus::NotApplicable
+    );
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Linux, None, Some("ubuntu")),
+        LingerStatus::NotApplicable
+    );
+
+    // macOS / Windows / Other OS -> always NotApplicable even if stray linger=no line appeared
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Macos, Some("no"), Some("alice")),
+        LingerStatus::NotApplicable
+    );
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Windows, Some("no"), Some("alice")),
+        LingerStatus::NotApplicable
+    );
+
+    // Malformed / injection username rejected safely
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Linux, Some("no"), Some("alice; rm -rf /")),
+        LingerStatus::NotApplicable
+    );
+    assert_eq!(
+        parse_linger_status(&RemoteOs::Linux, Some("no"), Some("-flag")),
+        LingerStatus::NotApplicable
+    );
+    assert_eq!(
+        LingerStatus::Disabled {
+            user: "bad user".into()
+        }
+        .fix_command(),
+        None
+    );
+
+    // Full probe output parsing
+    let linux_probe = "\
+krill-os=Linux\n\
+krill-arch=x86_64\n\
+krill-home=/home/deploy\n\
+krill-version=unmanaged\n\
+krill-user=deploy\n\
+krill-linger=no\n";
+    let info = parse_probe(linux_probe).unwrap();
+    assert_eq!(
+        info.linger,
+        LingerStatus::Disabled {
+            user: "deploy".into()
+        }
+    );
+    assert_eq!(
+        info.linger.fix_command().as_deref(),
+        Some("sudo loginctl enable-linger deploy")
+    );
+
+    let linux_ok = "\
+krill-os=Linux\n\
+krill-arch=aarch64\n\
+krill-home=/home/deploy\n\
+krill-version=unmanaged\n\
+krill-user=deploy\n\
+krill-linger=yes\n";
+    assert_eq!(parse_probe(linux_ok).unwrap().linger, LingerStatus::Enabled);
+
+    let mac_probe = "\
+krill-os=Darwin\n\
+krill-arch=arm64\n\
+krill-home=/Users/alice\n\
+krill-version=0.3.24\n";
+    assert_eq!(
+        parse_probe(mac_probe).unwrap().linger,
+        LingerStatus::NotApplicable
+    );
 }

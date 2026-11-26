@@ -5,11 +5,15 @@
 //! 노출해 추후 MK-130(iroh QUIC)이 같은 타깃 추상화에 로컬 포워딩 소켓만 꽂을 수 있게 한다.
 
 use std::ffi::OsString;
-use std::io;
+#[cfg(unix)]
+use std::hash::{Hash as _, Hasher as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -167,14 +171,20 @@ impl SshOptions {
     /// 안정성용 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
     /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
     pub fn common_args(&self, connect_timeout_secs: u16) -> Vec<String> {
+        let effective = effective_config(&self.destination, self.port);
+        self.common_args_with_config(connect_timeout_secs, effective.as_deref())
+    }
+
+    fn common_args_with_config(
+        &self,
+        connect_timeout_secs: u16,
+        effective: Option<&str>,
+    ) -> Vec<String> {
         // 모든 호출이 비대화형이다: 비밀번호·ASKPASS 창을 띄우지 않고 바로 실패한다.
         let mut args = vec!["-o".to_owned(), "BatchMode=yes".to_owned()];
-        // 사용자가 StrictHostKeyChecking을 정하지 않았을 때만 처음 보는 호스트 키를 기록하고 믿는다.
-        // 바뀐 키는 ssh가 그대로 거부한다.
-        if !effective_config(&self.destination, self.port)
-            .as_deref()
-            .is_some_and(user_sets_host_key_checking)
-        {
+        // 사용자가 StrictHostKeyChecking을 정하지 않았음을 `ssh -G`로 확인했을 때만 accept-new를 붙인다.
+        // `ssh -G`가 실패하면 fail-closed로 두어 `~/.ssh/config`의 명시 설정을 CLI 플래그로 덮어쓰지 않는다.
+        if effective.is_some_and(|cfg| !user_sets_host_key_checking(cfg)) {
             args.extend([
                 "-o".to_owned(),
                 "StrictHostKeyChecking=accept-new".to_owned(),
@@ -260,11 +270,19 @@ impl SshOptions {
 /// `hosts.toml`에서 `destination`·`label`·`id`가 일치하는 항목을 찾아 포트·키·원격 소켓 옵션을 채운다.
 pub fn resolve_host_options(host: &str, state_dir: Option<&Path>) -> io::Result<SshOptions> {
     let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SSH destination: empty host",
+        ));
+    }
     if let Some(dir) = state_dir
         && let Ok(text) = std::fs::read_to_string(dir.join(HOSTS_FILE))
         && let Ok(parsed) = toml::from_str::<HostsFile>(&text)
         && let Some(entry) = parsed.hosts.into_iter().find(|h| {
-            h.destination == trimmed || h.label == trimmed || (!h.id.is_empty() && h.id == trimmed)
+            (!h.destination.is_empty() && h.destination == trimmed)
+                || (!h.label.is_empty() && h.label == trimmed)
+                || (!h.id.is_empty() && h.id == trimmed)
         })
     {
         let opts = SshOptions {
@@ -294,24 +312,126 @@ fn remote_state_dirs() -> [String; 2] {
     ]
 }
 
+/// SSH 오류 문자열이 인증 실패(잠긴 `ssh-agent`, 패스프레이즈 미로드 키, `Permission denied (publickey/password)`,
+/// 호스트 키 불일치 등)인지 일시적 네트워크 단절과 구분한다.
+///
+/// 인증 실패 시 빠른 재시도를 반복하면 원격 `fail2ban`/`CrowdSec`이 사용자 IP를 차단하므로
+/// [`crate::HostManager`]가 별도 느린 백오프(2분 → 5분 → 10분)로 전환한다.
+#[must_use]
+pub fn is_ssh_auth_failure(message: &str) -> bool {
+    const AUTH_MARKERS: &[&str] = &[
+        "permission denied (publickey",
+        "permission denied (password",
+        "permission denied (keyboard-interactive",
+        "permission denied (gssapi",
+        "permission denied, please try again",
+        "authentication failed",
+        "too many authentication failures",
+        "no more authentication methods to try",
+        "host key verification failed",
+        "agent refused operation",
+        "sign_and_send_pubkey",
+        "the agent has no identities",
+        "could not open a connection to your authentication agent",
+        "enter passphrase for key",
+        "passphrase",
+        "load key",
+        "no identities",
+        "publickey",
+    ];
+    let lower = message.to_ascii_lowercase();
+    // 원격 명령(mkdir/chmod 등)의 파일 권한 오류나 네트워크/데몬 오류와 혼동하지 않도록
+    // 일시적 네트워크 오류만 있는 문자열은 제외하고 SSH 인증 패턴을 검사한다.
+    let is_remote_fs_perm = lower.contains("permission denied")
+        && (lower.contains("mkdir:") || lower.contains("chmod:"));
+    if is_remote_fs_perm {
+        return false;
+    }
+    if AUTH_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // `ssh: ... Permission denied` 또는 `user@host: Permission denied.` 형태.
+    lower.contains("permission denied")
+        && (lower.contains("ssh")
+            || lower.contains('@')
+            || lower.contains("authenticat")
+            || lower.contains("key"))
+}
+
+/// 현재 프로세스 환경의 `ssh-agent` 신원 지문을 가볍게 계산한다(잠금 해제·키 추가 감지용).
+///
+/// `SSH_AUTH_SOCK`이 없거나 `ssh-add -l`을 실행할 수 없으면 `None`. UI 스레드에서 호출하지 않는다.
+#[must_use]
+pub fn ssh_agent_fingerprint() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let sock = std::env::var_os("SSH_AUTH_SOCK")?;
+        if sock.is_empty() {
+            return None;
+        }
+        let prog =
+            std::env::var_os("KRILL_SSH_ADD_BIN").unwrap_or_else(|| OsString::from("ssh-add"));
+        let args = vec!["-l".to_owned()];
+        let out = crate::managed::run_piped_command_with_timeout(
+            &prog,
+            &args,
+            None,
+            Duration::from_millis(500),
+        )
+        .ok()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sock.hash(&mut h);
+        out.status.code().hash(&mut h);
+        out.stdout.hash(&mut h);
+        Some(h.finish())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// 원격 `$HOME`과 krilld 소켓이 있는 상태 디렉터리를 한 번에 묻는 명령(MK-170). 후보는 [`remote_state_dirs`] 순서로
 /// 찾는다(macOS·Linux). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
 ///
 /// Linux 원격은 찾기 전에 항상 원격 `krill ls`(`~/.local/bin/krill` → `PATH`)를 한 번 돌린다. 데몬이 없으면 띄우고
 /// (재부팅한 VM), holder만 죽었으면 새 holder로 재결합한다(ARCHITECTURE §4.1). krill이 없거나 실행이 실패하면
 /// 둘째 줄에 표식을 남겨 원인을 알린다. macOS 원격은 깨우지 않는다 — ssh 세션 안에서 띄운 데몬은 GUI·키체인 밖이다.
+/// Linux에서는 셋째 줄 이후에 `krill-user=`·`krill-linger=`를 함께 출력해 추가 SSH 왕복 없이 systemd linger 상태를 확인한다.
 pub fn remote_query() -> String {
     let dirs = remote_state_dirs().map(|d| format!("\"{d}\"")).join(" ");
     let [.., linux] = remote_state_dirs();
+    let linger = crate::managed::LINGER_PROBE_SNIPPET;
     format!(
         "/bin/sh -c 'printf \"%s\\n\" \"$HOME\"; \
-         f() {{ for d in {dirs}; do if [ -S \"$HOME/$d/run/krilld.sock\" ]; then printf %s \"$d\"; exit 0; fi; done; }}; \
+         l() {{ {linger}; }}; \
+         f() {{ for d in {dirs}; do if [ -S \"$HOME/$d/run/krilld.sock\" ]; then printf \"%s\\n\" \"$d\"; l; exit 0; fi; done; }}; \
          if [ \"$(uname -s)\" != Linux ]; then f; exit 0; fi; \
          k=\"$HOME/.local/bin/krill\"; [ -x \"$k\" ] || k=$(command -v krill); \
-         if [ -z \"$k\" ]; then f; printf %s {MISSING_MARK}; exit 0; fi; \
-         if ! e=$(\"$k\" ls </dev/null 2>&1 >/dev/null); then f; printf \"%s %s\" {WAKE_FAILED_MARK} \"$(printf %s \"$e\" | head -n 1)\"; exit 0; fi; \
-         f; printf %s \"{linux}\"'"
+         if [ -z \"$k\" ]; then f; printf \"%s\\n\" {MISSING_MARK}; l; exit 0; fi; \
+         if ! e=$(\"$k\" ls </dev/null 2>&1 >/dev/null); then f; printf \"%s %s\\n\" {WAKE_FAILED_MARK} \"$(printf %s \"$e\" | head -n 1)\"; l; exit 0; fi; \
+         f; printf \"%s\\n\" \"{linux}\"; l'"
     )
+}
+
+/// [`remote_query`] 출력에서 Linux systemd linger 상태를 읽는다(macOS·비systemd·출력 없음이면 `NotApplicable`).
+#[must_use]
+pub fn parse_remote_query_linger(output: &str) -> crate::managed::LingerStatus {
+    let mut user: Option<&str> = None;
+    let mut linger: Option<&str> = None;
+    for line in output.lines().skip(2) {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "krill-user" => user = Some(value),
+                "krill-linger" => linger = Some(value),
+                _ => {}
+            }
+        }
+    }
+    if linger.is_none() {
+        return crate::managed::LingerStatus::NotApplicable;
+    }
+    crate::managed::parse_linger_status(&crate::managed::RemoteOs::Linux, linger, user)
 }
 
 /// [`remote_query`] 답(첫 줄 `$HOME`, 있으면 둘째 줄에 상태 디렉터리)으로 원격 krilld 소켓 경로를 계산한다.
@@ -423,18 +543,33 @@ pub fn resolve_remote_endpoint_with_program(
     opts: &SshOptions,
     ssh_bin: &std::ffi::OsStr,
 ) -> io::Result<RemoteEndpoint> {
+    resolve_remote_endpoint_with_linger_and_program(opts, ssh_bin).map(|(endpoint, _)| endpoint)
+}
+
+/// [`resolve_remote_endpoint_with_program`]과 함께 Linux systemd linger 상태도 돌려준다.
+pub fn resolve_remote_endpoint_with_linger_and_program(
+    opts: &SshOptions,
+    ssh_bin: &std::ffi::OsStr,
+) -> io::Result<(RemoteEndpoint, crate::managed::LingerStatus)> {
     if let Some(sock) = explicit_remote_socket(opts)? {
-        return Ok(RemoteEndpoint::Socket(sock));
+        return Ok((
+            RemoteEndpoint::Socket(sock),
+            crate::managed::LingerStatus::NotApplicable,
+        ));
     }
     opts.validate()?;
     let out = run_ssh_output(ssh_bin, &opts.remote_home_args(), Duration::from_secs(30))?;
     if out.status.success() {
         let home = String::from_utf8(out.stdout)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        return remote_socket_for_home(&home).map(RemoteEndpoint::Socket);
+        let linger = parse_remote_query_linger(&home);
+        return remote_socket_for_home(&home).map(|sock| (RemoteEndpoint::Socket(sock), linger));
     }
     if bridge::reached_remote(out.status) && bridge::probe(opts, ssh_bin)?.is_some() {
-        return Ok(RemoteEndpoint::Bridge);
+        return Ok((
+            RemoteEndpoint::Bridge,
+            crate::managed::LingerStatus::NotApplicable,
+        ));
     }
     Err(home_query_failed(opts, &out))
 }
@@ -498,16 +633,18 @@ fn effective_config(destination: &str, port: Option<u16>) -> Option<String> {
     let key = (ssh_program(), destination.to_owned(), port);
     let mtime = ssh_config_mtime();
     if let Ok(cache) = SSH_CONFIGS.lock()
-        && let Some((at, seen, value)) = cache.get(&key)
+        && let Some((at, seen, Some(value))) = cache.get(&key)
         && at.elapsed() < MACHINE_KEY_TTL
         && *seen == mtime
     {
-        return value.clone();
+        return Some(value.clone());
     }
     let value = effective_config_with_program(destination, port, &ssh_program());
-    if let Ok(mut cache) = SSH_CONFIGS.lock() {
+    if let Some(ref resolved) = value
+        && let Ok(mut cache) = SSH_CONFIGS.lock()
+    {
         cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
-        cache.insert(key, (Instant::now(), mtime, value.clone()));
+        cache.insert(key, (Instant::now(), mtime, Some(resolved.clone())));
     }
     value
 }
@@ -528,8 +665,12 @@ fn effective_config_with_program(
     #[cfg(windows)]
     let out = windows::stdio::output(program, &args, None, Duration::from_secs(5));
     #[cfg(unix)]
-    let out =
-        crate::managed::run_piped_ssh_with_timeout(program, &args, None, Duration::from_secs(5));
+    let out = crate::managed::run_piped_command_with_timeout(
+        program,
+        &args,
+        None,
+        Duration::from_secs(5),
+    );
     match out {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         _ => None,
@@ -614,10 +755,12 @@ pub fn valid_identity_file(path: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && !s.chars().any(char::is_control)
 }
 
-/// 원격 소켓(또는 원격 HOME) 경로 검사. 절대 경로(`/`)여야 하며 `-L` 구분자(`:`)와 제어문자를 거부한다.
+/// 원격 소켓(또는 원격 HOME) 경로 검사. 앞뒤 공백 없는 절대 경로(`/`)여야 하며 `-L` 구분자(`:`)와 제어문자를 거부한다.
 pub fn valid_remote_socket(path: &str) -> bool {
-    let s = path.trim();
-    s.starts_with('/') && !s.contains(':') && !s.chars().any(char::is_control)
+    path.trim() == path
+        && path.starts_with('/')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control)
 }
 
 /// 로컬 포워딩 소켓 경로 검사. Unix `-L` 구분자(`:`)와 제어문자를 거부한다.
@@ -777,19 +920,64 @@ impl Tunnel {
         prepare_local(&local)?;
         let host = &opts.destination;
         // stdin 파이프의 쓰기 쪽은 `child`가 쥔다. 이 프로세스가 죽으면 닫혀 원격 `cat`과 ssh가 끝난다.
+        // stderr는 파이프로 받아 초반 16KiB만 수집하고 나머지는 즉시 비워, 인증 실패(`Permission denied`·잠긴 에이전트)
+        // 원인을 잃지 않으면서도 장기 실행 터널의 stderr 파이프가 막히지 않게 한다.
         let mut child = Command::new(ssh_bin)
             .args(opts.tunnel_args(&local, remote))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
+        let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr_reader = child.stderr.take().and_then(|mut stderr| {
+            let sink = Arc::clone(&stderr_tail);
+            thread::Builder::new()
+                .name("ssh-tunnel-stderr".into())
+                .spawn(move || {
+                    use std::io::Read as _;
+                    const CAP: usize = 16 * 1024;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stderr.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Ok(mut collected) = sink.lock()
+                            && collected.len() < CAP
+                        {
+                            let room = CAP - collected.len();
+                            collected.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                    }
+                })
+                .ok()
+        });
+        let format_failure = |status: std::process::ExitStatus,
+                              reader: Option<thread::JoinHandle<()>>,
+                              buf: &Arc<Mutex<Vec<u8>>>| {
+            if let Some(handle) = reader {
+                handle.join().ok();
+            }
+            let detail = buf
+                .lock()
+                .ok()
+                .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
+                .filter(|s| !s.is_empty());
+            match detail {
+                Some(detail) => format!("ssh forwarding to {host} failed ({status}): {detail}"),
+                None => format!(
+                    "ssh forwarding to {host} failed ({status}); check the host and KRILL_REMOTE_SOCK"
+                ),
+            }
+        };
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if local.exists() {
                 if let Some(status) = child.try_wait()? {
                     std::fs::remove_file(&local).ok();
-                    return Err(io::Error::other(format!(
-                        "ssh forwarding to {host} failed ({status}); check the host and KRILL_REMOTE_SOCK"
+                    return Err(io::Error::other(format_failure(
+                        status,
+                        stderr_reader,
+                        &stderr_tail,
                     )));
                 }
                 return Ok(Self {
@@ -801,8 +989,10 @@ impl Tunnel {
             }
             if let Some(status) = child.try_wait()? {
                 std::fs::remove_file(&local).ok();
-                return Err(io::Error::other(format!(
-                    "ssh forwarding to {host} failed ({status}); check the host and KRILL_REMOTE_SOCK"
+                return Err(io::Error::other(format_failure(
+                    status,
+                    stderr_reader,
+                    &stderr_tail,
                 )));
             }
             if Instant::now() >= deadline {
@@ -1051,13 +1241,17 @@ pub fn dial_tunnel(
 pub fn forward_main(args: &[OsString]) -> ExitCode {
     let paths: Vec<PathBuf> = args.iter().skip(1).map(PathBuf::from).collect();
     let [local, remote] = paths.as_slice() else {
-        eprintln!("usage: krill __forward <local-sock> <remote-sock>");
+        writeln!(
+            io::stderr(),
+            "usage: krill __forward <local-sock> <remote-sock>"
+        )
+        .ok();
         return ExitCode::from(2);
     };
     match serve(local, remote) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("__forward: {e}");
+            writeln!(io::stderr(), "__forward: {e}").ok();
             ExitCode::FAILURE
         }
     }

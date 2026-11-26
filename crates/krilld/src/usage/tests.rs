@@ -10,12 +10,6 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-fn enable_auto_switch(home: &std::path::Path, state: &std::path::Path) {
-    let mut file = accounts::load_file(home, Some(state));
-    file.auto_switch.enabled = true;
-    accounts::save_file(home, Some(state), &file).unwrap();
-}
-
 /// Claude local file measured format.
 #[test]
 fn claude_files_parse_five_hour_and_seven_day() {
@@ -108,13 +102,12 @@ fn codex_rollout_parses_primary_and_secondary() {
 }
 
 #[test]
-fn multi_account_registry_manual_switch_and_auto_switch_engine() {
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
+fn multi_account_registry_manual_switch_and_crud() {
+    use krill_proto::usage::ProviderKind;
 
     let home = dir("multi-home");
     let state = dir("multi-state");
 
-    // 1. 두 번째 Claude 계정("Work Max")과 세 번째 계정("Backup Pro") 등록 및 사용량 기록.
     let work_dir = home.join("claude-work");
     let backup_dir = home.join("claude-backup");
     accounts::add_account(
@@ -147,51 +140,41 @@ fn multi_account_registry_manual_switch_and_auto_switch_engine() {
     )
     .unwrap();
 
-    // 2. 호스트 기본 Claude 계정에 92% 사용량 기록 (임계치 90% 초과).
+    // 호스트 계정이 92%를 넘어도 자동 전환은 일어나지 않고 호스트 계정을 유지한다.
     let host_claude = home.join(".claude");
     fs::create_dir_all(&host_claude).unwrap();
-    // K-11: 리셋 시각은 미래여야 지난 창 수치가 아니라 유효 수치로 판단된다.
     fs::write(
         host_claude.join(CLAUDE_CACHE),
         r#"{"five_hour":{"utilization":92,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":40}}"#,
     )
     .unwrap();
 
-    // 기본 설정에서는 임계치를 넘어도 호스트 계정을 유지한다.
     let initial = accounts::refresh_accounts(&home, Some(&state));
     assert!(!initial.auto_switch.enabled);
     assert!(initial.switched.is_empty());
     assert!(initial.accounts.iter().any(|a| a.host_default && a.active));
 
-    // 3. 사용자가 Auto-Switch(임계치 90%)를 켜면 호스트 계정(92%)에서
-    // 가장 여유 있는 Backup Pro(15%)로 자동 전환되어야 한다.
-    let snap = accounts::set_auto_switch(
+    // 원클릭 수동 전환(Backup Pro로 전환) 및 CLAUDE_CONFIG_DIR 환경 변수 반영 검증.
+    let switched = accounts::switch_account(
         &home,
         Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            ..AutoSwitchPolicy::default()
-        },
+        ProviderKind::Claude,
+        "claude-backup-pro",
     )
     .unwrap();
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].from_id, "claude-host");
-    assert_eq!(snap.switched[0].to_id, "claude-backup-pro");
-    assert_eq!(snap.switched[0].reason_percent, 92);
-
-    let active = snap
+    assert!(switched.switched.is_empty());
+    let active = switched
         .accounts
         .iter()
         .find(|a| a.provider == ProviderKind::Claude && a.active)
         .unwrap();
     assert_eq!(active.id, "claude-backup-pro");
 
-    // 4. 에이전트 실행 시 활성 계정의 CLAUDE_CONFIG_DIR 환경 변수가 반환되는지 검증.
     let env = accounts::active_profile_env(&home, Some(&state), "claude").unwrap();
     assert_eq!(env.0, "CLAUDE_CONFIG_DIR");
     assert_eq!(env.1, backup_dir.display().to_string());
 
-    // 5. 원클릭 수동 전환(Work Max로 전환) 검증.
+    // 원클릭 수동 전환(Work Max로 전환) 검증.
     let switched =
         accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-work-max")
             .unwrap();
@@ -203,23 +186,7 @@ fn multi_account_registry_manual_switch_and_auto_switch_engine() {
     assert_eq!(active.id, "claude-work-max");
     assert_eq!(active.usage.max_percent(), 55);
 
-    // 6. 자동전환 임계치를 50%로 낮추면 Work Max(55%) → Backup Pro(15%)로 즉시 자동전환.
-    let updated = accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            threshold_percent: 50,
-            switch_on_rate_limit: true,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    assert_eq!(updated.switched.len(), 1);
-    assert_eq!(updated.switched[0].from_id, "claude-work-max");
-    assert_eq!(updated.switched[0].to_id, "claude-backup-pro");
-
-    // 7. 계정 삭제 검증.
+    // 계정 삭제 검증.
     let after_rm =
         accounts::remove_account(&home, Some(&state), ProviderKind::Claude, "claude-work-max")
             .unwrap();
@@ -230,134 +197,19 @@ fn multi_account_registry_manual_switch_and_auto_switch_engine() {
 }
 
 #[test]
-fn per_account_rules_choose_metric_target_and_fallback_and_preserve_global_updates() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule, ProviderKind};
-
-    let root = std::env::temp_dir().join(format!("krilld-rule-behavior-{}", std::process::id()));
-    std::fs::remove_dir_all(&root).ok();
-    let home = root.join("home");
-    let state = root.join("state");
-    for provider in [ProviderKind::Claude, ProviderKind::Codex] {
-        let host = accounts::host_default_dir(&home, provider);
-        let target = root.join(provider.as_str()).join("target");
-        let backup = root.join(provider.as_str()).join("backup");
-        for dir in [&host, &target, &backup] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        let write_usage = |dir: &std::path::Path, five: u8, seven: u8| {
-            std::fs::write(dir.join("statusline_cache.json"), format!(
-                "{{\"five_hour\":{{\"utilization\":{five}}},\"seven_day\":{{\"utilization\":{seven}}}}}"
-            )).unwrap();
-        };
-        write_usage(&host, 20, 95);
-        write_usage(&target, 70, 80);
-        write_usage(&backup, 10, 15);
-        let host_id = format!("{}-host", provider.as_str());
-        let target_id = format!("{}-target", provider.as_str());
-        let backup_id = format!("{}-backup", provider.as_str());
-        let mut file = accounts::AccountsFile::default();
-        file.auto_switch.enabled = false;
-        file.accounts = vec![
-            accounts::StoredAccount {
-                id: target_id.clone(),
-                provider: provider.as_str().into(),
-                label: "Target".into(),
-                email: None,
-                profile_dir: target.display().to_string(),
-            },
-            accounts::StoredAccount {
-                id: backup_id.clone(),
-                provider: provider.as_str().into(),
-                label: "Backup".into(),
-                email: None,
-                profile_dir: backup.display().to_string(),
-            },
-        ];
-        let mut rule = AutoSwitchRule {
-            provider,
-            from_account_id: host_id.clone(),
-            enabled: true,
-            threshold_percent: 90,
-            metric: AutoSwitchMetric::FiveHour,
-            target_account_id: Some(target_id.clone()),
-        };
-        file.auto_switch.rules = vec![rule.clone()];
-        accounts::save_file(&home, Some(&state), &file).unwrap();
-        // 5h remains below threshold even though weekly usage is already high.
-        assert!(
-            accounts::refresh_accounts(&home, Some(&state))
-                .switched
-                .is_empty()
-        );
-        rule.metric = AutoSwitchMetric::SevenDay;
-        let snap = accounts::upsert_auto_switch_rule(&home, Some(&state), rule.clone()).unwrap();
-        assert_eq!(snap.switched.len(), 1);
-        assert_eq!(snap.switched[0].to_id, target_id);
-        assert_eq!(snap.switched[0].reason_percent, 95);
-        // Either exhausted window makes the explicit target ineligible.
-        for (five, seven) in [(100, 80), (70, 100)] {
-            write_usage(&target, five, seven);
-            file.auto_switch.rules = vec![rule.clone()];
-            accounts::save_file(&home, Some(&state), &file).unwrap();
-            let snap = accounts::refresh_accounts(&home, Some(&state));
-            assert_eq!(snap.switched[0].to_id, backup_id);
-        }
-        // Missing targets also fall back to the best available account.
-        rule.target_account_id = Some("missing".into());
-        file.auto_switch.rules = vec![rule.clone()];
-        accounts::save_file(&home, Some(&state), &file).unwrap();
-        assert_eq!(
-            accounts::refresh_accounts(&home, Some(&state)).switched[0].to_id,
-            backup_id
-        );
-        // A disabled rule overrides both the global policy and its rate-limit flag.
-        write_usage(&host, 100, 100);
-        rule.enabled = false;
-        file.auto_switch.enabled = true;
-        file.auto_switch.rules = vec![rule.clone()];
-        accounts::save_file(&home, Some(&state), &file).unwrap();
-        assert!(
-            accounts::refresh_accounts(&home, Some(&state))
-                .switched
-                .is_empty()
-        );
-        let policy = AutoSwitchPolicy {
-            enabled: false,
-            ..AutoSwitchPolicy::default()
-        };
-        let updated = accounts::set_auto_switch(&home, Some(&state), &policy).unwrap();
-        assert_eq!(updated.auto_switch.rules, vec![rule.clone()]);
-        assert_eq!(
-            accounts::load_file(&home, Some(&state)).auto_switch.rules,
-            vec![rule]
-        );
-        let removed =
-            accounts::remove_auto_switch_rule(&home, Some(&state), provider, &host_id).unwrap();
-        assert!(removed.auto_switch.rules.is_empty());
-        assert!(
-            accounts::load_file(&home, Some(&state))
-                .auto_switch
-                .rules
-                .is_empty()
-        );
-    }
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn legacy_accounts_toml_defaults_rules_to_empty() {
+fn legacy_accounts_toml_ignores_auto_switch_and_advanced_policy_tables() {
     let file: accounts::AccountsFile = toml::from_str(
-        "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = true\n",
+        "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = true\n[[auto_switch.rules]]\nprovider = 'Claude'\nfrom_account_id = 'claude-host'\nenabled = true\nthreshold_percent = 80\n[advanced_policy]\npredict_exhaustion = true\n",
     )
     .unwrap();
-    assert!(file.auto_switch.enabled);
-    assert!(file.auto_switch.rules.is_empty());
+    assert!(file.accounts.is_empty());
+    assert!(file.provisioning);
 }
 
 /// K-03: `accounts.toml` 파싱 실패는 기본값으로 대체하지 않는다. 원문을 보존하고 쓰기를 거부한다.
 #[test]
 fn corrupt_accounts_toml_is_preserved_and_writes_refused() {
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
+    use krill_proto::usage::ProviderKind;
 
     let home = dir("k03-home");
     let state = dir("k03-state");
@@ -373,10 +225,9 @@ fn corrupt_accounts_toml_is_preserved_and_writes_refused() {
     .unwrap();
     let path = state.join("accounts.toml");
     let before = fs::read(&path).unwrap();
-    // u8을 벗어난 임계치로 파일을 손상시킨다(감사 보고서 재현 절차).
     let corrupt = String::from_utf8(before.clone())
         .unwrap()
-        .replace("threshold_percent = 90", "threshold_percent = 300");
+        .replace("provisioning = true", "provisioning = 'corrupt'");
     assert_ne!(corrupt.as_bytes(), before.as_slice());
     fs::write(&path, &corrupt).unwrap();
 
@@ -391,8 +242,6 @@ fn corrupt_accounts_toml_is_preserved_and_writes_refused() {
         accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-keep").is_err()
     );
     assert_eq!(fs::read(&path).unwrap(), corrupt.as_bytes());
-    assert!(accounts::set_auto_switch(&home, Some(&state), &AutoSwitchPolicy::default()).is_err());
-    assert_eq!(fs::read(&path).unwrap(), corrupt.as_bytes());
     // 조회는 기본값 스냅샷만 내보내고 저장하지 않는다.
     let _ = accounts::refresh_accounts(&home, Some(&state));
     assert_eq!(fs::read(&path).unwrap(), corrupt.as_bytes());
@@ -401,14 +250,11 @@ fn corrupt_accounts_toml_is_preserved_and_writes_refused() {
     fs::remove_dir_all(&state).ok();
 }
 
-/// K-03: `[auto_switch]` 일부 필드 누락(부분 쓰기·구버전 파일) 때도 파싱이 깨지지 않는다.
+/// K-03: 과거 `[auto_switch]` 일부 필드 누락(부분 쓰기·구버전 파일) 때도 파싱이 깨지지 않는다.
 #[test]
-fn partial_auto_switch_table_parses_with_defaults() {
+fn partial_legacy_auto_switch_table_parses_cleanly() {
     let file: accounts::AccountsFile = toml::from_str("[auto_switch]\n").unwrap();
-    assert!(!file.auto_switch.enabled);
-    assert_eq!(file.auto_switch.threshold_percent, 90);
-    assert!(file.auto_switch.switch_on_rate_limit);
-    assert!(file.auto_switch.rules.is_empty());
+    assert!(file.accounts.is_empty());
 }
 
 /// K-04: 비ASCII 라벨은 서로 다른 id·프로필 디렉터리를 받는다. 같은 라벨 재등록은 멱등하다.
@@ -521,97 +367,6 @@ fn concurrent_add_account_keeps_all_entries_and_valid_toml() {
     fs::remove_dir_all(&state).ok();
 }
 
-/// K-10: 사용량을 모르는 계정은 0%로 보고 1순위로 고르지 않는다.
-#[test]
-fn unknown_usage_is_never_auto_switch_target() {
-    use krill_proto::usage::ProviderKind;
-
-    let home = dir("k10-home");
-    let state = dir("k10-state");
-    enable_auto_switch(&home, &state);
-    // 사용량 파일 없는 후보(미로그인 프로필).
-    let fresh = home.join("claude-fresh");
-    accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Claude,
-        "Fresh",
-        None,
-        &fresh.display().to_string(),
-    )
-    .unwrap();
-    // 기본 프로비저닝은 공유 기록 링크를 만들지만, 계정별 사용량 근거는 만들지 않는다.
-    assert!(!fresh.join(CLAUDE_CACHE).exists());
-    assert!(!fresh.join("usage_cache.json").exists());
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95,"resets_at":"2099-01-01T00:00:00Z"}}"#,
-    )
-    .unwrap();
-
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{:?}", snap.switched);
-    let active = snap
-        .accounts
-        .iter()
-        .find(|a| a.provider == ProviderKind::Claude && a.active)
-        .unwrap();
-    assert_eq!(active.id, "claude-host");
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
-/// K-11: 리셋된 창의 지난 수치로는 전환하지 않는다. 유효 수치는 그대로 쓴다.
-#[test]
-fn expired_window_is_ignored_for_auto_switch() {
-    use krill_proto::usage::ProviderKind;
-
-    let home = dir("k11-home");
-    let state = dir("k11-state");
-    enable_auto_switch(&home, &state);
-    let backup = home.join("claude-backup");
-    accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Claude,
-        "Backup",
-        None,
-        &backup.display().to_string(),
-    )
-    .unwrap();
-    fs::write(
-        backup.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":10}}"#,
-    )
-    .unwrap();
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    // 5h 창은 리셋됨(2001년), 7d 40%는 유효 → 임계치 90% 미달이라 전환 없음.
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95,"resets_at":"2001-01-01T00:00:00Z"},"seven_day":{"utilization":40}}"#,
-    )
-    .unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{:?}", snap.switched);
-
-    // 리셋 시각이 미래면 같은 95%로 전환이 동작한다.
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":40}}"#,
-    )
-    .unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].from_id, "claude-host");
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
 /// K-11: `resets_at`은 epoch 초·RFC 3339(Z·오프셋·소수초)를 푼다. 모르면 `None`.
 #[test]
 fn reset_epoch_parses_rfc3339_and_epoch_seconds() {
@@ -641,363 +396,6 @@ fn reset_epoch_parses_rfc3339_and_epoch_seconds() {
     ] {
         assert_eq!(parse_reset_epoch(bad), None, "{bad:?}");
     }
-}
-
-#[test]
-fn stale_preferred_target_is_skipped_for_fresh_fallback() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-    let root = std::env::temp_dir().join(format!("krilld-stale-rule-{}", std::process::id()));
-    std::fs::remove_dir_all(&root).ok();
-    let home = root.join("home");
-    let state = root.join("state");
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
-    // 등록 계정은 자기 캐시가 없으면 Orca 캐시 행(라벨 일치)에서 사용량·stale을 받는다.
-    std::fs::write(
-        home.join(".claude/orca-usage-cache.json"),
-        r#"{"accounts":[
-        {"host":true,"label":"Host","five_hour":{"utilization":95}},
-        {"label":"Stale","stale":true,"five_hour":{"utilization":1}},
-        {"label":"Backup","stale":false,"five_hour":{"utilization":30}}
-    ]}"#,
-    )
-    .unwrap();
-    for label in ["Stale", "Backup"] {
-        accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Claude,
-            label,
-            None,
-            &root.join(label).display().to_string(),
-        )
-        .unwrap();
-    }
-    let mut file = accounts::load_file(&home, Some(&state));
-    // 호스트에서 시작해 계정별 규칙의 후보 선택을 확인한다.
-    file.active.clear();
-    file.auto_switch.enabled = false;
-    file.auto_switch.rules.push(AutoSwitchRule {
-        provider: ProviderKind::Claude,
-        from_account_id: "claude-host".into(),
-        enabled: true,
-        threshold_percent: 90,
-        metric: AutoSwitchMetric::Max,
-        target_account_id: Some("claude-stale".into()),
-    });
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].to_id, "claude-backup");
-    std::fs::remove_dir_all(root).ok();
-}
-
-/// K-12·OWE-770: 수동 전환 직후뿐 아니라 같은 사용량이 유지되는 동안 주기 새로고침(`refresh_accounts`)을
-/// 반복해도 사용자 선택이 유지되고, 사용량이 늘어나면 자동전환이 다시 동작한다.
-#[test]
-fn manual_switch_is_not_overridden_by_auto_switch() {
-    use krill_proto::usage::ProviderKind;
-
-    let home = dir("k12-home");
-    let state = dir("k12-state");
-    enable_auto_switch(&home, &state);
-    let high_profile = home.join("claude-High");
-    for (label, five) in [("High", 95), ("Low", 10)] {
-        let profile = home.join(format!("claude-{label}"));
-        accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Claude,
-            label,
-            None,
-            &profile.display().to_string(),
-        )
-        .unwrap();
-        fs::write(
-            profile.join(CLAUDE_CACHE),
-            format!(r#"{{"five_hour":{{"utilization":{five}}}}}"#),
-        )
-        .unwrap();
-    }
-    // 95% 계정으로 명시 전환: 저장된 활성·응답 활성이 모두 선택 계정이고 전환 기록은 없다.
-    let high_id = "claude-high";
-    let snap =
-        accounts::switch_account(&home, Some(&state), ProviderKind::Claude, high_id).unwrap();
-    assert!(snap.switched.is_empty(), "{snap:?}");
-    assert_eq!(
-        snap.accounts
-            .iter()
-            .find(|a| a.provider == ProviderKind::Claude && a.active)
-            .map(|a| a.id.as_str()),
-        Some(high_id)
-    );
-    assert_eq!(
-        accounts::load_file(&home, Some(&state))
-            .active
-            .get("claude")
-            .map(String::as_str),
-        Some(high_id)
-    );
-    // OWE-770: 사용량이 그대로(95%)인 동안 주기 새로고침·ListAccounts가 반복돼도 수동 고정이 유지된다.
-    for _ in 0..3 {
-        let polled = accounts::refresh_accounts(&home, Some(&state));
-        assert!(polled.switched.is_empty(), "{polled:?}");
-        assert!(polled.advanced.history.is_empty(), "{polled:?}");
-        assert_eq!(
-            polled
-                .accounts
-                .iter()
-                .find(|a| a.provider == ProviderKind::Claude && a.active)
-                .map(|a| a.id.as_str()),
-            Some(high_id)
-        );
-    }
-    // 사용량이 증가(95% -> 96%)하면 수동 고정이 풀리고 자동전환이 정상 동작한다.
-    fs::write(
-        high_profile.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":96,"resets_at":"2099-01-01T00:00:00Z"}}"#,
-    )
-    .unwrap();
-    let next = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(next.switched.len(), 1);
-    assert_eq!(next.switched[0].from_id, high_id);
-    assert_eq!(next.switched[0].to_id, "claude-low");
-    assert_eq!(next.switched[0].reason_percent, 96);
-
-    // 다시 수동 고정한 뒤 퍼센트는 같아도 리셋 시각이 바뀌면 고정이 풀려 자동전환된다.
-    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, high_id).unwrap();
-    assert!(
-        accounts::refresh_accounts(&home, Some(&state))
-            .switched
-            .is_empty()
-    );
-    fs::write(
-        high_profile.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":96,"resets_at":"2099-01-02T00:00:00Z"}}"#,
-    )
-    .unwrap();
-    let reset_changed = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(reset_changed.switched.len(), 1);
-    assert_eq!(reset_changed.switched[0].to_id, "claude-low");
-
-    // 다시 수동 고정한 뒤 자동전환 정책이 바뀌면 고정이 풀려 즉시 자동전환된다.
-    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, high_id).unwrap();
-    assert!(
-        accounts::refresh_accounts(&home, Some(&state))
-            .switched
-            .is_empty()
-    );
-    let policy_changed = accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &krill_proto::usage::AutoSwitchPolicy {
-            enabled: true,
-            threshold_percent: 85,
-            switch_on_rate_limit: true,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    assert_eq!(policy_changed.switched.len(), 1);
-    assert_eq!(policy_changed.switched[0].to_id, "claude-low");
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
-#[test]
-fn failed_auto_switch_save_keeps_persisted_selection() {
-    use krill_proto::usage::ProviderKind;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let home = dir("audit-save-home");
-    let state = dir("audit-save-state");
-    enable_auto_switch(&home, &state);
-    let backup = home.join("backup");
-    accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Claude,
-        "Backup",
-        None,
-        &backup.display().to_string(),
-    )
-    .unwrap();
-    fs::write(
-        backup.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":10}}"#,
-    )
-    .unwrap();
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95}}"#,
-    )
-    .unwrap();
-    let before = fs::read(accounts::config_path(&home, Some(&state))).unwrap();
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-    let after = fs::read(accounts::config_path(&home, Some(&state))).unwrap();
-    fs::remove_dir_all(home).unwrap();
-    fs::remove_dir_all(state).unwrap();
-    assert_eq!(before, after);
-    assert!(
-        snap.switched.is_empty(),
-        "failed persistence cannot report success"
-    );
-    assert!(
-        snap.accounts
-            .iter()
-            .any(|a| a.provider == ProviderKind::Claude && a.active && a.host_default)
-    );
-}
-
-/// K-14: 지정 타깃이 동률·열위면 전환하지 않고, 근소 우위(5%p 미만)에도 가만히 있어 왕복이 멈춘다.
-#[test]
-fn auto_switch_hysteresis_prevents_flapping() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-
-    let root = std::env::temp_dir().join(format!("krilld-flap-{}", std::process::id()));
-    std::fs::remove_dir_all(&root).ok();
-    let home = root.join("home");
-    let state = root.join("state");
-    let host = accounts::host_default_dir(&home, ProviderKind::Claude);
-    let target = root.join("target");
-    std::fs::create_dir_all(&host).unwrap();
-    std::fs::create_dir_all(&target).unwrap();
-    let write = |five_host: u8, five_target: u8| {
-        std::fs::write(
-            host.join("statusline_cache.json"),
-            format!("{{\"five_hour\":{{\"utilization\":{five_host}}}}}"),
-        )
-        .unwrap();
-        std::fs::write(
-            target.join("statusline_cache.json"),
-            format!("{{\"five_hour\":{{\"utilization\":{five_target}}}}}"),
-        )
-        .unwrap();
-    };
-    let target_id = "claude-target";
-    let mut file = accounts::AccountsFile::default();
-    file.accounts.push(accounts::StoredAccount {
-        id: target_id.into(),
-        provider: "claude".into(),
-        label: "Target".into(),
-        email: None,
-        profile_dir: target.display().to_string(),
-    });
-    file.auto_switch.rules = vec![AutoSwitchRule {
-        provider: ProviderKind::Claude,
-        from_account_id: "claude-host".into(),
-        enabled: true,
-        threshold_percent: 90,
-        metric: AutoSwitchMetric::Max,
-        target_account_id: Some(target_id.into()),
-    }];
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-
-    // 규칙 타깃(95%)이 활성(91%)보다 차다 → 전환 없음(감사 보고서 왕복 사례).
-    write(91, 95);
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{snap:?}");
-    // 근소 우위(95 vs 92, 3%p)에도 전환 없음.
-    write(95, 92);
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{snap:?}");
-    // 5%p 이상 여유(95 vs 90)면 전환한다.
-    write(95, 90);
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].to_id, target_id);
-
-    std::fs::remove_dir_all(root).ok();
-}
-
-/// K-27: 임계치는 문서 범위(1~100)를 따르고, `switch_on_rate_limit=false`면 100%만으로 전환하지 않는다.
-#[test]
-fn threshold_uses_documented_range_and_rate_limit_flag() {
-    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
-
-    let home = dir("k27-home");
-    let state = dir("k27-state");
-    let backup = home.join("claude-backup");
-    accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Claude,
-        "Backup",
-        None,
-        &backup.display().to_string(),
-    )
-    .unwrap();
-    fs::write(
-        backup.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":10}}"#,
-    )
-    .unwrap();
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    // 임계치 30%: 40%면 전환한다(50~99 고정이면 전환하지 않던 결함).
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":40}}"#,
-    )
-    .unwrap();
-    let updated = accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            threshold_percent: 30,
-            switch_on_rate_limit: true,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        accounts::load_file(&home, Some(&state))
-            .auto_switch
-            .threshold_percent,
-        30
-    );
-    // 정책 저장 끝의 평가에서 바로 전환된다(다음 조회에서는 이미 전환돼 기록이 없다 — 왕복 없음).
-    assert_eq!(updated.switched.len(), 1, "{updated:?}");
-    assert_eq!(updated.switched[0].to_id, "claude-backup");
-    let stable = accounts::refresh_accounts(&home, Some(&state));
-    assert!(stable.switched.is_empty(), "{stable:?}");
-
-    // 100% 도달만으로는 전환하지 않는다(플래그 꺼짐). 95% 임계치 구간은 전환한다.
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":100}}"#,
-    )
-    .unwrap();
-    accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            threshold_percent: 90,
-            switch_on_rate_limit: false,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    // 활성 계정을 호스트로 되돌린다(앞 단계에서 전환됐을 수 있다).
-    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-host").unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{snap:?}");
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95}}"#,
-    )
-    .unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1, "{snap:?}");
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
 }
 
 /// K-28: `active-accounts.env`는 셸에 안전하게 인용된다. source해도 값이 그대로다.
@@ -1226,63 +624,14 @@ fn account_statuses_classify_unknown_stale_login_error_ok() {
     fs::remove_dir_all(&state).ok();
 }
 
-/// OWE-703 + K-10: 모름 상태 계정은 상태 꼬리가 있어도 자동전환 후보가 아니다.
+/// OWE-703 2단계 지시: 한도 기록 계정은 상태 꼬리에 `RateLimited`로 표시되고,
+/// 수동 전환이나 clear 시 해제된다(자동 전환은 일어나지 않는다).
 #[test]
-fn unknown_status_is_never_auto_switch_target() {
+fn rate_limited_status_is_recorded_and_cleared_on_manual_switch() {
     use krill_proto::usage::{AccountStatus, ProviderKind};
-
-    let home = dir("status-k10-home");
-    let state = dir("status-k10-state");
-    enable_auto_switch(&home, &state);
-    let fresh = home.join("claude-fresh");
-    accounts::add_account(
-        &home,
-        Some(&state),
-        ProviderKind::Claude,
-        "Fresh",
-        None,
-        &fresh.display().to_string(),
-    )
-    .unwrap();
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95,"resets_at":"2099-01-01T00:00:00Z"}}"#,
-    )
-    .unwrap();
-
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{:?}", snap.switched);
-    let active = snap
-        .accounts
-        .iter()
-        .find(|a| a.provider == ProviderKind::Claude && a.active)
-        .unwrap();
-    assert_eq!(active.id, "claude-host");
-    let status_of = |id: &str| {
-        snap.statuses
-            .iter()
-            .find(|s| s.account_id == id)
-            .map(|s| s.status)
-    };
-    assert_eq!(status_of("claude-fresh"), Some(AccountStatus::Unknown));
-    assert_eq!(status_of("claude-host"), Some(AccountStatus::Ok));
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
-/// OWE-703 2단계 지시: 한도 기록 계정은 캐시 사용량이 미상·낮아도 후보에서 빠지고,
-/// 활성 계정이면 전환 평가가 일어난다. 수동 고정·`switch_on_rate_limit=false`·비활성은 존중된다.
-#[test]
-fn rate_limited_is_excluded_and_triggers_switch() {
-    use krill_proto::usage::{AccountStatus, AutoSwitchPolicy, ProviderKind};
 
     let home = dir("ratelim-home");
     let state = dir("ratelim-state");
-    enable_auto_switch(&home, &state);
-    // id 충돌 방지: 이 테스트 전용 라벨(프로세스 전역 한도 기록과 겹치지 않게).
     for (label, five) in [("RateLim", 10), ("RateBak", 15)] {
         let profile = home.join(format!("claude-{label}"));
         accounts::add_account(
@@ -1308,14 +657,15 @@ fn rate_limited_is_excluded_and_triggers_switch() {
     )
     .unwrap();
 
-    // 한도 계정을 활성으로 두고 기록한다(캐시는 10%로 낮다).
     accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-ratelim").unwrap();
     accounts::record_rate_limited(ProviderKind::Claude, "claude-ratelim");
     let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].from_id, "claude-ratelim");
-    assert_eq!(snap.switched[0].to_id, "claude-ratebak");
-    assert_eq!(snap.switched[0].reason_percent, 100);
+    assert!(snap.switched.is_empty());
+    assert!(
+        snap.accounts
+            .iter()
+            .any(|a| a.id == "claude-ratelim" && a.active)
+    );
     let status_of = |id: &str| {
         snap.statuses
             .iter()
@@ -1336,17 +686,11 @@ fn rate_limited_is_excluded_and_triggers_switch() {
     );
     assert_eq!(status_of("claude-ratebak"), Some(AccountStatus::Ok));
 
-    // 사용자가 한도 계정을 직접 고르면 다음 주기 새로고침이 다른 계정으로 되돌리지 않는다
-    // (모델별 한도라 다른 모델로 쓰려는 경우, 액터진 2026-11-20 제보).
-    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-ratelim").unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
+    // 사용자가 직접 선택하면 이전 한도 기록이 지워진다.
+    let snap =
+        accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-ratelim")
+            .unwrap();
     assert!(snap.switched.is_empty(), "{snap:?}");
-    assert!(
-        snap.accounts
-            .iter()
-            .any(|a| a.id == "claude-ratelim" && a.active),
-        "{snap:?}"
-    );
     assert_ne!(
         snap.statuses
             .iter()
@@ -1355,82 +699,10 @@ fn rate_limited_is_excluded_and_triggers_switch() {
         Some(AccountStatus::RateLimited)
     );
 
-    // `switch_on_rate_limit=false`면 한도만으로는 전환하지 않지만 후보 제외·상태는 유지된다.
-    accounts::record_rate_limited(ProviderKind::Claude, "claude-ratelim");
-    accounts::set_auto_switch(
-        &home,
-        Some(&state),
-        &AutoSwitchPolicy {
-            enabled: true,
-            threshold_percent: 90,
-            switch_on_rate_limit: false,
-            rules: Vec::new(),
-        },
-    )
-    .unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(snap.switched.is_empty(), "{snap:?}");
-    assert_eq!(
-        snap.statuses
-            .iter()
-            .find(|s| s.account_id == "claude-ratelim")
-            .map(|s| s.status),
-        Some(AccountStatus::RateLimited)
-    );
-
-    // 수동 전환 직후에는 자동전환이 덮어쓰지 않는다(K-12).
-    let snap =
-        accounts::switch_account(&home, Some(&state), ProviderKind::Claude, "claude-ratelim")
-            .unwrap();
-    assert!(snap.switched.is_empty(), "{snap:?}");
-
-    accounts::clear_rate_limited(ProviderKind::Claude, "claude-ratelim");
     assert!(!accounts::clear_rate_limited(
         ProviderKind::Claude,
         "claude-ratelim"
     ));
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
-/// OWE-703 2단계 지시: 한도 계정은 여유가 있어도 자동전환 후보가 아니다.
-#[test]
-fn rate_limited_candidate_is_skipped_for_fresh_fallback() {
-    use krill_proto::usage::ProviderKind;
-
-    let home = dir("ratelim-cand-home");
-    let state = dir("ratelim-cand-state");
-    enable_auto_switch(&home, &state);
-    for (label, five) in [("RateLim", 5), ("RateBak", 30)] {
-        let profile = home.join(format!("claude-{label}"));
-        accounts::add_account(
-            &home,
-            Some(&state),
-            ProviderKind::Claude,
-            label,
-            None,
-            &profile.display().to_string(),
-        )
-        .unwrap();
-        fs::write(
-            profile.join(CLAUDE_CACHE),
-            format!(r#"{{"five_hour":{{"utilization":{five}}}}}"#),
-        )
-        .unwrap();
-    }
-    let host = home.join(".claude");
-    fs::create_dir_all(&host).unwrap();
-    fs::write(
-        host.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":95,"resets_at":"2099-01-01T00:00:00Z"}}"#,
-    )
-    .unwrap();
-    accounts::record_rate_limited(ProviderKind::Claude, "claude-ratelim");
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    // 호스트 95% → 가장 여유로운 비한도 계정으로 간다(5% 한도 계정 아님).
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].to_id, "claude-ratebak");
-    accounts::clear_rate_limited(ProviderKind::Claude, "claude-ratelim");
     fs::remove_dir_all(&home).ok();
     fs::remove_dir_all(&state).ok();
 }
@@ -1464,8 +736,6 @@ fn orca_detected_accounts_have_stable_uuid_ids_and_never_launch() {
     let b = ("432d5922-d39e-4df0-9255-6de3443b3df0", "b@example.com");
     cache(&[a, b]);
     let mut file = accounts::AccountsFile::default();
-    file.auto_switch.enabled = true;
-    file.auto_switch.threshold_percent = 90;
     // 구버전처럼 Orca 계정이 활성으로 저장돼 있어도 실행 env는 주입하지 않는다.
     let b_id = format!("claude-orca-{}", b.0);
     file.active.insert("claude".into(), b_id.clone());
@@ -1642,12 +912,9 @@ fn registered_account_with_missing_dir_is_not_a_candidate() {
     );
     // 다음 저장 때 env 파일도 실행과 같은 호스트 경로로 맞춰진다.
     let mut file = accounts::load_file(&home, Some(&state));
-    file.auto_switch.enabled = true;
-    file.auto_switch.threshold_percent = 90;
     accounts::save_file(&home, Some(&state), &file).unwrap();
     let env = fs::read_to_string(state.join("active-accounts.env")).unwrap();
     assert!(env.contains(&format!("'{}'", host.display())), "{env:?}");
-    // 호스트(95%)로 돌아가도 폴더 없는 계정(5%)은 후보가 아니다.
     file.active.insert("claude".into(), "claude-host".into());
     accounts::save_file(&home, Some(&state), &file).unwrap();
     let snap = accounts::refresh_accounts(&home, Some(&state));
@@ -2094,300 +1361,41 @@ fn delete_registered_orca_account_hides_orca_cache_ghost_and_readd_unhides_it() 
     fs::remove_dir_all(&state).ok();
 }
 
-#[test]
-fn antigravity_auto_switch_ignores_exhausted_claude_gpt_pool_by_default_and_respects_provider_metrics()
- {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-
-    let home = dir("agy-gemini-vs-claude-home");
-    let state = dir("agy-gemini-vs-claude-state");
-    let p1 = home.join("agy-p1");
-    let p2 = home.join("agy-p2");
-    fs::create_dir_all(&p1).unwrap();
-    fs::create_dir_all(&p2).unwrap();
-
-    // p1: Gemini 5% (plenty left), Claude/GPT 100% (exhausted).
-    fs::write(
-        p1.join("usage.json"),
-        r#"{
-            "status": "SUCCESS",
-            "command": {
-                "name": "usage",
-                "data": {
-                    "groups": [
-                        {
-                            "name": "Gemini Models",
-                            "buckets": [
-                                {"id": "5h", "window": "5h", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"},
-                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.95, "reset_time": "2099-01-01T00:00:00Z"}
-                            ]
-                        },
-                        {
-                            "name": "Claude and GPT models",
-                            "buckets": [
-                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": "2099-01-01T00:00:00Z"}
-                            ]
-                        }
-                    ]
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-    // p2: Gemini 1%, Claude/GPT 10%.
-    fs::write(
-        p2.join("usage.json"),
-        r#"{
-            "status": "SUCCESS",
-            "command": {
-                "name": "usage",
-                "data": {
-                    "groups": [
-                        {
-                            "name": "Gemini Models",
-                            "buckets": [
-                                {"id": "5h", "window": "5h", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"},
-                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.99, "reset_time": "2099-01-01T00:00:00Z"}
-                            ]
-                        },
-                        {
-                            "name": "Claude and GPT models",
-                            "buckets": [
-                                {"id": "weekly", "window": "weekly", "remaining_fraction": 0.90, "reset_time": "2099-01-01T00:00:00Z"}
-                            ]
-                        }
-                    ]
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-
-    let mut file = accounts::AccountsFile::default();
-    file.auto_switch.enabled = true;
-    file.auto_switch.threshold_percent = 80;
-    file.auto_switch.switch_on_rate_limit = true;
-    file.accounts.push(accounts::StoredAccount {
-        id: "agy-1".into(),
-        provider: "agy".into(),
-        label: "Profile 1".into(),
-        email: None,
-        profile_dir: p1.display().to_string(),
-    });
-    file.accounts.push(accounts::StoredAccount {
-        id: "agy-2".into(),
-        provider: "agy".into(),
-        label: "Profile 2".into(),
-        email: None,
-        profile_dir: p2.display().to_string(),
-    });
-    file.active.insert("agy".into(), "agy-1".into());
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-
-    // Default metric (Max -> Gemini Max on Antigravity) must NOT switch when only Claude/GPT is at 100%.
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert!(
-        snap.switched.is_empty(),
-        "Gemini quota is at 5%, so exhausted Claude/GPT quota must not trigger auto-switch: {:?}",
-        snap.switched
-    );
-    let active = snap
-        .accounts
-        .iter()
-        .find(|a| a.provider == ProviderKind::Antigravity && a.active)
-        .unwrap();
-    assert_eq!(active.id, "agy-1");
-
-    // When the user explicitly selects Claude/GPT 7d as the auto-switch metric, it switches to agy-2.
-    let mut file = accounts::load_file(&home, Some(&state));
-    file.auto_switch.rules = vec![AutoSwitchRule {
-        provider: ProviderKind::Antigravity,
-        from_account_id: "agy-1".into(),
-        enabled: true,
-        threshold_percent: 80,
-        metric: AutoSwitchMetric::AntigravityClaudeGptSevenDay,
-        target_account_id: Some("agy-2".into()),
-    }];
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched.len(), 1);
-    assert_eq!(snap.switched[0].from_id, "agy-1");
-    assert_eq!(snap.switched[0].to_id, "agy-2");
-
-    fs::remove_dir_all(&home).ok();
-    fs::remove_dir_all(&state).ok();
-}
-
-/// 2026-10-28 장애: 5h 규칙의 지정 타깃은 토큰이 죽어 사용량을 모르는데 공유 rollout에 다른 계정
-/// 값이 남아 있었고, 5h 창이 없는 Pro 계정은 '모름'으로 빠져 전환이 0회였다.
+/// 공유 세션 폴더(symlink)의 rollout은 다른 계정의 사용량으로 귀속하지 않는다.
 #[cfg(unix)]
 #[test]
-fn dead_target_is_never_chosen_and_account_without_five_hour_window_is() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-
+fn shared_rollout_is_not_attributed_to_other_codex_profile() {
     let root = dir("codex-shared-rollout");
     let (home, state) = (root.join("home"), root.join("state"));
-    let [czyb, tnlvof, pro] = ["czyb", "tnlvof", "pro"].map(|n| root.join(n));
-    for d in [&czyb, &tnlvof, &pro] {
-        fs::create_dir_all(d).unwrap();
-    }
-    fs::write(
-        czyb.join(CLAUDE_CACHE),
-        r#"{"five_hour":{"utilization":96},"seven_day":{"utilization":16}}"#,
-    )
-    .unwrap();
-    fs::write(
-        pro.join(CLAUDE_CACHE),
-        r#"{"seven_day":{"utilization":12}}"#,
-    )
-    .unwrap();
-    // 마지막 rollout은 Pro 계정이 쓴 값(5h 없음, 7d 10%)이다.
-    let rollout = |sessions: &std::path::Path| {
-        fs::create_dir_all(sessions.join("2026/10/28")).unwrap();
-        fs::write(
-            sessions.join("2026/10/28/rollout-2026-10-28T15-35-18-x.jsonl"),
-            "{\"rate_limits\":{\"primary\":{\"used_percent\":10.0,\"window_minutes\":10080},\"secondary\":null}}\n",
-        )
-        .unwrap();
-    };
+    let tnlvof = root.join("tnlvof");
+    fs::create_dir_all(&tnlvof).unwrap();
     let shared = root.join("shared");
-    rollout(&shared);
+    fs::create_dir_all(shared.join("2026/10/28")).unwrap();
+    fs::write(
+        shared.join("2026/10/28/rollout-2026-10-28T15-35-18-x.jsonl"),
+        "{\"rate_limits\":{\"primary\":{\"used_percent\":10.0,\"window_minutes\":10080},\"secondary\":null}}\n",
+    )
+    .unwrap();
     std::os::unix::fs::symlink(&shared, tnlvof.join("sessions")).unwrap();
 
-    let mut file = accounts::AccountsFile {
-        accounts: [
-            ("codex-czyb", &czyb),
-            ("codex-tnlvof", &tnlvof),
-            ("codex-pro", &pro),
-        ]
-        .map(|(id, d)| accounts::StoredAccount {
-            id: id.into(),
+    let file = accounts::AccountsFile {
+        accounts: vec![accounts::StoredAccount {
+            id: "codex-tnlvof".into(),
             provider: "codex".into(),
-            label: id.into(),
+            label: "codex-tnlvof".into(),
             email: None,
-            profile_dir: d.display().to_string(),
-        })
-        .into(),
+            profile_dir: tnlvof.display().to_string(),
+        }],
         ..Default::default()
     };
-    file.auto_switch.enabled = false;
-    let switch_with = |file: &mut accounts::AccountsFile, metric| {
-        file.active.insert("codex".into(), "codex-czyb".into());
-        file.auto_switch.rules = vec![AutoSwitchRule {
-            provider: ProviderKind::Codex,
-            from_account_id: "codex-czyb".into(),
-            enabled: true,
-            threshold_percent: 95,
-            metric,
-            target_account_id: Some("codex-tnlvof".into()),
-        }];
-        accounts::save_file(&home, Some(&state), file).unwrap();
-        accounts::refresh_accounts(&home, Some(&state))
-    };
-
-    // 공유 세션 폴더의 rollout은 tnlvof 값이 아니다(사용량·미터 모두).
-    for metric in [AutoSwitchMetric::FiveHour, AutoSwitchMetric::Max] {
-        let snap = switch_with(&mut file, metric);
-        let dead = snap
-            .accounts
-            .iter()
-            .find(|a| a.id == "codex-tnlvof")
-            .unwrap();
-        assert!(dead.usage.is_empty(), "{dead:?}");
-        assert_eq!(snap.switched[0].to_id, "codex-pro", "{metric:?} {snap:?}");
-    }
-    // 자기 rollout이 남아 있어도 직접 조회가 401로 실패한 계정은 후보가 아니다.
-    fs::remove_file(tnlvof.join("sessions")).unwrap();
-    rollout(&tnlvof.join("sessions"));
-    super::direct::fail_for_tests(&home, ProviderKind::Codex, &tnlvof);
-    let snap = switch_with(&mut file, AutoSwitchMetric::Max);
-    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
-
-    fs::remove_dir_all(&root).ok();
-}
-
-/// 5h 창이 없는 계정을 후보로 열면서 생기는 비대칭 규칙 왕복(Plus 5h ↔ Pro 7d)을 막는다.
-#[test]
-fn asymmetric_rules_do_not_ping_pong_but_exhausted_account_still_escapes() {
-    use krill_proto::usage::{AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-
-    let root = dir("codex-ping-pong");
-    let (home, state) = (root.join("home"), root.join("state"));
-    let [plus, pro] = ["plus", "pro"].map(|n| root.join(n));
-    for d in [&plus, &pro] {
-        fs::create_dir_all(d).unwrap();
-    }
-    fs::write(
-        pro.join(CLAUDE_CACHE),
-        r#"{"seven_day":{"utilization":90}}"#,
-    )
-    .unwrap();
-    let rule = |from: &str, metric, threshold| AutoSwitchRule {
-        provider: ProviderKind::Codex,
-        from_account_id: from.into(),
-        enabled: true,
-        threshold_percent: threshold,
-        metric,
-        target_account_id: None,
-    };
-    let mut file = accounts::AccountsFile {
-        accounts: [("codex-plus", &plus), ("codex-pro", &pro)]
-            .map(|(id, d)| accounts::StoredAccount {
-                id: id.into(),
-                provider: "codex".into(),
-                label: id.into(),
-                email: None,
-                profile_dir: d.display().to_string(),
-            })
-            .into(),
-        ..Default::default()
-    };
-    file.active.insert("codex".into(), "codex-plus".into());
-    file.auto_switch.enabled = false;
-    file.auto_switch.rules = vec![
-        rule("codex-plus", AutoSwitchMetric::FiveHour, 95),
-        rule("codex-pro", AutoSwitchMetric::SevenDay, 90),
-    ];
     accounts::save_file(&home, Some(&state), &file).unwrap();
-    let plus_usage = |five: u8| {
-        fs::write(
-            plus.join(CLAUDE_CACHE),
-            format!(r#"{{"five_hour":{{"utilization":{five}}},"seven_day":{{"utilization":20}}}}"#),
-        )
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    let dead = snap
+        .accounts
+        .iter()
+        .find(|a| a.id == "codex-tnlvof")
         .unwrap();
-    };
-
-    // Pro는 자기 7d 규칙(90%)으로 바로 되돌아오므로 고르지 않는다.
-    plus_usage(96);
-    assert!(
-        accounts::refresh_accounts(&home, Some(&state))
-            .switched
-            .is_empty()
-    );
-    // 소진되면 피신하고, 소진 계정으로는 되돌아가지 않는다.
-    plus_usage(100);
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
-    assert!(
-        accounts::refresh_accounts(&home, Some(&state))
-            .switched
-            .is_empty()
-    );
-
-    // 같은 지표에서 임계 이상 후보로 가는 기존 폴백은 그대로다(되돌아올 수 없다).
-    file.active.insert("codex".into(), "codex-plus".into());
-    file.auto_switch.rules.clear();
-    file.auto_switch.enabled = true;
-    file.auto_switch.threshold_percent = 80;
-    accounts::save_file(&home, Some(&state), &file).unwrap();
-    plus_usage(97);
-    fs::write(
-        pro.join(CLAUDE_CACHE),
-        r#"{"seven_day":{"utilization":82}}"#,
-    )
-    .unwrap();
-    let snap = accounts::refresh_accounts(&home, Some(&state));
-    assert_eq!(snap.switched[0].to_id, "codex-pro", "{snap:?}");
+    assert!(dead.usage.is_empty(), "{dead:?}");
 
     fs::remove_dir_all(&root).ok();
 }

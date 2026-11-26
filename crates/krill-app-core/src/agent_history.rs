@@ -1,8 +1,10 @@
 //! MK-082·MK-181: 요청 시 멀티 에이전트 대화 기록을 스캔·전문 검색하고 선택한 대화를 새 탭에서 재개한다.
 //! 열기·새로고침·검색·필터 전환 때만 일회성 백그라운드 IO를 실행하며, 감시·폴링·상주 프로세스는 없다.
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
 use gpui_component::button::ButtonVariants as _;
@@ -39,7 +41,110 @@ fn should_reconnect_ipc(err: &io::Error) -> bool {
     )
 }
 
+const MAX_IDLE_CONNS_PER_KEY: usize = 4;
+const POOL_IDLE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PoolChannel {
+    Workflow,
+    History,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolKey {
+    host: HostId,
+    socket: PathBuf,
+    allow_local_launch: bool,
+    channel: PoolChannel,
+}
+
+impl PoolKey {
+    fn of(target: &HostTarget, channel: PoolChannel) -> Self {
+        Self {
+            host: target.host().clone(),
+            socket: target.socket().to_owned(),
+            allow_local_launch: target.allow_local_launch(),
+            channel,
+        }
+    }
+}
+
+struct PooledConn {
+    conn: daemon::Connection,
+    epoch: u64,
+    idle_since: Instant,
+}
+
+type PoolMap = Mutex<BTreeMap<PoolKey, VecDeque<PooledConn>>>;
+
+fn connection_pool() -> &'static PoolMap {
+    static POOL: OnceLock<PoolMap> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Drops any idle pooled history/workflow IPC connections for `host`
+/// (call on host disconnect or target change).
+pub fn invalidate_host_connections(host: &HostId) {
+    if let Ok(mut pool) = connection_pool().lock() {
+        pool.retain(|key, _| &key.host != host);
+    }
+}
+
+fn checkout_pooled_conn(target: &HostTarget, channel: PoolChannel) -> Option<PooledConn> {
+    let key = PoolKey::of(target, channel);
+    let epoch = target.transport_epoch();
+    let now = Instant::now();
+    let mut pool = connection_pool().lock().ok()?;
+    let queue = pool.get_mut(&key)?;
+    while let Some(item) = queue.pop_front() {
+        if item.epoch == epoch && now.saturating_duration_since(item.idle_since) < POOL_IDLE_TTL {
+            if queue.is_empty() {
+                pool.remove(&key);
+            }
+            return Some(item);
+        }
+    }
+    pool.remove(&key);
+    None
+}
+
+fn return_pooled_conn(
+    target: &HostTarget,
+    channel: PoolChannel,
+    conn: daemon::Connection,
+    epoch: u64,
+) {
+    if !target.is_current() || target.transport_epoch() != epoch {
+        return;
+    }
+    let key = PoolKey::of(target, channel);
+    let Ok(mut pool) = connection_pool().lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let queue = pool.entry(key).or_default();
+    queue.retain(|c| {
+        c.epoch == epoch && now.saturating_duration_since(c.idle_since) < POOL_IDLE_TTL
+    });
+    while queue.len() >= MAX_IDLE_CONNS_PER_KEY {
+        queue.pop_back();
+    }
+    queue.push_front(PooledConn {
+        conn,
+        epoch,
+        idle_since: now,
+    });
+}
+
 pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
+    workflow_call_with_timeouts(target, Duration::from_secs(15), Duration::from_secs(5))
+}
+
+fn workflow_call_with_timeouts(
+    target: Option<HostTarget>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> WorkflowCall {
     #[cfg(test)]
     if target.is_none() {
         return Arc::new(|_| {
@@ -49,49 +154,60 @@ pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
             ))
         });
     }
-    let cached: Mutex<Option<daemon::Connection>> = Mutex::new(None);
     Arc::new(move |json| {
-        let mut guard = cached
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let req = krill_proto::mobile::MobileRequest::Workflow(json.to_owned());
+        let encoded = req.encode()?;
+        let resolved = match &target {
+            Some(t) => t.clone(),
+            None => HostTarget::local_dev()?,
+        };
         for attempt in 0..2 {
-            if guard.is_none() {
-                let mut hello = daemon::client_hello(ClientRole::App, "krill-app-composer");
-                hello.features = krill_proto::mobile::FEAT_MOBILE;
-                let resolved = match &target {
-                    Some(t) => t.clone(),
-                    None => HostTarget::local_dev()?,
+            let (mut conn, epoch, from_pool) =
+                if let Some(pooled) = checkout_pooled_conn(&resolved, PoolChannel::Workflow) {
+                    (pooled.conn, pooled.epoch, true)
+                } else {
+                    let mut hello = daemon::client_hello(ClientRole::App, "krill-app-composer");
+                    hello.features = krill_proto::mobile::FEAT_MOBILE;
+                    let epoch = resolved.transport_epoch();
+                    let conn = resolved.connect(&hello).map_err(io::Error::other)?;
+                    if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
+                        return Err(io::ErrorKind::Unsupported.into());
+                    }
+                    (conn, epoch, false)
                 };
-                let conn = resolved.connect(&hello).map_err(io::Error::other)?;
-                if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
-                    return Err(io::ErrorKind::Unsupported.into());
+            if let Err(err) = conn
+                .stream
+                .set_read_timeout(Some(read_timeout))
+                .and_then(|()| conn.stream.set_write_timeout(Some(write_timeout)))
+            {
+                if attempt == 0 && (from_pool || should_reconnect_ipc(&err)) {
+                    continue;
                 }
-                conn.stream
-                    .set_read_timeout(Some(Duration::from_secs(15)))?;
-                conn.stream
-                    .set_write_timeout(Some(Duration::from_secs(5)))?;
-                *guard = Some(conn);
+                return Err(err);
             }
-            let result = (|| -> io::Result<String> {
-                let conn = guard.as_mut().ok_or(io::ErrorKind::NotConnected)?;
-                conn.stream.write_all(&req.encode()?)?;
+            let result = (|| -> io::Result<Result<String, String>> {
+                conn.stream.write_all(&encoded)?;
                 let (kind, body) =
                     ipc::read_frame(&mut conn.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
                 match krill_proto::mobile::MobileReply::decode(kind, &body)? {
-                    krill_proto::mobile::MobileReply::Workflow(out) => Ok(out),
-                    krill_proto::mobile::MobileReply::Failed(err) => Err(io::Error::other(err)),
+                    krill_proto::mobile::MobileReply::Workflow(out) => Ok(Ok(out)),
+                    krill_proto::mobile::MobileReply::Failed(err) => Ok(Err(err)),
                     _ => Err(io::ErrorKind::InvalidData.into()),
                 }
             })();
             match result {
-                Ok(out) => return Ok(out),
-                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
-                    *guard = None;
+                Ok(Ok(out)) => {
+                    return_pooled_conn(&resolved, PoolChannel::Workflow, conn, epoch);
+                    return Ok(out);
+                }
+                Ok(Err(err)) => {
+                    return_pooled_conn(&resolved, PoolChannel::Workflow, conn, epoch);
+                    return Err(io::Error::other(err));
                 }
                 Err(err) => {
-                    if should_reconnect_ipc(&err) {
-                        *guard = None;
+                    drop(conn);
+                    if attempt == 0 && should_reconnect_ipc(&err) {
+                        continue;
                     }
                     return Err(err);
                 }
@@ -102,6 +218,14 @@ pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
 }
 
 pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
+    daemon_call_with_timeouts(target, Duration::from_secs(10), Duration::from_secs(2))
+}
+
+fn daemon_call_with_timeouts(
+    target: Option<HostTarget>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Call {
     #[cfg(test)]
     if target.is_none() {
         return Arc::new(|_| {
@@ -111,38 +235,41 @@ pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
             ))
         });
     }
-    let cached: Mutex<Option<daemon::Connection>> = Mutex::new(None);
     Arc::new(move |req| {
-        let mut guard = cached
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resolved = match &target {
+            Some(t) => t.clone(),
+            None => HostTarget::local_dev()?,
+        };
         for attempt in 0..2 {
-            if guard.is_none() {
-                let hello = daemon::client_hello(ClientRole::App, "krill-app-history");
-                let resolved = match &target {
-                    Some(t) => t.clone(),
-                    None => HostTarget::local_dev()?,
+            let (mut conn, epoch, from_pool) =
+                if let Some(pooled) = checkout_pooled_conn(&resolved, PoolChannel::History) {
+                    (pooled.conn, pooled.epoch, true)
+                } else {
+                    let hello = daemon::client_hello(ClientRole::App, "krill-app-history");
+                    let epoch = resolved.transport_epoch();
+                    let conn = resolved.connect(&hello).map_err(io::Error::other)?;
+                    (conn, epoch, false)
                 };
-                let conn = resolved.connect(&hello).map_err(io::Error::other)?;
-                conn.stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))?;
-                conn.stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))?;
-                *guard = Some(conn);
+            if let Err(err) = conn
+                .stream
+                .set_read_timeout(Some(read_timeout))
+                .and_then(|()| conn.stream.set_write_timeout(Some(write_timeout)))
+            {
+                if attempt == 0 && (from_pool || should_reconnect_ipc(&err)) {
+                    continue;
+                }
+                return Err(err);
             }
-            let result = {
-                let conn = guard.as_mut().ok_or(io::ErrorKind::NotConnected)?;
-                let features = conn.negotiated.features;
-                exchange(features, &mut conn.stream, req)
-            };
-            match result {
-                Ok(reply) => return Ok(reply),
-                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
-                    *guard = None;
+            let features = conn.negotiated.features;
+            match exchange(features, &mut conn.stream, req) {
+                Ok(reply) => {
+                    return_pooled_conn(&resolved, PoolChannel::History, conn, epoch);
+                    return Ok(reply);
                 }
                 Err(err) => {
-                    if should_reconnect_ipc(&err) {
-                        *guard = None;
+                    drop(conn);
+                    if attempt == 0 && should_reconnect_ipc(&err) {
+                        continue;
                     }
                     return Err(err);
                 }
@@ -1089,3 +1216,342 @@ impl Render for Panel {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod reconnect_tests {
+    use super::*;
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+
+    fn handshake(stream: &mut (impl Read + Write), features: u64) -> io::Result<()> {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features,
+            build: "reconnect-test".into(),
+            instance_id: 1,
+        }
+        .encode()?;
+        stream.write_all(&hello)?;
+        let (kind, body) = ipc::read_frame(stream)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let _client = ClientHello::decode(kind, &body)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_call_drops_cached_connection_after_timeout_and_invalid_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-history-drop-conn-daemon-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let features = FEAT_CONTROL | FEAT_AGENT_HISTORY;
+
+        let server = std::thread::spawn(move || {
+            // Connection 1: delay past read timeout, then send a stale reply so reusing conn 1 would desync.
+            let (mut s1, _) = listener.accept().unwrap();
+            s1.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s1, features).unwrap();
+            let _ = ipc::read_frame(&mut s1).unwrap().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).ok();
+            s1.write_all(
+                &Reply::AgentHistory(Response::Resumed {
+                    session: SessionId(111),
+                })
+                .encode()
+                .unwrap(),
+            )
+            .ok();
+
+            // Connection 2: return an invalid/unexpected frame kind (triggers InvalidData), keep open.
+            let (mut s2, _) = listener.accept().unwrap();
+            s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s2, features).unwrap();
+            let _ = ipc::read_frame(&mut s2).unwrap().unwrap();
+            s2.write_all(
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features,
+                    build: "wrong-frame".into(),
+                    instance_id: 2,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Connection 3: valid response proves both TimedOut and InvalidData dropped the cached stream.
+            let (mut s3, _) = listener.accept().unwrap();
+            s3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s3, features).unwrap();
+            let _ = ipc::read_frame(&mut s3).unwrap().unwrap();
+            s3.write_all(
+                &Reply::AgentHistory(Response::Resumed {
+                    session: SessionId(333),
+                })
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        });
+
+        let call = daemon_call_with_timeouts(
+            Some(HostTarget::remote("studio", socket)),
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+        let req = Request::AgentHistory(Action::Scan);
+
+        let err1 = call(&req).unwrap_err();
+        assert!(
+            matches!(
+                err1.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "expected timeout, got {err1:?}"
+        );
+        release_tx.send(()).ok();
+
+        let err2 = call(&req).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+
+        let reply3 = call(&req).unwrap();
+        assert_eq!(
+            reply3,
+            Reply::AgentHistory(Response::Resumed {
+                session: SessionId(333),
+            })
+        );
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workflow_call_drops_cached_connection_after_timeout_and_invalid_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-history-drop-conn-workflow-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("workflow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let features = krill_proto::mobile::FEAT_MOBILE;
+
+        let server = std::thread::spawn(move || {
+            // Connection 1: time out, then write a stale Workflow reply.
+            let (mut s1, _) = listener.accept().unwrap();
+            s1.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s1, features).unwrap();
+            let _ = ipc::read_frame(&mut s1).unwrap().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).ok();
+            s1.write_all(
+                &krill_proto::mobile::MobileReply::Workflow("stale".into())
+                    .encode()
+                    .unwrap(),
+            )
+            .ok();
+
+            // Connection 2: write an unexpected frame kind (InvalidData), keep open.
+            let (mut s2, _) = listener.accept().unwrap();
+            s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s2, features).unwrap();
+            let _ = ipc::read_frame(&mut s2).unwrap().unwrap();
+            s2.write_all(
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features,
+                    build: "wrong-frame".into(),
+                    instance_id: 2,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Connection 3: fresh valid reply.
+            let (mut s3, _) = listener.accept().unwrap();
+            s3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s3, features).unwrap();
+            let _ = ipc::read_frame(&mut s3).unwrap().unwrap();
+            s3.write_all(
+                &krill_proto::mobile::MobileReply::Workflow("fresh".into())
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+        });
+
+        let call = workflow_call_with_timeouts(
+            Some(HostTarget::remote("studio", socket)),
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+
+        let err1 = call("{}").unwrap_err();
+        assert!(
+            matches!(
+                err1.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "expected timeout, got {err1:?}"
+        );
+        release_tx.send(()).ok();
+
+        let err2 = call("{}").unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(call("{}").unwrap(), "fresh");
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perf_bench_workflow_and_daemon_calls() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use krill_proto::agent_history::ChatPollSnapshot;
+
+        let dir = std::env::temp_dir().join(format!(
+            "krill-perf-ipc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_bg = Arc::clone(&accepts);
+        let features =
+            FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_CHAT_POLL | krill_proto::mobile::FEAT_MOBILE;
+
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stop_bg.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                if stop_bg.load(Ordering::Relaxed) {
+                    break;
+                }
+                accepts_bg.fetch_add(1, Ordering::Relaxed);
+                workers.push(std::thread::spawn(move || {
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    if handshake(&mut stream, features).is_err() {
+                        return;
+                    }
+                    while let Ok(Some((rk, rb))) = ipc::read_frame(&mut stream) {
+                        if krill_proto::mobile::MobileRequest::decode(rk, &rb).is_ok() {
+                            let out =
+                                r#"{"ok":true,"data":{"next_offset":10,"items":[]}}"#.to_owned();
+                            if stream
+                                .write_all(
+                                    &krill_proto::mobile::MobileReply::Workflow(out)
+                                        .encode()
+                                        .unwrap(),
+                                )
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if Request::decode(rk, &rb).is_ok() {
+                            let rep = Reply::AgentHistory(Response::ChatPolled(
+                                ChatPollSnapshot::default(),
+                            ));
+                            if stream.write_all(&rep.encode().unwrap()).is_err() {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for w in workers {
+                w.join().ok();
+            }
+        });
+
+        let target = HostTarget::remote("perf-host", socket);
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            let wf = workflow_call_for(Some(target.clone()));
+            let out = wf(r#"{"action":"chat_poll","session":1,"offset":0}"#).unwrap();
+            assert!(out.contains("\"ok\":true"));
+        }
+        let wf_elapsed = t0.elapsed();
+        let wf_accepts = accepts.load(Ordering::Relaxed);
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..50 {
+            let dc = daemon_call_for(Some(target.clone()));
+            let rep = dc(&Request::AgentHistory(Action::ChatPoll {
+                session: SessionId(1),
+                offset: 0,
+            }))
+            .unwrap();
+            assert!(matches!(rep, Reply::AgentHistory(Response::ChatPolled(_))));
+        }
+        let dc_elapsed = t1.elapsed();
+        let dc_accepts = accepts.load(Ordering::Relaxed) - wf_accepts;
+
+        eprintln!(
+            "[BENCH] workflow_call_for x50: {:.3} ms, accepts={wf_accepts} | daemon_call_for x50: {:.3} ms, accepts={dc_accepts}",
+            wf_elapsed.as_secs_f64() * 1000.0,
+            dc_elapsed.as_secs_f64() * 1000.0,
+        );
+        assert_eq!(
+            wf_accepts, 1,
+            "workflow_call_for must reuse a single pooled stream"
+        );
+        assert_eq!(
+            dc_accepts, 1,
+            "daemon_call_for must reuse a single pooled stream"
+        );
+
+        // Host invalidation must drop pooled connections so the next call reconnects cleanly.
+        invalidate_host_connections(target.host());
+        let wf = workflow_call_for(Some(target.clone()));
+        assert!(
+            wf(r#"{"action":"chat_poll","session":1,"offset":0}"#)
+                .unwrap()
+                .contains("\"ok\":true")
+        );
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            3,
+            "invalidate_host_connections must force a fresh stream"
+        );
+        invalidate_host_connections(target.host());
+
+        stop.store(true, Ordering::Relaxed);
+        // Wake accept loop if needed
+        krill_proto::os::net::UnixStream::connect(target.socket()).ok();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

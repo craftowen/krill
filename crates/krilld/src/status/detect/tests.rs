@@ -547,3 +547,39 @@ fn codex_queued_question_must_remain_visible_without_a_title() {
         (AgentState::Waiting, Source::Screen, Confidence::Low)
     );
 }
+
+#[test]
+fn agy_auth_login_screen_classifies_as_blocked_not_done() {
+    let mut detector = Detector::default();
+    let now = Instant::now();
+    let stage1 = "Welcome to the Antigravity CLI. You are currently not signed in.\n\
+                  Select login method:\n\
+                  > 1. Google OAuth\n\
+                    2. Use a Google Cloud project";
+    let _ = detector.observe("◇ Ready (krill)", stage1, 1, &AgentStatus::UNKNOWN, now);
+    let e = detector
+        .observe(
+            "◇ Ready (krill)",
+            stage1,
+            1,
+            &AgentStatus::UNKNOWN,
+            now + QUIET,
+        )
+        .unwrap();
+    assert_eq!(
+        (e.state, e.source, e.confidence),
+        (AgentState::Blocked, Source::Screen, Confidence::Low)
+    );
+
+    let stage2 = "Your browser should open automatically.\n\
+                  → Click here to authenticate\n\
+                  Enter authorization code:";
+    let _ = detector.observe("", stage2, 2, &AgentStatus::UNKNOWN, now + QUIET);
+    let e2 = detector
+        .observe("", stage2, 2, &AgentStatus::UNKNOWN, now + QUIET * 2)
+        .unwrap();
+    assert_eq!(
+        (e2.state, e2.source, e2.confidence),
+        (AgentState::Blocked, Source::Screen, Confidence::Low)
+    );
+}

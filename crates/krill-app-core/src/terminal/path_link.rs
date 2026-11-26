@@ -255,6 +255,32 @@ pub fn sanitize_external_url(raw: &str) -> Option<String> {
     }
 }
 
+/// Sanitizes an untrusted external URL for `cx.open_url`, allowing only `http://` and `https://`
+/// schemes with a non-empty authority and percent-encoding non-ASCII characters (so macOS
+/// `NSURL::initWithString:` never rejects Korean/CJK URLs or executes arbitrary OS schemes).
+#[must_use]
+pub fn sanitize_http_url(raw: &str) -> Option<String> {
+    let clean = sanitize_external_url(raw)?;
+    let rest = if clean
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        clean.get(8..)?
+    } else if clean
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        clean.get(7..)?
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return None;
+    }
+    Some(clean)
+}
+
 /// 포인터 칸을 덮는 후보 글자열(디스크를 보지 않는다). 글자마다 시작 칸, 마지막 글자 다음 칸을 함께 둔다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {

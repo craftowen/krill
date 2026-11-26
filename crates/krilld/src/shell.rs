@@ -117,14 +117,24 @@ const LOCALE_MAX: usize = 32;
 
 /// 로그인 셸 `PATH` 조회의 하드 상한. rc 파일이 멈추거나 백그라운드 자식을 띄워도 데몬이 멈추지 않는다.
 #[cfg(unix)]
-const PATH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PATH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// 로그인 셸 stdout 수집 상한.
 #[cfg(unix)]
 const PATH_MAX: usize = 64 * 1024;
 #[cfg(unix)]
+const ENV_MAX: usize = 256 * 1024;
+#[cfg(unix)]
+const ENV_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(unix)]
 const PATH_MARKER: &[u8] = b"__MK_PATH__=";
 #[cfg(unix)]
 const PATH_PROBE: &str = "/usr/bin/printf '\\n__MK_PATH__='; /usr/bin/printenv PATH";
+#[cfg(unix)]
+const ENV_START_MARKER: &[u8] = b"__MK_ENV0_START__\0";
+#[cfg(unix)]
+const ENV_END_MARKER: &[u8] = b"\0__MK_ENV0_END__";
+#[cfg(unix)]
+const ENV_PROBE: &str = "/usr/bin/printf '\\n__MK_ENV0_START__\\0'; /usr/bin/env -0; /usr/bin/printf '\\0__MK_ENV0_END__'";
 
 /// launchd 환경에서 그대로 물려줄 변수. HOME·USER·LOGNAME·SHELL은 passwd에서, PATH는 [`LAUNCHD_PATH`]로 새로 채운다.
 /// `XPC_*`·`__CFBundleIdentifier`는 부모 잡을 가리키는 값이라 넘기지 않는다.
@@ -135,6 +145,7 @@ const KEEP: &[&[u8]] = &[
     b"__CF_USER_TEXT_ENCODING",
     b"COMMAND_MODE",
     b"LANG",
+    b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
 ];
 
 /// 세션 셸 설정.
@@ -178,12 +189,196 @@ impl std::fmt::Debug for Launch {
 const PATH_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 로그인 셸(`-l -i -c`)이 만든 `PATH`의 성공값만 캐시한다. 실패·타임아웃이면 기본값을 쓰고
-/// [`PATH_RETRY`] 뒤에 다시 시도한다(git 호출마다 최대 5초씩 재탐색하지 않는다).
+/// [`PATH_RETRY`] 뒤에 다시 시도한다(git 호출마다 최대 10초씩 재탐색하지 않는다).
 #[cfg(unix)]
 pub(crate) fn login_path() -> &'static [u8] {
     static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     static FAILED_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     cached_path(&PATH, &FAILED_AT, PATH_RETRY, || Shell::Login.launch())
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct EnvCache {
+    fingerprint: Vec<(bool, u64, u64)>,
+    at: Option<std::time::Instant>,
+    env: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    failed_at: Option<std::time::Instant>,
+}
+
+/// 로그인 셸(`-l -i -c`)이 내보낸 환경 변수를 `$HOME`에서 한 번 탐침해 캐시한다.
+/// 에이전트 기동마다 `.zprofile`·`.zshrc`(`brew shellenv` 등)를 다시 실행해 TCC나 `syspolicyd`로 멈추는 일을 막는다.
+/// 셸 시작 파일이 바뀌면 지문(`rc_fingerprint`) 변경으로 자동 갱신된다.
+#[cfg(unix)]
+pub(crate) fn login_env() -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    static CACHE: std::sync::Mutex<EnvCache> = std::sync::Mutex::new(EnvCache {
+        fingerprint: Vec::new(),
+        at: None,
+        env: None,
+        failed_at: None,
+    });
+    let login = Shell::Login.launch();
+    let home = env_value(&login.env, b"HOME").map(std::path::PathBuf::from_bytes_lossy);
+    let fp = home.as_deref().map(rc_fingerprint).unwrap_or_default();
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(env), Some(at)) = (&cache.env, cache.at)
+        && cache.fingerprint == fp
+        && at.elapsed() < ENV_CACHE_TTL
+    {
+        return Some(env.clone());
+    }
+    if cache.failed_at.is_some_and(|at| at.elapsed() < PATH_RETRY) {
+        return cache.env.clone();
+    }
+    if let Some(env) = probe_login_env(&login) {
+        cache.fingerprint = fp;
+        cache.at = Some(std::time::Instant::now());
+        cache.failed_at = None;
+        cache.env = Some(env.clone());
+        Some(env)
+    } else {
+        cache.failed_at = Some(std::time::Instant::now());
+        cache.env.clone()
+    }
+}
+
+/// 로그인 셸 탐침이 실패·타임아웃했을 때 표준 설치 경로에서 에이전트를 찾기 위한 안전한 폴백 `PATH`.
+#[cfg(unix)]
+pub(crate) fn fallback_agent_path(home: Option<&[u8]>) -> Vec<u8> {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
+        for rel in [&b"/.local/bin"[..], b"/.bun/bin", b"/.cargo/bin"] {
+            let mut dir = Vec::with_capacity(home.len() + rel.len());
+            dir.extend_from_slice(home);
+            dir.extend_from_slice(rel);
+            parts.push(dir);
+        }
+    }
+    for sys in [
+        &b"/opt/homebrew/bin"[..],
+        b"/opt/homebrew/sbin",
+        b"/usr/local/bin",
+    ] {
+        parts.push(sys.to_vec());
+    }
+    for base in LAUNCHD_PATH.split(|&b| b == b':') {
+        if !base.is_empty() && !parts.iter().any(|p| p.as_slice() == base) {
+            parts.push(base.to_vec());
+        }
+    }
+    parts.join(&b':')
+}
+
+/// 탐침한 로그인 셸 환경을 `target` 아래에 깐다. `target`이 이미 명시한 값(계정·프로필·`MK_*`·`KRILL_*` 등)이
+/// 이기며, `PATH`가 기본 `LAUNCHD_PATH`일 때만 로그인 셸의 `PATH`로 승격한다.
+#[cfg(unix)]
+pub(crate) fn merge_login_env(target: &mut Vec<(Vec<u8>, Vec<u8>)>, probed: &[(Vec<u8>, Vec<u8>)]) {
+    let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(probed.len() + target.len());
+    let mut probed_path: Option<&[u8]> = None;
+    for (k, v) in probed {
+        if !allow_probed_env_key(k) {
+            continue;
+        }
+        if k.as_slice() == b"PATH" {
+            if !v.is_empty() {
+                probed_path = Some(v.as_slice());
+            }
+            continue;
+        }
+        merged.push((k.clone(), v.clone()));
+    }
+    for (k, v) in target.iter() {
+        if k.as_slice() == b"PATH"
+            && v.as_slice() == LAUNCHD_PATH
+            && let Some(path) = probed_path
+        {
+            merged.push((b"PATH".to_vec(), path.to_vec()));
+        } else {
+            merged.push((k.clone(), v.clone()));
+        }
+    }
+    dedupe_env(&mut merged);
+    *target = merged;
+}
+
+#[cfg(unix)]
+fn allow_probed_env_key(key: &[u8]) -> bool {
+    if key.is_empty()
+        || key.contains(&b'=')
+        || key.contains(&0)
+        || matches!(
+            key,
+            b"PWD"
+                | b"OLDPWD"
+                | b"SHLVL"
+                | b"_"
+                | b"TERM"
+                | b"COLORTERM"
+                | b"ZDOTDIR"
+                | b"KRILL_ORIG_ZDOTDIR"
+                | b"PS1"
+                | b"PS2"
+                | b"PROMPT"
+                | b"RPROMPT"
+                | b"CLAUDECODE"
+                | b"CLAUDE_CODE_ENTRYPOINT"
+        )
+    {
+        return false;
+    }
+    !key.starts_with(b"MK_") && !key.starts_with(b"KRILL_") && !key.starts_with(b"ORCA_")
+}
+
+#[cfg(unix)]
+fn env_value<'a>(env: &'a [(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<&'a [u8]> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == key)
+        .map(|(_, v)| v.as_slice())
+}
+
+#[cfg(unix)]
+trait PathBufFromBytes {
+    fn from_bytes_lossy(bytes: &[u8]) -> std::path::PathBuf;
+}
+
+#[cfg(unix)]
+impl PathBufFromBytes for std::path::PathBuf {
+    fn from_bytes_lossy(bytes: &[u8]) -> Self {
+        Self::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+}
+
+#[cfg(unix)]
+fn rc_fingerprint(home: &std::path::Path) -> Vec<(bool, u64, u64)> {
+    const USER_FILES: &[&str] = &[
+        ".zshenv",
+        ".zprofile",
+        ".zshrc",
+        ".zlogin",
+        ".bash_profile",
+        ".bashrc",
+        ".profile",
+    ];
+    const SYS_FILES: &[&str] = &["/etc/zshenv", "/etc/zprofile", "/etc/zshrc", "/etc/profile"];
+    USER_FILES
+        .iter()
+        .map(|name| home.join(name))
+        .chain(SYS_FILES.iter().map(std::path::PathBuf::from))
+        .map(|path| match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                (true, meta.len(), mtime)
+            }
+            Err(_) => (false, 0, 0),
+        })
+        .collect()
 }
 
 /// Windows는 탐침이 레지스트리 읽기라 싸다. [`PATH_REFRESH`]마다 다시 만들어 krilld 수명 내내 낡지 않는다.
@@ -701,13 +896,27 @@ fn set_path(launch: &mut Launch, path: &[u8]) {
 /// 에이전트 `wrap`과 같은 방식(`<login_shell> -l -i -c`)으로 로그인 셸의 `PATH`를 읽는다.
 #[cfg(unix)]
 fn probe_path(login: &Launch) -> Option<Vec<u8>> {
+    let out = run_shell_probe(login, PATH_PROBE, PATH_MAX)?;
+    extract_path(&out)
+}
+
+/// `$HOME`에서 로그인 셸(`-l -i -c`)을 한 번 실행해 내보낸 환경 전체를 읽는다.
+/// 작업 폴더를 `$HOME`으로 고정해 `brew shellenv`의 `[[ -r "$PWD" ]]`가 TCC 보호 폴더에서 멈추는 일을 막는다.
+#[cfg(unix)]
+pub(crate) fn probe_login_env(login: &Launch) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let out = run_shell_probe(login, ENV_PROBE, ENV_MAX)?;
+    extract_env0(&out)
+}
+
+#[cfg(unix)]
+fn run_shell_probe(login: &Launch, probe: &str, max_bytes: usize) -> Option<Vec<u8>> {
     use std::ffi::OsStr;
     use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt as _;
 
     let program = login.argv.first()?;
-    let Ok(mut child) = std::process::Command::new(OsStr::from_bytes(program))
-        .args(["-l", "-i", "-c", PATH_PROBE])
+    let mut cmd = std::process::Command::new(OsStr::from_bytes(program));
+    cmd.args(["-l", "-i", "-c", probe])
         .env_clear()
         .envs(
             login
@@ -717,9 +926,14 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
         )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    if let Some(home) = env_value(&login.env, b"HOME") {
+        let home_path = std::path::Path::new(OsStr::from_bytes(home));
+        if home_path.is_dir() {
+            cmd.current_dir(home_path);
+        }
+    }
+    let Ok(mut child) = cmd.spawn() else {
         return None;
     };
     let Some(mut stdout) = child.stdout.take() else {
@@ -733,13 +947,13 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
     let mut buf = [0u8; 4096];
     let start = std::time::Instant::now();
     let status = loop {
-        while out.len() < PATH_MAX {
+        while out.len() < max_bytes {
             match stdout.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => out.extend(
                     buf.iter()
                         .take(n)
-                        .take(PATH_MAX.saturating_sub(out.len()))
+                        .take(max_bytes.saturating_sub(out.len()))
                         .copied(),
                 ),
                 Err(e)
@@ -754,13 +968,13 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
             }
         }
         if let Ok(Some(status)) = child.try_wait() {
-            while out.len() < PATH_MAX {
+            while out.len() < max_bytes {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => out.extend(
                         buf.iter()
                             .take(n)
-                            .take(PATH_MAX.saturating_sub(out.len()))
+                            .take(max_bytes.saturating_sub(out.len()))
                             .copied(),
                     ),
                 }
@@ -776,7 +990,39 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
     if !status.is_some_and(|s| s.success()) {
         return None;
     }
-    extract_path(&out)
+    Some(out)
+}
+
+#[cfg(unix)]
+fn extract_env0(out: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    let start = out
+        .windows(ENV_START_MARKER.len())
+        .rposition(|w| w == ENV_START_MARKER)?
+        .checked_add(ENV_START_MARKER.len())?;
+    let tail = out.get(start..)?;
+    let end = tail
+        .windows(ENV_END_MARKER.len())
+        .position(|w| w == ENV_END_MARKER)?;
+    let payload = tail.get(..end)?;
+    let mut pairs = Vec::new();
+    for entry in payload.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+            continue;
+        };
+        let (Some(key), Some(val)) = (entry.get(..eq), entry.get(eq.saturating_add(1)..)) else {
+            continue;
+        };
+        if !key.is_empty() {
+            pairs.push((key.to_vec(), val.to_vec()));
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(pairs)
 }
 
 /// Windows는 로그인 셸 탐침이 없다. 셸에 줄 PATH(물려받은 값)가 곧 답이다.

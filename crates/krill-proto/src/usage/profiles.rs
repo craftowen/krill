@@ -479,6 +479,13 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
     {
         return Err(invalid());
     }
+    #[cfg(windows)]
+    if is_windows_network_or_device_path(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Recycle Bin is not available for network or device paths",
+        ));
+    }
     let parent = path.parent().ok_or_else(invalid)?.canonicalize()?;
     if !parent.starts_with(root.canonicalize()?) {
         return Err(invalid());
@@ -488,10 +495,54 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
     #[cfg(windows)]
     {
         let _ = (home, name);
+        if is_windows_network_or_device_path(&parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Recycle Bin is not available for network or device paths",
+            ));
+        }
         recycle_windows_path(path)
     }
     #[cfg(not(windows))]
     rename_into_trash(home, path, &name)
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_network_or_device_path(path: &Path) -> bool {
+    if matches!(
+        path.as_os_str().as_encoded_bytes(),
+        [
+            b'\\' | b'/',
+            b'\\' | b'/',
+            b'?',
+            b'\\' | b'/',
+            drive,
+            b':',
+            b'\\' | b'/',
+            ..,
+        ] | [b'\\' | b'/', b'\\' | b'/', b'?', b'\\' | b'/', drive, b':']
+            if drive.is_ascii_alphabetic()
+    ) {
+        return false;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(prefix)
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::UNC(..)
+                        | std::path::Prefix::VerbatimUNC(..)
+                        | std::path::Prefix::DeviceNS(..)
+                )
+        )
+    }) {
+        return true;
+    }
+    matches!(
+        path.as_os_str().as_encoded_bytes(),
+        [b'\\' | b'/', b'\\' | b'/', ..]
+    )
 }
 
 /// File explorer deletion uses the OS recovery surface on Windows. Account data is
@@ -500,6 +551,13 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
 fn recycle_windows_path(path: &Path) -> io::Result<PathBuf> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
+    if is_windows_network_or_device_path(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Recycle Bin is not available for network or device paths",
+        ));
+    }
+    let recycle_target = crate::os::shell_path(path);
     let system_root =
         std::env::var_os("SystemRoot").ok_or_else(|| io::Error::other("SystemRoot is not set"))?;
     let powershell =
@@ -508,7 +566,7 @@ fn recycle_windows_path(path: &Path) -> io::Result<PathBuf> {
 try {
   Add-Type -AssemblyName Microsoft.VisualBasic
   $p=$env:KRILL_RECYCLE_PATH
-  if ($p.StartsWith('\\') -or ([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint)) {
+  if ($p.StartsWith('\\') -or $p.StartsWith('//') -or $p.StartsWith('\/') -or $p.StartsWith('/\') -or ([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint)) {
     throw 'Recycle Bin is not available for network paths or reparse points'
   }
   if ([IO.Directory]::Exists($p)) {
@@ -527,7 +585,7 @@ try {
             "-Command",
             script,
         ])
-        .env("KRILL_RECYCLE_PATH", path)
+        .env("KRILL_RECYCLE_PATH", &recycle_target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -560,17 +618,168 @@ try {
     }
 }
 
-fn rename_into_trash(home: &Path, src: &Path, base: &str) -> io::Result<PathBuf> {
-    let trash = home.join(".Trash");
-    std::fs::create_dir_all(&trash)?;
+static TRASH_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_trash_target(trash: &Path, base: &str) -> PathBuf {
     let mut target = trash.join(base);
     let mut n = 2_u32;
     while target.symlink_metadata().is_ok() {
         target = trash.join(format!("{base} {n}"));
         n = n.saturating_add(1);
     }
-    std::fs::rename(src, &target)?;
+    target
+}
+
+fn rename_into_trash(home: &Path, src: &Path, base: &str) -> io::Result<PathBuf> {
+    rename_into_trash_with(home, src, base, |from, to| std::fs::rename(from, to))
+}
+
+fn rename_into_trash_with(
+    home: &Path,
+    src: &Path,
+    base: &str,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    let trash = home.join(".Trash");
+    std::fs::create_dir_all(&trash)?;
+    let target = next_trash_target(&trash, base);
+    match rename(src, &target) {
+        Ok(()) => Ok(target),
+        Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+            cross_device_move_into_trash(&trash, src, base)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn cross_device_move_into_trash(trash: &Path, src: &Path, base: &str) -> io::Result<PathBuf> {
+    use std::sync::atomic::Ordering;
+
+    let meta = src.symlink_metadata()?;
+    let seq = TRASH_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let staging = trash.join(format!(".krill-trash-{}-{seq}.tmp", std::process::id()));
+    let is_dir = meta.file_type().is_dir();
+
+    let staged = (|| -> io::Result<PathBuf> {
+        if meta.file_type().is_symlink() {
+            copy_trash_symlink(src, &staging)?;
+        } else if is_dir {
+            std::fs::create_dir(&staging)?;
+            let mut dir_perms = Vec::new();
+            copy_trash_tree(src, &staging, 0, &mut dir_perms)?;
+            for (dir, perms) in dir_perms {
+                std::fs::set_permissions(&dir, perms).ok();
+            }
+            std::fs::set_permissions(&staging, meta.permissions()).ok();
+        } else if meta.file_type().is_file() {
+            std::fs::copy(src, &staging)?;
+            if !same_file_contents(src, &staging)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trash source changed during copy",
+                ));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot move special file across filesystems into trash",
+            ));
+        }
+        let target = next_trash_target(trash, base);
+        std::fs::rename(&staging, &target)?;
+        Ok(target)
+    })();
+
+    let target = match staged {
+        Ok(target) => target,
+        Err(err) => {
+            cleanup_trash_staging(&staging);
+            return Err(err);
+        }
+    };
+
+    if is_dir {
+        // Keep the verified trash copy if removing the source tree partially fails.
+        std::fs::remove_dir_all(src)?;
+    } else if let Err(err) = std::fs::remove_file(src) {
+        std::fs::remove_file(&target).ok();
+        return Err(err);
+    }
     Ok(target)
+}
+
+fn copy_trash_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let link_target = std::fs::read_link(src)?;
+        std::os::unix::fs::symlink(&link_target, dst)?;
+        if std::fs::read_link(dst)? != link_target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trash symlink changed during copy",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, dst);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot copy symlink across filesystems on this platform",
+        ))
+    }
+}
+
+fn copy_trash_tree(
+    source: &Path,
+    target: &Path,
+    depth: usize,
+    dir_perms: &mut Vec<(PathBuf, std::fs::Permissions)>,
+) -> io::Result<()> {
+    if depth > 128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trash directory nesting too deep",
+        ));
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        let meta = src.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            copy_trash_symlink(&src, &dst)?;
+        } else if meta.file_type().is_dir() {
+            std::fs::create_dir(&dst)?;
+            copy_trash_tree(&src, &dst, depth.saturating_add(1), dir_perms)?;
+            dir_perms.push((dst, meta.permissions()));
+        } else if meta.file_type().is_file() {
+            std::fs::copy(&src, &dst)?;
+            if !same_file_contents(&src, &dst)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trash source changed during copy",
+                ));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot move special file across filesystems into trash",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_trash_staging(staging: &Path) {
+    if let Ok(meta) = staging.symlink_metadata() {
+        if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(staging).ok();
+        } else {
+            std::fs::remove_file(staging).ok();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -763,6 +972,127 @@ mod tests {
                 .any(|o| o.dir == migrated.display().to_string())
         );
         std::fs::remove_dir_all(h).unwrap();
+    }
+
+    #[test]
+    fn cross_device_trash_copies_verifies_and_removes_files_dirs_and_links() {
+        let h = home("cross-device-trash");
+        let work = h.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::CrossesDevices));
+
+        // Regular file + collision suffix.
+        let file = work.join("report.txt");
+        std::fs::write(&file, b"cross-volume file").unwrap();
+        let trashed = rename_into_trash_with(&h, &file, "report.txt", exdev).unwrap();
+        assert_eq!(trashed, h.join(".Trash").join("report.txt"));
+        assert_eq!(std::fs::read(&trashed).unwrap(), b"cross-volume file");
+        assert!(!file.exists());
+
+        std::fs::write(&file, b"second copy").unwrap();
+        let trashed2 = rename_into_trash_with(&h, &file, "report.txt", exdev).unwrap();
+        assert_eq!(trashed2, h.join(".Trash").join("report.txt 2"));
+        assert_eq!(std::fs::read(&trashed2).unwrap(), b"second copy");
+        assert!(!file.exists());
+
+        // Nested directory (and symlink preservation on Unix).
+        let dir = work.join("nested");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/data.bin"), b"payload-123").unwrap();
+        #[cfg(unix)]
+        {
+            let outside = h.join("outside.txt");
+            std::fs::write(&outside, b"keep-me").unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("ext-link")).unwrap();
+            std::os::unix::fs::symlink("missing-target", dir.join("dangling-link")).unwrap();
+        }
+        let trashed_dir = rename_into_trash_with(&h, &dir, "nested", exdev).unwrap();
+        assert_eq!(trashed_dir, h.join(".Trash").join("nested"));
+        assert_eq!(
+            std::fs::read(trashed_dir.join("sub/data.bin")).unwrap(),
+            b"payload-123"
+        );
+        assert!(!dir.exists());
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::read_link(trashed_dir.join("ext-link")).unwrap(),
+                h.join("outside.txt")
+            );
+            assert_eq!(
+                std::fs::read_link(trashed_dir.join("dangling-link")).unwrap(),
+                PathBuf::from("missing-target")
+            );
+            assert_eq!(std::fs::read(h.join("outside.txt")).unwrap(), b"keep-me");
+
+            // Top-level symlink moved as symlink without touching its target.
+            let top_link = work.join("top-link");
+            std::os::unix::fs::symlink(h.join("outside.txt"), &top_link).unwrap();
+            let trashed_link = rename_into_trash_with(&h, &top_link, "top-link", exdev).unwrap();
+            assert!(
+                trashed_link
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!top_link.exists());
+            assert_eq!(std::fs::read(h.join("outside.txt")).unwrap(), b"keep-me");
+
+            // Special file (FIFO) fails without removing source or leaving temp files.
+            let fifo = work.join("pipe");
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let err = rename_into_trash_with(&h, &fifo, "pipe", exdev).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(fifo.symlink_metadata().is_ok());
+        }
+
+        // No leftover `.krill-trash-*.tmp` files in `.Trash`.
+        let leftovers = std::fs::read_dir(h.join(".Trash"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftovers);
+        std::fs::remove_dir_all(h).unwrap();
+    }
+
+    #[test]
+    fn windows_network_and_device_paths_are_rejected_including_forward_slash_unc() {
+        for blocked in [
+            r"\\server\share\repo\file.txt",
+            "//server/share/repo/file.txt",
+            r"\/server/share/file.txt",
+            r"/\server\share\file.txt",
+            r"\\?\UNC\server\share\file.txt",
+            "//?/UNC/server/share/file.txt",
+            r"\\.\pipe\krill",
+            r"\\.\C:\repo\file.txt",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\file.txt",
+        ] {
+            assert!(
+                is_windows_network_or_device_path(Path::new(blocked)),
+                "expected blocked: {blocked}"
+            );
+        }
+        for allowed in [
+            r"C:\Users\alice\repo\file.txt",
+            "C:/Users/alice/repo/file.txt",
+            r"\\?\C:\Users\alice\repo\file.txt",
+            "//?/C:/Users/alice/repo/file.txt",
+            "/Users/alice/repo/file.txt",
+        ] {
+            assert!(
+                !is_windows_network_or_device_path(Path::new(allowed)),
+                "expected allowed: {allowed}"
+            );
+        }
     }
 }
 

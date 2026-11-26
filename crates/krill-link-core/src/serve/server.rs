@@ -424,7 +424,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
     write_atomic_0600(&ticket_path, ticket.as_bytes()).ok();
 
     let ctl_sock_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
-    let ctl_listener = bind_ctl_listener(&ctl_sock_path)?;
+    let mut ctl_listener = bind_ctl_listener(&ctl_sock_path)?;
 
     let active_peers: ActivePeersMap = Arc::new(Mutex::new(BTreeMap::new()));
     let streams = Arc::new(crate::resume::registry::Registry::new(
@@ -506,22 +506,36 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                     });
                 }
                 ctl_res = accept_ctl_optional(ctl_listener.as_ref()) => {
-                    if let Some(stream) = ctl_res {
-                        let allowed_ctl = Arc::clone(&allowed_loop);
-                        let peers_ctl = Arc::clone(&peers_loop);
-                        let state_ctl = state_loop.clone();
-                        let node_str = endpoint.id().to_string();
-                        let should_stop = handle_ctl_stream(
-                            stream,
-                            &state_ctl,
-                            &node_str,
-                            &allowed_ctl,
-                            &peers_ctl,
-                            &streams_loop,
-                        )
-                        .await;
-                        if should_stop {
-                            break;
+                    match ctl_res {
+                        Ok(stream) => {
+                            let allowed_ctl = Arc::clone(&allowed_loop);
+                            let peers_ctl = Arc::clone(&peers_loop);
+                            let state_ctl = state_loop.clone();
+                            let node_str = endpoint.id().to_string();
+                            let should_stop = handle_ctl_stream(
+                                stream,
+                                &state_ctl,
+                                &node_str,
+                                &allowed_ctl,
+                                &peers_ctl,
+                                &streams_loop,
+                            )
+                            .await;
+                            if should_stop {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                kind = ?error.kind(),
+                                os_code = ?error.raw_os_error(),
+                                "control listener accept failed"
+                            );
+                            if is_permanent_ctl_accept_error(&error) {
+                                ctl_listener = None;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
                         }
                     }
                 }
@@ -625,11 +639,25 @@ fn bind_ctl_listener(ctl_path: &Path) -> Result<Option<Listener>, Error> {
     Ok(Some(listener))
 }
 
-async fn accept_ctl_optional(listener: Option<&Listener>) -> Option<Stream> {
+async fn accept_ctl_optional(listener: Option<&Listener>) -> std::io::Result<Stream> {
     match listener {
-        Some(l) => l.accept().await.ok().map(|(stream, _)| stream),
+        Some(l) => l.accept().await.map(|(stream, _)| stream),
         None => std::future::pending().await,
     }
+}
+
+fn is_permanent_ctl_accept_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error()) {
+        return true;
+    }
+    false
 }
 
 /// `devices.toml`을 다시 읽고, 빠진 기기의 스트림과 연결을 끊는다.
@@ -911,25 +939,30 @@ pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
     if !is_serve_running(state_dir) {
         return Ok(());
     }
+    let request = serde_json::to_vec(&ControlRequest::Shutdown)
+        .map_err(|_| Error::Protocol("invalid shutdown request"))?;
+    let ctl_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
     tokio::time::timeout(Duration::from_secs(10), async {
-        let mut stream = Stream::connect(state_dir.join(SERVE_CTL_SOCK_REL_PATH))
-            .await
-            .map_err(Error::Io)?;
-        let request = serde_json::to_vec(&ControlRequest::Shutdown)
-            .map_err(|_| Error::Protocol("invalid shutdown request"))?;
-        stream.write_all(&request).await.map_err(Error::Io)?;
-        stream.shutdown().await.map_err(Error::Io)?;
-        let mut reply = Vec::new();
-        stream
-            .take(4097)
-            .read_to_end(&mut reply)
-            .await
-            .map_err(Error::Io)?;
-        if !matches!(
-            serde_json::from_slice::<ControlResponse>(&reply),
-            Ok(ControlResponse::Ok { .. })
-        ) {
-            return Err(Error::Protocol("invalid shutdown response"));
+        if let Ok(mut stream) = Stream::connect(&ctl_path).await {
+            let io_res: std::io::Result<Vec<u8>> = async {
+                stream.write_all(&request).await?;
+                stream.shutdown().await?;
+                let mut reply = Vec::new();
+                stream.take(4097).read_to_end(&mut reply).await?;
+                Ok(reply)
+            }
+            .await;
+            if let Ok(reply) = io_res
+                && !reply.is_empty()
+                && !matches!(
+                    serde_json::from_slice::<ControlResponse>(&reply),
+                    Ok(ControlResponse::Ok { .. })
+                )
+            {
+                return Err(Error::Protocol("invalid shutdown response"));
+            }
+            // Connect/IO error or empty EOF reply can race with an in-progress
+            // SIGTERM exit (e.g. launchctl bootout); fall through and wait for stop.
         }
         while is_serve_running(state_dir) {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1146,5 +1179,76 @@ mod tests {
         assert!(slug_a.starts_with("host-"));
         assert!(slug_b.starts_with("host-"));
         assert_ne!(slug_a, slug_b);
+    }
+
+    #[tokio::test]
+    async fn shutdown_command_succeeds_when_server_exits_mid_request_without_reply() {
+        let dir = std::env::temp_dir().join(format!("mklink-ll08-eof-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let ctl = dir.join(SERVE_CTL_SOCK_REL_PATH);
+        let listener = krill_proto::os::net::UnixListener::bind(&ctl).unwrap();
+        // Simulate a server that received SIGTERM and stopped calling accept(),
+        // then unlinks link-ctl.sock and drops the listener after 120ms.
+        let ctl_drop = ctl.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            std::fs::remove_file(&ctl_drop).ok();
+            drop(listener);
+        });
+        shutdown_server_command(&dir).await.unwrap();
+        stopper.await.unwrap();
+        assert!(!is_serve_running(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn shutdown_command_rejects_non_empty_invalid_response() {
+        let dir = std::env::temp_dir().join(format!("mklink-ll08-err-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let ctl = dir.join(SERVE_CTL_SOCK_REL_PATH);
+        let listener = Listener::bind(&ctl).unwrap();
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                stream.read_to_end(&mut req).await.ok();
+                if req.is_empty() {
+                    continue;
+                }
+                let reply = serde_json::to_vec(&ControlResponse::Err {
+                    message: "rejected".to_owned(),
+                })
+                .unwrap();
+                stream.write_all(&reply).await.unwrap();
+                stream.shutdown().await.unwrap();
+                break;
+            }
+        });
+        let err = shutdown_server_command(&dir).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol("invalid shutdown response")));
+        responder.await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn permanent_ctl_accept_error_classification() {
+        assert!(is_permanent_ctl_accept_error(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "local listener stopped",
+        )));
+        assert!(is_permanent_ctl_accept_error(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid",
+        )));
+        assert!(!is_permanent_ctl_accept_error(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "transient",
+        )));
+        #[cfg(unix)]
+        assert!(is_permanent_ctl_accept_error(
+            &std::io::Error::from_raw_os_error(rustix::io::Errno::BADF.raw_os_error())
+        ));
     }
 }

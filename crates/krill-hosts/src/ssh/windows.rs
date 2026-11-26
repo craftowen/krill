@@ -96,18 +96,40 @@ impl Tunnel {
                 tx.send(result).ok();
                 io::copy(&mut stdout, &mut io::sink()).ok();
             })?;
+        let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let stderr_sink = Arc::clone(&stderr_tail);
         thread::Builder::new()
             .name("ssh-keepalive-stderr".into())
             .spawn(move || {
-                io::copy(&mut stderr, &mut io::sink()).ok();
+                const CAP: usize = 16 * 1024;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stderr.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut collected) = stderr_sink.lock()
+                        && collected.len() < CAP
+                    {
+                        let room = CAP - collected.len();
+                        collected.extend_from_slice(&buf[..n.min(room)]);
+                    }
+                }
             })?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))?
             .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("ssh forwarding to {} failed: {error}", opts.destination),
-                )
+                let detail = stderr_tail
+                    .lock()
+                    .ok()
+                    .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let message = match detail {
+                    Some(detail) => {
+                        format!("ssh forwarding to {} failed: {detail}", opts.destination)
+                    }
+                    None => format!("ssh forwarding to {} failed: {error}", opts.destination),
+                };
+                io::Error::new(error.kind(), message)
             })?;
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
@@ -190,6 +212,14 @@ fn accept(
     }
 }
 
+fn prepare_accepted_socket(socket: &UnixStream) -> io::Result<UnixStream> {
+    // Winsock2 accept() inherits FIONBIO from the non-blocking listener.
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(READ_POLL))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    socket.try_clone()
+}
+
 fn bridge(
     mut socket: UnixStream,
     opts: &SshOptions,
@@ -197,9 +227,7 @@ fn bridge(
     program: &OsStr,
     stopped: &AtomicBool,
 ) -> io::Result<()> {
-    socket.set_read_timeout(Some(READ_POLL))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut back = socket.try_clone()?;
+    let mut back = prepare_accepted_socket(&socket)?;
     let mut args = opts.common_args(10);
     args.extend([
         "-T".into(),
@@ -278,6 +306,34 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn accepted_socket_from_nonblocking_listener_becomes_blocking_with_timeout() {
+        let path = std::env::temp_dir().join(format!("kh915-nb-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        let _back = prepare_accepted_socket(&accepted).unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let err = accepted.read(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "unexpected read error: {err:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "accepted socket remained non-blocking: elapsed {:?}",
+            started.elapsed()
+        );
+        drop((accepted, client, listener));
+        std::fs::remove_file(&path).ok();
     }
 
     // 외부 네트워크를 쓰는 실측은 명시 실행한다. 일반 테스트는 네트워크에 접속하지 않는다.

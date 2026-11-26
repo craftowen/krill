@@ -186,10 +186,26 @@ fn share_live(
     backup: &Path,
     merge_tree: &dyn Fn(&Path, &Path, &Path, usize) -> io::Result<()>,
 ) -> io::Result<()> {
-    let displaced = backup.join("displaced");
     if source.symlink_metadata()?.is_file() {
-        append_missing_lines(source, target)?;
+        let linked_new = match fs::hard_link(source, target) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !target.symlink_metadata()?.is_file() {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                append_missing_lines(source, target)?;
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        let original = unused_path(&backup.join("original"));
+        replace_with_link(target, source, &original)?;
+        if !linked_new {
+            append_missing_lines(&original, target)?;
+        }
+        return Ok(());
     }
+    let displaced = backup.join("displaced");
     merge_tree(source, target, &displaced, 0)?;
     let original = unused_path(&backup.join("original"));
     replace_with_link(target, source, &original)?;
@@ -248,7 +264,15 @@ pub(super) fn replace_with_link(target: &Path, source: &Path, parked: &Path) -> 
     )));
     std::os::unix::fs::symlink(target, &staged)?;
     match exchange(&staged, source) {
-        Ok(()) => fs::rename(&staged, parked),
+        Ok(()) => {
+            if let Err(error) = fs::rename(&staged, parked) {
+                if exchange(&staged, source).is_ok() {
+                    fs::remove_file(&staged).ok();
+                }
+                return Err(error);
+            }
+            Ok(())
+        }
         // 교체를 지원하지 않는 파일시스템은 잠깐의 공백을 감수하고 되돌릴 수 있게 옮긴다.
         Err(error)
             if matches!(

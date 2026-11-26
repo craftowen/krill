@@ -335,7 +335,24 @@ fn capture_with(
         Kind::NativeCrash => event.native = Some(NativeData::unknown()),
         Kind::OperationError | Kind::Panic | Kind::AbnormalExit => {}
     }
+    trim_frames_for_install_hash(&mut event);
     record_with_consent(state, event, &consent).ok();
+}
+
+/// Leave room for the 32-hex `install_hash` field attached inside `record_with_consent`
+/// so long backtraces trim trailing frames instead of failing validation and dropping.
+fn trim_frames_for_install_hash(event: &mut Event) {
+    if event.frames.is_empty() {
+        return;
+    }
+    let mut probe = event.clone();
+    if probe.install_hash.is_none() {
+        probe.install_hash = Some("0".repeat(32));
+    }
+    while probe.validate().is_err() && !event.frames.is_empty() {
+        event.frames.pop();
+        probe.frames.pop();
+    }
 }
 
 /// 비밀·사용자 경로·제어 문자를 제거하고 [`MAX_DETAIL_LEN`](256바이트)로 자른 한 줄 상세 사유.

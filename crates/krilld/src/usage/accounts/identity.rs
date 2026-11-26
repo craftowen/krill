@@ -209,7 +209,7 @@ mod tests {
     }
     #[test]
     fn live_auth_identity_reaches_accounts_snapshot() {
-        use super::super::{RefreshTrigger, host_default_dir, refresh_accounts_authenticated};
+        use super::super::{host_default_dir, refresh_accounts_authenticated};
         use std::collections::BTreeMap;
         let root =
             std::env::temp_dir().join(format!("mobile-home-identity-{}", std::process::id()));
@@ -236,8 +236,7 @@ mod tests {
             )
         })
         .collect::<BTreeMap<_, _>>();
-        let snapshot =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let snapshot = refresh_accounts_authenticated(&home, Some(&state), &auth);
         for (key, value) in &auth {
             let a = snapshot
                 .accounts
@@ -252,8 +251,7 @@ mod tests {
         for status in auth.values_mut() {
             status.logged_in = false;
         }
-        let snapshot =
-            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth);
+        let snapshot = refresh_accounts_authenticated(&home, Some(&state), &auth);
         assert!(
             snapshot
                 .accounts

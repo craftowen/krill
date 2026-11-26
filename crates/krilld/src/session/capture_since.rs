@@ -1,5 +1,5 @@
 //! Cheap CLI pattern probes. A stamp never substitutes for raw-stream capture/ACK semantics.
-use super::{Tap, lock};
+use super::Tap;
 use krill_proto::control::{CaptureFormat, CaptureStamp, Reply};
 use krill_proto::screen::{Revision, Seq};
 
@@ -8,7 +8,7 @@ impl Tap {
         &self,
         since: Option<CaptureStamp>,
     ) -> std::io::Result<Reply> {
-        let live = lock(&self.0.live);
+        let live = self.0.live();
         let stamp = CaptureStamp {
             session: self.id(),
             revision: Revision(live.revision),

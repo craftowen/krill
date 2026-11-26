@@ -1696,7 +1696,9 @@ impl Sidebar {
                 .remote_hosts
                 .iter()
                 .find(|r| r.id == *id)
-                .is_some_and(|r| r.status == HostStatus::Disconnected),
+                .is_some_and(|r| {
+                    matches!(r.status, HostStatus::Disconnected | HostStatus::AuthFailed)
+                }),
         }
     }
 
@@ -1996,8 +1998,11 @@ impl Sidebar {
                                 }
                             });
                         let label = spec.display_name().to_owned();
-                        let reconnected = entry.status == HostStatus::Disconnected
-                            && matches!(status, HostStatus::Connecting | HostStatus::Connected);
+                        let reconnected =
+                            matches!(
+                                entry.status,
+                                HostStatus::Disconnected | HostStatus::AuthFailed
+                            ) && matches!(status, HostStatus::Connecting | HostStatus::Connected);
                         changed |= entry.label != label || entry.status != status;
                         entry.label = label;
                         entry.status = status;
@@ -4580,7 +4585,9 @@ impl Sidebar {
     }
 
     fn toggle_pin_cursor(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.cursor_worktree() {
+        if self.cursor.is_some_and(|c| self.row_host(c).is_local())
+            && let Some(path) = self.cursor_worktree()
+        {
             self.toggle_pin(path, cx);
         }
     }
@@ -4889,7 +4896,9 @@ impl Sidebar {
     }
 
     fn rename_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.cursor_worktree() {
+        if self.cursor.is_some_and(|c| self.row_host(c).is_local())
+            && let Some(path) = self.cursor_worktree()
+        {
             self.rename(path, window, cx);
         }
     }
@@ -4902,14 +4911,22 @@ impl Sidebar {
         let name = self.name(&path);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
         input.update(cx, |input, cx| input.focus(window, cx));
-        self.edit_subscription =
-            Some(
-                cx.subscribe_in(&input, window, |s, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        s.finish_rename(Some(window), cx);
+        self.edit_subscription = Some(cx.subscribe_in(
+            &input,
+            window,
+            |s, input, event: &InputEvent, window, cx| {
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
                     }
-                }),
-            );
+                ) && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    s.finish_rename(Some(window), cx);
+                }
+            },
+        ));
         self.editing = Some((path, input));
         cx.notify();
     }
@@ -5641,8 +5658,9 @@ impl Sidebar {
         if self.bot_sessions.get(&host) == Some(&sessions) {
             return;
         }
+        let is_local = host.is_local();
         self.bot_sessions.insert(host, sessions);
-        if self.bot_worktrees.is_some() {
+        if is_local && self.bot_worktrees.is_some() {
             self.rebuild(cx);
         } else {
             cx.notify();
@@ -5657,11 +5675,15 @@ impl Sidebar {
         meta: krill_ui::bot_types::BotSessionMeta,
         cx: &mut Context<Self>,
     ) {
-        self.bot_sessions
-            .entry(host)
-            .or_default()
-            .insert(session_id, meta);
-        cx.notify();
+        let is_local = host.is_local();
+        let entry = self.bot_sessions.entry(host).or_default();
+        let changed = entry.get(&session_id) != Some(&meta);
+        entry.insert(session_id, meta);
+        if is_local && changed && self.bot_worktrees.is_some() {
+            self.rebuild(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Rebinds cached bot identity metadata when a live bot session switches accounts in place.

@@ -464,7 +464,7 @@ impl VoiceService {
         }
         self.context
             .push_turn(kind, target_id, "user", trimmed, cwd.clone());
-        if cwd.is_some() {
+        if cwd.is_some() && self.bridge.is_installed() {
             self.context.schedule_git_refresh(kind, target_id, cwd);
         }
         let now_ms = now_unix_ms();
@@ -486,7 +486,7 @@ impl VoiceService {
     ) {
         self.context
             .replace_turns(kind, target_id, turns, cwd.clone());
-        if cwd.is_some() {
+        if cwd.is_some() && self.bridge.is_installed() {
             self.context.schedule_git_refresh(kind, target_id, cwd);
         }
     }

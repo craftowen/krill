@@ -6,7 +6,7 @@ const PHASES = ['idle', 'discovery', 'socket_open', 'challenge', 'authentication
 const REASONS = ['websocket_error', 'websocket_closed', 'timeout', 'http_error', 'auth_required',
   'auth_rejected', 'protocol_error', 'network_offline', 'runtime_error', 'unhandled_rejection', 'resource_error', 'unknown'];
 const SOURCES = ['index.html', 'app.js', 'client.js', 'diagnostics.js', 'crypto.js', 'storage.js', 'terminal.js',
-  'updates.js', 'i18n.js', 'qr.js', 'sw.js', 'screens/home.js', 'screens/session.js', 'screens/chat.js',
+  'updates.js', 'i18n.js', 'qr.js', 'sw.js', 'screens/home.js', 'screens/bots.js', 'screens/session.js', 'screens/chat.js',
   'screens/settings.js', 'screens/workspaces.js', 'screens/details.js'];
 const FIELDS = ['event_id', 'process', 'kind', 'error_code', 'release', 'build_id', 'os', 'arch',
   'source_loc', 'hang_bucket_ms', 'native', 'diagnostics'];

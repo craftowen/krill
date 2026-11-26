@@ -45,11 +45,17 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
         .accounts
         .into_iter()
         .filter_map(|a| {
-            Some((
-                ProviderKind::parse(&a.provider)?,
-                PathBuf::from(a.profile_dir),
-                false,
-            ))
+            let provider = ProviderKind::parse(&a.provider)?;
+            if !cfg!(test) && provider == ProviderKind::Antigravity {
+                return None;
+            }
+            let raw_dir = PathBuf::from(&a.profile_dir);
+            let dir = if provider == ProviderKind::Codex {
+                super::resolve_codex_dir(home, &a.id, &raw_dir)
+            } else {
+                raw_dir
+            };
+            Some((provider, dir, false))
         })
         .collect();
     for provider in ProviderKind::ALL {
@@ -83,6 +89,25 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 .ok()
         })
         .collect();
+        if provider == ProviderKind::OpenCode && host {
+            stamp.push(
+                std::fs::metadata(super::super::direct::opencode_host_auth_path(home))
+                    .and_then(|m| m.modified())
+                    .ok(),
+            );
+            stamp.push(state.and_then(|s| {
+                std::fs::metadata(s.join("opencode-go-api-key"))
+                    .and_then(|m| m.modified())
+                    .ok()
+            }));
+            stamp.push(
+                std::fs::metadata(
+                    krill_proto::user_dirs::config_dir(home).join("opencode-go-api-key"),
+                )
+                .and_then(|m| m.modified())
+                .ok(),
+            );
+        }
         stamp.push(std::fs::metadata(&exe).and_then(|m| m.modified()).ok());
         stamp.push(state.and_then(|s| {
             std::fs::metadata(s.join(krill_proto::agent::FILE_NAME))
@@ -107,7 +132,17 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 status
             }
             _ if provider == ProviderKind::Antigravity => {
-                let status = super::super::direct::antigravity_auth_file(&dir, host);
+                let file_storage_host = super::agy_native::is_antigravity_file_storage_host(
+                    &super::agy_native::backend::current_process_env(),
+                );
+                let status = if !host
+                    || file_storage_host
+                    || !super::agy_native::backend::is_real_home(home)
+                {
+                    super::super::direct::antigravity_auth_file(&dir, host)
+                } else {
+                    None
+                };
                 if !host || status.as_ref().is_some_and(|s| s.logged_in) {
                     lock(&STATES).insert(key.clone(), connection_from_auth(status.as_ref()));
                     lock(&CACHE).insert(key.clone(), (Instant::now(), stamp, status.clone()));
@@ -264,7 +299,7 @@ mod tests {
     #[test]
     fn agy_profiles_refresh_native_emails_after_login_without_cross_profile_fallback() {
         use super::super::{
-            AccountsFile, RefreshTrigger, StoredAccount, refresh_accounts_authenticated, save_file,
+            AccountsFile, StoredAccount, refresh_accounts_authenticated, save_file,
         };
         let root = std::env::temp_dir().join(format!("agy-native-identity-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
@@ -294,12 +329,7 @@ mod tests {
         FAKE_EXE.with(|e| *e.borrow_mut() = Some(root.join("unused-cli")));
         let emails = || {
             let auth = statuses(&home, Some(&state));
-            let snapshot = refresh_accounts_authenticated(
-                &home,
-                Some(&state),
-                RefreshTrigger::ReadOnly,
-                &auth,
-            );
+            let snapshot = refresh_accounts_authenticated(&home, Some(&state), &auth);
             snapshot
                 .accounts
                 .into_iter()
@@ -473,6 +503,68 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(found.get(&key).is_some_and(|s| s.logged_in), "{found:?}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn host_opencode_stamp_tracks_local_share_auth_and_go_api_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("opencode-host-stamp-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let exe = root.join("fake-opencode");
+        let auth_file = home.join(".local/share/opencode/auth.json");
+        let override_file = state.join("opencode-go-api-key");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ] || [ -f '{}' ]; then echo '1 credential'; else echo '0 credentials'; fi\n",
+                auth_file.display(),
+                override_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        FAKE_EXE.with(|e| *e.borrow_mut() = Some(exe));
+
+        let key = (
+            ProviderKind::OpenCode,
+            host_default_dir(&home, ProviderKind::OpenCode),
+        );
+        let wait_logged_in = |expected: bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let found = statuses(&home, Some(&state));
+                if found
+                    .get(&key)
+                    .is_some_and(|status| status.logged_in == expected)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {expected}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        wait_logged_in(false);
+        std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        std::fs::write(&auth_file, br#"{"opencode":{"type":"api","key":"sk-1"}}"#).unwrap();
+        // Immediate cache invalidation without waiting 30s TTL:
+        wait_logged_in(true);
+
+        std::fs::remove_file(&auth_file).unwrap();
+        wait_logged_in(false);
+
+        std::fs::write(&override_file, "sk-go-override\n").unwrap();
+        wait_logged_in(true);
+
+        FAKE_EXE.with(|e| *e.borrow_mut() = None);
         std::fs::remove_dir_all(root).ok();
     }
 }

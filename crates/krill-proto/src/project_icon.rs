@@ -520,9 +520,27 @@ pub fn detect_local_file_icon(repo_path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn is_valid_dns_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.contains('.') {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
+}
+
 /// 웹사이트 주소에서 Google S2 파비콘 URL을 만든다(Orca `faviconUrlFromWebsite` 패리티).
 #[must_use]
 pub fn favicon_url_from_website(raw: &str) -> Option<String> {
+    if raw.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -535,8 +553,7 @@ pub fn favicon_url_from_website(raw: &str) -> Option<String> {
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = host_port.split(':').next()?.trim().to_ascii_lowercase();
     let host = host.strip_prefix("www.").unwrap_or(&host);
-    if host.is_empty()
-        || !host.contains('.')
+    if !is_valid_dns_hostname(host)
         || matches!(
             host,
             "localhost"

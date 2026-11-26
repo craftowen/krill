@@ -429,9 +429,10 @@ where
                 let BotRpcResponse::Items(mut items) = resp else {
                     return Err(CliError::fail("unexpected reply for ListItems"));
                 };
-                if let Some(filter) = status {
-                    items.retain(|i| i.status == filter);
-                }
+                items.retain(|i| {
+                    i.snoozed_until_ms.is_none_or(|until| until <= now_ms)
+                        && status.is_none_or(|filter| i.status == filter)
+                });
                 format::format_items(&items, json)
             } else if let Some(filter) = status {
                 let page_resp = list_filtered_items_page(
@@ -570,6 +571,7 @@ where
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: patch,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -588,6 +590,7 @@ where
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: FieldPatch::Clear,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -628,6 +631,7 @@ where
                 decisions: Vec::new(),
                 close_note: note,
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -932,6 +936,7 @@ where
                 done_means: None,
                 status: Some(BotItemStatus::Planned),
                 links,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for CreateItem"));
@@ -1501,6 +1506,12 @@ where
                 png_bytes,
             })?;
             match resp {
+                BotRpcResponse::BotAvatar(data) => format::format_avatar_updated(
+                    &data.bot_id,
+                    &data.mime,
+                    data.png_bytes.len(),
+                    json,
+                ),
                 BotRpcResponse::Bot(cfg) => format::format_bot_detail(&cfg, json),
                 BotRpcResponse::Ok => {
                     format::format_ok(&format!("updated avatar for {bot_id}"), json)
@@ -1634,10 +1645,30 @@ where
     }
 }
 
+fn validate_default_export_filename(default_filename: &str) -> Result<(), CliError> {
+    let has_drive_prefix = default_filename
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && default_filename.as_bytes().get(1) == Some(&b':');
+    let mut comps = Path::new(default_filename).components();
+    let single_normal = matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !single_normal || default_filename.contains(['/', '\\', '\0']) || has_drive_prefix {
+        return Err(CliError::fail(format!(
+            "refusing unsafe filename from daemon: {default_filename:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_output_file_path(
     out_path: &str,
     default_filename: &str,
 ) -> Result<std::path::PathBuf, CliError> {
+    validate_default_export_filename(default_filename)?;
     let p = Path::new(out_path);
     let target_path = if out_path.ends_with('/') || out_path.ends_with('\\') || p.is_dir() {
         p.join(default_filename)
@@ -1934,6 +1965,7 @@ fn exec_items_add(args: ItemsAddArgs, client: &mut dyn BotClient) -> Result<Stri
         done_means: args.done_means,
         status: args.status,
         links: args.links,
+        waiting_reason: args.waiting_reason,
     })))?;
     let BotRpcResponse::Item(item) = resp else {
         return Err(CliError::fail("unexpected reply for CreateItem"));
@@ -1964,6 +1996,7 @@ fn exec_items_update(
         decisions: args.decisions,
         close_note: args.close_note,
         snoozed_until_ms,
+        waiting_reason: args.waiting_reason,
     })))?;
     let BotRpcResponse::Item(item) = resp else {
         return Err(CliError::fail("unexpected reply for UpdateItem"));

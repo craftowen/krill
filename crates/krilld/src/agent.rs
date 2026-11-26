@@ -52,18 +52,52 @@ const PREFLIGHT: &str = r#"
 hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }
 set +m; trap : INT QUIT; trap 'exit 129' HUP; trap 'exit 143' TERM
 (
+if [ -n "${MK_PANE_ID-}" ]; then export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1; fi
+if [ -n "${KRILL_ORIG_ZDOTDIR+x}" ]; then
+  if [ -n "$KRILL_ORIG_ZDOTDIR" ]; then export ZDOTDIR="$KRILL_ORIG_ZDOTDIR"; else unset ZDOTDIR; fi
+  unset KRILL_ORIG_ZDOTDIR
+fi
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
   opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi; if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi;;
-  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; else unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
+  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; elif [ "${SSH_CONNECTION-}" = krill ]; then unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
 esac
+if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
-if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@"; fi; exec "$@"
+if [ "$(basename "$1")" = agy ] || [ "$(basename "$1")" = antigravity ]; then
+  _krill_agy_gd=""
+  for _krill_a in "$@"; do
+    case "$_krill_a" in --gemini_dir=*) _krill_agy_gd="${_krill_a#--gemini_dir=}"; break;; --gemini_dir) _krill_agy_gd="__split__"; break;; esac
+  done
+  if [ -z "$_krill_agy_gd" ]; then
+    if [ -n "${HOME-}" ] && [ "${HOME#/}" != "$HOME" ]; then
+      _krill_agy_cmd=$1; shift; exec "$_krill_agy_cmd" "--gemini_dir=$HOME/.gemini" "$@"
+    fi
+  elif [ "$_krill_agy_gd" != "__split__" ] && [ "$_krill_agy_gd" != "${HOME-}/.gemini" ]; then
+    SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@"
+  fi
+fi
+exec "$@"
 )
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 exec "${SHELL:-/bin/zsh}" -l
 "#;
+
+#[cfg(unix)]
+const PROBE_PREFLIGHT: &str = r#"
+command -v "$1" >/dev/null 2>&1 || exit 127
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
+exec "$@"
+"#;
+
+pub(super) fn env_key_eq(a: &[u8], b: &[u8]) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
 
 /// 이 프로세스의 환경과 passwd로 에이전트 실행 argv·env를 만든다.
 /// 프로그램 파일명이 `claude`면 `UUIDv4`를 사전 발급하고 버전 게이트된 세션별 설정을 주입한다.
@@ -306,6 +340,11 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
         if dir.is_empty() {
             continue;
         }
+        if provider == ProviderKind::Antigravity
+            && Path::new(dir) == accounts::host_default_dir(&home, provider)
+        {
+            continue;
+        }
         if let Some(host_home) = trust_home_for_runtime() {
             match provider {
                 ProviderKind::Antigravity => {
@@ -327,14 +366,14 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             !provider
                 .credential_overrides()
                 .iter()
-                .any(|name| key.as_slice() == name.as_bytes())
+                .any(|name| env_key_eq(key, name.as_bytes()))
         });
         if provider == ProviderKind::OpenCode {
             login.env.retain(|(k, _)| {
-                !matches!(
-                    k.as_slice(),
-                    b"OPENCODE_DB" | b"XDG_DATA_HOME" | b"XDG_STATE_HOME" | b"OPENCODE_CONFIG_DIR"
-                )
+                !env_key_eq(k, b"OPENCODE_DB")
+                    && !env_key_eq(k, b"XDG_DATA_HOME")
+                    && !env_key_eq(k, b"XDG_STATE_HOME")
+                    && !env_key_eq(k, b"OPENCODE_CONFIG_DIR")
             });
             login
                 .env
@@ -351,7 +390,7 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             }
         } else {
             let key = provider.env_var().as_bytes();
-            login.env.retain(|(k, _)| k.as_slice() != key);
+            login.env.retain(|(k, _)| !env_key_eq(k, key));
             login.env.push((key.to_vec(), dir.as_bytes().to_vec()));
         }
     }
@@ -475,6 +514,27 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
         .transpose()?;
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, selected.as_ref());
+    if (is(profile, "agy") || is(profile, "antigravity"))
+        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+        && let Some(host_home) = trust_home_for_runtime()
+    {
+        let launch_env: std::collections::BTreeMap<String, String> = login
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        crate::usage::accounts::agy_native::prepare_antigravity_account_for_launch(
+            &host_home,
+            state,
+            &launch_env,
+        )
+        .map_err(io::Error::other)?;
+    }
     if bot_mcp.is_some() {
         merge_loopback_no_proxy(&mut login.env);
     }
@@ -651,14 +711,16 @@ fn instruction_args(
             }
         }
         env.retain(|(k, _)| {
-            k.as_slice() != b"OPENCODE_CONFIG_DIR"
-                && k.as_slice() != b"KRILL_OPENCODE_INSTRUCTIONS_DIR"
+            !k.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR")
+                && !k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         });
-        let dir_bytes = dir.as_os_str().as_bytes().to_vec();
-        env.push((b"OPENCODE_CONFIG_DIR".to_vec(), dir_bytes.clone()));
         // Preflight/Windows account isolation strips inherited OPENCODE_CONFIG_DIR; pass the
-        // Krill-generated bot instructions dir through an explicit marker so it is restored.
-        env.push((b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(), dir_bytes));
+        // Krill-generated bot instructions dir through an explicit marker so it is restored only
+        // for the agent subshell and never leaks into the fallback login shell (DC-24).
+        env.push((
+            b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(),
+            dir.as_os_str().as_bytes().to_vec(),
+        ));
         return Ok(Vec::new());
     }
     Ok(Vec::new())
@@ -757,7 +819,25 @@ fn selected_account(
         .and_then(ProviderKind::parse)
         .ok_or(io::ErrorKind::InvalidInput)?;
     let home = accounts::default_home();
-    let snap = accounts::refresh_accounts_with(&home, state, false);
+    if provider == ProviderKind::Antigravity
+        && crate::usage::accounts::agy_native::vault_has_account(&home, state, id)
+    {
+        crate::usage::accounts::agy_native::handle_op(
+            &home,
+            state,
+            &krill_proto::usage::AntigravityAccountOp::Select {
+                account_id: id.to_owned(),
+            },
+        )
+        .map_err(io::Error::other)?;
+        return Ok(LaunchAccount {
+            id: id.to_owned(),
+            env_key: provider.env_var().into(),
+            dir: String::new(),
+        });
+    }
+    let snap = accounts::refresh_accounts(&home, state);
+    let host_agy = accounts::host_default_dir(&home, ProviderKind::Antigravity);
     let a = snap
         .accounts
         .iter()
@@ -766,10 +846,12 @@ fn selected_account(
             a.host_default || (!a.profile_dir.is_empty() && Path::new(&a.profile_dir).is_dir())
         })
         .ok_or(io::ErrorKind::NotFound)?;
+    let use_host_native = a.host_default
+        || (provider == ProviderKind::Antigravity && Path::new(&a.profile_dir) == host_agy);
     Ok(LaunchAccount {
         id: a.id.clone(),
         env_key: provider.env_var().into(),
-        dir: if a.host_default {
+        dir: if use_host_native {
             String::new()
         } else {
             a.profile_dir.clone()
@@ -847,6 +929,27 @@ pub(crate) fn resume_in_with_bot_mcp(
     let mut files_guard = SessionFilesGuard::new(state, session);
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, account);
+    if (is(profile, "agy") || is(profile, "antigravity"))
+        && account.as_ref().is_none_or(|a| a.dir.is_empty())
+        && let Some(host_home) = trust_home_for_runtime()
+    {
+        let launch_env: std::collections::BTreeMap<String, String> = login
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    std::str::from_utf8(k).ok()?.to_owned(),
+                    std::str::from_utf8(v).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        crate::usage::accounts::agy_native::prepare_antigravity_account_for_launch(
+            &host_home,
+            state,
+            &launch_env,
+        )
+        .map_err(io::Error::other)?;
+    }
     if bot_mcp.is_some() {
         merge_loopback_no_proxy(&mut login.env);
     }
@@ -887,11 +990,8 @@ pub(crate) fn resume_in_with_bot_mcp(
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let krill = mk_bin()?;
         let version = claude::probe(profile, &login);
-        let settings = if kept_id.is_some() {
-            claude::Settings::create(state, &krill, session, version.as_deref())?
-        } else {
-            claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?
-        };
+        let settings =
+            claude::Settings::create_for_resume(state, &krill, session, version.as_deref())?;
         if let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
             && cwd.is_none_or(|c| !same_workspace_dir(c, home))
         {
@@ -1256,9 +1356,19 @@ fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> 
 
 fn active_account_in(home: &Path, state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
     let provider = ProviderKind::parse(program)?;
-    let (id, dir) = match accounts::active_account_info(home, state, program) {
-        Some((_, active)) => (active.id, active.profile_dir),
-        None => (accounts::host_default_id(provider), String::new()),
+    let (id, dir) = if provider == ProviderKind::Antigravity {
+        if let Some(active_id) =
+            crate::usage::accounts::agy_native::active_account_for_launch(home, state)
+        {
+            (active_id, String::new())
+        } else {
+            (accounts::host_default_id(provider), String::new())
+        }
+    } else {
+        match accounts::active_account_info(home, state, program) {
+            Some((_, active)) => (active.id, active.profile_dir),
+            None => (accounts::host_default_id(provider), String::new()),
+        }
     };
     Some(LaunchAccount {
         id,
@@ -1444,14 +1554,14 @@ fn trust_home_for_runtime() -> Option<PathBuf> {
     Some(home)
 }
 
-/// 루트(`/`)나 홈 디렉터리 자체는 신뢰 범위를 넓히지 않도록 거부한다.
+/// 루트(`/`, `C:\` 등)나 홈 디렉터리 자체는 신뢰 범위를 넓히지 않도록 거부한다.
 pub(crate) fn is_too_broad_to_pre_trust(home: &Path, cwd: &Path) -> bool {
-    if cwd.as_os_str().is_empty() || cwd == Path::new("/") || cwd == home {
+    if cwd.as_os_str().is_empty() || cwd.parent().is_none() || cwd == home {
         return true;
     }
-    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    cwd_canon == Path::new("/") || (!home.as_os_str().is_empty() && cwd_canon == home_canon)
+    let cwd_canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let home_canon = krill_proto::os::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    cwd_canon.parent().is_none() || (!home.as_os_str().is_empty() && cwd_canon == home_canon)
 }
 
 fn trust_candidates(cwd: &Path) -> Vec<String> {
@@ -1459,7 +1569,7 @@ fn trust_candidates(cwd: &Path) -> Vec<String> {
     if let Some(s) = cwd.to_str().filter(|s| !s.is_empty()) {
         candidates.push(s.to_owned());
     }
-    if let Ok(canon) = std::fs::canonicalize(cwd)
+    if let Ok(canon) = krill_proto::os::canonicalize(cwd)
         && let Some(s) = canon.to_str().filter(|s| !s.is_empty())
         && !candidates.iter().any(|c| c == s)
     {
@@ -2004,11 +2114,42 @@ pub(crate) fn pre_trust_codex_in_with_hook(
     )
 }
 
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '#' => return line.get(..idx).unwrap_or(line),
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
 pub(crate) fn upsert_codex_project_trust_checked(
     existing: &str,
     project_path: &str,
 ) -> Option<(String, bool)> {
-    if !existing.trim().is_empty() {
+    let mut expected: toml::Table = if existing.trim().is_empty() {
+        toml::Table::new()
+    } else {
         let parsed: toml::Value = toml::from_str(existing).ok()?;
         let root_tbl = parsed.as_table()?;
         if let Some(projects_val) = root_tbl.get("projects") {
@@ -2019,10 +2160,29 @@ pub(crate) fn upsert_codex_project_trust_checked(
                 return None;
             }
         }
-    }
+        root_tbl.clone()
+    };
     let (next, changed) = upsert_codex_project_trust(existing, project_path);
     if changed {
-        toml::from_str::<toml::Value>(&next).ok()?;
+        let after: toml::Value = toml::from_str(&next).ok()?;
+        let projects_tbl = expected
+            .entry("projects".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()?;
+        let proj_tbl = projects_tbl
+            .entry(project_path.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()?;
+        if proj_tbl.contains_key("trust_level") {
+            return None;
+        }
+        proj_tbl.insert(
+            "trust_level".to_owned(),
+            toml::Value::String("trusted".to_owned()),
+        );
+        if after != toml::Value::Table(expected) {
+            return None;
+        }
     }
     Some((next, changed))
 }
@@ -2041,7 +2201,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
     };
 
     let section_idx = lines.iter().position(|line| {
-        let trimmed = line.trim();
+        let trimmed = strip_toml_comment(line).trim();
         let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
             return false;
         };
@@ -2052,7 +2212,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
     if let Some(start) = section_idx {
         let mut end = lines.len();
         for (i, line) in lines.iter().enumerate().skip(start + 1) {
-            let trimmed = line.trim();
+            let trimmed = strip_toml_comment(line).trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
                 end = i;
                 break;
@@ -2060,7 +2220,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
         }
         if let Some(slice) = lines.get_mut((start + 1)..end) {
             for line in slice {
-                let without_comment = line.split('#').next().unwrap_or("").trim();
+                let without_comment = strip_toml_comment(line).trim();
                 if let Some((key, _)) = without_comment.split_once('=')
                     && key.trim() == "trust_level"
                 {
@@ -2110,7 +2270,7 @@ pub(crate) fn pre_trust_cursor_in(home: &Path, cwd: &Path) -> io::Result<bool> {
     if is_too_broad_to_pre_trust(home, cwd) {
         return Ok(false);
     }
-    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Some(canon_str) = canon.to_str().filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
@@ -2311,6 +2471,9 @@ fn apply_account_env(
     state: Option<&Path>,
     pinned: Option<&LaunchAccount>,
 ) -> Option<LaunchAccount> {
+    login
+        .env
+        .retain(|(key, _)| !key.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR"));
     let prog = profile.program()?;
     let account = pinned.cloned().or_else(|| active_account(state, prog));
     if let Some(account) = &account {
@@ -2329,9 +2492,10 @@ fn apply_account_env(
             }
         }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
-            login
-                .env
-                .retain(|(key, _)| key != b"KRILL_ACCOUNT_PROVIDER" && key != b"KRILL_ACCOUNT_DIR");
+            login.env.retain(|(key, _)| {
+                !env_key_eq(key, b"KRILL_ACCOUNT_PROVIDER")
+                    && !env_key_eq(key, b"KRILL_ACCOUNT_DIR")
+            });
             login.env.push((
                 b"KRILL_ACCOUNT_PROVIDER".to_vec(),
                 provider.as_str().as_bytes().to_vec(),
@@ -2344,7 +2508,7 @@ fn apply_account_env(
                 !provider
                     .credential_overrides()
                     .iter()
-                    .any(|name| key.as_slice() == name.as_bytes())
+                    .any(|name| env_key_eq(key, name.as_bytes()))
             });
         }
         // OWE-699: 켜져 있을 때만 실행 전 멱등 프로비저닝. 실패해도 실행은 그대로 간다(경고만).
@@ -2361,11 +2525,12 @@ fn apply_account_env(
             );
         }
         if is(profile, "opencode") && !account.dir.is_empty() {
+            login.env.retain(|(k, _)| !env_key_eq(k, b"OPENCODE_DB"));
             login
                 .env
                 .push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
             for (key, suffix) in [("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")] {
-                login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
+                login.env.retain(|(k, _)| !env_key_eq(k, key.as_bytes()));
                 login.env.push((
                     key.as_bytes().to_vec(),
                     Path::new(&account.dir)
@@ -2377,10 +2542,10 @@ fn apply_account_env(
             }
             login
                 .env
-                .retain(|(k, _)| k.as_slice() != b"OPENCODE_CONFIG_DIR");
+                .retain(|(k, _)| !env_key_eq(k, b"OPENCODE_CONFIG_DIR"));
         } else if !is(profile, "agy") && !is(profile, "antigravity") {
             let key = account.env_key.as_bytes();
-            login.env.retain(|(k, _)| k.as_slice() != key);
+            login.env.retain(|(k, _)| !env_key_eq(k, key));
             if !account.dir.is_empty() {
                 login
                     .env
@@ -2390,22 +2555,32 @@ fn apply_account_env(
     }
     // User environment remains customizable; credential authority belongs to the selected account.
     for (key, value) in &profile.env {
+        if key.eq_ignore_ascii_case("KRILL_OPENCODE_INSTRUCTIONS_DIR") {
+            continue;
+        }
+        let key_bytes = key.as_bytes();
         if let Some(provider) = account
             .as_ref()
             .and_then(|a| ProviderKind::from_env_var(&a.env_key))
-            && (key == provider.env_var()
-                || matches!(key.as_str(), "KRILL_ACCOUNT_PROVIDER" | "KRILL_ACCOUNT_DIR")
-                || provider.credential_overrides().contains(&key.as_str())
+            && (env_key_eq(key_bytes, provider.env_var().as_bytes())
+                || env_key_eq(key_bytes, b"KRILL_ACCOUNT_PROVIDER")
+                || env_key_eq(key_bytes, b"KRILL_ACCOUNT_DIR")
+                || provider
+                    .credential_overrides()
+                    .iter()
+                    .any(|name| env_key_eq(key_bytes, name.as_bytes()))
                 || account.as_ref().is_some_and(|a| !a.dir.is_empty())
                     && provider == ProviderKind::OpenCode
-                    && matches!(key.as_str(), "XDG_DATA_HOME" | "XDG_STATE_HOME"))
+                    && (env_key_eq(key_bytes, b"XDG_DATA_HOME")
+                        || env_key_eq(key_bytes, b"XDG_STATE_HOME")
+                        || env_key_eq(key_bytes, b"OPENCODE_DB")))
         {
             continue;
         }
-        login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
+        login.env.retain(|(k, _)| !env_key_eq(k, key_bytes));
         login
             .env
-            .push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
+            .push((key_bytes.to_vec(), value.as_bytes().to_vec()));
     }
     if let Some(state) = state {
         inject_zsh_env(login, state);
@@ -2697,7 +2872,149 @@ fn wrap(profile: &Profile, permission: Permission, login: Launch) -> Launch {
     wrap_account(profile, permission, login, None)
 }
 
+#[cfg(unix)]
+enum ProbedLoginEnv {
+    /// Keep legacy `-l -i -c` launch without probing (used by unit tests with synthetic shells).
+    Skip,
+    /// Login shell environment probe succeeded.
+    Ready(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Login shell environment probe failed or timed out; try standard fallback PATH before `-l -i -c`.
+    Unavailable,
+}
+
+/// Runs a short probe command (`--version`) in the user's login/interactive shell PATH without
+/// `PREFLIGHT`'s fallback `exec "$SHELL" -l`, so non-zero exit statuses propagate directly.
+#[cfg(unix)]
+fn wrap_probe(profile: &Profile, login: Launch) -> Launch {
+    let Launch { mut argv, env } = login;
+    argv.truncate(1);
+    // `+m` disables interactive job control so `zsh -l -i` running in its own process group
+    // (`own_group`) does not call `tcsetpgrp` and stop on `SIGTTOU` when a controlling TTY exists.
+    argv.extend(
+        ["-l", "-i", "+m", "-c", PROBE_PREFLIGHT, WRAPPER_ARG0]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec()),
+    );
+    argv.extend(
+        profile
+            .argv(Permission::Manual)
+            .into_iter()
+            .map(String::into_bytes),
+    );
+    Launch { argv, env }
+}
+
 fn wrap_account(
+    profile: &Profile,
+    permission: Permission,
+    login: Launch,
+    account: Option<&LaunchAccount>,
+) -> Launch {
+    #[cfg(unix)]
+    let fast_env = if cfg!(test) {
+        ProbedLoginEnv::Skip
+    } else {
+        match crate::shell::login_env() {
+            Some(env) => ProbedLoginEnv::Ready(env),
+            None => ProbedLoginEnv::Unavailable,
+        }
+    };
+    #[cfg(unix)]
+    return wrap_account_with_probed_env(profile, permission, login, account, fast_env);
+    #[cfg(not(unix))]
+    wrap_account_inner(profile, permission, login, account)
+}
+
+#[cfg(unix)]
+fn wrap_account_with_probed_env(
+    profile: &Profile,
+    permission: Permission,
+    mut login: Launch,
+    account: Option<&LaunchAccount>,
+    probed_env: ProbedLoginEnv,
+) -> Launch {
+    skills::prepare(Some(profile), &login, account);
+    let hint = format!(
+        "{}: not installed. install: {}",
+        profile.program().unwrap_or_default(),
+        profile.install_command()
+    );
+    let mut agent_argv = profile.argv(permission);
+    if is(profile, "codex")
+        && std::env::var_os("KRILL_CODEX_ISOLATE").is_none_or(|v| v != "0")
+        && !agent_argv.iter().skip(1).any(|a| {
+            matches!(a.as_str(), "--no-daemon" | "agents" | "queue" | "--remote")
+                || a.starts_with("--remote=")
+        })
+        && codex::no_daemon_supported(profile.program())
+    {
+        agent_argv.insert(1, "--no-daemon".to_owned());
+    }
+    let fast_flags = match probed_env {
+        ProbedLoginEnv::Skip => None,
+        ProbedLoginEnv::Ready(env) => prepare_fast_shell(&mut login, profile, Some(env)),
+        ProbedLoginEnv::Unavailable => prepare_fast_shell(&mut login, profile, None),
+    };
+    let Launch { mut argv, env } = login;
+    argv.truncate(1);
+    let (flag1, flag2) = fast_flags.unwrap_or(("-l", "-i"));
+    argv.extend(
+        [flag1, flag2, "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec()),
+    );
+    argv.extend(agent_argv.into_iter().map(String::into_bytes));
+    Launch { argv, env }
+}
+
+/// 캐시된 로그인 셸 환경(또는 폴백 표준 `PATH`에서 에이전트가 바로 확인될 때)을 `login.env`에 병합하고,
+/// 에이전트 시작 시 `.zprofile`·`.zshrc`(`brew shellenv` 등)를 건너뛸 수 있는 2-인자 셸 플래그를 돌려준다.
+/// `argv` 인덱스(`-c`=3, `mk-agent`=5, agent=7..)는 `-l -i -c`와 동일하게 유지된다.
+#[cfg(unix)]
+fn prepare_fast_shell(
+    login: &mut Launch,
+    profile: &Profile,
+    probed: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+) -> Option<(&'static str, &'static str)> {
+    let shell_name = login
+        .argv
+        .first()
+        .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
+        .and_then(|n| n.to_str())?;
+    let flags = match shell_name {
+        "zsh" => ("-f", "+i"),
+        "bash" => ("--noprofile", "--norc"),
+        _ => return None,
+    };
+    if let Some(probed_env) = probed {
+        crate::shell::merge_login_env(&mut login.env, &probed_env);
+        return Some(flags);
+    }
+    // 로그인 셸 탐침이 실패·타임아웃한 경우(예: 깨진 .zprofile 또는 극심한 syspolicyd 부하):
+    // 표준 경로에서 에이전트 실행 파일이 이미 보이면 rc 파일 없이 바로 기동한다.
+    let program = profile.program()?;
+    let home = login
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"HOME")
+        .map(|(_, v)| v.as_slice());
+    let fallback = crate::shell::fallback_agent_path(home);
+    let found = Path::new(program).is_file()
+        || krill_proto::agent::which(program, std::ffi::OsStr::from_bytes(&fallback)).is_some();
+    if found {
+        if let Some((_, v)) = login.env.iter_mut().find(|(k, _)| k.as_slice() == b"PATH") {
+            *v = fallback;
+        } else {
+            login.env.push((b"PATH".to_vec(), fallback));
+        }
+        return Some(flags);
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn wrap_account_inner(
     profile: &Profile,
     permission: Permission,
     login: Launch,
@@ -2720,22 +3037,7 @@ fn wrap_account(
     {
         agent_argv.insert(1, "--no-daemon".to_owned());
     }
-    #[cfg(windows)]
-    {
-        windows::wrap(login, &hint, agent_argv, true)
-    }
-    #[cfg(unix)]
-    {
-        let Launch { mut argv, env } = login;
-        argv.truncate(1);
-        argv.extend(
-            ["-l", "-i", "-c", PREFLIGHT, WRAPPER_ARG0, &hint]
-                .into_iter()
-                .map(|s| s.as_bytes().to_vec()),
-        );
-        argv.extend(agent_argv.into_iter().map(String::into_bytes));
-        Launch { argv, env }
-    }
+    windows::wrap(login, &hint, agent_argv, true)
 }
 
 #[cfg(test)]

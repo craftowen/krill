@@ -24,9 +24,10 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
+use std::sync::Mutex;
 
 use krill_proto::control::{Create, Failure, NewWorktree, Program, Reply, Setup, Worktree};
 use krill_proto::holder::WinSize;
@@ -261,7 +262,9 @@ pub fn create_with_pool(
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
     if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
-        && *h == digest(&top, archive)
+        && trust_path_aliases(&top)
+            .iter()
+            .any(|alias| *h == digest(alias, archive))
     {
         remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
     }
@@ -270,9 +273,13 @@ pub fn create_with_pool(
         (None, _) | (_, Setup::Skip) => None,
         (Some(script), mode) => {
             let hash = digest(&top, &script);
-            if matches!(mode, Setup::Approve(h) if *h == hash) {
-                remember(trust, &hash).map_err(|e| format!("cannot record setup trust: {e}"))?;
-            } else if !trusted(trust, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+            let aliases = trust_path_aliases(&top);
+            if matches!(mode, Setup::Approve(h) if aliases.iter().any(|alias| *h == digest(alias, &script)))
+            {
+                if let Setup::Approve(h) = mode {
+                    remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
+                }
+            } else if !is_trusted_any_alias(trust, &aliases, &script)? {
                 return Ok(Outcome::Untrusted { script, hash });
             }
             Some(script)
@@ -371,7 +378,9 @@ fn create_folder_workspace(
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
     if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
-        && *h == digest(&top, archive)
+        && trust_path_aliases(&top)
+            .iter()
+            .any(|alias| *h == digest(alias, archive))
     {
         remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
     }
@@ -380,9 +389,13 @@ fn create_folder_workspace(
         (None, _) | (_, Setup::Skip) => None,
         (Some(script), mode) => {
             let hash = digest(&top, &script);
-            if matches!(mode, Setup::Approve(h) if *h == hash) {
-                remember(trust, &hash).map_err(|e| format!("cannot record setup trust: {e}"))?;
-            } else if !trusted(trust, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+            let aliases = trust_path_aliases(&top);
+            if matches!(mode, Setup::Approve(h) if aliases.iter().any(|alias| *h == digest(alias, &script)))
+            {
+                if let Setup::Approve(h) = mode {
+                    remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
+                }
+            } else if !is_trusted_any_alias(trust, &aliases, &script)? {
                 return Ok(Outcome::Untrusted { script, hash });
             }
             Some(script)
@@ -572,12 +585,13 @@ pub(crate) fn trusted(file: &Path, hash: &[u8]) -> io::Result<bool> {
     }
 }
 
+static TRUST_LOCK: Mutex<()> = Mutex::new(());
+
 pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
+    let _guard = crate::session::lock(&TRUST_LOCK);
+    let _file_lock = krill_proto::config_document::lock_toml(file)?;
     if trusted(file, hash)? {
         return Ok(());
-    }
-    if let Some(d) = file.parent() {
-        fs::create_dir_all(d)?;
     }
     let mut content = match fs::read_to_string(file) {
         Ok(s) => s,
@@ -589,22 +603,83 @@ pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
     }
     content.push_str(&hex(hash));
     content.push('\n');
-    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
-    let write_result = (|| -> io::Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        drop(f);
-        fs::rename(&tmp, file)
-    })();
-    if write_result.is_err() {
-        fs::remove_file(&tmp).ok();
+    krill_proto::os::write_atomic_0600(file, content.as_bytes())
+}
+
+fn trust_path_aliases(top: &Path) -> Vec<PathBuf> {
+    let mut aliases: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        // Compare raw OsStr rather than Path::eq because on Windows Path::eq treats `/` and `\`
+        // as equal, which would drop the alternate slash spelling needed for SHA-256 digest lookup.
+        if !aliases
+            .iter()
+            .any(|existing| existing.as_os_str() == p.as_os_str())
+        {
+            aliases.push(p);
+        }
+    };
+    let add_variants = |push: &mut dyn FnMut(PathBuf), path: &Path| {
+        push(path.to_path_buf());
+        let shell = krill_proto::os::shell_path(path);
+        push(shell);
+        if let Some(s) = path.to_str() {
+            let stripped =
+                if let Some(after) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix("//?/")) {
+                    if let Some((unc, rest)) = after.split_at_checked(4)
+                        && (unc.eq_ignore_ascii_case(r"unc\") || unc.eq_ignore_ascii_case("unc/"))
+                    {
+                        format!(r"\\{rest}")
+                    } else {
+                        after.to_owned()
+                    }
+                } else {
+                    s.to_owned()
+                };
+            push(PathBuf::from(&stripped));
+            let is_win = cfg!(windows)
+                || matches!(stripped.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+                || stripped.starts_with(r"\\");
+            if is_win {
+                let backslash = stripped.replace('/', r"\");
+                push(PathBuf::from(&backslash));
+                if stripped.contains('\\') {
+                    push(PathBuf::from(stripped.replace('\\', "/")));
+                }
+                if let Some(unc_rest) = backslash.strip_prefix(r"\\") {
+                    push(PathBuf::from(format!(r"\\?\UNC\{unc_rest}")));
+                } else {
+                    push(PathBuf::from(format!(r"\\?\{backslash}")));
+                }
+            }
+        }
+        if let Ok(rest) = path.strip_prefix("/private") {
+            push(Path::new("/").join(rest));
+        } else if let Ok(rest) = path.strip_prefix("/") {
+            push(Path::new("/private").join(rest));
+        }
+    };
+    add_variants(&mut push, top);
+    if let Ok(canon) = fs::canonicalize(top) {
+        add_variants(&mut push, &canon);
     }
-    write_result
+    if let Ok(canon) = krill_proto::os::canonicalize(top) {
+        add_variants(&mut push, &canon);
+    }
+    aliases
+}
+
+fn is_trusted_any_alias(
+    trust_file: &Path,
+    aliases: &[PathBuf],
+    script: &str,
+) -> Result<bool, String> {
+    for alias in aliases {
+        let hash = digest(alias, script);
+        if trusted(trust_file, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `state_dir/setup-trust`에 `(top, script)` SHA-256 해시가 승인돼 있거나
@@ -618,29 +693,16 @@ pub(crate) fn is_setup_trusted(
         return Ok(false);
     };
     let trust_file = dir.join(TRUST_FILE);
-    let hash = digest(top, script);
-    if trusted(&trust_file, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+    let aliases = trust_path_aliases(top);
+    if is_trusted_any_alias(&trust_file, &aliases, script)? {
         return Ok(true);
     }
-    if let Ok(canon) = fs::canonicalize(top)
-        && canon != top
-    {
-        let canon_hash = digest(&canon, script);
-        if trusted(&trust_file, &canon_hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
-            return Ok(true);
-        }
-    }
-    if let Ok(rest) = top.strip_prefix("/private") {
-        let alias = Path::new("/").join(rest);
-        let alias_hash = digest(&alias, script);
-        if trusted(&trust_file, &alias_hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
-            return Ok(true);
-        }
-    }
     if let Ok(store) = krill_proto::orchestration::WorktreeStore::load(dir) {
-        let top_key = top.to_string_lossy();
-        if store.archive_script_for(&top_key).as_deref() == Some(script) {
-            return Ok(true);
+        for alias in &aliases {
+            let key = alias.to_string_lossy();
+            if store.archive_script_for(&key).as_deref() == Some(script) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1123,6 +1185,34 @@ mod trust_tests {
     }
 
     #[test]
+    fn remember_serializes_concurrent_writes_without_losing_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-setup-trust-conc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let file = dir.join(TRUST_FILE);
+        let hashes: Vec<Vec<u8>> = (0..32_u32)
+            .map(|i| digest(Path::new("/tmp/repo-conc"), &format!("echo {i}")))
+            .collect();
+        std::thread::scope(|s| {
+            for chunk in hashes.chunks(4) {
+                let file = &file;
+                s.spawn(move || {
+                    for h in chunk {
+                        remember(file, h).unwrap();
+                    }
+                });
+            }
+        });
+        for h in &hashes {
+            assert!(
+                trusted(&file, h).unwrap(),
+                "missing hash after concurrent remember"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn folder_workspace_canonicalizes_without_verbatim_prefix() {
         let dir = std::env::temp_dir().join(format!("krill-folder-ws-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
@@ -1148,6 +1238,38 @@ mod trust_tests {
             !got.to_string_lossy().starts_with(r"\\?\"),
             "unexpected verbatim prefix in {got:?}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_setup_trusted_matches_windows_slash_and_verbatim_path_aliases() {
+        let dir = std::env::temp_dir().join(format!("r2d18-trust-win-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let trust_file = dir.join(TRUST_FILE);
+        let script = "echo clean-archive";
+
+        // Approved using git rev-parse forward-slash path `C:/Users/Owen/repo`
+        let git_top = Path::new("C:/Users/Owen/repo");
+        remember(&trust_file, &digest(git_top, script)).unwrap();
+
+        for query in [
+            Path::new("C:/Users/Owen/repo"),
+            Path::new(r"C:\Users\Owen\repo"),
+            Path::new(r"\\?\C:\Users\Owen\repo"),
+        ] {
+            assert!(
+                is_setup_trusted(Some(&dir), query, script).unwrap(),
+                "expected archive hook approved under {git_top:?} to be trusted for {query:?}"
+            );
+        }
+
+        // Approved using raw verbatim path `\\?\D:\work\proj`
+        let verbatim_top = Path::new(r"\\?\D:\work\proj");
+        remember(&trust_file, &digest(verbatim_top, script)).unwrap();
+        assert!(is_setup_trusted(Some(&dir), Path::new(r"D:\work\proj"), script).unwrap());
+        assert!(is_setup_trusted(Some(&dir), Path::new("D:/work/proj"), script).unwrap());
+
         fs::remove_dir_all(&dir).ok();
     }
 }

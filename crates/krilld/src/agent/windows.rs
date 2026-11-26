@@ -75,18 +75,32 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
         writeln!(io::stderr().lock(), "{}", hint.to_string_lossy()).ok();
         return ExitCode::from(127);
     };
-    let args: Vec<_> = args.collect();
-    // agy needs SSH mode with --gemini_dir even when no account marker is present.
-    if std::path::Path::new(&program)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| matches!(name, "agy" | "antigravity"))
-        && args
-            .iter()
-            .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))
-    {
-        command.env("SSH_CONNECTION", "krill");
-        command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
+    let mut args: Vec<_> = args.collect();
+    if is_agy_program(&program) {
+        let host_gemini = std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|p| p.join(".gemini"));
+        let explicit_gemini = args.iter().find_map(|arg| {
+            let lossy = arg.to_string_lossy();
+            lossy
+                .strip_prefix("--gemini_dir=")
+                .map(std::path::PathBuf::from)
+        });
+        let has_split_gemini = args.iter().any(|arg| arg == "--gemini_dir");
+        if let Some(explicit) = explicit_gemini {
+            if host_gemini.as_ref().is_none_or(|hg| hg != &explicit)
+                && needs_agy_ssh_mode(&program, &args)
+            {
+                // Only legacy isolated non-host --gemini_dir forces file storage.
+                command.env("SSH_CONNECTION", "krill");
+                command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
+            }
+        } else if !has_split_gemini && let Some(hg) = host_gemini {
+            let mut flag = OsString::from("--gemini_dir=");
+            flag.push(hg.as_os_str());
+            args.insert(0, flag);
+        }
     }
     crate::sys::console_utf8();
     if let Err(error) = crate::sys::protect_agent_launcher() {
@@ -117,6 +131,24 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
     }
 }
 
+#[cfg(any(windows, test))]
+fn is_agy_program(program: &OsStr) -> bool {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity")
+        })
+}
+
+#[cfg(any(windows, test))]
+fn needs_agy_ssh_mode(program: &OsStr, args: &[OsString]) -> bool {
+    is_agy_program(program)
+        && args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))
+}
+
 /// Windows 폴백 셸(`then_shell`)에 에이전트 계정 격리 변수가 누수되지 않도록 제거할 목록.
 #[cfg(any(windows, test))]
 const FALLBACK_SHELL_REMOVED_ENVS: &[&str] = &[
@@ -143,9 +175,19 @@ fn fallback_shell_command(login: &Launch) -> Option<Command> {
     Some(shell)
 }
 
+fn dedupe_env_ci(env: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut seen = std::collections::HashSet::new();
+    env.reverse();
+    env.retain(|(k, _)| seen.insert(k.to_ascii_uppercase()));
+    env.reverse();
+}
+
 pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Option<Command> {
+    // Windows env keys are case-insensitive; normalize to last-wins before reading markers or PATH.
+    dedupe_env_ci(&mut env);
     let value = |key: &[u8]| {
         env.iter()
+            .rev()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
@@ -174,6 +216,7 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     env.retain(|(key, _)| {
                         !key.eq_ignore_ascii_case(b"XDG_DATA_HOME")
                             && !key.eq_ignore_ascii_case(b"XDG_STATE_HOME")
+                            && !key.eq_ignore_ascii_case(b"OPENCODE_DB")
                     });
                     for (key, suffix) in [
                         (b"XDG_DATA_HOME".as_slice(), "data"),
@@ -188,23 +231,32 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     env.push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
                 }
                 ProviderKind::Antigravity => {
+                    env.retain(|(key, _)| {
+                        !key.eq_ignore_ascii_case(b"SSH_CONNECTION")
+                            && !key.eq_ignore_ascii_case(b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE")
+                    });
                     env.push((b"SSH_CONNECTION".to_vec(), b"krill".to_vec()));
                     env.push((b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE".to_vec(), b"1".to_vec()));
                 }
                 _ => env.push((provider.env_var().as_bytes().to_vec(), dir)),
             }
         }
-        if provider == ProviderKind::OpenCode && !opencode_instructions_dir.is_empty() {
-            env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
-        }
+    }
+    if !opencode_instructions_dir.is_empty()
+        && provider.is_none_or(|kind| kind == ProviderKind::OpenCode)
+    {
+        env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR"));
+        env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
     }
     env.retain(|(key, _)| {
         !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_PROVIDER")
             && !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_DIR")
             && !key.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
     });
+    dedupe_env_ci(&mut env);
     let path = env
         .iter()
+        .rev()
         .find(|(key, _)| key.eq_ignore_ascii_case(b"PATH"))
         .map(|(_, v)| OsStr::from_bytes(v))?;
     let executable = krill_proto::agent::which(program.to_str()?, path)?;

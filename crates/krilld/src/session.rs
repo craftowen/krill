@@ -643,7 +643,7 @@ impl Tap {
 
     /// Dashboard cards need only a few tail lines, without screen cell composition.
     pub(crate) fn preview_tail(&self) -> Vec<String> {
-        lock(&self.0.live).engine.screen_tail(3, 500)
+        self.0.live().engine.screen_tail(3, 500)
     }
 
     /// 현재 평문 화면과 입력 모드를 `Screen` 셀 복제 없이 한 잠금 안에서 읽는다(OWE-944·OWE-946).
@@ -1023,8 +1023,8 @@ fn guarded(
 // 엔진 전체 상태 키프레임이 생기면 앞 세그먼트 재생 없이 복원할 수 있다.
 fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
     let end = rec.seq();
-    if end == 0 {
-        return; // 새 세션
+    if end == 0 || shared.live().history_epoch > 0 {
+        return; // 새 세션 또는 재구성 전 명시적 이력 지우기
     }
     let restored = panic::catch_unwind(AssertUnwindSafe(|| {
         let r = rec
@@ -1038,14 +1038,38 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
             engine
         })
     }));
-    let Ok(Some(engine)) = restored else { return };
-    let rev = {
-        let mut live = shared.live();
-        live.engine = engine;
-        live.size = size;
-        live.revision += 1;
-        live.revision
+    let Ok(Some(mut engine)) = restored else {
+        return;
     };
+    let (rev, parked) = {
+        let mut live = shared.live();
+        if live.history_epoch > 0 {
+            return;
+        }
+        let current_size = live.size;
+        let parked = live.parked;
+        let adjusted = panic::catch_unwind(AssertUnwindSafe(|| {
+            if current_size != size {
+                engine.resize(current_size);
+            }
+            if parked {
+                engine.demote(&shared.look);
+            }
+            engine
+        }));
+        let Ok(engine) = adjusted else {
+            return;
+        };
+        if parked {
+            *lock(&shared.capture) = None;
+        }
+        live.engine = engine;
+        live.revision = live.revision.wrapping_add(1);
+        (live.revision, parked)
+    };
+    if parked {
+        crate::alloc::purge();
+    }
     shared.publish(&[], rev, false);
 }
 

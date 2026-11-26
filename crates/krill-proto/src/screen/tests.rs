@@ -918,6 +918,89 @@ fn history_view_fit_guarantees_max_frame_and_preserves_rows_over_oversized_scree
 }
 
 #[test]
+fn history_view_fit_accounts_for_full_header_within_one_frame() {
+    let mut reply = HistoryViewRows {
+        req: u32::MAX,
+        view: u64::MAX,
+        session: crate::SessionId(u64::MAX),
+        epoch: [u64::MAX; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: crate::SessionId(u64::MAX),
+            source: Source::Cold { page: u32::MAX },
+            start_seq: Seq(u64::MAX),
+            end_seq: Seq(u64::MAX),
+            digest: [0xAB; 32],
+        }),
+        skip: u64::MAX,
+        total: u64::MAX,
+        complete: true,
+        rows: Vec::new(),
+        screen: None,
+    };
+    let header_bytes = postcard::experimental::serialized_size(&reply).unwrap();
+    assert!(
+        header_bytes > 64,
+        "test requires a header exceeding the legacy 64B OPS_BUDGET margin ({header_bytes}B)"
+    );
+    // Pack rows so their total lands in (MAX_FRAME - header_bytes, MAX_FRAME - 64],
+    // which used to pass OPS_BUDGET in fit() and then fail encode() with BadLength,
+    // while keeping row count well under MAX_HISTORY_ROWS so decode() accepts the result.
+    let big_row: Vec<Cell> = (0..1024).map(|_| styled()).collect();
+    let big_row_bytes = postcard::experimental::serialized_size(&big_row).unwrap();
+    let mut row_bytes = 0usize;
+    while row_bytes + big_row_bytes <= MAX_FRAME - 64 {
+        reply.rows.push(big_row.clone());
+        row_bytes += big_row_bytes;
+    }
+    let medium_row: Vec<Cell> = (0..64).map(|_| styled()).collect();
+    let medium_row_bytes = postcard::experimental::serialized_size(&medium_row).unwrap();
+    while row_bytes + medium_row_bytes <= MAX_FRAME - 64 {
+        reply.rows.push(medium_row.clone());
+        row_bytes += medium_row_bytes;
+    }
+    let small_row = vec![cell('x')];
+    let small_row_bytes = postcard::experimental::serialized_size(&small_row).unwrap();
+    while row_bytes + small_row_bytes <= MAX_FRAME - 64 {
+        reply.rows.push(small_row.clone());
+        row_bytes += small_row_bytes;
+    }
+    assert!(reply.rows.len() <= usize::from(MAX_HISTORY_ROWS));
+    assert!(reply.encode().is_err());
+
+    reply.fit();
+    assert!(!reply.rows.is_empty());
+    let encoded = reply.encode().unwrap();
+    assert!(encoded.len() <= MAX_FRAME + 4, "frame {}B", encoded.len());
+    let (kind, body) = frame(&encoded);
+    assert_eq!(HistoryViewRows::decode(kind, &body).unwrap(), reply);
+}
+
+#[test]
+fn history_view_fit_enforces_max_history_rows_even_when_bytes_fit() {
+    let mut reply = HistoryViewRows {
+        req: 7,
+        view: 3,
+        session: crate::SessionId(11),
+        epoch: [1, 2, 3],
+        status: HistoryViewStatus::Ready,
+        identity: None,
+        skip: 0,
+        total: u64::from(MAX_HISTORY_ROWS) + 25,
+        complete: false,
+        rows: vec![Vec::new(); usize::from(MAX_HISTORY_ROWS) + 25],
+        screen: None,
+    };
+    // Empty rows easily fit under ipc::MAX_FRAME in bytes, yet decode rejects > MAX_HISTORY_ROWS.
+    assert!(reply.encode().is_ok());
+    reply.fit();
+    assert_eq!(reply.rows.len(), usize::from(MAX_HISTORY_ROWS));
+    let encoded = reply.encode().unwrap();
+    let (kind, body) = frame(&encoded);
+    assert_eq!(HistoryViewRows::decode(kind, &body).unwrap(), reply);
+}
+
+#[test]
 fn cursor_explicit_postfix_is_compatible_bounded_and_applied_after_reset() {
     let mut current = update();
     let old = current.encode().unwrap();

@@ -215,14 +215,14 @@ fn jump_palette_filters_vault_hits_and_emits_resume_vault(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 1);
 
-    // One-click Resume on OpenCode vault hit (index 1)
+    // One-click Resume on OpenCode vault hit (index 1) must emit exactly one event.
     let btn = cx
         .debug_bounds("jump-vault-resume-1")
         .expect("jump vault resume button");
     cx.simulate_click(btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let expected = cx.update(|_, cx| view.read(cx).vault_event(1).unwrap());
-    assert_eq!(events.borrow().last(), Some(&expected));
+    assert_eq!(events.borrow().as_slice(), &[expected]);
 }
 
 /// OWE-768: 열린 세션이 있을 때와 0개일 때 모두 방향키(↑/↓)·Enter로
@@ -1044,5 +1044,56 @@ fn ime_preedit_blocks_palette_navigation_confirm_and_dismiss(cx: &mut TestAppCon
     assert_eq!(
         events.borrow().as_slice(),
         &[Event::Confirm(SessionId(2)), Event::Dismiss]
+    );
+}
+
+#[test]
+fn vault_filter_and_repo_labels_support_windows_paths_and_drive_case() {
+    let hits = vec![
+        VaultHit {
+            id: "1".into(),
+            agent: VaultAgent::Claude,
+            title: "Win sub".into(),
+            summary: String::new(),
+            snippet: String::new(),
+            cwd: r"c:\Users\owen\repo\packages\app\".into(),
+            modified: 100,
+            role: String::new(),
+            score: 1,
+        },
+        VaultHit {
+            id: "2".into(),
+            agent: VaultAgent::Codex,
+            title: "Other repo".into(),
+            summary: String::new(),
+            snippet: String::new(),
+            cwd: r"C:\Users\owen\repo-other".into(),
+            modified: 90,
+            role: String::new(),
+            score: 1,
+        },
+    ];
+    let matched = filter_vault(
+        &hits,
+        "",
+        VaultScope::Workspace,
+        None,
+        None,
+        Some(r"C:\Users\owen\repo\"),
+        &[],
+    );
+    assert_eq!(matched, vec![0]);
+
+    assert_eq!(
+        cwd_repo_and_worktree(r"C:\Users\owen\repo\"),
+        ("owen".into(), "repo".into())
+    );
+    assert_eq!(
+        cwd_repo_and_worktree(r"C:\repo\"),
+        ("repo".into(), String::new())
+    );
+    assert_eq!(
+        cwd_repo_and_worktree(r"C:\"),
+        (String::new(), String::new())
     );
 }

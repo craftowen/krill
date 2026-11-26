@@ -256,9 +256,13 @@ impl Selection {
 
     /// 선택한 칸의 텍스트.
     pub fn text(self, screen: &Screen) -> String {
+        if screen.lines == 0 {
+            return String::new();
+        }
         let (start, end) = self.ordered();
+        let last_line = end.line.min(screen.lines - 1);
         let mut out = String::new();
-        for line in start.line..=end.line.min(screen.lines.saturating_sub(1)) {
+        for line in start.line..=last_line {
             let Some((first, n)) = self.span(line, screen.cols) else {
                 continue;
             };
@@ -314,7 +318,7 @@ impl Selection {
                 out.push_str(&seg);
             } else {
                 out.push_str(seg.trim_end_matches(' '));
-                if line != end.line {
+                if line != last_line {
                     out.push('\n');
                 }
             }
@@ -1273,5 +1277,21 @@ IFS=,;a='shortcuts,run';python3,-c,'import
         // 일반 들여쓰기 코드 블록은 줄바꿈과 들여쓰기를 유지한다.
         let py = "def hello():\n    print(\"world\")\n    return 42";
         assert_eq!(clean_text(py), py);
+    }
+
+    #[test]
+    fn selection_text_clamps_to_shrunk_and_zero_line_screens_without_spurious_newline() {
+        let shrunk = screen(&["hello", "world"], 8);
+        assert_eq!(sel((0, 0), (4, 2)).text(&shrunk), "hello\nworld");
+        assert_eq!(block_sel((0, 1), (4, 3)).text(&shrunk), "ell\norl");
+        assert_eq!(sel((3, 0), (5, 2)).text(&shrunk), "");
+
+        let empty = Screen {
+            cols: 8,
+            lines: 0,
+            ..Screen::default()
+        };
+        assert_eq!(sel((0, 0), (1, 2)).text(&empty), "");
+        assert_eq!(sel((0, 0), (0, 2)).text(&empty), "");
     }
 }

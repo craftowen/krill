@@ -3,11 +3,27 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-fn is_dot_git_segment(part: &std::ffi::OsStr) -> bool {
-    part.to_str().is_none_or(|s| {
-        let trimmed = s.trim_end_matches(['.', ' ']);
-        trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case("git~1")
-    })
+fn is_dot_git_segment(s: &str) -> bool {
+    let trimmed = s.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case("git~1")
+}
+
+fn tilde_remainder(raw: &str) -> Option<&str> {
+    if raw == "~" {
+        Some("")
+    } else if raw.starts_with("~/") || raw.starts_with("~\\") {
+        raw.strip_prefix('~')
+            .map(|rest| rest.trim_start_matches(['/', '\\']))
+    } else {
+        None
+    }
+}
+
+fn has_root_or_drive_prefix(rel: &str) -> bool {
+    matches!(rel.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        || Path::new(rel)
+            .components()
+            .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
 }
 
 pub fn normalize(raw: &str) -> io::Result<Option<String>> {
@@ -15,12 +31,15 @@ pub fn normalize(raw: &str) -> io::Result<Option<String>> {
     if raw.is_empty() {
         return Ok(None);
     }
+    let bad_tilde =
+        raw.starts_with('~') && tilde_remainder(raw).is_none_or(has_root_or_drive_prefix);
     if raw.len() > 4096
         || raw.chars().any(char::is_control)
-        || (raw.starts_with('~') && raw != "~" && !raw.starts_with("~/") && !raw.starts_with("~\\"))
-        || Path::new(raw)
-            .components()
-            .any(|part| matches!(part, Component::Normal(s) if is_dot_git_segment(s)))
+        || bad_tilde
+        || raw.split(['/', '\\']).any(is_dot_git_segment)
+        || Path::new(raw).components().any(|part| {
+            matches!(part, Component::Normal(s) if s.to_str().is_none_or(is_dot_git_segment))
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -34,14 +53,15 @@ pub fn resolve(raw: &str, repository: &Path, home: Option<&Path>) -> io::Result<
     let Some(raw) = normalize(raw)? else {
         return Ok(None);
     };
-    let path = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+    let path = if let Some(rel) = tilde_remainder(&raw) {
+        if has_root_or_drive_prefix(rel) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid worktree directory: use a path outside .git, optionally starting with ~/",
+            ));
+        }
         let home =
             home.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        let rel = raw
-            .strip_prefix("~/")
-            .or_else(|| raw.strip_prefix("~\\"))
-            .filter(|_| raw != "~")
-            .unwrap_or("");
         home.join(rel)
     } else {
         repository.join(raw)
@@ -65,6 +85,9 @@ mod tests {
             (" ~/작업 폴더 ", Some("/home/me/작업 폴더")),
             ("~", Some("/home/me/")),
             (r"~\worktrees", Some("/home/me/worktrees")),
+            ("~//worktrees", Some("/home/me/worktrees")),
+            (r"~\\worktrees", Some("/home/me/worktrees")),
+            ("~///", Some("/home/me/")),
         ] {
             assert_eq!(
                 resolve(raw, repo, home).unwrap(),
@@ -73,12 +96,21 @@ mod tests {
         }
         for raw in [
             "~someone/tasks",
+            "~/D:/worktrees",
+            "~//C:/worktrees",
+            r"~\C:\worktrees",
+            "~/c:worktrees",
             ".git/tasks",
             ".GIT/tasks",
             ".Git/tasks",
             "/repo/.git",
             "/repo/.GIT.",
             "GIT~1/tasks",
+            r"~\.git",
+            r"~\.git/tasks",
+            r"~\.GIT.\tasks",
+            r"~\GIT~1\tasks",
+            r"foo\.git\bar",
             "bad\0path",
             "bad\npath",
         ] {

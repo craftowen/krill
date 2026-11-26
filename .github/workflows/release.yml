@@ -224,13 +224,27 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       # +crt-static: VCRUNTIME140.dll 의존 제거(docs/research/windows-spike-OWE-837.md §4).
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        shell: bash
+        run: |
+          python packaging/vendor_cache.py stage --case producer \
+            --vendor-root "$RUNNER_TEMP/krill-ci-vendor" \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
       - name: Restore Windows release dependencies
         id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
           shared-key: release-windows-msvc-static
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
           save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
+
+      - name: Verify restored vendor and external configuration
+        shell: bash
+        run: python packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
       - name: Build release binaries
         env:
@@ -245,41 +259,6 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\packaging\windows\test_resources.ps1 -TargetDir target\release -Version $env:VERSION
           & .\packaging\windows\test_defender-scan.ps1
-
-      - name: Verify native Windows audit regressions
-        shell: powershell
-        # 출고 바이너리(target\release\*.exe, lto=thin/cgu=1)와 캐시는 건드리지 않고 격리 타깃에서
-        # 빠른 테스트 프로필(LTO=off, cgu=16, opt-level=0)로 필수 8건의 +crt-static 회귀만 컴파일·실행한다.
-        timeout-minutes: 30
-        env:
-          KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
-          KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
-          CARGO_PROFILE_RELEASE_LTO: 'off'
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $gitShell = & git var GIT_SHELL_PATH
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitShell)) { throw 'Native precheck regression requires Git for Windows sh' }
-          if (-not (Test-Path -LiteralPath $gitShell.Trim() -PathType Leaf)) { throw 'Git for Windows sh is missing' }
-          $auditTarget = Join-Path $env:RUNNER_TEMP 'krill-audit-target'
-          function Test-KrillNative {
-            param([string]$Package, [string[]]$TargetArgs, [string]$TestName)
-            $testArgs = @('test', '--release', '--locked', '--target-dir', $auditTarget, '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
-            $inventory = & cargo @testArgs --list
-            if ($LASTEXITCODE -ne 0) { throw "Native test inventory failed: $Package $TestName" }
-            if ($inventory -notcontains ($TestName + ': test')) { throw "Required native regression is missing: $Package $TestName" }
-            & cargo @testArgs --nocapture --test-threads=1
-            if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $Package $TestName" }
-          }
-          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::empty_duplicate_holder_exits_instead_of_restarting'
-          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::crash_exit_still_schedules_restart'
-          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'sys::windows::tests::socket_disconnected_sees_eof_without_consuming_on_tcp_and_af_unix'
-          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::blocked_input_write_is_cancelled_by_peer_hup_and_reports_written_prefix'
-          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::query_replies_never_block_the_engine_on_a_full_input_pipe'
-          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::halt_deadline_and_resume_run_in_an_isolated_process'
-          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'registry::schedule::windows_tests::precheck_passes_exit_zero_and_reports_status_output_and_timeout'
-          Test-KrillNative -Package krill-app -TargetArgs @('--bin', 'krill-app') -TestName 'shell::folder::tests::windows_project_commands_create_and_clone_with_literal_paths'
 
       # ConPTY B안 파일은 저장소에 없다. nupkg 해시를 확인하고, 안의 두 파일 해시는 bundle.ps1이 다시 확인한다.
       - name: Fetch pinned ConPTY package
@@ -391,11 +370,110 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # 필수 8건의 +crt-static 네이티브 회귀를 build-windows와 병렬 실행하고 전용 캐시를 재사용한다.
+  audit-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Preserve LF before checkout
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        shell: bash
+        run: |
+          python packaging/vendor_cache.py stage --case producer \
+            --vendor-root "$RUNNER_TEMP/krill-ci-vendor" \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Restore Windows audit dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
+          shared-key: release-windows-audit
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
+          cache-bin: 'false'
+          cache-on-failure: true
+          save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
+
+      - name: Verify restored vendor and external configuration
+        shell: bash
+        run: python packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Verify native Windows audit regressions
+        shell: powershell
+        # build-windows와 완전히 분리된 러너·캐시에서 빠른 프로필(LTO=off, cgu=16, opt-level=0)로
+        # 필수 8건의 +crt-static 회귀를 컴파일·실행한다.
+        timeout-minutes: 30
+        env:
+          KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
+          KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+          CARGO_PROFILE_RELEASE_LTO: 'off'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gitShell = & git var GIT_SHELL_PATH
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitShell)) { throw 'Native precheck regression requires Git for Windows sh' }
+          if (-not (Test-Path -LiteralPath $gitShell.Trim() -PathType Leaf)) { throw 'Git for Windows sh is missing' }
+          function Test-KrillNative {
+            param([string]$Package, [string[]]$TargetArgs, [string]$TestName)
+            $testArgs = @('test', '--release', '--locked', '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
+            $inventory = & cargo @testArgs --list
+            if ($LASTEXITCODE -ne 0) { throw "Native test inventory failed: $Package $TestName" }
+            if ($inventory -notcontains ($TestName + ': test')) { throw "Required native regression is missing: $Package $TestName" }
+            & cargo @testArgs --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "Native regression failed: $Package $TestName" }
+          }
+          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::empty_duplicate_holder_exits_instead_of_restarting'
+          Test-KrillNative -Package krill-holder -TargetArgs @('--lib') -TestName 'windows::tests::crash_exit_still_schedules_restart'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'sys::windows::tests::socket_disconnected_sees_eof_without_consuming_on_tcp_and_af_unix'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::blocked_input_write_is_cancelled_by_peer_hup_and_reports_written_prefix'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::query_replies_never_block_the_engine_on_a_full_input_pipe'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'session::windows::tests::halt_deadline_and_resume_run_in_an_isolated_process'
+          Test-KrillNative -Package krilld -TargetArgs @('--lib') -TestName 'registry::schedule::windows_tests::precheck_passes_exit_zero_and_reports_status_output_and_timeout'
+          Test-KrillNative -Package krill-app-shell -TargetArgs @('--lib') -TestName 'shell::folder::tests::windows_project_commands_create_and_clone_with_literal_paths'
+
+  prune-caches:
+    name: prune stale caches
+    needs: [build-windows, audit-windows]
+    if: always() && inputs.build_only && github.ref == 'refs/heads/release/nightly'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prune superseded Rust caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_cache_prune.py
+
   # macOS 잡이 끝난 뒤(성공·실패 무관) 올린다. 먼저 릴리스를 만들어 버리면 macOS 잡이 "이미 있음"으로 업로드를 건너뛰기 때문이다.
+  # build-windows와 audit-windows가 모두 성공해야 Windows 자산을 게시한다.
   # 이미 있는 자산은 덮어쓰지 않는다. 잘못 올라간 자산은 사람이 지우고 다시 실행한다.
   publish-windows:
-    needs: [release, build-windows]
-    if: ${{ !inputs.build_only && !cancelled() && needs.build-windows.result == 'success' }}
+    needs: [release, build-windows, audit-windows]
+    if: ${{ !inputs.build_only && !cancelled() && needs.build-windows.result == 'success' && needs.audit-windows.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -15,9 +15,7 @@ use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
@@ -460,9 +458,7 @@ fn publication_available(publication: &Publication) -> bool {
     )) == Some(200)
 }
 fn http_status(url: &str) -> Option<u16> {
-    let mut command = Command::new("curl");
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
+    let mut command = krill_proto::os::background_command("curl");
     let out = command
         .args([
             "-sS",

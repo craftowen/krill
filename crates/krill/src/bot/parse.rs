@@ -576,6 +576,7 @@ pub(crate) struct ItemsAddArgs {
     pub done_means: Option<String>,
     pub status: Option<BotItemStatus>,
     pub links: Vec<BotItemLink>,
+    pub waiting_reason: Option<String>,
     pub json: bool,
 }
 
@@ -590,6 +591,7 @@ pub(crate) struct ItemsUpdateArgs {
     pub comment: Option<String>,
     pub decisions: Vec<BotItemDecision>,
     pub close_note: Option<String>,
+    pub waiting_reason: Option<String>,
     pub snooze: Option<String>,
     pub unsnooze: bool,
     pub json: bool,
@@ -698,7 +700,7 @@ pub(crate) fn help_text(topic: Option<&str>) -> &'static str {
         }
         Some("tidy") => "usage: krill bot tidy [<bot>] [run | status | undo [<tidy-id>]] [--json]",
         Some("items" | "item") => {
-            "usage: krill bot items [<bot>] [ls [--status <st>] [--all] [--include-snoozed] [--limit <N>] [--cursor <c> | --page <N>] | show <item-id> | add <title> [--body <text>] [--done-means <text>] [--status <st>] [--link <kind:target>...] | update <item-id> [--status <st>] [--title <t>] [--body <b>] [--done-means <d>] [--comment <c>] [--close-note <n>] [--snooze <until>|--unsnooze] [--ask <q> | --question <q> [--option <opt>... [--recommended <idx>]]] | answer <item-id> [--text <str> | --option <idx>] [--decision-id <id>] [--request-id <id>] | comment <item-id> <text> [--author <name>] | snooze <item-id> <until> | unsnooze <item-id> | link <item-id> (<dispatch|pr|url|file> <target> | <kind>:<target>) | done <item-id> [--note <text>] | cancel <item-id> [--note <text>]] [--json]"
+            "usage: krill bot items [<bot>] [ls [--status <st>] [--all] [--include-snoozed] [--limit <N>] [--cursor <c> | --page <N>] | show <item-id> | add <title> [--body <text>] [--done-means <text>] [--status <st>] [--note <text>] [--link <kind:target>...] | update <item-id> [--status <st>] [--note <text>] [--title <t>] [--body <b>] [--done-means <d>] [--comment <c>] [--close-note <n>] [--snooze <until>|--unsnooze] [--ask <q> | --question <q> [--option <opt>... [--recommended <idx>]]] | answer <item-id> [--text <str> | --option <idx>] [--decision-id <id>] [--request-id <id>] | comment <item-id> <text> [--author <name>] | snooze <item-id> <until> | unsnooze <item-id> | link <item-id> (<dispatch|pr|url|file> <target> | <kind>:<target>) | done <item-id> [--note <text>] | cancel <item-id> [--note <text>]] [--json]\nstatuses: planned | working | waiting (--note required; external waits only — your own running worker counts as working) | needs-you | done | canceled"
         }
         Some("suggestions" | "suggestion") => {
             "usage: krill bot suggestions [<bot>] [ls [--include-dismissed] | dismiss <id> | start <id>] [--json]"
@@ -852,11 +854,12 @@ pub(crate) fn parse_item_status(raw: &str) -> Result<BotItemStatus, CliError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "planned" => Ok(BotItemStatus::Planned),
         "working" | "in_progress" | "in-progress" => Ok(BotItemStatus::Working),
-        "needs_you" | "needs-you" | "waiting" => Ok(BotItemStatus::NeedsYou),
+        "waiting" => Ok(BotItemStatus::Waiting),
+        "needs_you" | "needs-you" => Ok(BotItemStatus::NeedsYou),
         "done" | "completed" => Ok(BotItemStatus::Done),
         "canceled" | "cancelled" => Ok(BotItemStatus::Canceled),
         other => Err(CliError::usage(format!(
-            "invalid item status '{other}' (expected planned|working|needs_you|done|canceled)"
+            "invalid item status '{other}' (expected planned|working|waiting|needs_you|done|canceled)"
         ))),
     }
 }
@@ -1934,6 +1937,7 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
             let mut body: Option<String> = None;
             let mut done_means: Option<String> = None;
             let mut status: Option<BotItemStatus> = None;
+            let mut waiting_reason: Option<String> = None;
             let mut links = Vec::new();
             let mut idx = 0usize;
             while let Some(arg) = tail.get(idx) {
@@ -1951,6 +1955,12 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                     done_means = Some(val.to_owned());
                 } else if let Some(val) = take_opt(tail, &mut idx, "--status")? {
                     status = Some(parse_item_status(val)?);
+                } else if let Some(val) = take_opt(tail, &mut idx, "--note")?.or(take_opt(
+                    tail,
+                    &mut idx,
+                    "--waiting-reason",
+                )?) {
+                    waiting_reason = Some(val.to_owned());
                 } else if let Some(val) = take_opt(tail, &mut idx, "--link")? {
                     links.push(parse_link_spec(val)?);
                 } else if !arg.starts_with('-') && title.is_none() {
@@ -1965,6 +1975,15 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
             let title = title
                 .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| CliError::usage("items add requires <title> or --title <title>"))?;
+            if status == Some(BotItemStatus::Waiting) {
+                let raw = waiting_reason.as_deref().ok_or_else(|| {
+                    CliError::usage(
+                        "items add --status waiting requires --note \"<what it waits on>\"",
+                    )
+                })?;
+                waiting_reason =
+                    Some(krill_proto::bots::validate_waiting_reason(raw).map_err(CliError::usage)?);
+            }
             Ok(BotCommand::ItemsAdd(ItemsAddArgs {
                 bot: require_bot(bot, default_bot, "items add")?,
                 title,
@@ -1972,6 +1991,7 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                 done_means,
                 status,
                 links,
+                waiting_reason,
                 json,
             }))
         }
@@ -2013,12 +2033,20 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                 } else if let Some(val) = take_opt(tail, &mut idx, "--close-note")? {
                     out.close_note = Some(val.to_owned());
                     any_field = true;
+                } else if let Some(val) = take_opt(tail, &mut idx, "--note")?.or(take_opt(
+                    tail,
+                    &mut idx,
+                    "--waiting-reason",
+                )?) {
+                    out.waiting_reason = Some(val.to_owned());
+                    any_field = true;
                 } else if let Some(val) = take_opt(tail, &mut idx, "--snooze")? {
                     out.snooze = Some(val.to_owned());
                     any_field = true;
-                } else if let Some(val) =
-                    take_opt(tail, &mut idx, "--ask")?.or(take_opt(tail, &mut idx, "--question")?)
-                {
+                } else if let Some(val) = match take_opt(tail, &mut idx, "--ask")? {
+                    Some(v) => Some(v),
+                    None => take_opt(tail, &mut idx, "--question")?,
+                } {
                     let trimmed = val.trim();
                     if trimmed.is_empty() {
                         return Err(CliError::usage(
@@ -2076,6 +2104,23 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                     "items update requires at least one field flag",
                 ));
             }
+            if matches!(
+                out.status,
+                Some(BotItemStatus::Done | BotItemStatus::Canceled)
+            ) && out.close_note.is_none()
+                && out.waiting_reason.is_some()
+            {
+                out.close_note = out.waiting_reason.take();
+            }
+            if out.status == Some(BotItemStatus::Waiting) {
+                let raw = out.waiting_reason.as_deref().ok_or_else(|| {
+                    CliError::usage(
+                        "items update --status waiting requires --note \"<what it waits on>\"",
+                    )
+                })?;
+                out.waiting_reason =
+                    Some(krill_proto::bots::validate_waiting_reason(raw).map_err(CliError::usage)?);
+            }
             out.item_id =
                 item_id.ok_or_else(|| CliError::usage("items update requires <item-id>"))?;
             out.bot = bot.or_else(|| default_bot.map(str::to_owned));
@@ -2095,11 +2140,10 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                     bot = Some(val.to_owned());
                 } else if let Some(val) = take_opt(tail, &mut idx, "--text")? {
                     text = Some(val.to_owned());
-                } else if let Some(val) = take_opt(tail, &mut idx, "--option")?.or(take_opt(
-                    tail,
-                    &mut idx,
-                    "--option-index",
-                )?) {
+                } else if let Some(val) = match take_opt(tail, &mut idx, "--option")? {
+                    Some(v) => Some(v),
+                    None => take_opt(tail, &mut idx, "--option-index")?,
+                } {
                     let n = val
                         .parse::<u32>()
                         .map_err(|_| CliError::usage("--option must be a non-negative integer"))?;
@@ -2432,9 +2476,12 @@ fn parse_reply(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
         idx = idx.saturating_add(1);
     }
 
+    let has_non_text = reaction.is_some() || !files.is_empty();
     match (bot.is_some(), text.is_some(), positionals.as_slice()) {
         (_, true, []) => {}
+        (_, false, []) if has_non_text => {}
         (false, true, [b]) => bot = Some(b.clone()),
+        (false, false, [b]) if default_bot.is_none() && has_non_text => bot = Some(b.clone()),
         (true, false, [t]) => text = Some(t.clone()),
         (false, false, [b, t]) => {
             bot = Some(b.clone());
@@ -2445,7 +2492,7 @@ fn parse_reply(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
         }
         _ => {
             return Err(CliError::usage(
-                "reply requires <bot> <text> (or --text <text> with KRILL_BOT_ID)",
+                "reply requires <bot> <text> (or --text <text> / --file / --react with KRILL_BOT_ID)",
             ));
         }
     }

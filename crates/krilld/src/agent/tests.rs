@@ -1012,7 +1012,6 @@ fn selected_account_is_per_session_and_does_not_change_global_selection() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     let mut file = accounts::AccountsFile::default();
-    file.auto_switch.enabled = false;
     file.accounts.push(accounts::StoredAccount {
         id: "codex-selected".into(),
         provider: "codex".into(),
@@ -2266,10 +2265,14 @@ fn bot_instructions_reach_each_agent_system_prompt_not_first_input() {
     );
 
     let (_, oc_env) = launch(&["opencode"], 916, &[("XDG_CONFIG_HOME", &xdg)]);
+    assert!(
+        !oc_env.iter().any(|(k, _)| k == b"OPENCODE_CONFIG_DIR"),
+        "launch.env should pass bot instructions via KRILL_OPENCODE_INSTRUCTIONS_DIR, not OPENCODE_CONFIG_DIR"
+    );
     let oc_dir = oc_env
         .iter()
         .rev()
-        .find(|(k, _)| k == b"OPENCODE_CONFIG_DIR")
+        .find(|(k, _)| k == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
         .unwrap();
     assert_ne!(oc_dir, oc_config);
@@ -2397,13 +2400,20 @@ fn resume_opencode_bot_instructions_reads_custom_config_dir_from_login_env() {
     )
     .unwrap();
 
+    assert!(
+        !launch
+            .env
+            .iter()
+            .any(|(k, _)| k.as_slice() == b"OPENCODE_CONFIG_DIR"),
+        "resume launch.env should pass bot instructions via KRILL_OPENCODE_INSTRUCTIONS_DIR"
+    );
     let resumed_cfg = launch
         .env
         .iter()
         .rev()
-        .find(|(k, _)| k.as_slice() == b"OPENCODE_CONFIG_DIR")
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
-        .expect("OPENCODE_CONFIG_DIR set on resume");
+        .expect("KRILL_OPENCODE_INSTRUCTIONS_DIR set on resume");
     assert_ne!(resumed_cfg, custom_cfg);
     let agents_md = std::fs::read_to_string(resumed_cfg.join("AGENTS.md")).unwrap();
     assert!(agents_md.contains("User base rules"), "{agents_md}");
@@ -2620,9 +2630,9 @@ fn resume_in_with_bot_mcp_preserves_bot_context_for_all_four_providers() {
     .unwrap();
     let oc_instr_dir = env_val(&oc_launch, b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .expect("KRILL_OPENCODE_INSTRUCTIONS_DIR marker set");
-    assert_eq!(
-        env_val(&oc_launch, b"OPENCODE_CONFIG_DIR").as_deref(),
-        Some(oc_instr_dir.as_str())
+    assert!(
+        env_val(&oc_launch, b"OPENCODE_CONFIG_DIR").is_none(),
+        "outer launch.env must not leak OPENCODE_CONFIG_DIR to fallback shell"
     );
     assert_eq!(
         env_val(&oc_launch, b"KRILL_MCP_HELPER_TOKEN").as_deref(),
@@ -2679,6 +2689,272 @@ fn resume_in_with_bot_mcp_preserves_bot_context_for_all_four_providers() {
 }
 
 #[test]
+fn opencode_bot_instructions_survive_preflight_launch_and_resume_without_leaking() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-dc24-opencode-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let bot_home = dir.join("bot-home");
+    let zdot = dir.join("zdot");
+    let bin = dir.join("bin");
+    let iso = dir.join("iso-account");
+    for d in [&state, &bot_home, &zdot, &bin, &iso] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let opencode_exe = bin.join("opencode");
+    std::fs::write(
+        &opencode_exe,
+        "#!/bin/sh\nprintf 'AGENT_CFG=%s\\nAGENT_MARKER=%s\\nAGENT_KEY=%s\\nAGENT_XDG=%s\\n' \"${OPENCODE_CONFIG_DIR-unset}\" \"${KRILL_OPENCODE_INSTRUCTIONS_DIR-unset}\" \"${OPENAI_API_KEY-unset}\" \"${XDG_DATA_HOME-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&opencode_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let fallback_shell = bin.join("fallback-shell");
+    std::fs::write(
+        &fallback_shell,
+        "#!/bin/sh\nprintf 'SHELL_CFG=%s\\nSHELL_MARKER=%s\\n' \"${OPENCODE_CONFIG_DIR-unset}\" \"${KRILL_OPENCODE_INSTRUCTIONS_DIR-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fallback_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let exec_launch = |mut launch: Launch| -> String {
+        launch.env.retain(|(k, _)| {
+            !matches!(
+                k.as_slice(),
+                b"HOME" | b"ZDOTDIR" | b"SHELL" | b"OPENAI_API_KEY"
+            )
+        });
+        launch.env.extend([
+            kv("HOME", zdot.to_str().unwrap()),
+            kv("ZDOTDIR", zdot.to_str().unwrap()),
+            kv("SHELL", fallback_shell.to_str().unwrap()),
+            kv("OPENAI_API_KEY", "should-be-cleared"),
+        ]);
+        let (prog, args) = launch.argv.split_first().unwrap();
+        let out = Command::new(OsStr::from_bytes(prog))
+            .args(args.iter().map(|a| OsStr::from_bytes(a)))
+            .env_clear()
+            .envs(
+                launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // 1. Fresh bot launch with OpenCode host account.
+    let oc = profile(&[opencode_exe.to_str().unwrap()]);
+    let mcp = BotMcpLaunchConfig {
+        bot_home: Some(bot_home.clone()),
+        instructions: Some("Bot launch instructions".into()),
+        ..BotMcpLaunchConfig::default()
+    };
+    let (launch, _, _) = launch_selected_in_with_bot_mcp(
+        &oc,
+        Permission::Manual,
+        krill_proto::SessionId(951),
+        Some(&state),
+        None,
+        Some(&bot_home),
+        Some(&mcp),
+    )
+    .unwrap();
+    let expected_dir = launch
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        .expect("instructions marker on launch");
+    let stdout = exec_launch(launch);
+    assert!(
+        stdout.contains(&format!("AGENT_CFG={expected_dir}\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("AGENT_MARKER=unset\n"), "{stdout}");
+    assert!(stdout.contains("AGENT_KEY=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_CFG=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_MARKER=unset\n"), "{stdout}");
+
+    // 2. Cold resume with isolated OpenCode account preserves both XDG isolation and instructions dir.
+    let isolated = LaunchAccount {
+        id: "oc-iso".into(),
+        env_key: "OPENCODE_CONFIG_DIR".into(),
+        dir: iso.to_str().unwrap().to_owned(),
+    };
+    let (resumed, _, _) = resume_in_with_bot_instructions(
+        &oc,
+        Permission::Manual,
+        krill_proto::SessionId(952),
+        Some(&state),
+        Some("ses_bot_952"),
+        Some(&isolated),
+        Some("Bot resume instructions"),
+    )
+    .unwrap();
+    let expected_resumed_dir = resumed
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        .expect("instructions marker on resume");
+    let stdout = exec_launch(resumed);
+    assert!(
+        stdout.contains(&format!("AGENT_CFG={expected_resumed_dir}\n")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("AGENT_XDG={}\n", iso.join("data").display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("AGENT_MARKER=unset\n"), "{stdout}");
+    assert!(stdout.contains("AGENT_KEY=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_CFG=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_MARKER=unset\n"), "{stdout}");
+
+    // 3. Profile env cannot forge KRILL_OPENCODE_INSTRUCTIONS_DIR to bypass credential clearing.
+    let mut forged = profile(&["opencode"]);
+    forged
+        .env
+        .insert("KRILL_OPENCODE_INSTRUCTIONS_DIR".into(), "/forged".into());
+    let mut login = Launch {
+        argv: Vec::new(),
+        env: vec![kv("KRILL_OPENCODE_INSTRUCTIONS_DIR", "/inherited")],
+    };
+    apply_account_env(&mut login, &forged, None, Some(&isolated));
+    assert!(
+        !login
+            .env
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR"))
+    );
+
+    claude::discard(&state, krill_proto::SessionId(951));
+    claude::discard(&state, krill_proto::SessionId(952));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn preflight_sets_ssh_connection_for_antigravity_alias_and_spliced_args() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-dc35-preflight-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let zdot = dir.join("zdot");
+    std::fs::create_dir_all(&zdot).unwrap();
+    let exe = dir.join("antigravity");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\nprintf 'SSH=%s\\n' \"${SSH_CONNECTION-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let done_shell = dir.join("done-shell");
+    std::fs::write(&done_shell, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&done_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let run_with = |args: &[&str]| -> String {
+        let mut launch = wrap(
+            &profile(args),
+            Permission::Manual,
+            Shell::Login.launch_with(Some(&user()), vec![kv("PATH", "/usr/bin:/bin")]),
+        );
+        launch
+            .env
+            .retain(|(k, _)| !matches!(k.as_slice(), b"HOME" | b"ZDOTDIR" | b"SSH_CONNECTION"));
+        launch.env.extend([
+            kv("HOME", zdot.to_str().unwrap()),
+            kv("ZDOTDIR", zdot.to_str().unwrap()),
+            kv("SHELL", done_shell.to_str().unwrap()),
+        ]);
+        let (prog, argv) = launch.argv.split_first().unwrap();
+        let out = Command::new(OsStr::from_bytes(prog))
+            .args(argv.iter().map(|a| OsStr::from_bytes(a)))
+            .env_clear()
+            .envs(
+                launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let exe_str = exe.to_str().unwrap();
+    let with_spliced = run_with(&[
+        exe_str,
+        "--add-dir",
+        "/tmp/bot-home",
+        "--gemini_dir=/tmp/profile/.gemini",
+    ]);
+    assert!(with_spliced.contains("SSH=krill\n"), "{with_spliced}");
+
+    let without_gemini = run_with(&[exe_str, "--add-dir", "/tmp/bot-home"]);
+    assert!(without_gemini.contains("SSH=unset\n"), "{without_gemini}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn upsert_codex_project_trust_handles_commented_headers_and_guards_other_tables() {
+    // Commented following header `[features] # enabled` must end the project section
+    // so `trust_level = "trusted"` is placed in `[projects."/ws"]`, never `[features]`.
+    let with_commented_next = "\
+[projects.\"/ws\"]
+sandbox_mode = \"workspace-write\"
+
+[features] # enabled
+multi_agent = true
+";
+    let (next, changed) =
+        upsert_codex_project_trust_checked(with_commented_next, "/ws").expect("valid update");
+    assert!(changed);
+    let parsed: toml::Value = toml::from_str(&next).unwrap();
+    assert_eq!(
+        parsed["projects"]["/ws"]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert_eq!(
+        parsed["projects"]["/ws"]["sandbox_mode"].as_str(),
+        Some("workspace-write")
+    );
+    assert!(parsed["features"].get("trust_level").is_none());
+    assert_eq!(parsed["features"]["multi_agent"].as_bool(), Some(true));
+
+    // Commented target header and `#` inside a quoted path must match cleanly without duplicating.
+    let with_hash_path = "\
+[projects.\"/tmp/a#b\"] # my project
+foo = 1
+[other] # trailing comment
+bar = 2
+";
+    let (next_hash, changed_hash) =
+        upsert_codex_project_trust_checked(with_hash_path, "/tmp/a#b").expect("hash path update");
+    assert!(changed_hash);
+    let parsed_hash: toml::Value = toml::from_str(&next_hash).unwrap();
+    assert_eq!(
+        parsed_hash["projects"]["/tmp/a#b"]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert!(parsed_hash["other"].get("trust_level").is_none());
+
+    // Existing dotted-key untrusted choice must not be overwritten or duplicated.
+    let dotted_untrusted = "projects.\"/ws\".trust_level = \"untrusted\"\n";
+    assert!(upsert_codex_project_trust_checked(dotted_untrusted, "/ws").is_none());
+}
+
+#[test]
 fn launch_selected_in_with_bot_mcp_cleans_up_claude_files_on_intermediate_failure() {
     let dir = std::env::temp_dir().join(format!(
         "krill-claude-launch-cleanup-{}",
@@ -2726,5 +3002,176 @@ fn launch_selected_in_with_bot_mcp_cleans_up_claude_files_on_intermediate_failur
         leftovers.is_empty(),
         "failed launch must not leak claude settings/mcp/instruction files: {leftovers:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fast_shell_launch_skips_startup_rc_files_and_keeps_wrapper_contract() {
+    let dir = std::env::temp_dir().join(format!("krill-fast-shell-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Simulate a broken/hanging .zprofile that would stall `-l -i -c` forever.
+    std::fs::write(home.join(".zprofile"), "sleep 60\n").unwrap();
+    let fake_agy = bin.join("agy");
+    std::fs::write(
+        &fake_agy,
+        "#!/bin/sh\nprintf 'AGY_OK ZDOT=%s HERDR=%s TOKEN=%s\\n' \"${ZDOTDIR-unset}\" \"${HERDR_ENV-unset}\" \"${USER_EXPORT-unset}\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let u = User {
+        name: b"owen".to_vec(),
+        home: home.as_os_str().as_bytes().to_vec(),
+        shell: b"/bin/zsh".to_vec(),
+    };
+    let mut login = Shell::Login.launch_with_lang(Some(&u), polluted(), None);
+    login.env.push(kv("MK_PANE_ID", "42"));
+    login.env.push(kv("ZDOTDIR", "/tmp/krill-managed-zdot"));
+    login.env.push(kv("KRILL_ORIG_ZDOTDIR", ""));
+    let agy_profile = profile(&["agy"]);
+
+    // 1. Probed login env succeeds -> uses `zsh -f +i -c` and merges user exports.
+    let probed = vec![
+        kv("PATH", &format!("{}:/usr/bin:/bin", bin.display())),
+        kv("USER_EXPORT", "from-profile"),
+    ];
+    let fast = wrap_account_with_probed_env(
+        &agy_profile,
+        Permission::Manual,
+        login.clone(),
+        None,
+        ProbedLoginEnv::Ready(probed),
+    );
+    let argv: Vec<_> = fast
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect();
+    assert_eq!(argv[..4], ["/bin/zsh", "-f", "+i", "-c"]);
+    assert_eq!(argv[5], WRAPPER_ARG0);
+    assert_eq!(argv[7..], ["agy"]);
+    assert!(crate::registry::is_wrapper_argv(&fast.argv));
+
+    // Actually run the fast-path launch with SHELL=/usr/bin/true (so post-agent exec exits immediately)
+    // and verify it completes without executing the hanging `sleep 60` in .zprofile!
+    let mut exec_env = fast.env.clone();
+    exec_env.retain(|(k, _)| k.as_slice() != b"SHELL");
+    exec_env.push(kv("SHELL", "/usr/bin/true"));
+    let (prog, args) = fast.argv.split_first().unwrap();
+    let started = Instant::now();
+    let out = Command::new(OsStr::from_bytes(prog))
+        .args(args.iter().map(|a| OsStr::from_bytes(a)))
+        .env_clear()
+        .envs(
+            exec_env
+                .iter()
+                .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "fast launch must bypass hanging .zprofile, took {:?}",
+        started.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("AGY_OK ZDOT=unset HERDR=1 TOKEN=from-profile"),
+        "unexpected stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Probed login env failed/timed out (`Unavailable`) -> fallback PATH still finds ~/.local/bin/agy
+    // and launches via `-f +i -c` instead of hanging on .zprofile!
+    let fallback = wrap_account_with_probed_env(
+        &agy_profile,
+        Permission::Manual,
+        login,
+        None,
+        ProbedLoginEnv::Unavailable,
+    );
+    let fb_argv: Vec<_> = fallback
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect();
+    assert_eq!(fb_argv[..4], ["/bin/zsh", "-f", "+i", "-c"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn preflight_injects_host_gemini_dir_without_forcing_ssh_or_file_storage() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-agy-preflight-gd-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let home = dir.join("home");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agy_bin = bin.join("agy");
+    std::fs::write(
+        &agy_bin,
+        "#!/bin/sh\nprintf 'ARGS=%s|SSH=%s|FORCE=%s\\n' \"$*\" \"${SSH_CONNECTION-unset}\" \"${AGY_CLI_FORCE_FILE_TOKEN_STORAGE-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&agy_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. Standard native host launch: injects --gemini_dir=$HOME/.gemini, strips leaked
+    //    SSH_CONNECTION=krill, and does NOT force AGY_CLI_FORCE_FILE_TOKEN_STORAGE.
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            PREFLIGHT,
+            WRAPPER_ARG0,
+            "hint",
+            "agy",
+            "--mode",
+            "yolo",
+        ])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("KRILL_ACCOUNT_PROVIDER", "agy")
+        .env("SSH_CONNECTION", "krill")
+        .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1")
+        .env("SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_gd = format!("--gemini_dir={}/.gemini --mode yolo", home.display());
+    assert!(
+        stdout.contains(&format!("ARGS={expected_gd}|SSH=unset|FORCE=unset")),
+        "unexpected stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Host with explicit AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 (without fake SSH_CONNECTION=krill)
+    //    preserves AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 and still injects host --gemini_dir.
+    let out2 = std::process::Command::new("/bin/sh")
+        .args(["-c", PREFLIGHT, WRAPPER_ARG0, "hint", "agy", "--version"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("KRILL_ACCOUNT_PROVIDER", "agy")
+        .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1")
+        .env("SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let expected_gd2 = format!("--gemini_dir={}/.gemini --version", home.display());
+    assert!(
+        stdout2.contains(&format!("ARGS={expected_gd2}|SSH=unset|FORCE=1")),
+        "unexpected stdout2={stdout2:?} stderr={:?}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

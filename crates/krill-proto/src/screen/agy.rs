@@ -92,8 +92,8 @@ fn is_empty_composer_row(cells: &[Cell]) -> bool {
 }
 
 /// Locates Antigravity's interactive composer box (`───` / `> ...` / `───`) near the bottom
-/// of the screen, returning `(top_border_row, composer_is_empty)`.
-fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
+/// of the screen, returning `(top_border_row, bottom_border_row, composer_is_empty)`.
+fn find_composer_box_bounds(screen: &Screen) -> Option<(usize, usize, bool)> {
     let rows = &screen.rows;
     if rows.len() < 3 {
         return None;
@@ -117,12 +117,18 @@ fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
             if first_interior.starts_with('>') {
                 let single_row = bottom == top.saturating_add(2);
                 let empty = single_row && is_empty_composer_row(interior);
-                return Some((top, empty));
+                return Some((top, bottom, empty));
             }
             break;
         }
     }
     None
+}
+
+/// Locates Antigravity's interactive composer box (`───` / `> ...` / `───`) near the bottom
+/// of the screen, returning `(top_border_row, composer_is_empty)`.
+fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
+    find_composer_box_bounds(screen).map(|(top, _, empty)| (top, empty))
 }
 
 fn normalize_ws(text: &str) -> String {
@@ -218,11 +224,97 @@ fn count_matching_rows_above(
     result
 }
 
+/// Returns `true` when plain screen text shows an Antigravity (`agy`) unauthenticated login
+/// or OAuth authentication TUI where sending Enter or a prompt could launch a browser OAuth flow.
+#[must_use]
+pub fn auth_login_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("welcome to the antigravity cli. you are currently not signed in")
+        || lower.contains("you are not logged into antigravity")
+        || lower.contains("click here to authenticate")
+        || lower.contains("log in with google")
+        || lower.contains("if you aren't automatically redirected, paste the authorization code")
+        || lower.contains("enter the redirect url (if redirect failed)")
+    {
+        return true;
+    }
+    if lower.contains("select login method")
+        && (lower.contains("google oauth") || lower.contains("google cloud project"))
+    {
+        return true;
+    }
+    if lower.contains("your browser should open automatically")
+        && (lower.contains("accounts.google.com/o/oauth2/auth")
+            || lower.contains("antigravity.google")
+            || lower.contains("authorization code")
+            || lower.contains("click here to authenticate"))
+    {
+        return true;
+    }
+    if lower.contains("accounts.google.com/o/oauth2/auth")
+        && (lower.contains("antigravity.google")
+            || lower.contains("oauth-callback")
+            || lower.contains("authorization code..."))
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns `true` when the live PTY screen is showing an Antigravity (`agy`) login or OAuth TUI.
+/// Automated prompt, steer, bot, schedule, and auto-resume senders must refuse to inject input
+/// (especially `\r` / Enter) whenever this returns `true`.
+#[must_use]
+pub fn auth_login_screen(screen: &Screen) -> bool {
+    let mut text = String::new();
+    for (idx, row) in screen.rows.iter().enumerate() {
+        if idx > 0 {
+            text.push('\n');
+        }
+        text.push_str(&row_text(row));
+    }
+    auth_login_text(&text)
+}
+
 /// Returns `true` when Antigravity's interactive composer box (`───` / `> ...` / `───`)
 /// is visible and empty (blank or placeholder-only, with no user draft).
 #[must_use]
 pub fn empty_composer_ready(screen: &Screen) -> bool {
+    if auth_login_screen(screen) {
+        return false;
+    }
     find_composer_box(screen).is_some_and(|(_, empty)| empty)
+}
+
+/// Returns the visible draft text inside Antigravity's interactive composer box:
+/// - `None` if no composer box is visible or an auth/login screen is active,
+/// - `Some("")` if the composer is visible and empty (placeholder-only),
+/// - `Some(text)` if non-empty draft text is sitting in the composer.
+#[must_use]
+pub fn composer_draft_text(screen: &Screen) -> Option<String> {
+    if auth_login_screen(screen) {
+        return None;
+    }
+    let (top, bottom, empty) = find_composer_box_bounds(screen)?;
+    if empty {
+        return Some(String::new());
+    }
+    let mut lines = Vec::new();
+    for y in top.saturating_add(1)..bottom {
+        let Some(cells) = screen.rows.get(y) else {
+            break;
+        };
+        let raw = row_text(cells);
+        let text = if y == top.saturating_add(1)
+            && let Some(rest) = raw.strip_prefix('>')
+        {
+            rest.trim_start().to_owned()
+        } else {
+            raw
+        };
+        lines.push(text);
+    }
+    Some(lines.join("\n").trim().to_owned())
 }
 
 /// Counts how many contiguous `▸ ` queued rows directly above Antigravity's composer currently
@@ -504,5 +596,60 @@ mod tests {
 
         let signing_in = screen_from_lines(&[("Signing in...", None)]);
         assert!(!empty_composer_ready(&signing_in));
+    }
+
+    #[test]
+    fn detects_agy_stage1_and_stage2_auth_login_screens_and_blocks_composer_ready() {
+        let stage1 = screen_from_lines(&[
+            ("Antigravity CLI v1.5.17", None),
+            (
+                "Welcome to the Antigravity CLI. You are currently not signed in.",
+                None,
+            ),
+            ("Select login method:", None),
+            ("> 1. Google OAuth", None),
+            ("  2. Use a Google Cloud project", None),
+            ("↑/↓ Navigate · enter Select", None),
+        ]);
+        assert!(auth_login_screen(&stage1));
+        assert!(!empty_composer_ready(&stage1));
+
+        let stage2 = screen_from_lines(&[
+            ("Logging in with Google...", None),
+            ("Your browser should open automatically.", None),
+            ("→ Click here to authenticate", None),
+            ("Paste authorization code here:", None),
+        ]);
+        assert!(auth_login_screen(&stage2));
+        assert!(!empty_composer_ready(&stage2));
+
+        let legacy_banner = screen_from_lines(&[
+            ("You are not logged into Antigravity.", None),
+            ("Log in with Google", None),
+        ]);
+        assert!(auth_login_screen(&legacy_banner));
+
+        let normal_chat = screen_from_lines(&[
+            ("User: how does Google OAuth work?", None),
+            ("Assistant: OAuth exchanges an authorization code.", None),
+            (BORDER, None),
+            ("> ", None),
+            (BORDER, None),
+        ]);
+        assert!(!auth_login_screen(&normal_chat));
+        assert!(empty_composer_ready(&normal_chat));
+        assert_eq!(composer_draft_text(&normal_chat), Some(String::new()));
+        assert_eq!(composer_draft_text(&stage1), None);
+
+        let multiline_draft = screen_from_lines(&[
+            (BORDER, None),
+            ("> check daily error audit", None),
+            ("  include summary", None),
+            (BORDER, None),
+        ]);
+        assert_eq!(
+            composer_draft_text(&multiline_draft).as_deref(),
+            Some("check daily error audit\n  include summary")
+        );
     }
 }

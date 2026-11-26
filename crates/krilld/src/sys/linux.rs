@@ -3,6 +3,7 @@
 //! - Time Machine 제외·APFS clone은 없다: 앞은 아무것도 안 하고, 뒤는 호출자가 일반 복사로 넘어간다.
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -201,7 +202,7 @@ impl ExitWatch {
     /// 감시하던 프로세스 하나가 끝날 때까지 기다리고 그 pid를 돌려준다.
     pub fn next(&self) -> io::Result<u32> {
         loop {
-            if let Some(pid) = self.wait(None)?.into_iter().next() {
+            if let Some(pid) = self.wait(None, 1)?.into_iter().next() {
                 return Ok(pid);
             }
         }
@@ -209,32 +210,30 @@ impl ExitWatch {
 
     /// 지금 큐에 쌓인 종료를 꺼낸다. 기다리지 않는다.
     pub(crate) fn drain(&self) -> io::Result<Vec<u32>> {
-        self.wait(Some(Duration::ZERO))
+        self.wait(Some(Duration::ZERO), 64)
     }
 
-    fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<u32>> {
+    fn wait(&self, timeout: Option<Duration>, max_events: usize) -> io::Result<Vec<u32>> {
         let ts = timeout.map(|d| rustix::time::Timespec {
             tv_sec: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(d.subsec_nanos()),
         });
-        let mut events = Vec::with_capacity(64);
-        match epoll::wait(
-            &self.epoll,
-            rustix::buffer::spare_capacity(&mut events),
-            ts.as_ref(),
-        ) {
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+        let mut buf = vec![MaybeUninit::<epoll::Event>::uninit(); max_events];
+        let done: Vec<u32> = match epoll::wait(&self.epoll, buf.as_mut_slice(), ts.as_ref()) {
+            Ok((events, _)) => events
+                .iter()
+                .filter_map(|e| u32::try_from(e.data.u64()).ok())
+                .collect(),
+            Err(rustix::io::Errno::INTR) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
+        };
+        if !done.is_empty() {
+            // kqueue NOTE_EXIT처럼 한 번만 알린다: pidfd를 닫으면 epoll에서도 빠진다.
+            self.pidfds
+                .lock()
+                .map_err(|_| io::Error::other("exit watch poisoned"))?
+                .retain(|(p, _)| !done.contains(p));
         }
-        let done: Vec<u32> = events
-            .iter()
-            .filter_map(|e| u32::try_from(e.data.u64()).ok())
-            .collect();
-        // kqueue NOTE_EXIT처럼 한 번만 알린다: pidfd를 닫으면 epoll에서도 빠진다.
-        self.pidfds
-            .lock()
-            .map_err(|_| io::Error::other("exit watch poisoned"))?
-            .retain(|(p, _)| !done.contains(p));
         Ok(done)
     }
 }
@@ -281,6 +280,29 @@ mod tests {
         watch.add(child.id()).unwrap();
         assert_eq!(watch.next().unwrap(), child.id());
         child.wait().unwrap();
+        assert!(watch.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exit_watch_next_returns_all_simultaneously_exited_children() {
+        let mut first = std::process::Command::new("sleep")
+            .arg("0.05")
+            .spawn()
+            .unwrap();
+        let mut second = std::process::Command::new("sleep")
+            .arg("0.05")
+            .spawn()
+            .unwrap();
+        let watch = ExitWatch::new().unwrap();
+        watch.add(first.id()).unwrap();
+        watch.add(second.id()).unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
+        let mut got = [watch.next().unwrap(), watch.next().unwrap()];
+        let mut expected = [first.id(), second.id()];
+        got.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(got, expected);
         assert!(watch.drain().unwrap().is_empty());
     }
 }
