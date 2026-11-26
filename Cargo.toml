@@ -197,7 +197,8 @@ opt-level = 2
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# ThinLTO preserves cross-CGU optimization while unlocking parallel LLVM codegen across cores.
+codegen-units = 16
 debug = "line-tables-only"
 split-debuginfo = "packed"
 overflow-checks = true

@@ -3,8 +3,9 @@
 // NativeChatMessageRow.tsx, NativeChatReasoningRow.tsx, NativeChatComposerField.tsx,
 // native-chat-autoscroll.ts; rendered with Krill design tokens and GPUI.
 
-use super::body::normalize_code_language;
+use super::body::{ChatBodySegment, normalize_code_language, parse_chat_segments_cached};
 use super::work_run;
+use super::work_run::is_other_option_label;
 use super::*;
 use gpui::StatefulInteractiveElement as _;
 use gpui::Styled;
@@ -14,17 +15,6 @@ use gpui_kit_assets::IconName;
 
 const CHAT_TOP_CONTROLS_GROUP: &str = "chat-top-controls";
 const MAX_RENDERED_DIFF_LINES: usize = 200;
-
-fn is_other_option_label(label: &str) -> bool {
-    let lower = label.trim().to_ascii_lowercase();
-    lower == "other"
-        || lower.starts_with("other.")
-        || lower.starts_with("other…")
-        || lower.starts_with("other...")
-        || lower.starts_with("other (")
-        || lower.starts_with("other:")
-        || lower.starts_with("type something")
-}
 
 fn render_diff_block(palette: &ui::Palette, text: &str) -> AnyElement {
     let mut rows = Vec::new();
@@ -112,7 +102,8 @@ impl Shell {
         let fg = style.palette.foreground;
         let muted_fg = style.palette.muted_foreground;
         let mut next_code_idx = 0usize;
-        for (seg_idx, segment) in parse_chat_segments(text).into_iter().enumerate() {
+        let segments = parse_chat_segments_cached(text);
+        for (seg_idx, segment) in segments.iter().enumerate() {
             container = match segment {
                 ChatBodySegment::Text(text) => {
                     let holder = if style.full_width {
@@ -131,7 +122,7 @@ impl Shell {
                                         "chat-markdown-{}-{epoch}-{abs_idx}-{seg_idx}",
                                         pane.get()
                                     )),
-                                    text,
+                                    text.clone(),
                                 )
                                 .scrollable(false)
                                 .selectable(true)
@@ -149,7 +140,7 @@ impl Shell {
                                         "chat-text-{}-{epoch}-{abs_idx}-{seg_idx}",
                                         pane.get()
                                     )),
-                                    text,
+                                    text.clone(),
                                 )
                                 .into_any_element()
                             }),
@@ -158,7 +149,7 @@ impl Shell {
                 ChatBodySegment::Code { lang, code } => {
                     let code_idx = next_code_idx;
                     next_code_idx += 1;
-                    let display_lang = normalize_code_language(&lang);
+                    let display_lang = normalize_code_language(lang.as_ref());
                     let is_copied = self.chat.copied_code.as_ref().is_some_and(|(k, target)| {
                         k == style.key && target.abs_idx == abs_idx && target.block_idx == code_idx
                     });
@@ -218,8 +209,8 @@ impl Shell {
                                 "chat-code-text-{}-{epoch}-{abs_idx}-{code_idx}",
                                 pane.get()
                             )),
-                            &lang,
-                            code,
+                            lang.as_ref(),
+                            code.clone(),
                             cx,
                         ));
 
@@ -1387,16 +1378,7 @@ impl Shell {
                     .logs
                     .get(&key)
                     .and_then(|log| log.cached_feed.as_ref())
-                    .and_then(|feed| {
-                        feed.rows().iter().rev().find_map(|row| match row {
-                            work_run::DisplayRow::Item { abs_idx, item }
-                                if item.kind == ChatItemKind::Assistant =>
-                            {
-                                Some(*abs_idx)
-                            }
-                            _ => None,
-                        })
-                    })
+                    .and_then(|feed| feed.latest_assistant_abs_idx())
                     == Some(abs_idx);
                 let show_footer = (!is_last_row
                     || agent_state != krill_proto::control::AgentState::Working)
@@ -4076,20 +4058,8 @@ impl Shell {
                 None => (false, 0, 0, work_run::DisplayFeed::empty(), None),
             };
 
-        let mut other_keys = Vec::new();
-        for row in display_feed.rows() {
-            if let work_run::DisplayRow::Item { abs_idx, item } = row
-                && item.kind == ChatItemKind::Question
-                && item
-                    .options
-                    .iter()
-                    .any(|opt| is_other_option_label(&opt.label))
-            {
-                other_keys.push(format!("{}:{abs_idx}", item.tool_id));
-            }
-        }
-        for answer_key in other_keys {
-            self.ensure_question_other_input(&key, &answer_key, window, cx);
+        for answer_key in display_feed.question_other_keys() {
+            self.ensure_question_other_input(&key, answer_key, window, cx);
         }
 
         let narrow_pane = self
@@ -4399,24 +4369,8 @@ impl Shell {
                 })
                 .size_full(),
             );
-            // Vertical turn minimap rail when there are >= 4 user turns.
-            let mut user_turns = Vec::new();
-            for row_ix in 0..display_feed.len() {
-                if let Some(work_run::DisplayRow::Item { item, .. }) = display_feed.get(row_ix)
-                    && item.kind == ChatItemKind::User
-                {
-                    let turn_num = user_turns.len() + 1;
-                    let preview: String = item
-                        .text
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(48)
-                        .collect();
-                    user_turns.push((turn_num, row_ix, preview));
-                }
-            }
+            // Vertical turn minimap rail when there are >= 4 user turns (precomputed on DisplayFeed).
+            let user_turns = display_feed.user_turns();
             if user_turns.len() >= 4 {
                 // Orca `NativeChatMessageRail` (`#47553`): light the turn whose row is at or
                 // immediately above the viewport top, even when scroll stops between two rows.
@@ -4426,8 +4380,8 @@ impl Shell {
                     .rfind(|(_, row_ix, _)| *row_ix <= scroll_top_row)
                     .or_else(|| user_turns.first())
                     .map(|(n, _, _)| *n);
-                let sampled: Vec<(usize, usize, String)> = if user_turns.len() <= 16 {
-                    user_turns
+                let sampled: Vec<(usize, usize, SharedString)> = if user_turns.len() <= 16 {
+                    user_turns.to_vec()
                 } else {
                     const MAX_PIPS: usize = 16;
                     (0..MAX_PIPS)

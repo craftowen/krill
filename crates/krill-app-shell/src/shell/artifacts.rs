@@ -593,6 +593,7 @@ impl Shell {
             self.bot_ui.hosts.remove(host);
             self.bot_ui.host_tasks.remove(host);
             krill_bots_ui::bots::invalidate_host_connections(host);
+            krill_app_core::agent_history::invalidate_host_connections(host);
             self.sidebar.update(cx, |sb, cx| {
                 sb.set_bot_sessions(host.clone(), std::collections::BTreeMap::new(), cx);
             });
@@ -776,12 +777,14 @@ impl Shell {
             state.in_flight = false;
             state.dirty = false;
             krill_bots_ui::bots::invalidate_host_connections(host);
+            krill_app_core::agent_history::invalidate_host_connections(host);
         } else if epoch_changed {
             // Transport epoch bumps on failed RPCs (record_outcome(false)) as well as reconnects.
             // Drop stale pooled sockets without wiping active retry backoff, which would otherwise
             // reset retry_secs back to 2s in a tight failure loop.
             state.transport_epoch = transport_epoch;
             krill_bots_ui::bots::invalidate_host_connections(host);
+            krill_app_core::agent_history::invalidate_host_connections(host);
         }
 
         if !force {

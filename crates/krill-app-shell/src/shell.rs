@@ -993,6 +993,8 @@ pub struct Shell {
     pub(super) expanded_prompt_panes: HashSet<PaneId>,
     /// 시작 복원된 터미널 탭들의 대표 칸 큐(상한 64). 초기 Cmd+T로 현재 활성이 `$HOME`이어도 늦게 도착한 데몬 세션을 놓치지 않는다.
     startup_reconcile_panes: Vec<PaneId>,
+    /// 마지막으로 OS 창 제목에 반영한 문자열. 동일 제목이면 매 프레임 `AppKit` FFI 호출을 생략한다.
+    last_window_title: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1674,6 +1676,7 @@ impl Shell {
             chat: chat::ChatState::default(),
             expanded_prompt_panes: HashSet::new(),
             startup_reconcile_panes: Vec::new(),
+            last_window_title: None,
         };
         // Unexpected entity release still hands the latest state to the
         // app-owned writer before Saver::drop disconnects it.
@@ -3290,6 +3293,7 @@ impl Shell {
                     if !invalidated.is_empty() {
                         for host in &invalidated {
                             krill_bots_ui::bots::invalidate_host_connections(host);
+                            krill_app_core::agent_history::invalidate_host_connections(host);
                         }
                         this.gone_sessions
                             .retain(|(host, _)| !invalidated.contains(host));
@@ -9201,10 +9205,16 @@ impl Render for Shell {
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
         // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
         if self.role == WindowRole::Main {
-            if self.settings().is_some() && !self.mobile_page_open(cx) {
-                window.set_window_title(krill_app_core::i18n::catalog::settings::TITLE.get());
+            let desired_title = if self.settings().is_some() && !self.mobile_page_open(cx) {
+                krill_app_core::i18n::catalog::settings::TITLE
+                    .get()
+                    .to_owned()
             } else {
-                window.set_window_title(&self.main_window_title(cx));
+                self.main_window_title(cx)
+            };
+            if self.last_window_title.as_deref() != Some(desired_title.as_str()) {
+                window.set_window_title(&desired_title);
+                self.last_window_title = Some(desired_title);
             }
         }
         if self.language != krill_app_core::i18n::language() {

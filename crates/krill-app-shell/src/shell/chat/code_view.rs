@@ -1,6 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, GlobalElementId, HighlightStyle,
@@ -30,11 +32,11 @@ impl SelectableHighlightedText {
     ) -> Self {
         let text: SharedString = code.into();
         let theme = cx.theme();
-        let runs = highlight_code_runs(language_tag, text.as_ref(), &theme.highlight_theme);
+        let runs = highlight_code_runs_cached(language_tag, text.as_ref(), &theme.highlight_theme);
         let styled_text = if runs.is_empty() {
             StyledText::new(text.clone())
         } else {
-            StyledText::new(text.clone()).with_highlights(runs)
+            StyledText::new(text.clone()).with_highlights(runs.iter().cloned())
         };
         Self {
             id: id.into(),
@@ -208,23 +210,129 @@ pub(super) fn normalize_fence_language_key(tag: &str) -> String {
     }
 }
 
+const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 256;
+const MAX_HIGHLIGHT_CACHE_CODE_BYTES: usize = 64 * 1024;
+
+type HighlightRuns = Arc<[(Range<usize>, HighlightStyle)]>;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct HighlightCacheKey {
+    lang: String,
+    theme_sig: u64,
+    code_hash: u64,
+    code_len: usize,
+}
+
+struct HighlightCacheEntry {
+    code: String,
+    runs: HighlightRuns,
+}
+
+#[derive(Default)]
+struct HighlightCache {
+    map: HashMap<HighlightCacheKey, HighlightCacheEntry>,
+    order: VecDeque<HighlightCacheKey>,
+}
+
+fn highlight_theme_signature(theme: &HighlightTheme) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    theme.name.hash(&mut hasher);
+    theme.appearance.hash(&mut hasher);
+    if let Some(bg) = theme.style.editor_background {
+        bg.h.to_bits().hash(&mut hasher);
+        bg.s.to_bits().hash(&mut hasher);
+        bg.l.to_bits().hash(&mut hasher);
+        bg.a.to_bits().hash(&mut hasher);
+    }
+    if let Some(fg) = theme.style.editor_foreground {
+        fg.h.to_bits().hash(&mut hasher);
+        fg.s.to_bits().hash(&mut hasher);
+        fg.l.to_bits().hash(&mut hasher);
+        fg.a.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+pub(super) fn highlight_code_runs_cached(
+    language_tag: &str,
+    code: &str,
+    highlight_theme: &HighlightTheme,
+) -> HighlightRuns {
+    if code.is_empty() {
+        return Arc::from([]);
+    }
+    let key_lang = normalize_fence_language_key(language_tag);
+    if key_lang.is_empty() {
+        return Arc::from([]);
+    }
+    if code.len() > MAX_HIGHLIGHT_CACHE_CODE_BYTES {
+        return Arc::from(compute_highlight_runs(&key_lang, code, highlight_theme));
+    }
+
+    let mut code_hasher = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut code_hasher);
+    let cache_key = HighlightCacheKey {
+        lang: key_lang.clone(),
+        theme_sig: highlight_theme_signature(highlight_theme),
+        code_hash: code_hasher.finish(),
+        code_len: code.len(),
+    };
+
+    thread_local! {
+        static RUNS_CACHE: RefCell<HighlightCache> = RefCell::new(HighlightCache::default());
+    }
+
+    if let Some(hit) = RUNS_CACHE.with(|cell| {
+        cell.borrow()
+            .map
+            .get(&cache_key)
+            .filter(|entry| entry.code == code)
+            .map(|entry| Arc::clone(&entry.runs))
+    }) {
+        return hit;
+    }
+
+    let runs: HighlightRuns = Arc::from(compute_highlight_runs(&key_lang, code, highlight_theme));
+    RUNS_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if !cache.map.contains_key(&cache_key) {
+            while cache.map.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
+                let Some(oldest) = cache.order.pop_front() else {
+                    break;
+                };
+                cache.map.remove(&oldest);
+            }
+            cache.order.push_back(cache_key.clone());
+        }
+        cache.map.insert(
+            cache_key,
+            HighlightCacheEntry {
+                code: code.to_owned(),
+                runs: Arc::clone(&runs),
+            },
+        );
+    });
+    runs
+}
+
+#[cfg(test)]
 pub(super) fn highlight_code_runs(
     language_tag: &str,
     code: &str,
     highlight_theme: &HighlightTheme,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    if code.is_empty() {
-        return Vec::new();
-    }
-    let key = normalize_fence_language_key(language_tag);
-    if key.is_empty() {
-        return Vec::new();
-    }
+    highlight_code_runs_cached(language_tag, code, highlight_theme).to_vec()
+}
 
-    let raw = if matches!(key.as_str(), "rust" | "json") {
-        highlight_with_treesitter(&key, code, highlight_theme)
+fn compute_highlight_runs(
+    key: &str,
+    code: &str,
+    highlight_theme: &HighlightTheme,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let raw = if matches!(key, "rust" | "json") {
+        highlight_with_treesitter(key, code, highlight_theme)
     } else {
-        krill_app_core::editor::syntax::tokenize_for(&key, code)
+        krill_app_core::editor::syntax::tokenize_for(key, code)
             .into_iter()
             .filter_map(|(range, kind)| highlight_theme.style(kind).map(|style| (range, style)))
             .collect()

@@ -30,6 +30,16 @@ class CachePruneTests(unittest.TestCase):
             cache_family("v0-rust-release-windows-msvc-static-Windows_NT-x64-7901fbdd-6b737a28"),
             "release-windows-msvc-static-Windows_NT-x64",
         )
+        win_vendor_ci = (
+            "v1-vendor-" + "a" * 64 + "-none-win25-20261118.1-" + "b" * 64
+            + "-ci-windows-test-Windows_NT-x64-7a5511c2-6b737a28"
+        )
+        win_vendor_rel = (
+            "v1-vendor-" + "a" * 64 + "-none-win25-20261118.1-" + "b" * 64
+            + "-release-windows-audit-Windows_NT-x64-7901fbdd-6b737a28"
+        )
+        self.assertEqual(cache_family(win_vendor_ci), "ci-windows-test-Windows_NT-x64")
+        self.assertEqual(cache_family(win_vendor_rel), "release-windows-audit-Windows_NT-x64")
         self.assertIsNone(cache_family("custom-unrelated-cache-key"))
         self.assertIsNone(cache_family(None))
 

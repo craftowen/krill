@@ -1062,27 +1062,105 @@ fn update_prompts(
         std::fs::remove_file(&tmp).ok();
     }
     write_res?;
+    invalidate_prompt_history_cache(&path);
     Ok(changed)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PromptFileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl PromptFileStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime: meta.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+}
+
+type PromptHistoryCacheMap = std::collections::HashMap<
+    std::path::PathBuf,
+    (
+        PromptFileStamp,
+        std::collections::BTreeMap<crate::SessionId, SessionPromptHistory>,
+    ),
+>;
+
+const MAX_PROMPT_HISTORY_CACHE_PATHS: usize = 16;
+
+fn prompt_history_cache() -> &'static std::sync::Mutex<PromptHistoryCacheMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<PromptHistoryCacheMap>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn invalidate_prompt_history_cache(path: &std::path::Path) {
+    if let Ok(mut guard) = prompt_history_cache().lock() {
+        guard.remove(path);
+    }
+}
+
 /// 상태 디렉터리에 기록된 세션별 프롬프트 히스토리 목록을 읽는다.
+/// 파일 메타데이터 스탬프가 바뀌지 않았으면 디스크 읽기·JSON 파싱을 생략하고 캐시를 반환한다.
 #[must_use]
 pub fn load_session_prompt_histories(
     state_dir: &std::path::Path,
 ) -> std::collections::BTreeMap<crate::SessionId, SessionPromptHistory> {
     let path = state_dir.join(SESSION_PROMPTS_FILE);
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(meta) = std::fs::metadata(&path) else {
+        invalidate_prompt_history_cache(&path);
+        return std::collections::BTreeMap::new();
+    };
+    let stamp = PromptFileStamp::from_metadata(&meta);
+    if let Ok(guard) = prompt_history_cache().lock()
+        && let Some((cached_stamp, cached_map)) = guard.get(&path)
+        && *cached_stamp == stamp
+    {
+        return cached_map.clone();
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        invalidate_prompt_history_cache(&path);
         return std::collections::BTreeMap::new();
     };
     let Ok(map) =
         serde_json::from_str::<std::collections::BTreeMap<u64, SessionPromptHistory>>(&text)
     else {
+        invalidate_prompt_history_cache(&path);
         return std::collections::BTreeMap::new();
     };
-    map.into_iter()
+    let parsed: std::collections::BTreeMap<crate::SessionId, SessionPromptHistory> = map
+        .into_iter()
         .filter(|(_, v)| !v.turns.is_empty())
         .map(|(k, v)| (crate::SessionId(k), v))
-        .collect()
+        .collect();
+    if let Ok(mut guard) = prompt_history_cache().lock() {
+        if guard.len() >= MAX_PROMPT_HISTORY_CACHE_PATHS && !guard.contains_key(&path) {
+            guard.clear();
+        }
+        guard.insert(path, (stamp, parsed.clone()));
+    }
+    parsed
 }
 
 #[cfg(test)]
@@ -1472,5 +1550,89 @@ mod slug_tests {
                 "expected substantive prompt: {substantive}"
             );
         }
+    }
+
+    #[test]
+    fn perf_bench_load_session_prompt_histories() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-perf-prompts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        for sid in 1u64..=20 {
+            let mut turns = Vec::new();
+            for turn in 1u32..=5 {
+                turns.push(SessionPromptTurn {
+                    turn,
+                    text: format!("Session {sid} turn {turn} prompt text for desktop polling"),
+                    unix_ns: 1_700_000_000_000_000_000 + sid * 1_000 + u64::from(turn),
+                });
+            }
+            map.insert(
+                sid,
+                SessionPromptHistory {
+                    total_turns: 5,
+                    turns,
+                },
+            );
+        }
+        std::fs::write(
+            dir.join(SESSION_PROMPTS_FILE),
+            serde_json::to_vec(&map).unwrap(),
+        )
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let mut total_sessions = 0usize;
+        for _ in 0..500 {
+            total_sessions += load_session_prompt_histories(&dir).len();
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(total_sessions, 500 * 20);
+        eprintln!(
+            "[BENCH] load_session_prompt_histories x500: {:.3} ms ({:.2} us/call)",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / 500.0
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_prompt_histories_cache_invalidates_on_change_and_removal() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-prompt-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_session_prompt_histories(&dir).is_empty());
+
+        record_session_prompt(&dir, crate::SessionId(1), "First task", 1_000_000_000).unwrap();
+        let first = load_session_prompt_histories(&dir);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[&crate::SessionId(1)].turns[0].text, "First task");
+
+        // Second call hits cache and matches
+        let cached = load_session_prompt_histories(&dir);
+        assert_eq!(cached, first);
+
+        // Mutation via record_session_prompt invalidates cache immediately
+        record_session_prompt(&dir, crate::SessionId(2), "Second task", 2_000_000_000).unwrap();
+        let updated = load_session_prompt_histories(&dir);
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[&crate::SessionId(2)].turns[0].text, "Second task");
+
+        // Removing the file clears cached entry
+        std::fs::remove_file(dir.join(SESSION_PROMPTS_FILE)).unwrap();
+        assert!(load_session_prompt_histories(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -829,47 +829,179 @@ fn chat_incremental_poll_request(session: SessionId, offset: u64) -> String {
     .to_string()
 }
 
-fn parse_chat_snapshot_data(data: &serde_json::Value) -> Option<ChatPollSnapshot> {
-    let mut snapshot: ChatPollSnapshot = serde_json::from_value(data.clone()).ok()?;
-    if let Some(raw_items) = data.get("items").and_then(serde_json::Value::as_array) {
-        for (item, raw_item) in snapshot.items.iter_mut().zip(raw_items.iter()) {
-            if let Some(at) = raw_item
-                .get("at")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                at.clone_into(&mut item.at);
+fn deser_opt_at<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct AtVisitor;
+    impl<'de> serde::de::Visitor<'de> for AtVisitor {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("optional timestamp string")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            let trimmed = v.trim();
+            if trimmed.len() > krill_proto::agent_history::MAX_TEXT {
+                return Ok(String::new());
             }
+            Ok(trimmed.to_owned())
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<String, D2::Error> {
+            d.deserialize_any(self)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<String, E> {
+            Ok(String::new())
         }
     }
-    Some(snapshot)
+    d.deserialize_any(AtVisitor)
 }
 
-/// Parses an incremental JSON `chat_poll` response (including per-item `at` timestamps).
+#[derive(serde::Deserialize)]
+struct WireChatItem {
+    kind: ChatItemKind,
+    text: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_id: String,
+    #[serde(default)]
+    file_path: String,
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    multi_select: bool,
+    #[serde(default)]
+    options: Vec<krill_proto::agent_history::ChatQuestionOption>,
+    #[serde(default, deserialize_with = "deser_opt_at")]
+    at: String,
+}
+
+impl WireChatItem {
+    fn into_chat_item(self) -> Option<ChatItem> {
+        use krill_proto::agent_history::{MAX_CHAT_TEXT, MAX_QUESTION_OPTIONS, MAX_TEXT};
+        if self.text.len() > MAX_CHAT_TEXT
+            || self.title.len() > MAX_TEXT
+            || self.tool_name.len() > MAX_TEXT
+            || self.tool_id.len() > MAX_TEXT
+            || self.file_path.len() > MAX_TEXT
+            || self.options.len() > MAX_QUESTION_OPTIONS
+        {
+            return None;
+        }
+        Some(ChatItem {
+            kind: self.kind,
+            text: self.text,
+            title: self.title,
+            tool_name: self.tool_name,
+            tool_id: self.tool_id,
+            file_path: self.file_path,
+            is_error: self.is_error,
+            multi_select: self.multi_select,
+            options: self.options,
+            at: self.at,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WireChatSnapshotData {
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    transcript_path: String,
+    next_offset: u64,
+    reset: bool,
+    bound: bool,
+    items: Option<Vec<WireChatItem>>,
+    page_start: Option<u64>,
+    has_earlier: Option<bool>,
+}
+
+impl WireChatSnapshotData {
+    fn into_snapshot(
+        self,
+        require_items: bool,
+    ) -> Option<(ChatPollSnapshot, Option<u64>, Option<bool>)> {
+        use krill_proto::agent_history::MAX_TEXT;
+        if self.agent.len() > MAX_TEXT
+            || self.session_id.len() > MAX_TEXT
+            || self.transcript_path.len() > MAX_TEXT
+        {
+            return None;
+        }
+        let raw_items = match self.items {
+            Some(v) => v,
+            None if require_items => return None,
+            None => Vec::new(),
+        };
+        if raw_items.len() > krill_proto::ipc::MAX_FRAME {
+            return None;
+        }
+        let mut items = Vec::with_capacity(raw_items.len());
+        for raw in raw_items {
+            items.push(raw.into_chat_item()?);
+        }
+        let page_start = self.page_start;
+        let has_earlier = self.has_earlier;
+        Some((
+            ChatPollSnapshot {
+                agent: self.agent,
+                session_id: self.session_id,
+                transcript_path: self.transcript_path,
+                next_offset: self.next_offset,
+                reset: self.reset,
+                bound: self.bound,
+                items,
+            },
+            page_start,
+            has_earlier,
+        ))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WireChatEnvelope {
+    #[serde(default)]
+    ok: bool,
+    data: Option<WireChatSnapshotData>,
+}
+
+/// Parses an incremental JSON `chat_poll` response in a single typed pass (including per-item `at`).
 fn parse_chat_snapshot(raw: &str) -> Option<ChatPollSnapshot> {
-    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+    let env: WireChatEnvelope = serde_json::from_str(raw).ok()?;
+    if !env.ok {
         return None;
     }
-    let data = root.get("data")?;
-    if data.get("next_offset").is_none() || data.get("items").is_none() {
-        return None;
-    }
-    parse_chat_snapshot_data(data)
+    let (snapshot, _, _) = env.data?.into_snapshot(true)?;
+    Some(snapshot)
 }
 
 /// `None` also covers an older daemon, which has no tail page and is read from the start instead.
 fn parse_chat_page(raw: &str) -> Option<ChatPage> {
-    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
-    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+    let env: WireChatEnvelope = serde_json::from_str(raw).ok()?;
+    if !env.ok {
         return None;
     }
-    let data = root.get("data")?;
-    let snapshot = parse_chat_snapshot_data(data)?;
+    let (snapshot, page_start, has_earlier) = env.data?.into_snapshot(false)?;
     Some(ChatPage {
-        start: data.get("page_start")?.as_u64()?,
-        has_earlier: data.get("has_earlier")?.as_bool()?,
+        start: page_start?,
+        has_earlier: has_earlier?,
         snapshot,
     })
 }
@@ -1412,8 +1544,6 @@ fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
     }
 }
 
-use body::{ChatBodySegment, parse_chat_segments};
-
 impl Shell {
     pub(super) fn is_session_chat_view(&self, session: SessionId, cx: &gpui::App) -> bool {
         let pane = self
@@ -1546,11 +1676,20 @@ impl Shell {
                     .await;
                 this.update(cx, |this, cx| {
                     this.chat.bot_notes_tasks.remove(&task_bot_key);
+                    let mut changed = false;
                     if let Ok(BotRpcResponse::Text(soul)) = soul {
-                        match krill_proto::bots::soul_description(&soul) {
-                            Some(line) => this.chat.bot_souls.insert(task_bot_key.clone(), line),
-                            None => this.chat.bot_souls.remove(&task_bot_key),
-                        };
+                        let next_soul = krill_proto::bots::soul_description(&soul);
+                        if this.chat.bot_souls.get(&task_bot_key) != next_soul.as_ref() {
+                            changed = true;
+                            match next_soul {
+                                Some(line) => {
+                                    this.chat.bot_souls.insert(task_bot_key.clone(), line);
+                                }
+                                None => {
+                                    this.chat.bot_souls.remove(&task_bot_key);
+                                }
+                            }
+                        }
                     }
                     let previous = this.chat.bot_notes.remove(&task_bot_key).map(|(_, n)| n);
                     let notes = match (items, memory) {
@@ -1565,12 +1704,17 @@ impl Shell {
                             notes.sort_by_key(|n| n.note.at_ms);
                             notes
                         }
-                        _ => previous.unwrap_or_default(),
+                        _ => previous.clone().unwrap_or_default(),
                     };
+                    if previous.as_ref() != Some(&notes) {
+                        changed = true;
+                    }
                     this.chat
                         .bot_notes
                         .insert(task_bot_key, (std::time::Instant::now(), notes));
-                    cx.notify();
+                    if changed {
+                        cx.notify();
+                    }
                 })
                 .ok();
             });
@@ -2865,11 +3009,13 @@ impl Shell {
                 {
                     let agent_state = this.session_agent_state(&host, session, cx);
                     let now = std::time::Instant::now();
+                    let mut should_notify = false;
                     if let Some(page) = page {
                         this.chat.poll_failed.remove(&task_key);
                         this.apply_chat_tail(session, host, page, meta, agent_state, now);
                         this.refresh_chat_composer(&task_key, false, cx);
                         this.flush_queued_chat_prompt_if_ready(&task_key, cx);
+                        should_notify = true;
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
                     {
@@ -2890,8 +3036,8 @@ impl Shell {
                                 .last_composer_poll
                                 .get(&task_key)
                                 .is_none_or(|t| t.elapsed() >= composer_interval);
-                        this.chat.poll_failed.remove(&task_key);
-                        this.apply_chat_poll_for_host_with_state(
+                        let cleared_failure = this.chat.poll_failed.remove(&task_key);
+                        let poll_changed = this.apply_chat_poll_for_host_with_state(
                             session,
                             host,
                             snapshot,
@@ -2899,21 +3045,26 @@ impl Shell {
                             agent_state,
                             now,
                         );
+                        let mut seeded_changed = false;
                         if seeding {
                             let log = this.chat.logs.entry(task_key.clone()).or_default();
-                            if !log.replace_on_next_poll {
+                            if !log.replace_on_next_poll && !log.seeded {
                                 log.seeded = true;
+                                seeded_changed = true;
                             }
                         }
                         if refresh_composer {
                             this.refresh_chat_composer(&task_key, false, cx);
                         }
                         this.flush_queued_chat_prompt_if_ready(&task_key, cx);
-                    } else {
-                        this.chat.poll_failed.insert(task_key.clone());
+                        should_notify = cleared_failure || poll_changed || seeded_changed;
+                    } else if this.chat.poll_failed.insert(task_key.clone()) {
+                        should_notify = true;
                     }
                     this.load_earlier_chat(pane, &task_key, cx);
-                    cx.notify();
+                    if should_notify {
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -3129,17 +3280,31 @@ impl Shell {
         observed: Option<ComposerMeta>,
         agent_state: krill_proto::control::AgentState,
         now: std::time::Instant,
-    ) {
+    ) -> bool {
         let key = (host.clone(), session);
         let host = Some(host);
+        let prev_pending_len = self.chat.pending_prompts.get(&key).map_or(0, Vec::len);
         let log = self.chat.logs.entry(key.clone()).or_default();
+        let prev_agent = log.agent.clone();
+        let prev_offset = log.offset;
+        let prev_bound = log.bound;
+        let prev_rev = log.revision;
+        let prev_unread = log.unread_from;
+        let prev_meta = (
+            log.meta.model.clone(),
+            log.meta.effort.clone(),
+            log.meta.context_percent,
+        );
+        let prev_timing_active = log.timing.is_active();
         if log.replace_on_next_poll && !snap.bound && snap.items.is_empty() && !snap.reset {
             if !snap.agent.is_empty() {
                 log.agent = snap.agent;
             }
             log.offset = snap.next_offset;
             log.sync_timing(agent_state, now);
-            return;
+            return log.agent != prev_agent
+                || log.offset != prev_offset
+                || log.timing.is_active() != prev_timing_active;
         }
         let replace_carried = log.replace_on_next_poll;
         let binding = (snap.session_id.clone(), snap.transcript_path.clone());
@@ -3242,12 +3407,38 @@ impl Shell {
             })
             .map(|(index, item)| format!("{}:{}", item.tool_id, log.base_index + index))
             .collect();
+        let mut resolved_changed = false;
         for resolved_key in resolved {
-            log.answered.insert(resolved_key.clone());
-            log.submissions.insert(resolved_key, Submission::Confirmed);
+            if log.answered.insert(resolved_key.clone()) {
+                resolved_changed = true;
+            }
+            if !matches!(
+                log.submissions.insert(resolved_key, Submission::Confirmed),
+                Some(Submission::Confirmed)
+            ) {
+                resolved_changed = true;
+            }
         }
+        let log_changed = log.revision != prev_rev
+            || log.agent != prev_agent
+            || log.offset != prev_offset
+            || log.bound != prev_bound
+            || log.unread_from != prev_unread
+            || log.timing.is_active()
+            || prev_timing_active
+            || resolved_changed
+            || (
+                log.meta.model.as_ref(),
+                log.meta.effort.as_ref(),
+                log.meta.context_percent,
+            ) != (prev_meta.0.as_ref(), prev_meta.1.as_ref(), prev_meta.2);
         self.reconcile_pending_prompts_on_poll(&key);
-        self.recompute_chat_find(&key);
+        let pending_changed =
+            self.chat.pending_prompts.get(&key).map_or(0, Vec::len) != prev_pending_len;
+        if log_changed {
+            self.recompute_chat_find(&key);
+        }
+        log_changed || pending_changed
     }
 
     fn send_to_session(&mut self, key: &ChatKey, bytes: &[u8], cx: &mut Context<Self>) -> bool {
@@ -3316,6 +3507,8 @@ impl Shell {
                     this.chat.composer_models_in_flight.remove(&task_key);
                 }
                 let log = this.chat.logs.entry(task_key.clone()).or_default();
+                let prev_meta = log.meta.clone();
+                let prev_agent = log.agent.clone();
                 if let Some(raw) = status_raw
                     && let Some(agent) = apply_composer_status_json(&raw, &mut log.meta)
                     && log.agent.is_empty()
@@ -3325,8 +3518,11 @@ impl Shell {
                 if let Some(raw) = models_raw {
                     apply_composer_models_json(&raw, &mut log.meta);
                 }
+                let changed = log.meta != prev_meta || log.agent != prev_agent;
                 this.sync_auto_continue(&task_key, cx);
-                cx.notify();
+                if changed {
+                    cx.notify();
+                }
             })
             .ok();
         });
@@ -6770,7 +6966,7 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
 }
 
 /// An item change and the chat that made it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BotNote {
     pub note: Arc<work_run::ItemNote>,
     pub session: Option<SessionId>,

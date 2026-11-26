@@ -173,8 +173,9 @@ MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_r
                         ("mobile_terminal_input_browser.py",), ("mobile_browser.py", "--address", "127.0.0.1:0"),
                         ("chat_scroll_browser.cjs",), ("mobile_scroll_browser.cjs",), ("mobile_terminal_scroll_browser.cjs",))
 # Every script in MOBILE_BROWSER_TESTS binds ephemeral 127.0.0.1:0 ports, uses its own
-# PID-scoped agent-browser session and temp/evidence directory, so 3 concurrent suites are safe.
-MOBILE_BROWSER_JOBS = 3
+# PID-scoped agent-browser session and temp/evidence directory, so 4 concurrent suites
+# run all 8 browser suites cleanly in 2 waves instead of 3.
+MOBILE_BROWSER_JOBS = 4
 
 
 def mobile_browser_gate(release, max_workers=MOBILE_BROWSER_JOBS):
@@ -231,15 +232,33 @@ def validate(head, directory, key_file, target_dir=None):
         checkpoint.write_text(json.dumps(sign({"schema": SCHEMA, "head": head, "scope": ["scripts/check.sh"],
                                               "fingerprint": fingerprint(), "passed_at": datetime.now(timezone.utc).isoformat()}, key_file)))
         checkpoint.chmod(0o600)
-    run(["/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir", TARGETS / "nightly-windows"], timeout=7200, env=cargo_env)
-    pane = test_executable("krill-app", "pane_e2e", target_dir=target)
-    fault = test_executable("krilld", "fault_ci", target_dir=target)
-    holder = test_executable("krill-holder", "survive", target_dir=target)
-    # 테스트 컴파일 뒤 최종 출고 프로필을 만든다. 이후 게이트는 Cargo 재빌드 없이 실행한다.
-    build = ["cargo", "build", "--release", "--locked", "--bins", "--target-dir", str(target)]
-    for package in BINARIES:
-        build.extend(("-p", package))
-    run(build, env=cargo_env)
+    # `check-windows.sh --clippy` uses an isolated toolchain and target directory
+    # (TARGETS/nightly-windows) and is read-only on the clean source tree, so it can
+    # safely overlap with the macOS release build phase and finish before any timing-
+    # or memory-sensitive runtime gates begin.
+    def run_windows_clippy():
+        run(["/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir", TARGETS / "nightly-windows"],
+            timeout=7200, env=cargo_env)
+
+    with ThreadPoolExecutor(max_workers=1) as windows_pool:
+        windows_future = windows_pool.submit(run_windows_clippy)
+        try:
+            pane = test_executable("krill-app", "pane_e2e", target_dir=target)
+            fault = test_executable("krilld", "fault_ci", target_dir=target)
+            holder = test_executable("krill-holder", "survive", target_dir=target)
+            # 테스트 컴파일 뒤 최종 출고 프로필을 만든다. 이후 게이트는 Cargo 재빌드 없이 실행한다.
+            build = ["cargo", "build", "--release", "--locked", "--bins", "--target-dir", str(target)]
+            for package in BINARIES:
+                build.extend(("-p", package))
+            run(build, env=cargo_env)
+        except BaseException:
+            # Always wait for the background Windows clippy process before unwinding.
+            try:
+                windows_future.result()
+            except BaseException:
+                pass
+            raise
+        windows_future.result()
     before = {name: sha256(target / "release" / name) for name in BINARIES}
     gates = ([pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
              [fault, "release_gui_survival_e2e_2_and_3_three_rounds", "--exact", "--ignored", "--nocapture", "--test-threads=1"],

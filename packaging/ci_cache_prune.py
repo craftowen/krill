@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 VENDOR_CACHE_RE = re.compile(
-    r"^v1-vendor-.+-(ci-[a-z0-9-]+-(?:Darwin|Linux|Windows_NT)-[A-Za-z0-9_]+)-[0-9a-f]{8}-[0-9a-f]{8}$"
+    r"^v1-vendor-.+-((?:ci|release)-[a-z0-9-]+-(?:Darwin|Linux|Windows_NT)-[A-Za-z0-9_]+)-[0-9a-f]{8}-[0-9a-f]{8}$"
 )
 RUST_CACHE_RE = re.compile(
     r"^v0-rust-([a-z0-9-]+-(?:Darwin|Linux|Windows_NT)-[A-Za-z0-9_]+)-[0-9a-f]{8}-[0-9a-f]{8}$"

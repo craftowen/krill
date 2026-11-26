@@ -58,13 +58,31 @@ jobs:
         with:
           toolchain: "1.98"
 
-      # nextest(dev 프로필)와 동일한 의존성 캐시를 읽기 전용으로 재사용해 추가 캐시 용량을 쓰지 않는다.
+      # nextest(test 프로필)와 동일한 의존성·vendor 캐시를 읽기 전용으로 재사용해 추가 캐시 용량을 쓰지 않는다.
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        shell: bash
+        run: |
+          python packaging/vendor_cache.py stage --case producer \
+            --vendor-root "$RUNNER_TEMP/krill-ci-vendor" \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
       - name: Restore check dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
           shared-key: ci-windows-test
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
           save-if: 'false'
+
+      - name: Verify restored vendor and external configuration
+        shell: bash
+        run: python packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Verify CI shard coverage
+        shell: bash
+        run: python packaging/ci_shards.py verify
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
@@ -89,7 +107,7 @@ jobs:
           toolchain: "1.98"
 
       # dev 대상 PR·dev push는 fxc 셰이더·release 경로 검증을 유지하면서 LTO=off·codegen-units=16으로 단축한다.
-      # main·release/** push 및 기타 이벤트는 Cargo.toml의 풀 프로필(lto=thin, codegen-units=1)로 검증한다.
+      # main·release/** push 및 기타 이벤트는 Cargo.toml의 풀 프로필(lto=thin, codegen-units=16)로 검증한다.
       - name: Configure release build profile
         id: profile
         shell: bash
@@ -103,24 +121,44 @@ jobs:
             echo "Using fast release profile (LTO=off, codegen-units=16) for dev/PR validation."
           else
             echo "cache_key=ci-windows-release-full" >> "$GITHUB_OUTPUT"
-            echo "Using full release profile (Cargo.toml: lto=thin, codegen-units=1)."
+            echo "Using full release profile (Cargo.toml: lto=thin, codegen-units=16)."
           fi
+
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        shell: bash
+        run: |
+          python packaging/vendor_cache.py stage --case producer \
+            --vendor-root "$RUNNER_TEMP/krill-ci-vendor" \
+            --directory "$RUNNER_TEMP/vendor-cache"
 
       - name: Restore release dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
           shared-key: ${{ steps.profile.outputs.cache_key }}
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
           cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
 
+      - name: Verify restored vendor and external configuration
+        shell: bash
+        run: python packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
+
       - name: Build app and release shaders
         run: cargo build -p krill-app --release --locked
 
+  # 3개 크레이트 샤드(gui·daemon·core)로 병렬 실행한다.
+  # 캐시 10 GiB 한도 보호: 전체 외부·vendor 의존성을 포함하는 gui 샤드만 캐시를 저장하고 나머지는 읽기 전용으로 쓴다.
   test:
-    name: nextest (MSVC)
+    name: nextest (MSVC, ${{ matrix.shard }})
     needs: reuse
     if: needs.reuse.outputs.reuse != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [gui, daemon, core]
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -136,28 +174,39 @@ jobs:
         with:
           toolchain: "1.98"
 
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        shell: bash
+        run: |
+          python packaging/vendor_cache.py stage --case producer \
+            --vendor-root "$RUNNER_TEMP/krill-ci-vendor" \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
       - name: Restore test dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
           shared-key: ci-windows-test
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
           cache-bin: 'false'
           cache-on-failure: true
-          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+          save-if: ${{ matrix.shard == 'gui' && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
+      - name: Verify restored vendor and external configuration
+        shell: bash
+        run: python packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
 
       - name: Install nextest
         uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest
 
-      # 통합 테스트가 krill·krill-holder·krilld 실행 파일을 찾는다.
-      - name: Build binaries
-        run: cargo build --workspace --bins --locked
-
       - name: nextest
+        shell: bash
         env:
           KRILL_TELEMETRY_DISABLED: '1'
           KRILL_ERROR_REPORTING_DISABLED: '1'
-        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass
+        run: python packaging/ci_shards.py run ${{ matrix.shard }}
 
   prune-caches:
     name: prune stale caches

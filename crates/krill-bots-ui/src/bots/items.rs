@@ -164,6 +164,8 @@ pub(super) struct ItemsState {
     pub(super) look_steps_open: bool,
     /// Home: when the bot's automations ran and run next.
     pub(super) upcoming: Option<krill_proto::bots::BotUpcoming>,
+    /// Per-bot cached `BotUpcoming` for instant SWR paint on bot switch.
+    pub(super) upcoming_cache: BTreeMap<BotId, krill_proto::bots::BotUpcoming>,
     /// Home: why the last Look now failed.
     pub(super) look_error: Option<String>,
     /// Home: each bot's suggestions seen mark as its Home opened, so new rows keep their dot.

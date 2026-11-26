@@ -42,6 +42,47 @@ impl RawSpan {
 #[derive(Debug, Default)]
 pub(super) struct DisplayFeed {
     rows: Vec<DisplayRow>,
+    user_turns: Vec<(usize, usize, gpui::SharedString)>,
+    question_other_keys: Vec<String>,
+    latest_assistant_abs_idx: Option<usize>,
+}
+
+fn format_user_turn_preview(text: &str) -> gpui::SharedString {
+    const MAX_PREVIEW_CHARS: usize = 48;
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut prev_ws = true;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            prev_ws = true;
+            continue;
+        }
+        if prev_ws && !out.is_empty() {
+            if count >= MAX_PREVIEW_CHARS {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+        }
+        if count >= MAX_PREVIEW_CHARS {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+        prev_ws = false;
+    }
+    out.into()
+}
+
+pub(super) fn is_other_option_label(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    lower == "other"
+        || lower.starts_with("other.")
+        || lower.starts_with("other…")
+        || lower.starts_with("other...")
+        || lower.starts_with("other (")
+        || lower.starts_with("other:")
+        || lower.starts_with("type something")
 }
 
 impl DisplayFeed {
@@ -215,7 +256,37 @@ impl DisplayFeed {
                 },
             );
         }
-        Self { rows }
+        let mut user_turns = Vec::new();
+        let mut question_other_keys = Vec::new();
+        let mut latest_assistant_abs_idx = None;
+        for (row_ix, row) in rows.iter().enumerate() {
+            if let DisplayRow::Item { abs_idx, item } = row {
+                match item.kind {
+                    ChatItemKind::User => {
+                        let turn_num = user_turns.len() + 1;
+                        user_turns.push((turn_num, row_ix, format_user_turn_preview(&item.text)));
+                    }
+                    ChatItemKind::Assistant => {
+                        latest_assistant_abs_idx = Some(*abs_idx);
+                    }
+                    ChatItemKind::Question
+                        if item
+                            .options
+                            .iter()
+                            .any(|opt| is_other_option_label(&opt.label)) =>
+                    {
+                        question_other_keys.push(format!("{}:{abs_idx}", item.tool_id));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            rows,
+            user_turns,
+            question_other_keys,
+            latest_assistant_abs_idx,
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -232,6 +303,18 @@ impl DisplayFeed {
 
     pub(super) fn rows(&self) -> &[DisplayRow] {
         &self.rows
+    }
+
+    pub(super) fn user_turns(&self) -> &[(usize, usize, gpui::SharedString)] {
+        &self.user_turns
+    }
+
+    pub(super) fn question_other_keys(&self) -> &[String] {
+        &self.question_other_keys
+    }
+
+    pub(super) fn latest_assistant_abs_idx(&self) -> Option<usize> {
+        self.latest_assistant_abs_idx
     }
 }
 
@@ -2240,6 +2323,10 @@ pub(super) struct WorkRunTimingState {
 impl WorkRunTimingState {
     pub(super) fn clear(&mut self) {
         self.runs.clear();
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.runs.values().any(|r| r.completed_at.is_none())
     }
 
     pub(super) fn sync(&mut self, feed: &DisplayFeed, agent_state: AgentState, now: Instant) {
