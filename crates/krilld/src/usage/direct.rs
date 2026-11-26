@@ -384,7 +384,19 @@ impl Retry {
 
     /// Like the scheduler failure streak: warn once, double the wait, reset on success.
     /// A changed reason starts a new streak; 429 only changes the deadline.
+    /// A transient `Transport` blip while a profile is already in a persistent auth failure
+    /// (`Expired`, `Http(401)`, `Http(403)`) keeps the auth streak intact instead of ping-ponging
+    /// warnings on every offline/wake cycle.
     fn fail(&mut self, reason: Failure, now: Instant) -> bool {
+        let persistent_auth = matches!(
+            self.reason,
+            Some(Failure::Expired | Failure::Http(401 | 403))
+        );
+        if persistent_auth && reason == Failure::Transport {
+            self.failures = self.failures.saturating_add(1);
+            self.until = now + failure_wait(self.failures);
+            return false;
+        }
         let report = self.reason != Some(reason);
         if report {
             self.failures = 0;

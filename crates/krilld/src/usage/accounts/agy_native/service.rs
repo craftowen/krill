@@ -9,10 +9,8 @@
 //! Native Antigravity (`agy`) account service: list, save current, select, remove,
 //! launch preflight verification, and switch-fenced usage attribution.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-#[cfg(not(target_os = "windows"))]
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -241,11 +239,15 @@ impl AntigravityAccountService {
     pub(crate) fn list_accounts(&self) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
         match self.reconcile(None) {
-            Ok((vault, current)) => Ok(Self::build_state(&vault, current.as_ref(), false)),
+            Ok((vault, current)) => {
+                clear_vault_locked_warnings();
+                Ok(Self::build_state(&vault, current.as_ref(), false))
+            }
             Err(ReconcileError::LegacyVaultLocked { status }) => {
-                tracing::warn!(
+                warn_vault_locked_once(
+                    "list_accounts",
                     status,
-                    "Antigravity vault is locked by a previous macOS ad-hoc Keychain ACL; returning host login with vault_locked=true"
+                    "Antigravity vault is locked by a previous macOS ad-hoc Keychain ACL; returning host login with vault_locked=true",
                 );
                 let current = self.backend.read()?;
                 Ok(Self::build_state(
@@ -263,9 +265,11 @@ impl AntigravityAccountService {
         // Never wipe a healthy, already-readable vault.
         if self.store.read().is_ok() {
             let (vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
+            clear_vault_locked_warnings();
             return Ok(Self::build_state(&vault, current.as_ref(), false));
         }
         self.store.reset_locked_vault()?;
+        clear_vault_locked_warnings();
         let current = self.backend.read()?;
         let mut vault = self.store.read().map_err(VaultError::into_message)?;
         let Some(current) = current else {
@@ -436,9 +440,10 @@ impl AntigravityAccountService {
         let (vault, current) = match self.reconcile(None) {
             Ok(pair) => pair,
             Err(ReconcileError::LegacyVaultLocked { status }) => {
-                tracing::warn!(
+                warn_vault_locked_once(
+                    "prepare_for_launch",
                     status,
-                    "skipping Antigravity account launch check because legacy vault is ACL-locked"
+                    "skipping Antigravity account launch check because legacy vault is ACL-locked",
                 );
                 return Ok(());
             }
@@ -463,9 +468,10 @@ impl AntigravityAccountService {
             Ok(vault) if vault.accounts.is_empty() => return Ok(None),
             Ok(_) => {}
             Err(VaultError::LegacyAclLocked { status }) => {
-                tracing::warn!(
+                warn_vault_locked_once(
+                    "begin_usage_read",
                     status,
-                    "skipping Antigravity vault usage attribution because legacy vault is ACL-locked"
+                    "skipping Antigravity vault usage attribution because legacy vault is ACL-locked",
                 );
                 return Ok(None);
             }
@@ -751,6 +757,9 @@ pub(crate) fn migrate_and_prune_legacy_agy_profiles(
     let Some(vault_dir) = vault_file.parent() else {
         return;
     };
+    if lock(&MIGRATION_LOCKED).contains(&vault_file) {
+        return;
+    }
     let migrated_marker = vault_dir.join(".legacy-migrated-v1");
     let pruned_marker = vault_dir.join(".legacy-pruned-v2");
     if migrated_marker.exists() && (!prune_accounts_toml || pruned_marker.exists()) {
@@ -815,9 +824,12 @@ pub(crate) fn migrate_and_prune_legacy_agy_profiles(
         if !imported.is_empty() {
             let svc = AntigravityAccountService::for_host(home, state_dir);
             if svc.import_snapshots(imported, selected.as_deref()).is_ok() {
+                lock(&MIGRATION_LOCKED).remove(&vault_file);
                 std::fs::write(&migrated_marker, b"1").ok();
             } else {
-                // Keep legacy accounts.toml rows intact if vault import failed.
+                // Keep legacy accounts.toml rows intact if vault import failed, and avoid
+                // re-attempting on every snapshot poll until the vault recovers or is reset.
+                lock(&MIGRATION_LOCKED).insert(vault_file);
                 return;
             }
         } else if vault_dir.is_dir() {
@@ -849,6 +861,22 @@ pub(crate) fn migrate_and_prune_legacy_agy_profiles(
             }
         }
     }
+}
+
+static VAULT_LOCKED_WARNED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+static MIGRATION_LOCKED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn warn_vault_locked_once(scope: &'static str, status: i32, message: &'static str) {
+    if lock(&VAULT_LOCKED_WARNED).insert(scope) {
+        tracing::warn!(status, "{message}");
+    } else {
+        tracing::debug!(scope, status, "{message}");
+    }
+}
+
+fn clear_vault_locked_warnings() {
+    lock(&VAULT_LOCKED_WARNED).clear();
+    lock(&MIGRATION_LOCKED).clear();
 }
 
 pub(crate) fn default_now_ms() -> u64 {

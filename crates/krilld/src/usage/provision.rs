@@ -242,7 +242,10 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
         ProviderKind::Gemini => return,
     };
     match result {
-        Ok(report) => report_conflicts(profile_dir, report.conflicts),
+        Ok(report) => {
+            clear_provision_error(provider, profile_dir);
+            report_conflicts(profile_dir, report.conflicts);
+        }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             tracing::debug!(
                 provider = provider.as_str(),
@@ -257,10 +260,56 @@ fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
             tracing::debug!(kind = ?error.kind(), "agy native account switching is unsupported; owner decision required");
         }
         Err(error) => {
-            tracing::warn!(provider = provider.as_str(), kind = ?error.kind(), "profile provisioning failed");
+            report_provision_error(provider, profile_dir, &error);
         }
     }
 }
+
+/// Deduplicates identical provisioning failure warnings per `(provider, profile_dir)` while the
+/// same `(ErrorKind, raw_os_error)` persists across periodic account polls.
+fn report_provision_error(provider: ProviderKind, profile_dir: &str, error: &io::Error) {
+    let key = (provider, profile_dir.to_owned());
+    let sig = (error.kind(), error.raw_os_error());
+    let should_warn = {
+        let mut reported = REPORTED_PROVISION_ERRORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.get(&key) == Some(&sig) {
+            false
+        } else {
+            reported.insert(key, sig);
+            true
+        }
+    };
+    if should_warn {
+        tracing::warn!(
+            provider = provider.as_str(),
+            kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "profile provisioning failed"
+        );
+    } else {
+        tracing::debug!(
+            provider = provider.as_str(),
+            kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "profile provisioning still failing"
+        );
+    }
+}
+
+fn clear_provision_error(provider: ProviderKind, profile_dir: &str) {
+    REPORTED_PROVISION_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(provider, profile_dir.to_owned()));
+}
+
+type ProvisionErrorKey = (ProviderKind, String);
+type ProvisionErrorSig = (io::ErrorKind, Option<i32>);
+
+static REPORTED_PROVISION_ERRORS: std::sync::Mutex<BTreeMap<ProvisionErrorKey, ProvisionErrorSig>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 /// Entries stay until the profile is idle or for good if the user kept them, and account status
 /// polls re-provision every minute, so each profile's conflict set is reported only when it changes.
@@ -603,3 +652,48 @@ fn publish(
 #[cfg(unix)]
 #[path = "provision/claude_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod error_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn provision_error_dedup_tracks_signature_and_clears_on_success() {
+        let profile = format!("/tmp/krill-provision-dedup-{}", std::process::id());
+        clear_provision_error(ProviderKind::Antigravity, &profile);
+
+        let err1 = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        report_provision_error(ProviderKind::Antigravity, &profile, &err1);
+        {
+            let map = REPORTED_PROVISION_ERRORS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                map.get(&(ProviderKind::Antigravity, profile.clone())),
+                Some(&(io::ErrorKind::PermissionDenied, None))
+            );
+        }
+
+        // Different error kind updates the recorded signature.
+        let err2 = io::Error::new(io::ErrorKind::NotFound, "missing");
+        report_provision_error(ProviderKind::Antigravity, &profile, &err2);
+        {
+            let map = REPORTED_PROVISION_ERRORS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                map.get(&(ProviderKind::Antigravity, profile.clone())),
+                Some(&(io::ErrorKind::NotFound, None))
+            );
+        }
+
+        // Clearing on recovery removes the entry so future regressions warn again.
+        clear_provision_error(ProviderKind::Antigravity, &profile);
+        assert!(
+            !REPORTED_PROVISION_ERRORS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&(ProviderKind::Antigravity, profile))
+        );
+    }
+}
