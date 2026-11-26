@@ -995,8 +995,6 @@ pub struct Sidebar {
     pr_task: Option<Task<()>>,
     pr_service: Option<Arc<crate::pull_request::Service>>,
     rows: Vec<Row>,
-    /// 프로젝트 기준 보기에서 다른 PC의 같은 프로젝트를 합친 머리줄 행 → 합쳐진 (호스트, 경로).
-    merged_projects: BTreeMap<usize, Vec<(HostId, PathBuf)>>,
     /// 논리 세션 행 → 카드 머리줄. 렌더 중 계보를 매번 역탐색하지 않는다.
     card_parents: Vec<Option<usize>>,
     prefs: Preferences,
@@ -1026,6 +1024,8 @@ pub struct Sidebar {
     sleeping_worktrees: BTreeSet<PathBuf>,
     shown_external: BTreeSet<PathBuf>,
     collapsed: BTreeSet<PathBuf>,
+    /// 원격 호스트별 프로젝트 접힘 상태(동일 절대 경로가 로컬과 충돌해도 독립 유지).
+    remote_collapsed: BTreeMap<(HostId, PathBuf), bool>,
     /// 카드 하단 요약 알약을 눌러 개별 세션 행을 펼친 워크트리 집합(Orca 기본값: 접힘).
     expanded_cards: BTreeSet<PathBuf>,
     /// 사용자가 요약 알약을 눌러 명시적으로 접은 다중 세션 카드(자동 펼침 예외).
@@ -1038,8 +1038,8 @@ pub struct Sidebar {
     pending_added_projects: BTreeSet<(HostId, PathBuf)>,
     /// 프로젝트(저장소·폴더) 헤더 아이콘·배지 색상·표시 이름 메타.
     project_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
-    /// 원격 호스트 저장소에서 탐지한 아이콘·메타 캐시.
-    remote_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
+    /// 원격 호스트 저장소에서 탐지한 아이콘·메타 캐시(호스트·경로 단위 격리).
+    remote_visuals: BTreeMap<(HostId, PathBuf), external::ProjectVisualMeta>,
     /// 원격 호스트별로 이미 아이콘 탐지를 요청한 저장소 경로 집합.
     remote_probed_repos: BTreeMap<String, BTreeSet<PathBuf>>,
     disk: async_state::State,
@@ -1158,19 +1158,16 @@ fn split_loose(rows: &mut Vec<Row>) -> Vec<Row> {
         .unwrap_or_default()
 }
 
-/// 프로젝트 기준 보기에서 호스트별 행 목록을 프로젝트 단위로 합친다([`Sidebar::rebuild_by_project`]).
+/// 프로젝트 기준 보기에서 호스트별 행 목록을 호스트 단위 프로젝트 묶음으로 수집한다([`Sidebar::rebuild_by_project`]).
 #[derive(Default)]
 struct ProjectMerge {
     chunks: Vec<ProjectChunk>,
-    /// 프로젝트 열쇠 → (묶음 번호, 머리줄 경로).
-    owners: BTreeMap<(bool, String), (usize, PathBuf)>,
     loose: Vec<(HostId, Row)>,
 }
 
-/// 머리줄 하나와 그 아래 행들. 다른 PC에서 합쳐진 프로젝트 경로는 `aliases`에 남는다.
+/// 머리줄 하나와 그 아래 행들.
 struct ProjectChunk {
     rows: Vec<(HostId, Row)>,
-    aliases: Vec<(HostId, PathBuf)>,
 }
 
 /// PC 사이에는 공통 프로젝트 ID가 없어 종류(git 저장소/폴더)와 폴더 이름(대소문자 무시)으로 맞춘다.
@@ -1215,37 +1212,8 @@ fn order_project_rows(rows: &mut Vec<Row>, order: &[PathBuf]) {
 }
 
 impl ProjectMerge {
-    /// 합쳐질 원격 머리줄은 화면에 없으므로 접힘 상태를 주인 머리줄 것으로 맞춘다.
-    fn aligned_collapsed<'a>(
-        &self,
-        collapsed: &'a BTreeSet<PathBuf>,
-        snapshot: &Snapshot,
-    ) -> std::borrow::Cow<'a, BTreeSet<PathBuf>> {
-        let mut out = std::borrow::Cow::Borrowed(collapsed);
-        let repos = snapshot.trees.keys().map(|p| (true, p));
-        let folders = snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.worktree.is_none())
-            .filter_map(|s| s.cwd.as_ref())
-            .map(|p| (false, p));
-        for (repo, path) in repos.chain(folders) {
-            let Some((_, owner)) = self.owners.get(&(repo, basename(path).to_lowercase())) else {
-                continue;
-            };
-            let closed = collapsed.contains(owner);
-            if closed != out.contains(path) {
-                if closed {
-                    out.to_mut().insert(path.clone());
-                } else {
-                    out.to_mut().remove(path);
-                }
-            }
-        }
-        out
-    }
-
-    /// 한 호스트의 행을 받아 이미 있는 프로젝트는 그 묶음 끝에 붙인다. 프로젝트가 있었으면 참.
+    /// 한 호스트의 행을 프로젝트 묶음 단위로 수집한다.
+    /// Orca처럼 동명 프로젝트라도 호스트별로 행을 분리하고, `Row::Loose`만 모든 호스트를 합쳐 끝에 둔다.
     fn absorb(&mut self, host: &HostId, mut rows: Vec<Row>) -> bool {
         // `Row::Loose` 머리줄은 모든 호스트를 합쳐 한 번만 둔다.
         let loose = split_loose(&mut rows);
@@ -1258,46 +1226,19 @@ impl ProjectMerge {
             while let Some(row) = rows.next_if(|r| !starts_chunk(r)) {
                 body.push((host.clone(), row));
             }
-            let Some((key, path)) = project_key(&head) else {
-                body.insert(0, (host.clone(), head));
-                self.chunks.push(ProjectChunk {
-                    rows: body,
-                    aliases: Vec::new(),
-                });
-                continue;
-            };
-            projects = true;
-            let owner = self.owners.get(&key).map(|(i, _)| *i);
-            if let Some(chunk) = owner.and_then(|i| self.chunks.get_mut(i)) {
-                chunk.aliases.push((host.clone(), path.clone()));
-                chunk.rows.extend(body);
-            } else {
-                self.owners.insert(key, (self.chunks.len(), path.clone()));
-                body.insert(0, (host.clone(), head));
-                self.chunks.push(ProjectChunk {
-                    rows: body,
-                    aliases: Vec::new(),
-                });
+            if project_key(&head).is_some() {
+                projects = true;
             }
+            body.insert(0, (host.clone(), head));
+            self.chunks.push(ProjectChunk { rows: body });
         }
         projects
     }
 
     /// 프로젝트 → 작업 폴더 모르는 세션 순으로 편다.
-    #[expect(
-        clippy::type_complexity,
-        reason = "rows, row hosts and merged headers are built together"
-    )]
-    fn finish(
-        mut self,
-        order: &[PathBuf],
-    ) -> (
-        Vec<Row>,
-        Vec<HostId>,
-        BTreeMap<usize, Vec<(HostId, PathBuf)>>,
-    ) {
-        // Sort whole projects after merging PCs so remote-only projects and folders
-        // can move between local repositories without separating their children.
+    fn finish(mut self, order: &[PathBuf]) -> (Vec<Row>, Vec<HostId>) {
+        // Sort whole projects so remote projects and folders can move between
+        // local repositories without separating their children.
         if !order.is_empty() {
             self.chunks.sort_by_key(|chunk| {
                 chunk
@@ -1308,24 +1249,18 @@ impl ProjectMerge {
         }
         let mut rows = Vec::new();
         let mut hosts = Vec::new();
-        let mut merged = BTreeMap::new();
         let mut push = |(host, row): (HostId, Row)| {
             hosts.push(host);
             rows.push(row);
         };
-        let mut start = 0;
         for chunk in self.chunks {
-            if !chunk.aliases.is_empty() {
-                merged.insert(start, chunk.aliases);
-            }
-            start += chunk.rows.len();
             chunk.rows.into_iter().for_each(&mut push);
         }
         if !self.loose.is_empty() {
             push((HostId::Local, Row::Loose));
             self.loose.into_iter().for_each(&mut push);
         }
-        (rows, hosts, merged)
+        (rows, hosts)
     }
 }
 
@@ -1415,7 +1350,6 @@ impl Sidebar {
             pr_task: None,
             pr_service: None,
             rows: Vec::new(),
-            merged_projects: BTreeMap::new(),
             card_parents: Vec::new(),
             prefs,
             options,
@@ -1438,6 +1372,7 @@ impl Sidebar {
             sleeping_worktrees: lin.sleeping_worktrees,
             shown_external: ui.shown_external,
             collapsed: ui.collapsed,
+            remote_collapsed: BTreeMap::new(),
             expanded_cards: ui.expanded_cards,
             manually_folded_cards: BTreeSet::new(),
             selected_worktree: ui.selected_worktree,
@@ -2383,6 +2318,7 @@ impl Sidebar {
                                     changed = true;
                                 }
                             }
+                            let probe_host = HostId::Remote(id.clone());
                             s.remote_poll_pacing.entry(id).or_default().record(
                                 ok,
                                 poll_elapsed,
@@ -2405,7 +2341,10 @@ impl Sidebar {
                                         .await;
                                     if !resolved.is_empty() {
                                         this.update(cx, |s, cx| {
-                                            s.remote_visuals.extend(resolved);
+                                            for (repo_path, meta) in resolved {
+                                                s.remote_visuals
+                                                    .insert((probe_host.clone(), repo_path), meta);
+                                            }
                                             cx.notify();
                                         })
                                         .ok();
@@ -3409,25 +3348,102 @@ impl Sidebar {
         }
     }
 
-    fn lookup_visual<'a>(
-        map: &'a BTreeMap<PathBuf, external::ProjectVisualMeta>,
-        path: &Path,
-    ) -> Option<&'a external::ProjectVisualMeta> {
-        if let Some(v) = map.get(path) {
+    fn lookup_local_visual(&self, path: &Path) -> Option<&external::ProjectVisualMeta> {
+        if let Some(v) = self.project_visuals.get(path) {
             return Some(v);
         }
         let name = basename(path);
         if name.is_empty() {
             return None;
         }
-        map.iter()
+        self.project_visuals
+            .iter()
             .find(|(k, _)| basename(k).eq_ignore_ascii_case(&name))
             .map(|(_, v)| v)
     }
 
+    fn lookup_remote_visual(
+        &self,
+        host: &HostId,
+        path: &Path,
+    ) -> Option<&external::ProjectVisualMeta> {
+        if let Some(v) = self.remote_visuals.get(&(host.clone(), path.to_path_buf())) {
+            return Some(v);
+        }
+        let name = basename(path);
+        if name.is_empty() {
+            return None;
+        }
+        self.remote_visuals
+            .iter()
+            .find(|((h, k), _)| h == host && basename(k).eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v)
+    }
+
+    fn lookup_any_remote_visual(&self, path: &Path) -> Option<&external::ProjectVisualMeta> {
+        if let Some((_, v)) = self.remote_visuals.iter().find(|((_, k), _)| k == path) {
+            return Some(v);
+        }
+        let name = basename(path);
+        if name.is_empty() {
+            return None;
+        }
+        self.remote_visuals
+            .iter()
+            .find(|((_, k), _)| basename(k).eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v)
+    }
+
+    pub(super) fn project_icon_on(
+        &self,
+        host: &HostId,
+        path: &Path,
+    ) -> Option<&crate::ui::icons::ProjectIcon> {
+        if host.is_local() {
+            return self.lookup_local_visual(path).and_then(|v| v.icon.as_ref());
+        }
+        self.lookup_remote_visual(host, path)
+            .and_then(|v| v.icon.as_ref())
+            .or_else(|| self.lookup_local_visual(path).and_then(|v| v.icon.as_ref()))
+    }
+
+    pub(super) fn project_badge_color_on(&self, host: &HostId, path: &Path) -> Option<&str> {
+        if host.is_local() {
+            return self
+                .lookup_local_visual(path)
+                .and_then(|v| v.badge_color.as_deref());
+        }
+        self.lookup_remote_visual(host, path)
+            .and_then(|v| v.badge_color.as_deref())
+            .or_else(|| {
+                self.lookup_local_visual(path)
+                    .and_then(|v| v.badge_color.as_deref())
+            })
+    }
+
+    pub(super) fn project_header_name_on(&self, host: &HostId, path: &Path) -> String {
+        let found = if host.is_local() {
+            self.lookup_local_visual(path)
+                .and_then(|v| v.display_name.as_deref())
+        } else {
+            self.lookup_remote_visual(host, path)
+                .and_then(|v| v.display_name.as_deref())
+                .or_else(|| {
+                    self.lookup_local_visual(path)
+                        .and_then(|v| v.display_name.as_deref())
+                })
+        };
+        found
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| basename(path), str::to_owned)
+    }
+
     pub(super) fn project_icon(&self, path: &Path) -> Option<&crate::ui::icons::ProjectIcon> {
-        let local = Self::lookup_visual(&self.project_visuals, path).and_then(|v| v.icon.as_ref());
-        let remote = Self::lookup_visual(&self.remote_visuals, path).and_then(|v| v.icon.as_ref());
+        let local = self.lookup_local_visual(path).and_then(|v| v.icon.as_ref());
+        let remote = self
+            .lookup_any_remote_visual(path)
+            .and_then(|v| v.icon.as_ref());
         match (local, remote) {
             (
                 Some(crate::ui::icons::ProjectIcon::Image(lp)),
@@ -3449,24 +3465,63 @@ impl Sidebar {
     }
 
     pub(super) fn project_badge_color(&self, path: &Path) -> Option<&str> {
-        Self::lookup_visual(&self.project_visuals, path)
+        self.lookup_local_visual(path)
             .and_then(|v| v.badge_color.as_deref())
             .or_else(|| {
-                Self::lookup_visual(&self.remote_visuals, path)
+                self.lookup_any_remote_visual(path)
                     .and_then(|v| v.badge_color.as_deref())
             })
     }
 
     pub(super) fn project_header_name(&self, path: &Path) -> String {
-        Self::lookup_visual(&self.project_visuals, path)
+        self.lookup_local_visual(path)
             .and_then(|v| v.display_name.as_deref())
             .or_else(|| {
-                Self::lookup_visual(&self.remote_visuals, path)
+                self.lookup_any_remote_visual(path)
                     .and_then(|v| v.display_name.as_deref())
             })
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map_or_else(|| basename(path), str::to_owned)
+    }
+
+    pub(super) fn is_collapsed_on(&self, host: &HostId, path: &Path) -> bool {
+        if host.is_local() {
+            return self.collapsed.contains(path);
+        }
+        if let Some(&closed) = self
+            .remote_collapsed
+            .get(&(host.clone(), path.to_path_buf()))
+        {
+            return closed;
+        }
+        if self.snapshot.trees.contains_key(path) {
+            return false;
+        }
+        self.collapsed.contains(path)
+    }
+
+    fn collapsed_for_remote(&self, host: &HostId, snapshot: &Snapshot) -> BTreeSet<PathBuf> {
+        let mut out = BTreeSet::new();
+        for (repo, trees) in &snapshot.trees {
+            if self.is_collapsed_on(host, repo) {
+                out.insert(repo.clone());
+            }
+            for wt in trees {
+                if self.is_collapsed_on(host, wt) {
+                    out.insert(wt.clone());
+                }
+            }
+        }
+        for session in &snapshot.sessions {
+            if session.worktree.is_none()
+                && let Some(cwd) = &session.cwd
+                && self.is_collapsed_on(host, cwd)
+            {
+                out.insert(cwd.clone());
+            }
+        }
+        out
     }
 
     /// 연결된 원격 호스트만 목록에 띄운다(연결 안 된 호스트와 그 프로젝트는 숨기고, 호스트 관리는 설정에서 한다).
@@ -3475,8 +3530,8 @@ impl Sidebar {
             .filter(|r| self.host_filter_matches(&HostId::Remote(r.id.clone())))
     }
 
-    /// Orca처럼 프로젝트가 맨 위 단계다. 여러 PC에 같은 프로젝트가 있으면 한 머리줄 아래로 합치고
-    /// 원격 PC의 워크트리·세션은 호스트 배지로 구분한다. 작업 폴더를 모르는 세션은 끝에 한 묶음으로 둔다.
+    /// Orca처럼 프로젝트가 맨 위 단계다. 로컬·원격 호스트별로 프로젝트 행을 분리해
+    /// 원격 프로젝트 헤더 우측에 기기명을 인라인 표시한다. 작업 폴더를 모르는 세션은 끝에 한 묶음으로 둔다.
     fn rebuild_by_project(&mut self) {
         let mut merge = ProjectMerge::default();
         if self.host_filter_matches(&HostId::Local) {
@@ -3484,13 +3539,12 @@ impl Sidebar {
         }
         for remote in self.live_remote_hosts() {
             let host = HostId::Remote(remote.id.clone());
-            let collapsed = merge.aligned_collapsed(&self.collapsed, &remote.snapshot);
+            let collapsed = self.collapsed_for_remote(&host, &remote.snapshot);
             merge.absorb(&host, self.remote_rows(remote, &collapsed));
         }
-        let (rows, row_hosts, merged) = merge.finish(&self.project_order);
+        let (rows, row_hosts) = merge.finish(&self.project_order);
         self.rows = rows;
         self.row_hosts = row_hosts;
-        self.merged_projects = merged;
     }
 
     fn reconcile_pending_added_projects(&mut self) -> bool {
@@ -3591,7 +3645,6 @@ impl Sidebar {
             ),
         );
         self.ensure_external_polling(cx);
-        self.merged_projects.clear();
         if !self.has_connected_remote_hosts() {
             self.rows = if self.host_filter_matches(&HostId::Local) {
                 self.local_rows()
@@ -3641,7 +3694,8 @@ impl Sidebar {
                 });
                 row_hosts.push(host.clone());
                 if !self.collapsed_hosts.contains(&host) {
-                    let r_rows = self.remote_rows(remote, &self.collapsed);
+                    let collapsed = self.collapsed_for_remote(&host, &remote.snapshot);
+                    let r_rows = self.remote_rows(remote, &collapsed);
                     row_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
                     rows.extend(r_rows);
                 }
@@ -4436,8 +4490,9 @@ impl Sidebar {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, None, cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, None, cx),
             Some(Row::Repository(path)) => {
+                let host = self.row_host(cursor).clone();
                 self.cursor = Some(cursor);
-                self.fold(&path, None, cx);
+                self.fold_on(&host, &path, None, cx);
             }
             Some(Row::Session(session, _)) => {
                 let host = self.row_host(cursor).clone();
@@ -4567,12 +4622,34 @@ impl Sidebar {
         self.persist(cx);
     }
 
+    /// 호스트별 프로젝트·워크트리 접기/펼치기. 로컬은 영속화(`fold`)하고 원격은 호스트 단위로 격리한다.
+    pub fn fold_on(
+        &mut self,
+        host: &HostId,
+        path: &Path,
+        open: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if host.is_local() {
+            self.fold(path, open, cx);
+            return;
+        }
+        let closed = self.is_collapsed_on(host, path);
+        let next_open = open.unwrap_or(closed);
+        self.remote_collapsed
+            .insert((host.clone(), path.to_path_buf()), !next_open);
+        self.rebuild(cx);
+    }
+
     fn fold_cursor(&mut self, open: bool, cx: &mut Context<Self>) {
+        let host = self
+            .cursor
+            .map_or(HostId::Local, |i| self.row_host(i).clone());
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, Some(open), cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, Some(open), cx),
             Some(Row::Worktree(path) | Row::Folder(path) | Row::Repository(path)) => {
-                self.fold(&path, Some(open), cx);
+                self.fold_on(&host, &path, Some(open), cx);
             }
             _ => {}
         }

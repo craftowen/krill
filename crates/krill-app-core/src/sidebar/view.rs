@@ -485,45 +485,141 @@ fn row_menu(
     menu
 }
 
+pub(super) struct ProjectHeaderMeta {
+    pub(super) name: String,
+    pub(super) host_label: Option<String>,
+    pub(super) tip_headline: String,
+    pub(super) tip_detail: Option<String>,
+}
+
+fn build_project_header_tooltip(
+    headline: String,
+    detail: Option<String>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> gpui::AnyView {
+    if let Some(detail) = detail {
+        let muted = ui::palette(cx).muted_foreground;
+        gpui_component::tooltip::Tooltip::element(move |_, _| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(headline.clone())
+                .child(div().text_color(muted).child(detail.clone()))
+        })
+        .build(window, cx)
+    } else {
+        gpui_component::tooltip::Tooltip::new(headline).build(window, cx)
+    }
+}
+
 impl Sidebar {
-    /// Connection context lives next to its project, never above the project tree.
-    /// Connected remote hosts already render their `[호스트]` badge on worktree cards and
-    /// session rows (Orca parity), so the project header only shows a status/reconnect
-    /// control when the host is connecting or disconnected.
-    fn project_host_control(
+    pub(super) fn project_header_meta(
+        &self,
+        host: &HostId,
+        path: &std::path::Path,
+        p: &ui::Palette,
+    ) -> ProjectHeaderMeta {
+        let name = self.project_header_name_on(host, path);
+        let Some(remote_id) = host.remote_id() else {
+            return ProjectHeaderMeta {
+                tip_headline: name.clone(),
+                name,
+                host_label: None,
+                tip_detail: None,
+            };
+        };
+        let remote = self.remote_hosts.iter().find(|r| r.id == remote_id);
+        let host_label = remote.map_or_else(|| remote_id.to_owned(), |r| r.label.clone());
+        let status = remote.map_or(HostStatus::Connected, |r| r.status);
+        let info = self.remote_info.get(remote_id);
+        let info_detail = info
+            .and_then(|i| i.error.as_deref().or(i.detail.as_deref()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let tip_detail = if status == HostStatus::Connected {
+            info_detail
+                .filter(|detail| *detail != host_label.trim())
+                .map(str::to_owned)
+        } else {
+            let reason = remote
+                .and_then(|r| r.error.as_deref())
+                .map(disconnect_reason);
+            let (_, state) = host_status_tone(status, false, reason, p);
+            Some(
+                info_detail
+                    .map_or_else(|| state.to_owned(), |detail| format!("{state} · {detail}")),
+            )
+        };
+        ProjectHeaderMeta {
+            tip_headline: format!("{name} — {host_label}"),
+            name,
+            host_label: Some(host_label),
+            tip_detail,
+        }
+    }
+
+    /// Orca `ProjectHeaderHostLabel` 패리티: 로컬 프로젝트에는 기기명을 숨기고,
+    /// 원격(페어링·SSH) 프로젝트는 프로젝트명 우측 같은 줄에 `[Server] 기기명`을 인라인 표시한다.
+    /// 연결 중·끊김·인증 실패 상태에서는 상태 점·`ServerOff`·다시 연결 버튼을 같은 자리에 통합한다.
+    fn project_host_inline(
         &self,
         index: usize,
         host: &HostId,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(remote) = host
-            .remote_id()
-            .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
-            .filter(|r| r.status != HostStatus::Connected)
-        else {
-            return div().into_any_element();
-        };
+    ) -> Option<AnyElement> {
+        let remote_id = host.remote_id()?;
         let p = ui::palette(cx);
-        let reason = remote.error.as_deref().map(disconnect_reason);
-        let (tone, state) = host_status_tone(remote.status, false, reason, p);
-        let info = host.remote_id().and_then(|id| self.remote_info.get(id));
-        let tip = format!(
-            "{} · {}{}",
-            remote.label,
-            state,
-            info.and_then(|i| i.error.as_ref().or(i.detail.as_ref()))
-                .map(|detail| format!(" · {detail}"))
-                .unwrap_or_default()
-        );
+        let remote = self.remote_hosts.iter().find(|r| r.id == remote_id);
+        let label = remote.map_or_else(|| remote_id.to_owned(), |r| r.label.clone());
+        let status = remote.map_or(HostStatus::Connected, |r| r.status);
+        if status == HostStatus::Connected {
+            return Some(
+                div()
+                    .id(("project-host", index))
+                    .debug_selector(move || format!("project-host-{index}"))
+                    .min_w_0()
+                    .max_w(gpui::relative(0.5))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_color(p.muted_foreground)
+                    .child(
+                        Icon::new(gpui_kit_assets::IconName::Server)
+                            .with_size(ui::ICON_MD)
+                            .flex_none()
+                            .text_color(p.muted_foreground),
+                    )
+                    .child(div().min_w_0().truncate().child(label))
+                    .into_any_element(),
+            );
+        }
+        let reason = remote
+            .and_then(|r| r.error.as_deref())
+            .map(disconnect_reason);
+        let (tone, _) = host_status_tone(status, false, reason, p);
+        let icon = if status == HostStatus::Connecting {
+            gpui_kit_assets::IconName::Server
+        } else {
+            gpui_kit_assets::IconName::ServerOff
+        };
         let badge = div()
             .id(("project-host", index))
             .debug_selector(move || format!("project-host-{index}"))
-            .flex_none()
-            .max_w(px(72.))
+            .min_w_0()
+            .max_w(gpui::relative(0.5))
+            .flex_shrink_0()
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap_1()
-            .text_size(ui::TEXT_2XS)
+            .text_size(ui::TEXT_SM)
+            .font_weight(gpui::FontWeight::NORMAL)
             .text_color(p.muted_foreground)
             .child(
                 div()
@@ -532,63 +628,37 @@ impl Sidebar {
                     .flex_none()
                     .bg(tone),
             )
-            .child(div().min_w_0().truncate().child(remote.label.clone()))
-            .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-            });
-        if matches!(
-            remote.status,
-            HostStatus::Disconnected | HostStatus::AuthFailed
-        ) {
-            let host = host.clone();
-            badge
-                .child(
-                    Button::new(("project-reconnect", index))
-                        .ghost()
-                        .xsmall()
-                        .debug_selector(move || format!("project-reconnect-{index}"))
-                        .icon(IconName::RefreshCw)
-                        .accessibility_label(text::HOST_RECONNECT.get())
-                        .tooltip(text::HOST_RECONNECT.get())
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            cx.stop_propagation();
-                            s.reconnect_host(host.clone(), cx);
-                        })),
-                )
-                .into_any_element()
-        } else {
-            badge.into_any_element()
-        }
-    }
-
-    /// 합쳐진 프로젝트 머리줄에, 다시 연결이 필요한 다른 PC의 상태·다시 연결 버튼을 단다.
-    /// 연결된 PC는 워크트리·세션 배지로 이미 보이므로 머리줄을 붐비게 하지 않는다.
-    fn merged_host_controls(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let primary_host = self.row_host(index);
-        let mut hosts: Vec<&HostId> = Vec::new();
-        for (host, _) in self.merged_projects.get(&index).into_iter().flatten() {
-            if host == primary_host {
-                continue;
-            }
-            let connected = host
-                .remote_id()
-                .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
-                .is_none_or(|r| r.status == HostStatus::Connected);
-            if !connected && !hosts.contains(&host) {
-                hosts.push(host);
-            }
-        }
-        hosts
-            .into_iter()
-            .enumerate()
-            .map(|(slot, host)| {
-                div()
-                    .id(("merged-host", slot))
+            .child(
+                Icon::new(icon)
+                    .with_size(ui::ICON_MD)
                     .flex_none()
-                    .child(self.project_host_control(index, host, cx))
-                    .into_any_element()
-            })
-            .collect()
+                    .text_color(p.muted_foreground),
+            )
+            .child(div().min_w_0().truncate().child(label));
+        if matches!(status, HostStatus::Disconnected | HostStatus::AuthFailed) {
+            let host = host.clone();
+            Some(
+                badge
+                    .child(
+                        div().flex_none().child(
+                            Button::new(("project-reconnect", index))
+                                .ghost()
+                                .xsmall()
+                                .debug_selector(move || format!("project-reconnect-{index}"))
+                                .icon(IconName::RefreshCw)
+                                .accessibility_label(text::HOST_RECONNECT.get())
+                                .tooltip(text::HOST_RECONNECT.get())
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    cx.stop_propagation();
+                                    s.reconnect_host(host.clone(), cx);
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            Some(badge.into_any_element())
+        }
     }
 
     /// Rebuilt with the row model; lookup stays constant-time while scrolling a large card.
@@ -1041,47 +1111,59 @@ impl Sidebar {
                 let repo = path.clone();
                 let fold_btn = path.clone();
                 let fold_row = path.clone();
-                let closed = self.collapsed.contains(path);
+                let fold_btn_host = row_host.clone();
+                let fold_row_host = row_host.clone();
+                let closed = self.is_collapsed_on(&row_host, path);
                 // OWE-900: 헤더에 워크트리 수를 표시한다(자기 자신 제외).
                 // 접힌 다량 유휴 프로젝트도 규모를 알 수 있다.
-                // 다른 PC에서 합쳐진 같은 프로젝트의 워크트리도 센다.
-                let wt_count: usize = std::iter::once((&row_host, path))
-                    .chain(
-                        self.merged_projects
-                            .get(&index)
-                            .into_iter()
-                            .flatten()
-                            .map(|(host, alias)| (host, alias)),
-                    )
-                    .map(|(host, repo)| {
-                        self.snapshot_for(host).trees.get(repo).map_or(0, |list| {
+                let wt_count: usize =
+                    self.snapshot_for(&row_host)
+                        .trees
+                        .get(path)
+                        .map_or(0, |list| {
                             list.iter()
-                                .filter(|t| t.as_path() != repo.as_path())
+                                .filter(|t| t.as_path() != path.as_path())
                                 .count()
-                        })
-                    })
-                    .sum();
-                let merged_hosts = self.merged_host_controls(index, cx);
+                        });
+                let meta = self.project_header_meta(&row_host, path, p);
+                let host_inline = self.project_host_inline(index, &row_host, cx);
+                let aria = match &meta.host_label {
+                    Some(host_label) => format!(
+                        "{} {} — {} {wt_count}",
+                        text::REPOSITORY.get(),
+                        meta.name,
+                        host_label
+                    ),
+                    None => format!("{} {} {wt_count}", text::REPOSITORY.get(), meta.name),
+                };
+                let tip_headline = meta.tip_headline;
+                let tip_detail = meta.tip_detail;
                 repo_heading(base)
                     .ml(px(4. + host_indent))
+                    .when(closed, |d| d.pr(px(26.)))
                     .debug_selector(move || format!("repo-header-{index}"))
-                    .aria_label(format!(
-                        "{} {} {wt_count}",
-                        text::REPOSITORY.get(),
-                        basename(path)
-                    ))
+                    .aria_label(aria)
                     .aria_expanded(!closed)
                     .cursor_pointer()
                     .hover(|d| {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
+                    .tooltip(move |window, cx| {
+                        build_project_header_tooltip(
+                            tip_headline.clone(),
+                            tip_detail.clone(),
+                            window,
+                            cx,
+                        )
+                    })
                     .child(
                         div()
+                            .flex_none()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
-                                self.project_icon(path),
-                                self.project_badge_color(path),
+                                self.project_icon_on(&row_host, path),
+                                self.project_badge_color_on(&row_host, path),
                                 ui::ICON_MD,
                                 p.muted_foreground,
                             )),
@@ -1090,8 +1172,17 @@ impl Sidebar {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .child(self.project_header_name(path)),
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("repo-title-{index}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(meta.name),
+                            )
+                            .when_some(host_inline, gpui::ParentElement::child),
                     )
                     // 펼친 동안에는 워크트리가 보이므로 개수는 접혔을 때만 보인다.
                     .when(wt_count > 0 && closed, |d| {
@@ -1108,172 +1199,210 @@ impl Sidebar {
                                 .child(wt_count.to_string()),
                         )
                     })
-                    // Orca처럼 접기 화살표는 오른쪽에 두고, 펼친 동안에는 호버할 때만 보인다.
+                    // Orca `ProjectHeaderActions` 패리티: 호버 액션(+, 접기 화살표)은 우측 오버레이로 띄워
+                    // 유휴 폭을 확보하고, 호버 시 행 배경색으로 덮어 기기명과 겹치지 않게 한다.
                     .child(
                         div()
-                            .flex_none()
-                            .when(!closed, |d| {
-                                d.invisible().group_hover(ROW_GROUP, Styled::visible)
-                            })
-                            .child(
-                                Button::new(("repo-fold", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(if closed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .accessibility_label(if closed {
-                                        text::UNFOLD.get()
-                                    } else {
-                                        text::FOLD.get()
-                                    })
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.cursor = Some(index);
-                                        s.fold(&fold_btn, None, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(110.))
-                            .overflow_hidden()
+                            .debug_selector(move || format!("repo-actions-{index}"))
+                            .absolute()
+                            .top_0()
+                            .right_1()
+                            .h_full()
+                            .pl_1()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .child(self.project_host_control(index, &row_host, cx))
-                            .children(merged_hosts),
+                            .gap_0p5()
+                            .rounded(ui::RADIUS_SM)
+                            .when(selected, |d| d.bg(p.sidebar_accent))
+                            .group_hover(ROW_GROUP, |d| d.bg(p.sidebar_accent))
+                            .when(!dimmed, |d| {
+                                let new_wt_host = row_host.clone();
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .invisible()
+                                        .group_hover(ROW_GROUP, Styled::visible)
+                                        .child(
+                                            Button::new(("new-worktree", index))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Plus)
+                                                .debug_selector(move || {
+                                                    format!("repo-new-worktree-{index}")
+                                                })
+                                                .accessibility_label(text::NEW_WORKTREE.get())
+                                                .tooltip(text::NEW_WORKTREE.get())
+                                                .on_click(cx.listener(move |s, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    s.new_worktree_on(
+                                                        &new_wt_host,
+                                                        repo.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .when(!closed, |d| {
+                                        d.invisible().group_hover(ROW_GROUP, Styled::visible)
+                                    })
+                                    .child(
+                                        Button::new(("repo-fold", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(if closed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .accessibility_label(if closed {
+                                                text::UNFOLD.get()
+                                            } else {
+                                                text::FOLD.get()
+                                            })
+                                            .on_click(cx.listener(move |s, _, _, cx| {
+                                                cx.stop_propagation();
+                                                s.cursor = Some(index);
+                                                s.fold_on(&fold_btn_host, &fold_btn, None, cx);
+                                            })),
+                                    ),
+                            ),
                     )
-                    .when(!dimmed, |d| {
-                        let new_wt_host = row_host.clone();
-                        d.child(
-                            div()
-                                .invisible()
-                                .group_hover(ROW_GROUP, Styled::visible)
-                                .child(
-                                    Button::new(("new-worktree", index))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Plus)
-                                        .debug_selector(move || {
-                                            format!("repo-new-worktree-{index}")
-                                        })
-                                        .accessibility_label(text::NEW_WORKTREE.get())
-                                        .tooltip(text::NEW_WORKTREE.get())
-                                        .on_click(cx.listener(move |s, _, window, cx| {
-                                            cx.stop_propagation();
-                                            s.new_worktree_on(
-                                                &new_wt_host,
-                                                repo.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                ),
-                        )
-                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
-                        s.fold(&fold_row, None, cx);
+                        s.fold_on(&fold_row_host, &fold_row, None, cx);
                     }))
             }
             Row::Folder(path) => {
                 let (fold_btn, fold_row, fresh, fresh_host) =
                     (path.clone(), path.clone(), path.clone(), row_host.clone());
-                let closed = self.collapsed.contains(path);
-                let merged_hosts = self.merged_host_controls(index, cx);
+                let fold_btn_host = row_host.clone();
+                let fold_row_host = row_host.clone();
+                let closed = self.is_collapsed_on(&row_host, path);
+                let meta = self.project_header_meta(&row_host, path, p);
+                let host_inline = self.project_host_inline(index, &row_host, cx);
+                let aria = match &meta.host_label {
+                    Some(host_label) => {
+                        format!("{} {} — {}", text::FOLDER.get(), meta.name, host_label)
+                    }
+                    None => format!("{} {}", text::FOLDER.get(), meta.name),
+                };
+                let tip_headline = meta.tip_headline;
+                let tip_detail = meta.tip_detail;
                 repo_heading(base)
                     .ml(px(4. + host_indent))
+                    .when(closed, |d| d.pr(px(26.)))
                     .debug_selector(move || format!("folder-header-{index}"))
-                    .aria_label(format!("{} {}", text::FOLDER.get(), basename(path)))
+                    .aria_label(aria)
                     .aria_expanded(!closed)
                     .cursor_pointer()
                     .hover(|d| {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(ui::icons::project_header_icon(
-                        self.project_icon(path),
-                        self.project_badge_color(path),
+                    .tooltip(move |window, cx| {
+                        build_project_header_tooltip(
+                            tip_headline.clone(),
+                            tip_detail.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                    .child(div().flex_none().child(ui::icons::project_header_icon(
+                        self.project_icon_on(&row_host, path),
+                        self.project_badge_color_on(&row_host, path),
                         ui::ICON_MD,
                         p.muted_foreground,
-                    ))
+                    )))
                     .child(
                         div()
-                            .debug_selector(move || format!("folder-title-{index}"))
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .child(self.project_header_name(path)),
-                    )
-                    // Orca처럼 접기 화살표는 오른쪽에 두고, 펼친 동안에는 호버할 때만 보인다.
-                    .child(
-                        div()
-                            .flex_none()
-                            .when(!closed, |d| {
-                                d.invisible().group_hover(ROW_GROUP, Styled::visible)
-                            })
-                            .child(
-                                Button::new(("folder-fold", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(if closed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .accessibility_label(if closed {
-                                        text::UNFOLD.get()
-                                    } else {
-                                        text::FOLD.get()
-                                    })
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.cursor = Some(index);
-                                        s.fold(&fold_btn, None, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(110.))
-                            .overflow_hidden()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .child(self.project_host_control(index, &row_host, cx))
-                            .children(merged_hosts),
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("folder-title-{index}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(meta.name),
+                            )
+                            .when_some(host_inline, gpui::ParentElement::child),
                     )
                     .child(
                         div()
-                            .invisible()
-                            .group_hover(ROW_GROUP, Styled::visible)
+                            .debug_selector(move || format!("folder-actions-{index}"))
+                            .absolute()
+                            .top_0()
+                            .right_1()
+                            .h_full()
+                            .pl_1()
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .rounded(ui::RADIUS_SM)
+                            .when(selected, |d| d.bg(p.sidebar_accent))
+                            .group_hover(ROW_GROUP, |d| d.bg(p.sidebar_accent))
                             .child(
-                                Button::new(("folder-new-session", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Plus)
-                                    .accessibility_label(text::NEW_TERMINAL.get())
-                                    .tooltip(text::NEW_TERMINAL.get())
-                                    .on_click(cx.listener(move |s, _, window, cx| {
-                                        cx.stop_propagation();
-                                        s.new_session_on(
-                                            fresh_host.clone(),
-                                            fresh.clone(),
-                                            Program::Login,
-                                            Some(window),
-                                            cx,
-                                        );
-                                    })),
+                                div()
+                                    .flex_none()
+                                    .invisible()
+                                    .group_hover(ROW_GROUP, Styled::visible)
+                                    .child(
+                                        Button::new(("folder-new-session", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Plus)
+                                            .accessibility_label(text::NEW_TERMINAL.get())
+                                            .tooltip(text::NEW_TERMINAL.get())
+                                            .on_click(cx.listener(move |s, _, window, cx| {
+                                                cx.stop_propagation();
+                                                s.new_session_on(
+                                                    fresh_host.clone(),
+                                                    fresh.clone(),
+                                                    Program::Login,
+                                                    Some(window),
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .when(!closed, |d| {
+                                        d.invisible().group_hover(ROW_GROUP, Styled::visible)
+                                    })
+                                    .child(
+                                        Button::new(("folder-fold", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(if closed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .accessibility_label(if closed {
+                                                text::UNFOLD.get()
+                                            } else {
+                                                text::FOLD.get()
+                                            })
+                                            .on_click(cx.listener(move |s, _, _, cx| {
+                                                cx.stop_propagation();
+                                                s.cursor = Some(index);
+                                                s.fold_on(&fold_btn_host, &fold_btn, None, cx);
+                                            })),
+                                    ),
                             ),
                     )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
-                        s.fold(&fold_row, None, cx);
+                        s.fold_on(&fold_row_host, &fold_row, None, cx);
                     }))
             }
             Row::HiddenWorktrees(repo, count, expanded) => {
@@ -1314,8 +1443,8 @@ impl Sidebar {
                 let current_account = session.account.as_ref().map(|a| a.account_id.clone());
                 let inside_card = self.session_card_index(index).is_some();
                 let session_highlighted = selected || self.is_session_focused(index, id);
-                // 프로젝트 기준 보기에서 카드 밖 원격 세션(폴더·작업 폴더 모르는 세션)은 PC 배지로 구분한다.
-                let host_label = (self.options.group_by == super::GroupBy::Repo && !inside_card)
+                // 프로젝트 기준 보기에서 폴더·워크트리 헤더에 속하지 않는 원격 세션(작업 폴더 없는 세션 등)만 PC 배지로 구분한다.
+                let host_label = (self.options.group_by == super::GroupBy::Repo && !*nested)
                     .then(|| {
                         row_host
                             .remote_id()
@@ -1587,12 +1716,7 @@ impl Sidebar {
             d.on_drag(
                 ProjectDrag {
                     path: path.clone(),
-                    name: if row_host.is_local() {
-                        self.project_header_name(path)
-                    } else {
-                        basename(path)
-                    }
-                    .into(),
+                    name: self.project_header_name_on(&row_host, path).into(),
                     index,
                 },
                 |drag, _, _, cx| cx.new(|_| drag.clone()),
