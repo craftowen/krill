@@ -1029,11 +1029,10 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .workspaces:has(>.tab-bar)>.workspace-bottom-bar{order:90;padding-bottom:8px}
 .bots .filter-chip,.up-next .filter-chip,.bots .small{min-height:var(--touch-target);min-width:var(--touch-target)}
 .bots .home-section-heading{margin-top:4px;align-items:center}
-/* Bot Mobile UX A+C+D: avatar rail, one-tap decision deck, 4-tab workspace, embedded chat, collapsible items */
+/* Bot Mobile UX: hub avatar rail, hub decision deck, and Orca 1.4.274 bot session screen (#/bots/:id) */
 .bot-rail{flex:none;width:100%;max-width:100%;overflow:hidden}
 .bot-rail-scroll{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;padding:4px 2px 6px;-webkit-overflow-scrolling:touch}
 .bot-rail-scroll::-webkit-scrollbar{display:none}
-.bot-workspace-rail{flex:none;padding:4px 12px 2px;border-bottom:1px solid var(--border);background:var(--surface-panel)}
 .bot-rail-item{flex:none;min-width:56px;max-width:68px;min-height:var(--touch-target);display:flex;flex-direction:column;align-items:center;gap:4px;padding:2px;color:var(--muted-foreground);text-align:center}
 .bot-rail-item.active{color:var(--foreground);font-weight:600}
 .bot-rail-ring{position:relative;display:inline-flex;padding:2px;border-radius:13px;border:2px solid transparent}
@@ -1049,17 +1048,17 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-rail-badge{position:absolute;top:-4px;right:-4px;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:17px;text-align:center;font-variant-numeric:tabular-nums}
 .bot-rail-name{font-size:calc(11px * var(--ui-scale,1));max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bot-avatar.has-color{color:var(--on-accent)}
+.bot-avatar-xs{width:20px;height:20px;border-radius:6px;font-size:calc(11px * var(--ui-scale,1))}
+.bot-avatar-sm{width:28px;height:28px;border-radius:8px;font-size:calc(13px * var(--ui-scale,1))}
 .bot-group-avatar{background:var(--accent);color:var(--on-accent)}
 .bot-add-avatar{border:1px dashed var(--floating-border);background:var(--surface-raised);color:var(--foreground)}
 .bot-seg-tabs{flex:none;display:flex;gap:4px;padding:4px;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
 .bot-seg-tabs::-webkit-scrollbar{display:none}
-.bot-workspace-tabs{margin:6px 12px}
 .bot-seg-tab{flex:1 1 0;min-width:0;min-height:var(--touch-target);padding:4px 8px;border-radius:var(--radius-sm);display:inline-flex;align-items:center;justify-content:center;gap:4px;font-size:calc(12px * var(--ui-scale,1));font-weight:600;color:var(--muted-foreground);white-space:nowrap}
 .bot-seg-tab.active{background:var(--surface-base);color:var(--foreground);box-shadow:0 1px 2px rgba(0,0,0,.16)}
 .bot-seg-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
 .bot-seg-badge.blocked{background:var(--status-blocked)}
 .bot-decision-deck{flex:none;width:100%}
-.bot-decision-deck.compact{padding:0 12px}
 .bot-decision-card{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:var(--radius-card);background:var(--group-surface);border:1px solid var(--border);border-left:3px solid var(--status-waiting)}
 .bot-decision-card.blocked{border-left-color:var(--status-blocked)}
 .bot-decision-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
@@ -1067,18 +1066,48 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-decision-card-sub{font-size:var(--font-meta);margin:0;overflow-wrap:anywhere}
 .bot-decision-card-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .bot-deck-next{margin-left:auto}
-.bot-workspace-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-.bot-chat-top{flex:none;display:flex;flex-direction:column;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border)}
-.bot-thread-bar{display:flex;align-items:center;gap:6px;padding:4px 12px 0;overflow-x:auto;scrollbar-width:none}
-.bot-thread-bar::-webkit-scrollbar{display:none}
-.bot-thread-chip,.bot-new-chat-btn{flex:none}
-.bot-term-btn{flex:none;margin-left:auto}
-.bot-worker-strip{display:flex;align-items:center;gap:8px;margin:0 12px;padding:6px 10px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--border);font-size:var(--font-meta)}
-.bot-worker-copy{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Orca 1.4.274 #/bots/:id session header (48px), conditional needs strip (0px when idle), 44px single-row tab bar, and botPanel sheet */
+.bot-workspace.screen{max-width:none;background:var(--surface-base)}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header{min-height:48px;height:48px;padding:2px 6px;gap:2px;flex-wrap:nowrap;background:var(--surface-panel);border-bottom:1px solid var(--border)}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header>.icon-button,#mobile-app :is(.settings,.details).bot-workspace.screen>.page-header.bot-session-header:not(.title-header)>.icon-button:first-child{position:relative;width:44px;min-width:44px;height:44px;min-height:44px;border-radius:22px;background:transparent;color:var(--foreground);flex:none}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header>.icon-button:active{background:var(--surface-raised)}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header>.icon-button.active{background:var(--surface-raised);color:var(--foreground)}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header .header-copy{flex:1;min-width:0;padding:0;text-align:center;display:flex;align-items:center;justify-content:center}
+#mobile-app .bot-header-title-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:100%;max-width:100%;min-width:0;min-height:44px;height:44px;padding:0 4px;border-radius:var(--radius-sm);background:transparent}
+#mobile-app .bot-header-title-btn:active{background:var(--surface-raised)}
+.bot-header-title-row{display:inline-flex;align-items:center;justify-content:center;gap:6px;max-width:100%;min-width:0}
+.bot-header-avatar{display:inline-flex;flex:none}
+#mobile-app .bot-workspace.screen>.page-header.bot-session-header h1{font-size:calc(14px * var(--ui-scale,1));font-weight:600;line-height:1.2;margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bot-header-meta-row{display:inline-flex;align-items:center;justify-content:center;gap:5px;max-width:100%;min-width:0}
+.bot-header-meta-dot{width:8px;height:8px;--spin-w:1.6px}
+.bot-workspace.screen>.page-header.bot-session-header .header-sub{font-size:calc(11px * var(--ui-scale,1));line-height:1.2;margin:0;color:var(--muted-foreground);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bot-header-badge{position:absolute;top:4px;right:2px;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:16px;text-align:center;font-variant-numeric:tabular-nums;pointer-events:none}
+.bot-needs-strip{flex:none;display:flex;align-items:center;gap:8px;min-height:36px;padding:4px 12px;background:color-mix(in srgb,var(--status-waiting) 12%,var(--surface-panel));border-bottom:1px solid var(--border);font-size:var(--font-meta)}
+.bot-needs-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--status-waiting)}
+.bot-needs-msg{flex:1;min-width:0;color:var(--foreground);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mobile-app .bot-needs-view{flex:none;min-width:auto;min-height:28px;height:28px;padding:0 10px;border-radius:var(--radius-pill);background:var(--status-waiting);color:var(--surface-base);font-size:var(--font-meta);font-weight:600}
+.bot-session-tabbar{flex:none;display:flex;align-items:stretch;height:44px;min-height:44px;background:var(--surface-panel);border-bottom:1px solid var(--border)}
+.bot-tab-cell{flex:1;min-width:0;display:flex;background:var(--surface-raised);border-bottom:2px solid var(--text-secondary);border-right:1px solid var(--border);overflow:hidden;touch-action:pan-y}
+#mobile-app .bot-tab-press{flex:1;min-width:0;min-height:41px;height:100%;padding:0 8px 0 14px;display:flex;align-items:center;text-align:left;background:transparent}
+#mobile-app .bot-tab-press:active{background:var(--translucent-fill)}
+.bot-tab-content{display:flex;align-items:center;gap:6px;min-width:0;flex:1;will-change:transform}
+.bot-tab-title{flex:0 1 auto;min-width:0;font-size:calc(14px * var(--ui-scale,1));font-weight:600;color:var(--foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mobile-app .bot-tab-side-cell{position:relative;flex:none;width:46px;min-width:46px;height:100%;min-height:41px;display:grid;place-items:center;color:var(--foreground);border-right:1px solid var(--border);background:transparent}
+#mobile-app .bot-tab-side-cell:last-child{border-right:0}
+#mobile-app .bot-tab-side-cell:active{background:var(--translucent-fill)}
+.bot-tab-side-cell svg{width:18px;height:18px;stroke-width:2.2}
+.bot-tab-count-alert{position:absolute;top:8px;right:9px;width:9px;height:9px;border-radius:999px;background:var(--status-blocked);border:2px solid var(--surface-panel)}
+.bot-chat-notices{flex:none;padding:6px 12px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:4px}
 .bot-chat-stage{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .bot-chat-empty{flex:1;min-height:0;overflow:auto;padding:20px 16px;display:flex;flex-direction:column;gap:12px;justify-content:center}
 .bot-first-chat-form{display:flex;flex-direction:column;gap:8px}
 .bot-first-chat-form textarea{min-height:68px;border-radius:var(--radius-md);background:var(--surface-panel)}
+.bot-panel-sheet{display:flex;flex-direction:column;gap:12px;min-height:0}
+.bot-panel-tabs{flex:none}
+.bot-panel-body{display:flex;flex-direction:column;gap:14px;max-height:min(60svh,520px);overflow-y:auto;overscroll-behavior:contain;padding:2px 0 4px}
+.bot-panel-body .bots-section{gap:8px}
+.bot-panel-body .home-section-heading{margin-top:0;padding:0 2px 4px;align-items:center}
+.bot-switcher-row .bot-seg-badge{flex:none}
 .bot-item-head-right{display:inline-flex;align-items:center;gap:4px;flex:none}
 .bot-item-details{display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border)}
 .bot-item-card.waiting{border-left:3px solid var(--status-waiting)}
@@ -1122,8 +1151,8 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-group-promoted-head{display:flex;align-items:center;gap:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
 .bot-group-messages.promoted{max-height:46svh;min-height:140px}
 .bot-automation-row{flex-wrap:wrap;align-items:flex-start}
-#mobile-app .bot-workspace>.page-header:not(.title-header) .header-copy{padding-right:0;text-align:left}
-@media(max-width:360px){.bot-workspace-tabs{margin:4px 8px}.bot-seg-tab{padding:4px;font-size:calc(11px * var(--ui-scale,1))}.bot-rail-item{min-width:50px}}
+@media(max-width:360px){.bot-seg-tab{padding:4px;font-size:calc(11px * var(--ui-scale,1))}.bot-rail-item{min-width:50px}}
+@media(orientation:landscape) and (max-height:500px){#mobile-app .bot-workspace.screen>.page-header.bot-session-header{min-height:44px;height:44px;padding:0 6px}#mobile-app .bot-header-title-btn{min-height:40px;height:40px}.bot-session-tabbar{height:38px;min-height:38px}#mobile-app .bot-tab-press,#mobile-app .bot-tab-side-cell{min-height:36px}.bot-needs-strip{min-height:32px;padding:2px 12px}}
 .voice-ctl{display:inline-flex;align-items:center;gap:4px;flex:none}
 .voice-rec{display:inline-flex;align-items:center;gap:6px;padding:2px 6px;border-radius:999px;background:color-mix(in srgb,var(--status-blocked) 14%,transparent);border:1px solid color-mix(in srgb,var(--status-blocked) 40%,transparent)}
 .voice-dot{width:8px;height:8px;border-radius:50%;background:var(--status-blocked);animation:voice-pulse 1s infinite}

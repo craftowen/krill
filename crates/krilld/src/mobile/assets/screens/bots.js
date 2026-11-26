@@ -1065,6 +1065,7 @@ const codeInput = el("input");
 codeInput.type = "text";
 codeInput.placeholder = t("Enter pairing code");
 codeInput.setAttribute("aria-label", t("Enter pairing code"));
+codeInput.dataset.autofocus = "false";
 let curReady = () => false;
 let curReload = async () => {};
 let curHosts = [];
@@ -1653,6 +1654,7 @@ const input = el("textarea");
 input.rows = 2;
 input.placeholder = t("Add a comment or answer…");
 input.setAttribute("aria-label", t("Comment"));
+input.dataset.autofocus = "false";
 input.value = ctx.state.drafts?.get?.(draftKey) || "";
 let composing = false;
 input.addEventListener("compositionstart", () => { composing = true; });
@@ -2982,9 +2984,11 @@ if (hubMode === "groups") {
 nodes.push(renderGroupPanel());
 } else {
 const botsSec = el("section", undefined, "bots-section");
+if (!bots.length && !groups.length) {
 const botsHead = el("div", undefined, "home-section-heading");
 botsHead.append(el("h2", t("Your bots"), "section-title"), el("small", String(bots.length), "muted"));
 botsSec.append(botsHead);
+}
 if (!bots.length) {
 const emptyBox = el("div", undefined, "bots-empty-card inset-group");
 emptyBox.append(
@@ -3084,25 +3088,163 @@ draw();
 function mountBotDetail(root, ctx, t, botId, ready) {
 const { el, button } = ctx;
 const screen = el("section", undefined, "details bots bot-detail bot-workspace screen");
-const header = ctx.header(botId, "/bots", undefined, { raw: true });
+const header = ctx.header(
+botId,
+"/bots",
+() => (ctx.backTo ? ctx.backTo("/bots") : ctx.go("/bots")),
+{ raw: true },
+);
+header.classList.add("bot-session-header");
+const h1 = header.querySelector("h1");
+const headerCopy = header.querySelector(".header-copy");
+const headerAvatarSlot = el("span", undefined, "bot-header-avatar");
+const headerTitleRow = el("span", undefined, "bot-header-title-row");
+if (h1) headerTitleRow.append(headerAvatarSlot, h1);
+const headerMetaRow = el("span", undefined, "bot-header-meta-row");
+const headerMetaDot = el("span", undefined, "status-dot unknown bot-header-meta-dot");
+headerMetaDot.setAttribute("aria-hidden", "true");
 const headerSub = el("small", "", "header-sub");
-header.querySelector(".header-copy")?.append(headerSub);
-const refreshBtn = button(t("Refresh"), () => load(true), "icon-button refresh-button", "activity");
-header.append(refreshBtn);
-const railMount = el("div", undefined, "bot-workspace-rail");
-const tabBar = el("div", undefined, "bot-seg-tabs bot-workspace-tabs");
-tabBar.setAttribute("role", "tablist");
-// Persistent panes so embedded M.chat.mount stays mounted without losing drafts/IME/scroll
-const chatPane = el("div", undefined, "bot-workspace-pane bot-chat-pane");
-const chatTop = el("div", undefined, "bot-chat-top");
+headerMetaRow.append(headerMetaDot, headerSub);
+const headerTitleBtn = button("", () => openBotSwitcherSheet(), "bot-header-title-btn");
+headerTitleBtn.setAttribute("aria-label", `${botId} · ${t("Switch bot")}`);
+headerTitleBtn.append(headerTitleRow, headerMetaRow);
+headerCopy?.replaceChildren(headerTitleBtn);
+const panelBtn = button(t("Items"), () => openBotPanelSheet("work"), "icon-button bot-panel-btn", "tasks");
+panelBtn.dataset.botPanelTrigger = "true";
+const panelBtnBadge = el("span", "", "bot-header-badge");
+panelBtnBadge.hidden = true;
+panelBtnBadge.setAttribute("aria-hidden", "true");
+panelBtn.append(panelBtnBadge);
+const moreBtn = button(t("More actions"), () => openBotMoreSheet(), "icon-button bot-more-btn", "more");
+moreBtn.dataset.botMoreTrigger = "true";
+header.append(panelBtn, moreBtn);
+// Conditional 1-line needs strip (Orca Nz — omitted from DOM when needsCount === 0)
+const needsStrip = el("div", undefined, "bot-needs-strip");
+const needsDot = el("span", undefined, "bot-needs-dot");
+needsDot.setAttribute("aria-hidden", "true");
+const needsMsg = el("span", "", "bot-needs-msg");
+const needsViewBtn = button(t("View"), () => openBotPanelSheet("work"), "bot-needs-view");
+needsStrip.append(needsDot, needsMsg, needsViewBtn);
+// Orca 1.4.274 MobileSessionTabBar (single 44px bar, shown only when >=1 live session)
+const sessionTabBar = el("nav", undefined, "bot-session-tabbar");
+sessionTabBar.setAttribute("aria-label", t("Sessions"));
+const tabCell = el("div", undefined, "bot-tab-cell");
+let swipeEndedAt = 0;
+const tabPressBtn = button(
+"",
+() => {
+if (Date.now() - swipeEndedAt < 400) return;
+const cur = currentLiveSession();
+if (cur) openSessionActionSheet(cur);
+},
+"bot-tab-press",
+);
+const tabContent = el("span", undefined, "bot-tab-content");
+const tabStatusDot = el("span", undefined, "status-dot connected");
+tabStatusDot.setAttribute("aria-hidden", "true");
+const tabTitleEl = el("span", "", "bot-tab-title");
+tabContent.append(tabStatusDot, tabTitleEl);
+tabPressBtn.append(tabContent);
+tabCell.append(tabPressBtn);
+let swipeStartX = 0;
+let swipeStartY = 0;
+let swipeStartTime = 0;
+let swipeDx = 0;
+let swipeLocked = false;
+let swipeDragging = false;
+const resetSwipeStyle = () => {
+tabContent.style.transform = "";
+tabContent.style.opacity = "";
+};
+tabCell.addEventListener(
+"touchstart",
+(e) => {
+const touch = e.touches?.[0];
+if (!touch) return;
+swipeStartX = touch.clientX;
+swipeStartY = touch.clientY;
+swipeStartTime = Date.now();
+swipeDx = 0;
+swipeLocked = false;
+swipeDragging = false;
+},
+{ passive: true, signal: ctx.signal },
+);
+tabCell.addEventListener(
+"touchmove",
+(e) => {
+const touch = e.touches?.[0];
+if (!touch) return;
+const live = liveBotSessions();
+if (live.length <= 1) return;
+const dx = touch.clientX - swipeStartX;
+const dy = touch.clientY - swipeStartY;
+if (!swipeLocked) {
+if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) {
+swipeLocked = true;
+swipeDragging = false;
+return;
+}
+if (Math.abs(dx) > 12 && Math.abs(dx) >= Math.abs(dy)) {
+swipeLocked = true;
+swipeDragging = true;
+}
+}
+if (!swipeDragging) return;
+swipeDx = dx;
+const idx = currentLiveSessionIndex(live);
+const hasTarget = (dx > 0 && idx > 0) || (dx < 0 && idx >= 0 && idx < live.length - 1);
+const offset = hasTarget ? dx : dx * 0.25;
+const width = Math.max(tabCell.clientWidth || 240, 1);
+tabContent.style.transform = `translateX(${Math.round(offset)}px)`;
+tabContent.style.opacity = String(Math.max(0.4, 1 - Math.min(Math.abs(offset) / width, 1) * 0.6));
+},
+{ passive: true, signal: ctx.signal },
+);
+const finishSwipe = (commit) => {
+const wasDragging = swipeDragging;
+const dx = swipeDx;
+const dt = Math.max(1, Date.now() - swipeStartTime);
+swipeDragging = false;
+swipeLocked = false;
+swipeDx = 0;
+resetSwipeStyle();
+if (!wasDragging) return;
+swipeEndedAt = Date.now();
+if (!commit) return;
+const live = liveBotSessions();
+if (live.length <= 1) return;
+const idx = currentLiveSessionIndex(live);
+const width = Math.max(tabCell.clientWidth || 240, 1);
+const velocity = Math.abs(dx) / dt;
+if (Math.abs(dx) > Math.max(48, width * 0.35) || velocity > 0.45) {
+const nextIdx = dx > 0 ? idx - 1 : idx + 1;
+if (nextIdx >= 0 && nextIdx < live.length) {
+activeSessionId = Number(live[nextIdx].session_id);
+draw();
+}
+}
+};
+tabCell.addEventListener("touchend", () => finishSwipe(true), { passive: true, signal: ctx.signal });
+tabCell.addEventListener("touchcancel", () => finishSwipe(false), { passive: true, signal: ctx.signal });
+const tabCountBtn = button("", () => openSessionsListSheet(), "bot-tab-side-cell bot-tab-count-cell");
+const tabCountBox = el("span", "1", "tab-count-box");
+const tabCountAlert = el("span", undefined, "bot-tab-count-alert");
+tabCountAlert.hidden = true;
+tabCountAlert.setAttribute("aria-hidden", "true");
+tabCountBtn.append(tabCountBox, tabCountAlert);
+const tabAddBtn = button("", () => startOrOpenBotChat(), "bot-tab-side-cell bot-tab-add-cell");
+tabAddBtn.setAttribute("aria-label", t("New Chat"));
+tabAddBtn.append(ctx.icon("plus"));
+sessionTabBar.append(tabCell, tabCountBtn, tabAddBtn);
+const statusNotice = el("div", undefined, "bot-chat-notices");
 const chatStage = el("div", undefined, "bot-chat-stage");
-chatPane.append(chatTop, chatStage);
-const list = el("div", undefined, "detail-list bots-list bot-workspace-scroll");
-screen.append(header, railMount, tabBar, chatPane, list);
+screen.append(header, chatStage);
 root.append(screen);
-let activeTab = ctx.state?.ui?.botPendingTab || "chat";
-if (!["chat", "work", "automations", "settings"].includes(activeTab)) activeTab = "chat";
+const pendingTab = ctx.state?.ui?.botPendingTab || null;
 if (ctx.state?.ui) ctx.state.ui.botPendingTab = null;
+let panelOpen = false;
+let panelTab = ["work", "automations", "settings"].includes(pendingTab) ? pendingTab : "work";
 let bot = null;
 let allBots = [];
 let allItems = [];
@@ -3120,7 +3262,6 @@ let chatHandle = null;
 let chatMountedSid = null;
 let chatStarting = false;
 let chatRefusal = null;
-let deckIndex = 0;
 let includeClosed = false;
 let includeSnoozed = false;
 let soulLoaded = false;
@@ -3134,8 +3275,38 @@ let loadSeq = 0;
 const avatars = new Map();
 const cardMap = new Map();
 const expandedItems = new Set();
-const h1 = header.querySelector("h1");
-// Persistent sections/inputs in Bot Workspace so background draw() preserves focus, cursor, scroll, and drafts.
+// Persistent Bot Panel Bottom Sheet containers so background load()/draw() preserves focus, drafts, and scroll.
+const panelWrap = el("div", undefined, "bot-panel-sheet");
+const panelTabsEl = el("div", undefined, "bot-seg-tabs bot-panel-tabs");
+panelTabsEl.setAttribute("role", "tablist");
+const panelTabButtons = new Map();
+for (const [id, lbl, isErr] of [
+["work", t("Work"), false],
+["automations", t("Automations"), true],
+["settings", t("Settings"), false],
+]) {
+const b = button(
+"",
+() => {
+panelTab = id;
+if (id === "settings" && !soulLoaded && !soulLoading) loadDocs().catch(() => {});
+renderBotPanel();
+},
+"bot-seg-tab",
+);
+b.setAttribute("role", "tab");
+b.setAttribute("aria-label", lbl);
+b.dataset.botTab = id;
+const labelSpan = el("span", lbl);
+const badgeSpan = el("span", "", `bot-seg-badge${isErr ? " blocked" : ""}`);
+badgeSpan.hidden = true;
+b.append(labelSpan, badgeSpan);
+panelTabButtons.set(id, { btn: b, badge: badgeSpan });
+panelTabsEl.append(b);
+}
+const panelBody = el("div", undefined, "bot-panel-body");
+panelWrap.append(panelTabsEl, panelBody);
+// Persistent sections/inputs in Bot Panel so background draw() preserves focus, cursor, scroll, and drafts.
 const accessCtrl = createAccessSection(ctx, t);
 const itemSec = el("section", undefined, "bots-section");
 const itemHead = el("div", undefined, "home-section-heading");
@@ -3145,11 +3316,11 @@ itemHead.append(addItemBtn);
 const itemFilters = el("div", undefined, "bot-decision-options");
 const closedBtn = button(t("Include closed"), () => {
 includeClosed = !includeClosed;
-return load();
+return load(true);
 }, "filter-chip");
 const snoozeBtn = button(t("Include snoozed"), () => {
 includeSnoozed = !includeSnoozed;
-return load();
+return load(true);
 }, "filter-chip");
 itemFilters.append(closedBtn, snoozeBtn);
 const itemsWrap = el("div", undefined, "bots-items-list");
@@ -3164,6 +3335,7 @@ const replyInput = el("textarea");
 replyInput.rows = 2;
 replyInput.placeholder = t("Send reply to latest linked external thread…");
 replyInput.setAttribute("aria-label", t("External reply"));
+replyInput.dataset.autofocus = "false";
 replyInput.value = ctx.state.drafts?.get?.(replyDraftKey) || "";
 replyInput.addEventListener("input", () => ctx.state.drafts?.set?.(replyDraftKey, replyInput.value));
 const submitReply = async () => {
@@ -3200,6 +3372,7 @@ const docCard = el("div", undefined, "inset-group bot-docs-card");
 const soulArea = el("textarea");
 soulArea.rows = 4;
 soulArea.setAttribute("aria-label", t("Soul"));
+soulArea.dataset.autofocus = "false";
 soulArea.addEventListener("input", () => (soulText = soulArea.value));
 const saveSoul = button(
 t("Save Soul"),
@@ -3212,6 +3385,7 @@ ctx.toast?.(t("Soul saved"));
 const memArea = el("textarea");
 memArea.rows = 4;
 memArea.setAttribute("aria-label", t("Memory"));
+memArea.dataset.autofocus = "false";
 memArea.addEventListener("input", () => (memoryText = memArea.value));
 const delToggle = button(
 t("Protect facts"),
@@ -3251,6 +3425,30 @@ delToggle,
 saveMem,
 );
 docSec.append(docHead);
+function liveBotSessions() {
+return botSessions.filter((s) => s.live);
+}
+function currentLiveSessionIndex(live = liveBotSessions()) {
+const idx = live.findIndex((s) => Number(s.session_id) === Number(activeSessionId));
+return idx >= 0 ? idx : live.length ? 0 : -1;
+}
+function currentLiveSession(live = liveBotSessions()) {
+const idx = currentLiveSessionIndex(live);
+return idx >= 0 ? live[idx] : null;
+}
+function sessionTabLabel(sess, idx) {
+return idx === 0 ? t("Home Chat") : sess?.label || `#${Number(sess?.session_id)}`;
+}
+function currentNeedsCount() {
+const now = Date.now();
+return (
+items.filter((i) => i.status === "needs_you" && !isActivelySnoozed(i, now)).length +
+requests.filter((r) => r.status === "pending").length
+);
+}
+function currentAutoErrCount() {
+return (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error).length;
+}
 function unmountChat() {
 if (chatHandle) {
 chatHandle.unmount?.();
@@ -3348,18 +3546,19 @@ return;
 }
 ensureBotSessionEntry(wantSid);
 if (chatMountedSid === wantSid && chatHandle) {
-chatHandle.setVisible?.(activeTab === "chat");
+chatHandle.setVisible?.(true);
 chatHandle.update?.();
 return;
 }
 unmountChat();
+lastEmptyKey = null;
 chatStage.replaceChildren();
 chatMountedSid = wantSid;
 chatHandle = M.chat.mount(chatStage, {
 ctx,
 sessionId: wantSid,
 agentIcon: M.agentIcon,
-visible: activeTab === "chat",
+visible: true,
 botSession: true,
 onSwitchTerm: () => openBotTerminalSession(ctx, t, wantSid, null),
 });
@@ -3393,7 +3592,11 @@ chatStarting = false;
 if (!ctx.signal.aborted) draw();
 }
 }
+let lastEmptyKey = null;
 function renderChatEmptyState() {
+const emptyKey = JSON.stringify([Boolean(bot?.paused), chatRefusal || "", Boolean(chatStarting), Boolean(ready())]);
+if (lastEmptyKey === emptyKey && chatStage.querySelector(".bot-chat-empty")) return;
+lastEmptyKey = emptyKey;
 const box = el("div", undefined, "bot-chat-empty");
 if (chatRefusal) {
 box.append(el("p", chatRefusal, "account-error"));
@@ -3837,133 +4040,302 @@ button(t("Save"), save, "primary"),
 );
 });
 }
-function buildBotDecisionCards() {
-const cards = [];
+function openBotSwitcherSheet() {
 const now = Date.now();
-for (const item of items) {
-if (item.status === "needs_you" && !isActivelySnoozed(item, now)) {
-cards.push({
-kind: "item",
-botId,
-hostId: null,
-title: item.title,
-subtitle: item.description || "",
-item,
-});
-}
-}
-for (const req of requests) {
-if (req.status === "pending") {
-cards.push({
-kind: "access",
-botId,
-hostId: null,
-title: req.sender_name || req.sender_id || t("Sender"),
-subtitle: req.source || "",
-request: req,
-});
-}
-}
-for (const run of upcoming?.schedules || []) {
-if (run?.last_refusal || run?.last_error) {
-const cfg = (bot?.schedules || []).find((s) => s.id === run.id);
-cards.push({
-kind: "schedule_error",
-botId,
-hostId: null,
-scheduleId: run.id,
-title: cfg?.name || run.id,
-subtitle: run.last_refusal
-? mobileBotRefusalText(run.last_refusal, t)
-: run.last_error
-? safeMsg(run.last_error, t)
-: "",
-});
-}
-}
-return cards;
-}
-function renderChatTopArea() {
-const topNodes = [];
-if (!ready()) topNodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
-if (failure) topNodes.push(el("p", failure, "account-error"));
-// Thread / session switcher bar + New Chat + Open in Terminal
-const threadBar = el("div", undefined, "bot-thread-bar");
-const liveSessions = botSessions.filter((s) => s.live);
-liveSessions.forEach((s, idx) => {
-const sid = Number(s.session_id);
-const lbl = idx === 0 ? t("Home Chat") : s.label || `#${sid}`;
-const chip = button(
-lbl,
+const botsList = sortBotsForDisplay(
+allBots.length ? allBots : bot ? [bot] : [],
+allItems,
+allBotSessions,
+);
+ctx.sheet(t("Switch bot"), [], "", (body) => {
+const grp = el("div", undefined, "sheet-group");
+if (!botsList.length) {
+grp.append(el("p", t("No other bots"), "empty"));
+} else {
+for (const b of botsList) {
+const needs = allItems.filter(
+(i) => i.owner_bot_id === b.id && i.status === "needs_you" && !isActivelySnoozed(i, now),
+).length;
+const working = allBotSessions.some((s) => s.bot_id === b.id && s.live && s.working);
+const isCurrent = b.id === botId;
+const row = button(
+"",
 () => {
-activeSessionId = sid;
-draw();
+ctx.closeSheet?.();
+if (!isCurrent) openBotDetail(ctx, b.id, b._hostId, "chat");
 },
-`filter-chip bot-thread-chip${Number(activeSessionId) === sid ? " active" : ""}`,
+"sheet-action device-sheet-row bot-switcher-row",
 );
-if (Number(activeSessionId) === sid) chip.setAttribute("aria-current", "true");
-threadBar.append(chip);
-});
-const newChatBtn = button(
-`+ ${t("New Chat")}`,
-() => startOrOpenBotChat(),
-"filter-chip bot-new-chat-btn",
-);
-newChatBtn.disabled = !ready() || !!bot?.paused || chatStarting;
-threadBar.append(newChatBtn);
-if (Number.isSafeInteger(Number(activeSessionId)) && Number(activeSessionId) > 0) {
-const termBtn = button(
-t("Terminal"),
-() => openBotTerminalSession(ctx, t, activeSessionId, null),
-"ghost small bot-term-btn",
-"terminal",
-);
-termBtn.setAttribute("aria-label", t("Open in terminal"));
-threadBar.append(termBtn);
+row.dataset.switchBotId = b.id;
+row.setAttribute("aria-label", b.name);
+const av = renderAvatar(el, b, avatars.get(b.id));
+av.classList.add("bot-avatar-sm");
+const copy = el("span", undefined, "device-sheet-copy");
+copy.append(el("strong", b.name));
+const sub = [
+refusalAgentLabel(b.agent_id, t),
+t(b.paused ? "Paused" : working ? "Working" : "Active"),
+needs > 0 ? t("{0} needs you", needs) : null,
+]
+.filter(Boolean)
+.join(" · ");
+copy.append(el("small", sub, "muted"));
+row.append(av, copy);
+if (needs > 0) {
+row.append(el("span", needs > 99 ? "99+" : String(needs), "bot-seg-badge"));
 }
-topNodes.push(threadBar);
-// Worker / activity progress strip
-const workingSessions = liveSessions.filter((s) => s.working);
-const orch = M.confirmationRequests ? M.confirmationRequests(ctx.state.snapshot?.orchestration) : { tasks: [] };
-const runningTasks = (orch.tasks || []).filter((tk) => tk.status === "running" || tk.status === "in_progress");
-if (workingSessions.length || runningTasks.length) {
-const strip = el("div", undefined, "bot-worker-strip");
-strip.append(ctx.dot("working"));
-const primary = workingSessions[0];
-const summary = workingSessions.length
-? `${t("Active workers")} · ${workingSessions.length === 1 ? t("1 active") : t("{0} active", workingSessions.length)}`
-: `${t("Active workers")} · ${runningTasks[0].title}`;
-strip.append(el("span", summary, "bot-worker-copy"));
-if (primary) {
-const stopBtn = button(
-t("Stop"),
-async () => {
-await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: Number(primary.session_id) });
+if (isCurrent) {
+const chk = el("span", undefined, "device-sheet-check");
+chk.append(ctx.icon("check"));
+row.append(chk);
+}
+grp.append(row);
+}
+}
+body.append(grp);
+if (allGroups.length) {
+body.append(el("p", t("Group chats"), "sheet-section-label eyebrow"));
+const gWrap = el("div", undefined, "sheet-group");
+for (const g of allGroups) {
+const row = button(
+"",
+() => {
+ctx.closeSheet?.();
+if (ctx.state?.ui) ctx.state.ui.activeBotGroup = { id: g.id, hostId: g._hostId ?? null };
+ctx.go("/bots");
+},
+"sheet-action device-sheet-row",
+);
+row.setAttribute("aria-label", g.name);
+const av = el("span", undefined, "bot-avatar bot-avatar-sm bot-group-avatar");
+av.append(ctx.icon("chat"));
+const copy = el("span", undefined, "device-sheet-copy");
+copy.append(el("strong", g.name));
+gWrap.append(row);
+row.append(av, copy, ctx.icon("chevronRight"));
+}
+body.append(gWrap);
+}
+const actionsGrp = el("div", undefined, "sheet-group");
+const newBotRow = button(
+t("New Bot"),
+() => {
+ctx.closeSheet?.();
+openCreateBotSheet(ctx, t, () => load(), []);
+},
+"sheet-action provider",
+"plus",
+);
+newBotRow.disabled = !ready();
+actionsGrp.append(newBotRow);
+body.append(actionsGrp);
+});
+}
+function openSessionActionSheet(sess) {
+const live = liveBotSessions();
+const idx = live.findIndex((s) => Number(s.session_id) === Number(sess.session_id));
+const sid = Number(sess.session_id);
+const lbl = sessionTabLabel(sess, idx >= 0 ? idx : 0);
+const actions = [
+{
+label: t("Open in terminal"),
+action: () => openBotTerminalSession(ctx, t, sid, null),
+},
+];
+if (live.length > 1) {
+actions.push({
+label: t("Switch chat"),
+action: () => openSessionsListSheet(),
+});
+}
+actions.push({
+label: t("Stop"),
+danger: true,
+action: async () => {
+await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: sid });
 ctx.toast?.(t("Session stopped"));
 await load(true);
 },
-"ghost small",
-);
-stopBtn.disabled = !ready();
-strip.append(stopBtn);
+});
+ctx.sheet(lbl, actions, t(sess.working ? "Working" : "Active"));
 }
-topNodes.push(strip);
-}
-// D: Bot-scoped One-Tap Decision Card Deck right above chat feed
-const deck = renderDecisionDeck(ctx, t, {
-cards: buildBotDecisionCards(),
-bots: allBots.length ? allBots : bot ? [bot] : [],
-ready,
-deckIndex,
-compact: true,
-onNext: () => {
-deckIndex++;
+function openSessionsListSheet() {
+const live = liveBotSessions();
+ctx.sheet(t("Chats ({0})", live.length), [], "", (body) => {
+const grp = el("div", undefined, "sheet-group");
+if (!live.length) {
+grp.append(el("p", t("No active chats"), "empty"));
+} else {
+live.forEach((s, idx) => {
+const sid = Number(s.session_id);
+const isActive = Number(activeSessionId) === sid;
+const lbl = sessionTabLabel(s, idx);
+const row = el("div", undefined, "tab-sheet-row");
+const mainBtn = button(
+"",
+() => {
+activeSessionId = sid;
+ctx.closeSheet?.();
 draw();
 },
-onReload: () => load(true),
+"tab-sheet-main",
+);
+mainBtn.dataset.sessionTabId = String(sid);
+mainBtn.setAttribute("aria-label", lbl);
+const copy = el("span", undefined, "tab-sheet-copy");
+copy.append(
+el("strong", lbl),
+el("small", t(s.working ? "Working" : "Active"), "muted"),
+);
+mainBtn.append(ctx.dot(s.working ? "working" : "connected"), copy);
+if (isActive) {
+const chk = el("span", undefined, "tab-sheet-check");
+chk.append(ctx.icon("check"));
+mainBtn.append(chk);
+}
+const stopBtn = button(
+t("Stop"),
+async () => {
+await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: sid });
+ctx.toast?.(t("Session stopped"));
+ctx.closeSheet?.();
+await load(true);
+},
+"icon-button tab-sheet-close",
+"close",
+);
+stopBtn.disabled = !ready();
+row.append(mainBtn, stopBtn);
+grp.append(row);
 });
-if (deck) topNodes.push(deck);
-sync(chatTop, topNodes);
+}
+body.append(grp);
+const actionsGrp = el("div", undefined, "sheet-group");
+const newChatRow = button(
+t("New Chat"),
+() => {
+ctx.closeSheet?.();
+return startOrOpenBotChat();
+},
+"sheet-action provider",
+"plus",
+);
+newChatRow.disabled = !ready() || !!bot?.paused || chatStarting;
+actionsGrp.append(newChatRow);
+if (Number.isSafeInteger(Number(activeSessionId)) && Number(activeSessionId) > 0) {
+actionsGrp.append(
+button(
+t("Open in terminal"),
+() => {
+ctx.closeSheet?.();
+return openBotTerminalSession(ctx, t, activeSessionId, null);
+},
+"sheet-action provider",
+"terminal",
+),
+);
+}
+body.append(actionsGrp);
+});
+}
+function openBotMoreSheet() {
+const live = liveBotSessions();
+const activeSess = currentLiveSession(live);
+const workingTarget =
+(activeSess?.working ? activeSess : null) || live.find((s) => s.working) || null;
+const actions = [];
+if (activeSess) {
+actions.push({
+label: t("Open in terminal"),
+action: () => openBotTerminalSession(ctx, t, Number(activeSess.session_id), null),
+});
+}
+if (workingTarget) {
+actions.push({
+label: t("Stop active work"),
+danger: true,
+action: async () => {
+await ctx.rpc({
+action: "bots.sessions.stop",
+bot_id: botId,
+session_id: Number(workingTarget.session_id),
+});
+ctx.toast?.(t("Session stopped"));
+await load(true);
+},
+});
+}
+actions.push(
+{
+label: t("Switch bot"),
+action: () => openBotSwitcherSheet(),
+},
+{
+label: t("Refresh"),
+action: () => load(true),
+},
+);
+if (bot) {
+actions.push({
+label: t(bot.paused ? "Resume" : "Pause"),
+action: async () => {
+const nextPaused = !bot.paused;
+const res = await ctx.rpc({ action: "bots.update", bot_id: botId, paused: nextPaused });
+if (res?.bot) bot = res.bot;
+ctx.toast?.(t(nextPaused ? "Bot paused" : "Bot resumed"));
+await refreshHost(ctx, null).catch(() => {});
+await load(true);
+},
+});
+}
+actions.push({
+label: t("Bot settings"),
+action: () => openBotPanelSheet("settings"),
+});
+ctx.sheet(bot?.name || botId, actions, headerSub.textContent || "");
+}
+function renderBotPanel() {
+if (!panelOpen) return;
+const needsCount = currentNeedsCount();
+const autoErrCount = currentAutoErrCount();
+const badgeMap = { work: needsCount, automations: autoErrCount, settings: 0 };
+for (const [id, refs] of panelTabButtons) {
+const isActive = panelTab === id;
+refs.btn.className = `bot-seg-tab${isActive ? " active" : ""}`;
+refs.btn.setAttribute("aria-selected", String(isActive));
+const count = badgeMap[id] || 0;
+refs.badge.hidden = !(count > 0);
+if (count > 0) refs.badge.textContent = count > 99 ? "99+" : String(count);
+}
+const titleEl = panelWrap.parentElement?.querySelector?.("#sheet-title");
+if (titleEl && bot?.name && titleEl.textContent !== bot.name) {
+titleEl.textContent = bot.name;
+}
+const paneNodes =
+panelTab === "work"
+? renderWorkNodes()
+: panelTab === "automations"
+? renderAutomationsNodes()
+: renderSettingsNodes();
+sync(panelBody, paneNodes);
+}
+function openBotPanelSheet(initialTab = "work") {
+panelTab = ["work", "automations", "settings"].includes(initialTab) ? initialTab : "work";
+panelOpen = true;
+if (panelTab === "settings" && !soulLoaded && !soulLoading) loadDocs().catch(() => {});
+ctx.sheet(bot?.name || botId, [], "", (body, sheetSignal) => {
+body.append(panelWrap);
+renderBotPanel();
+sheetSignal?.addEventListener?.(
+"abort",
+() => {
+panelOpen = false;
+panelBtn.classList.toggle("active", false);
+},
+{ once: true },
+);
+});
+panelBtn.classList.toggle("active", true);
 }
 function renderWorkNodes() {
 const nodes = [];
@@ -4248,90 +4620,93 @@ return nodes;
 }
 function draw() {
 if (ctx.signal.aborted) return;
-refreshBtn.disabled = loading || !ready();
-if (bot) {
-const working = botSessions.some((s) => s.live && s.working);
-headerSub.textContent = [
+const live = liveBotSessions();
+const needsCount = currentNeedsCount();
+const working = live.some((s) => s.working);
+// Header: avatar (20px) + bot name + 1-line sub meta + 2 icon buttons
+const avatarNode = renderAvatar(el, bot || { id: botId, name: botId }, avatars.get(botId));
+avatarNode.classList.add("bot-avatar-xs");
+headerAvatarSlot.replaceChildren(avatarNode);
+if (h1) h1.textContent = bot?.name || botId;
+headerTitleBtn.setAttribute("aria-label", `${bot?.name || botId} · ${t("Switch bot")}`);
+const metaTone = !ready()
+? "unknown"
+: bot?.paused
+? "unknown"
+: needsCount > 0
+? "waiting"
+: working
+? "working"
+: "connected";
+headerMetaDot.className = `status-dot ${metaTone} bot-header-meta-dot`;
+headerSub.textContent = !ready()
+? t("Not connected")
+: bot
+? [
 refusalAgentLabel(bot.agent_id, t),
-bot.model || null,
 t(bot.paused ? "Paused" : working ? "Working" : "Active"),
 ]
 .filter(Boolean)
-.join(" · ");
-}
-// C: Compact Avatar Quick-Switch Rail inside Bot Workspace
-const rail = renderBotRail(ctx, t, {
-bots: allBots.length ? allBots : bot ? [bot] : [],
-groups: allGroups,
-items: allItems,
-botSessions: allBotSessions,
-avatars,
-activeBotId: botId,
-activeGroupId: null,
-ready,
-onPickBot: (b) => {
-if (b.id !== botId) openBotDetail(ctx, b.id, b._hostId, activeTab);
-},
-onPickGroup: (g) => {
-if (ctx.state?.ui) ctx.state.ui.activeBotGroup = { id: g.id, hostId: g._hostId ?? null };
-ctx.go("/bots");
-},
-onNewBot: () => openCreateBotSheet(ctx, t, () => load(true), []),
-});
-railMount.replaceChildren(...(rail ? [rail] : []));
-railMount.hidden = !rail;
-// A: 4 Segment Tabs (Chat / Work / Automations / Settings)
-const now = Date.now();
-const needsCount = items.filter((i) => i.status === "needs_you" && !isActivelySnoozed(i, now)).length + requests.filter((r) => r.status === "pending").length;
-const autoErrCount = (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error).length;
-const tabDefs = [
-["chat", t("Chat"), 0, false],
-["work", t("Work"), needsCount, false],
-["automations", t("Automations"), autoErrCount, true],
-["settings", t("Settings"), 0, false],
-];
-const tabNodes = tabDefs.map(([id, lbl, badgeCount, isErr]) => {
-const b = button(
-"",
-() => {
-activeTab = id;
-if (id === "settings" && !soulLoaded && !soulLoading) loadDocs().catch(() => {});
-draw();
-},
-`bot-seg-tab${activeTab === id ? " active" : ""}`,
+.join(" · ")
+: "";
+panelBtnBadge.hidden = !(needsCount > 0);
+if (needsCount > 0) panelBtnBadge.textContent = needsCount > 99 ? "99+" : String(needsCount);
+panelBtn.setAttribute(
+"aria-label",
+needsCount > 0 ? t("Items, {0} need you", needsCount) : t("Items"),
 );
-b.setAttribute("role", "tab");
-b.setAttribute("aria-selected", String(activeTab === id));
-b.setAttribute("aria-label", lbl);
-b.dataset.botTab = id;
-b.append(el("span", lbl));
-if (badgeCount > 0) {
-b.append(el("span", badgeCount > 99 ? "99+" : String(badgeCount), `bot-seg-badge${isErr ? " blocked" : ""}`));
+panelBtn.classList.toggle("active", panelOpen);
+// Build top chrome stack: Header -> conditional 1-line needs strip (0px if 0) -> single 44px tab bar (>=1 live session) -> chatStage
+const screenNodes = [header];
+if (needsCount > 0) {
+needsMsg.textContent =
+needsCount === 1 ? t("1 item needs you") : t("{0} items need you", needsCount);
+screenNodes.push(needsStrip);
 }
-return b;
-});
-sync(tabBar, tabNodes);
-const inChat = activeTab === "chat";
-chatPane.hidden = !inChat;
-list.hidden = inChat;
-if (inChat) {
-renderChatTopArea();
+if (live.length > 0) {
+const activeIdx = currentLiveSessionIndex(live);
+const activeSess = live[activeIdx];
+const activeLbl = sessionTabLabel(activeSess, activeIdx);
+tabStatusDot.className = `status-dot ${activeSess.working ? "working" : "connected"}`;
+tabTitleEl.textContent = activeLbl;
+tabPressBtn.setAttribute(
+"aria-label",
+`${activeLbl}, ${t(activeSess.working ? "Working" : "Active")}`,
+);
+tabCountBox.textContent = String(live.length);
+const otherAlert = live.some(
+(s) => Number(s.session_id) !== Number(activeSess.session_id) && (s.working || s.needs_you || s.state === "Waiting"),
+);
+tabCountAlert.hidden = !otherAlert;
+const countLbl = live.length === 1 ? t("1 chat") : t("{0} chats", live.length);
+tabCountBtn.setAttribute(
+"aria-label",
+otherAlert ? `${countLbl}, ${t("another chat is active")}` : countLbl,
+);
+tabAddBtn.disabled = !ready() || !!bot?.paused || chatStarting;
+screenNodes.push(sessionTabBar);
+}
+const noticeNodes = [];
+if (!ready()) noticeNodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
+if (failure) noticeNodes.push(el("p", failure, "account-error"));
+if (noticeNodes.length) {
+sync(statusNotice, noticeNodes);
+screenNodes.push(statusNotice);
+}
+screenNodes.push(chatStage);
+sync(screen, screenNodes);
 ensureChatMounted();
-} else {
-chatHandle?.setVisible?.(false);
-const paneNodes =
-activeTab === "work"
-? renderWorkNodes()
-: activeTab === "automations"
-? renderAutomationsNodes()
-: renderSettingsNodes();
-sync(list, paneNodes);
-}
+if (panelOpen) renderBotPanel();
 }
 hydrateDetailFromCache();
 if (ready()) loading = true;
 draw();
 load();
+if (["work", "automations", "settings"].includes(pendingTab)) {
+Promise.resolve().then(() => {
+if (!ctx.signal.aborted && !panelOpen) openBotPanelSheet(pendingTab);
+});
+}
 return {
 update() {
 const nowReady = ready();
@@ -4342,12 +4717,11 @@ return;
 }
 wasReady = nowReady;
 draw();
-if (activeTab === "chat") {
 ensureBotSessionEntry(Number(activeSessionId));
 chatHandle?.update?.();
-}
 },
 cleanup() {
+panelOpen = false;
 unmountChat();
 },
 };
