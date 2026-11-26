@@ -1490,7 +1490,7 @@
                           C.concat(
                             v(1),
                             v(1),
-                            v((1n << 56n) | 1n | 4n | 4096n | 8192n),
+                            v((1n << 56n) | (1n << 24n) | 1n | 4n | 4096n | 8192n),
                             v(0),
                             text("krill-mobile-grid"),
                           ),
