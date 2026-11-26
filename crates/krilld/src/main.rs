@@ -142,20 +142,24 @@ fn main() -> ExitCode {
             }
         }
         Err(error) => {
-            let (reason, capture_error) = classify_listener_error(&error, &path);
+            let class = classify_listener_error(&error, &path);
             tracing::error!(
                 kind = ?error.kind(),
                 errno = error.raw_os_error(),
-                reason,
+                reason = class.reason,
+                fatal_config = class.fatal_config,
                 "listener failed"
             );
-            if capture_error && should_report_listener_failure(linked, &path) {
+            if class.capture_error && should_report_listener_failure(linked, &path) {
                 krill_proto::error_reporting::capture(
                     krill_proto::error_reporting::Process::Daemon,
                     krill_proto::error_reporting::Code::DaemonListenerFailed,
                     file!(),
                     line!(),
                 );
+            }
+            if linked && class.fatal_config {
+                return ExitCode::from(daemon::KRILLD_FATAL_CONFIG);
             }
             return ExitCode::FAILURE;
         }
@@ -510,7 +514,14 @@ fn should_init_log_with(
     }
 }
 
-fn classify_listener_error(error: &io::Error, path: &Path) -> (Option<&'static str>, bool) {
+#[derive(Debug, PartialEq, Eq)]
+struct ListenerErrorClass {
+    reason: Option<&'static str>,
+    capture_error: bool,
+    fatal_config: bool,
+}
+
+fn classify_listener_error(error: &io::Error, path: &Path) -> ListenerErrorClass {
     match error.kind() {
         io::ErrorKind::InvalidInput => {
             let message = error.to_string();
@@ -524,16 +535,33 @@ fn classify_listener_error(error: &io::Error, path: &Path) -> (Option<&'static s
             } else {
                 "invalid socket path"
             };
-            (Some(reason), false)
+            ListenerErrorClass {
+                reason: Some(reason),
+                capture_error: false,
+                fatal_config: true,
+            }
         }
         io::ErrorKind::PermissionDenied
             if error
                 .to_string()
                 .contains("socket directory must be a 0700 directory") =>
         {
-            (Some("socket directory must be a 0700 directory"), true)
+            ListenerErrorClass {
+                reason: Some("socket directory must be a 0700 directory"),
+                capture_error: true,
+                fatal_config: true,
+            }
         }
-        _ => (None, true),
+        io::ErrorKind::PermissionDenied => ListenerErrorClass {
+            reason: None,
+            capture_error: true,
+            fatal_config: true,
+        },
+        _ => ListenerErrorClass {
+            reason: None,
+            capture_error: true,
+            fatal_config: false,
+        },
     }
 }
 
@@ -563,23 +591,39 @@ mod tests {
         );
         assert_eq!(
             classify_listener_error(&too_long, Path::new("/tmp/very/long/socket.sock")),
-            (Some("socket path must be shorter than 100 bytes"), false)
+            ListenerErrorClass {
+                reason: Some("socket path must be shorter than 100 bytes"),
+                capture_error: false,
+                fatal_config: true,
+            }
         );
 
         let missing_parent = io::Error::from(io::ErrorKind::InvalidInput);
         assert_eq!(
             classify_listener_error(&missing_parent, Path::new("krilld.sock")),
-            (Some("socket path must include a parent directory"), false)
+            ListenerErrorClass {
+                reason: Some("socket path must include a parent directory"),
+                capture_error: false,
+                fatal_config: true,
+            }
         );
         assert_eq!(
             classify_listener_error(&missing_parent, Path::new("/")),
-            (Some("socket path must include a parent directory"), false)
+            ListenerErrorClass {
+                reason: Some("socket path must include a parent directory"),
+                capture_error: false,
+                fatal_config: true,
+            }
         );
 
         let generic_invalid = io::Error::new(io::ErrorKind::InvalidInput, "bad input");
         assert_eq!(
             classify_listener_error(&generic_invalid, Path::new("/tmp/run/krilld.sock")),
-            (Some("invalid socket path"), false)
+            ListenerErrorClass {
+                reason: Some("invalid socket path"),
+                capture_error: false,
+                fatal_config: true,
+            }
         );
 
         let bad_mode = io::Error::new(
@@ -588,13 +632,31 @@ mod tests {
         );
         assert_eq!(
             classify_listener_error(&bad_mode, Path::new("/tmp/run/krilld.sock")),
-            (Some("socket directory must be a 0700 directory"), true)
+            ListenerErrorClass {
+                reason: Some("socket directory must be a 0700 directory"),
+                capture_error: true,
+                fatal_config: true,
+            }
+        );
+
+        let os_denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            classify_listener_error(&os_denied, Path::new("/tmp/run/krilld.sock")),
+            ListenerErrorClass {
+                reason: None,
+                capture_error: true,
+                fatal_config: true,
+            }
         );
 
         let other = io::Error::from(io::ErrorKind::NotFound);
         assert_eq!(
             classify_listener_error(&other, Path::new("/tmp/run/krilld.sock")),
-            (None, true)
+            ListenerErrorClass {
+                reason: None,
+                capture_error: true,
+                fatal_config: false,
+            }
         );
     }
 
