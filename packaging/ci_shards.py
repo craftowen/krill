@@ -41,7 +41,7 @@ SHARDS = {
 # binary's own package. Built with `--profile test` so they reuse the exact
 # `[profile.test]` dependency graph without compiling duplicate dev artifacts.
 HELPER_BINS = {
-    "gui": ("krill-holder", "krilld", "krill"),
+    "gui": ("krill-holder", "krilld", "krill", "krill-link"),
     "daemon": ("krill-holder", "krill"),
     "core": ("krilld",),
 }
