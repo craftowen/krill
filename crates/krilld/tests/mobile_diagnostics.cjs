@@ -1805,3 +1805,111 @@ test("non-retryable HTTP 400 drops rejected batch immediately without retrying",
   assert.equal(h.requests.length, 1, "MB-33: HTTP 400 batch dropped without retries");
   assert.equal(h.timers.size, 0);
 });
+test("offline asset errors are suppressed and offline WebSocket drops classify as network_offline", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  h.context.navigator.onLine = false;
+  h.emit("error", {
+    target: {
+      src: "https://krill-mobile.pages.dev/m/0123456789abcdef/screens/bots.js",
+    },
+  });
+  await settle(h);
+  assert.equal(h.events().length, 0);
+
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 1);
+  socket.emit("close", { code: 1006 });
+  await pending;
+  await settle(h);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_connect_failed");
+  assert.equal(h.events()[0].diagnostics.reason, "network_offline");
+  t.close();
+});
+test("WS 1008 persists auth_blocked across reload until explicit reconnect", async () => {
+  const h = harness();
+  relayHost(h);
+  h.diagnostics.setEnabled(true);
+  const endpoint = h.context.KrillMobile.transport.bootstrap(),
+    peer = endpoint.forHost(endpoint.profiles()[0].id),
+    t = h.transport({ endpoint: peer, credentials: peer.credentials }),
+    { pending, socket } = await h.start(t, 2);
+  socket.emit("close", { code: 1008 });
+  await pending;
+  await settle(h);
+  assert.equal(t.blocked, true);
+  assert.equal(h.events().length, 1);
+  assert.equal(h.events()[0].error_code, "mobile_auth_failed");
+  t.close();
+
+  // Reloading bootstrap() reads persisted auth_blocked and refuses doomed reconnects.
+  const socketsBefore = h.sockets.length,
+    endpoint2 = h.context.KrillMobile.transport.bootstrap(),
+    peer2 = endpoint2.forHost(endpoint2.profiles()[0].id),
+    t2 = h.transport({ endpoint: peer2, credentials: peer2.credentials });
+  await t2.connect();
+  await settle(h);
+  assert.equal(t2.blocked, true);
+  assert.equal(h.sockets.length, socketsBefore);
+  assert.equal(h.events().length, 1);
+
+  // Explicit reconnect clears persisted auth_blocked and attempts a fresh connection.
+  t2.reconnect();
+  await flush();
+  assert.equal(t2.blocked, false);
+  assert.equal(h.sockets.length, socketsBefore + 1);
+  t2.close();
+});
+test("long RPC actions get 45s deadline and outdated-daemon replies are definitive without rpc error", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  const t = h.transport(),
+    { pending, socket } = await h.start(t, 4);
+  h.response(socket, {
+    sessions: [],
+    etag: "e1",
+    capabilities: { change_feed: true },
+  });
+  await pending;
+
+  const handoff = t.rpc({ action: "handoff", session: 1 });
+  await flush();
+  await h.tick(25000);
+  h.response(socket, { ok: true });
+  assert.equal((await handoff).ok, true);
+  t.close();
+
+  // Non-kind-6 reply ("Update the desktop for mobile workflows") is definitive -> zero reports.
+  const hOld = harness();
+  hOld.diagnostics.setEnabled(true);
+  const tOld = hOld.transport(),
+    sOld = await hOld.start(tOld, 4);
+  hOld.response(sOld.socket, { sessions: [] });
+  await sOld.pending;
+  const oldReply = tOld.rpc({ action: "git" });
+  await flush();
+  sOld.socket.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 101, 5]) });
+  await assert.rejects(oldReply, /Update the desktop/);
+  tOld.close();
+  await settle(hOld);
+  assert.equal(
+    hOld.events().filter((e) => e.error_code === "mobile_rpc_failed").length,
+    0,
+  );
+
+  // Framing corruption (bytes[4] !== 101) disconnects socket to prevent stream desync.
+  const h2 = harness();
+  h2.diagnostics.setEnabled(true);
+  const t2 = h2.transport(),
+    s2 = await h2.start(t2, 4);
+  h2.response(s2.socket, { sessions: [] });
+  await s2.pending;
+  const bad = t2.rpc({ action: "git" });
+  await flush();
+  s2.socket.emit("message", { data: Uint8Array.from([0, 0, 0, 0, 99]) });
+  await assert.rejects(bad, /Unexpected daemon response/);
+  assert.equal(t2.ready, false);
+  t2.close();
+});
+
