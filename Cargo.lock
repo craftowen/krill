@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "krill-hosts",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "gpui-component",
@@ -3917,7 +3917,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "krill-log",
@@ -3942,7 +3942,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "embed-resource",
  "iroh",
@@ -4048,11 +4048,11 @@ dependencies = [
 
 [[package]]
 name = "krill-version"
-version = "0.3.28"
+version = "0.3.29"
 
 [[package]]
 name = "krilld"
-version = "0.3.28"
+version = "0.3.29"
 dependencies = [
  "aes",
  "alacritty_terminal",
