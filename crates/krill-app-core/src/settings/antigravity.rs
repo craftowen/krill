@@ -30,6 +30,7 @@ pub(super) enum AntigravityAction {
     AddCurrent,
     Select(String),
     Remove(String),
+    ResetLockedVault,
     Usage,
 }
 
@@ -174,6 +175,22 @@ impl SettingsView {
                             match crate::accounts::antigravity_accounts_target(
                                 &target,
                                 AntigravityAccountOp::Remove { account_id },
+                            ) {
+                                Ok(state) => Ok((state, None)),
+                                Err(err) => {
+                                    let observed = crate::accounts::antigravity_accounts_target(
+                                        &target,
+                                        AntigravityAccountOp::List,
+                                    )
+                                    .ok();
+                                    Err((err, observed))
+                                }
+                            }
+                        }
+                        AntigravityAction::ResetLockedVault => {
+                            match crate::accounts::antigravity_accounts_target(
+                                &target,
+                                AntigravityAccountOp::ResetLockedVault,
                             ) {
                                 Ok(state) => Ok((state, None)),
                                 Err(err) => {
@@ -514,6 +531,59 @@ impl SettingsView {
             );
         }
 
+        // 1b. Locked legacy vault warning + one-click recovery row (keeps host login visible below)
+        if state.is_some_and(|s| s.vault_locked) {
+            rows.push(
+                div()
+                    .id("admin-agy-row-vault-locked")
+                    .debug_selector(|| "admin-agy-row-vault-locked".into())
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_2p5()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(p.warning)
+                                    .child(Icon::new(IconName::CircleAlert).xsmall())
+                                    .child(text::AGY_VAULT_LOCKED_TITLE.get()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(text::AGY_VAULT_LOCKED_DESC.get()),
+                            ),
+                    )
+                    .child(
+                        layout::secondary("admin-agy-recover-vault", text::AGY_VAULT_RECOVER.get())
+                            .xsmall()
+                            .disabled(busy)
+                            .debug_selector(|| "admin-agy-recover-vault".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_antigravity_action(
+                                    AntigravityAction::ResetLockedVault,
+                                    cx,
+                                );
+                            })),
+                    ),
+            );
+        }
+
         // 2. Signed-out OR Current unsaved login row (`AntigravityTerminalAccountRows.tsx:527-579`)
         if let Some(state) = state {
             if state.current_account.is_none() {
@@ -601,6 +671,27 @@ impl SettingsView {
                     || text::AGY_USAGE_REFRESH.get().to_owned(),
                     format_usage_reading,
                 );
+                let mut action_row = div().flex().items_center().gap_1p5().flex_none().child(
+                    layout::ghost("admin-agy-current-usage", usage_label)
+                        .xsmall()
+                        .icon(IconName::RefreshCw)
+                        .disabled(busy)
+                        .debug_selector(|| "admin-agy-current-usage".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.run_antigravity_action(AntigravityAction::Usage, cx);
+                        })),
+                );
+                if !state.vault_locked {
+                    action_row = action_row.child(
+                        layout::secondary("admin-agy-save-current", text::AGY_SAVE_SHORT.get())
+                            .xsmall()
+                            .disabled(busy)
+                            .debug_selector(|| "admin-agy-save-current".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_antigravity_action(AntigravityAction::AddCurrent, cx);
+                            })),
+                    );
+                }
                 rows.push(
                     div()
                         .id("admin-agy-row-current")
@@ -643,43 +734,7 @@ impl SettingsView {
                                 )
                                 .child(detail_node),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .flex_none()
-                                .child(
-                                    layout::ghost("admin-agy-current-usage", usage_label)
-                                        .xsmall()
-                                        .icon(IconName::RefreshCw)
-                                        .disabled(busy)
-                                        .debug_selector(|| "admin-agy-current-usage".into())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.run_antigravity_action(
-                                                AntigravityAction::Usage,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .child(
-                                    layout::secondary(
-                                        "admin-agy-save-current",
-                                        text::AGY_SAVE_SHORT.get(),
-                                    )
-                                    .xsmall()
-                                    .disabled(busy)
-                                    .debug_selector(|| "admin-agy-save-current".into())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.run_antigravity_action(
-                                                AntigravityAction::AddCurrent,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                ),
-                        ),
+                        .child(action_row),
                 );
             }
 

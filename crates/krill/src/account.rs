@@ -12,7 +12,7 @@ use krill_proto::usage::{
     AccountsSnapshot, FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | save agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
+const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | save agy [--json] | recover agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -42,7 +42,17 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         ["save", "agy" | "antigravity"] | ["save", "agy" | "antigravity", "--json"]
     ) {
         let json = strs.len() == 3;
-        return run_save_antigravity(json);
+        return run_antigravity_op(krill_proto::usage::AntigravityAccountOp::AddCurrent, json);
+    }
+    if matches!(
+        strs.as_slice(),
+        ["recover", "agy" | "antigravity"] | ["recover", "agy" | "antigravity", "--json"]
+    ) {
+        let json = strs.len() == 3;
+        return run_antigravity_op(
+            krill_proto::usage::AntigravityAccountOp::ResetLockedVault,
+            json,
+        );
     }
     if let ["login", provider, id] = strs.as_slice() {
         return match login(provider, id) {
@@ -352,9 +362,8 @@ fn run_remove_antigravity(account_id: &str) -> ExitCode {
     }
 }
 
-fn run_save_antigravity(json: bool) -> ExitCode {
-    let req =
-        UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::AddCurrent);
+fn run_antigravity_op(op: krill_proto::usage::AntigravityAccountOp, json: bool) -> ExitCode {
+    let req = UsageRequest::AntigravityAccounts(op);
     match exchange(&req) {
         Ok(UsageReply::AntigravityAccounts(Ok(state))) => {
             if json {
@@ -684,5 +693,14 @@ mod tests {
         let rendered = snapshot_to_json(&snap).unwrap();
         let back: AccountsSnapshot = serde_json::from_str(&rendered).unwrap();
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn recover_subcommand_is_documented_and_rejects_other_providers() {
+        assert!(USAGE.contains("recover agy [--json]"));
+        assert_eq!(
+            run(&[OsString::from("recover"), OsString::from("claude")]),
+            ExitCode::from(2)
+        );
     }
 }

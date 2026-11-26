@@ -31,7 +31,7 @@ use super::codec::{
 };
 use super::store::{
     AntigravityAccountStore, AntigravityAccountVault, EncryptedAntigravityAccountStore,
-    StoredAntigravityAccount, vault_path,
+    StoredAntigravityAccount, VaultError, vault_path,
 };
 use crate::bots::http_client::{HttpMethod, HttpRequest, SsrfPolicy};
 use crate::session::lock;
@@ -170,6 +170,37 @@ struct RewrittenLoginCache {
     identity: Option<AntigravityCredentialIdentity>,
 }
 
+enum ReconcileError {
+    LegacyVaultLocked { status: i32 },
+    Other(String),
+}
+
+impl ReconcileError {
+    fn into_message(self) -> String {
+        match self {
+            Self::LegacyVaultLocked { status } => {
+                VaultError::LegacyAclLocked { status }.into_message()
+            }
+            Self::Other(msg) => msg,
+        }
+    }
+}
+
+impl From<VaultError> for ReconcileError {
+    fn from(err: VaultError) -> Self {
+        match err {
+            VaultError::LegacyAclLocked { status } => Self::LegacyVaultLocked { status },
+            VaultError::Other(msg) => Self::Other(msg),
+        }
+    }
+}
+
+impl From<String> for ReconcileError {
+    fn from(msg: String) -> Self {
+        Self::Other(msg)
+    }
+}
+
 /// Mirrors Orca's `AntigravityAccountService` 1:1.
 pub(crate) struct AntigravityAccountService {
     store: Box<dyn AntigravityAccountStore>,
@@ -209,13 +240,75 @@ impl AntigravityAccountService {
 
     pub(crate) fn list_accounts(&self) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
-        let (vault, current) = self.reconcile(None)?;
-        Ok(Self::build_state(&vault, current.as_ref()))
+        match self.reconcile(None) {
+            Ok((vault, current)) => Ok(Self::build_state(&vault, current.as_ref(), false)),
+            Err(ReconcileError::LegacyVaultLocked { status }) => {
+                tracing::warn!(
+                    status,
+                    "Antigravity vault is locked by a previous macOS ad-hoc Keychain ACL; returning host login with vault_locked=true"
+                );
+                let current = self.backend.read()?;
+                Ok(Self::build_state(
+                    &AntigravityAccountVault::default(),
+                    current.as_ref(),
+                    true,
+                ))
+            }
+            Err(ReconcileError::Other(msg)) => Err(msg),
+        }
+    }
+
+    pub(crate) fn reset_locked_vault(&self) -> Result<AntigravityAccountState, String> {
+        let _guard = lock(&self.op_lock);
+        // Never wipe a healthy, already-readable vault.
+        if self.store.read().is_ok() {
+            let (vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
+            return Ok(Self::build_state(&vault, current.as_ref(), false));
+        }
+        self.store.reset_locked_vault()?;
+        let current = self.backend.read()?;
+        let mut vault = self.store.read().map_err(VaultError::into_message)?;
+        let Some(current) = current else {
+            return Ok(Self::build_state(&vault, None, false));
+        };
+        let identity = if let Some(id) = current.identity.clone() {
+            Some(id)
+        } else if let Ok(id) = (self.lookup_identity)(&current.access_token) {
+            let reread = self.backend.read()?;
+            if reread.as_ref().map(|c| c.contents.as_str()) == Some(current.contents.as_str()) {
+                Some(id)
+            } else {
+                None
+            }
+        } else {
+            tracing::warn!(
+                "Antigravity locked vault was reset, but Google userinfo lookup failed; leaving vault unlocked for manual save"
+            );
+            None
+        };
+        if let Some(identity) = identity {
+            let mut identified = current;
+            identified.identity = Some(identity.clone());
+            let timestamp = (self.now_ms)();
+            vault.accounts.push(StoredAntigravityAccount {
+                id: generate_uuid_v4(),
+                email: identity.email.or_else(|| identified.email_hint.clone()),
+                subject: Some(identity.subject),
+                auth_method: identified.auth_method.clone(),
+                created_at: timestamp,
+                updated_at: timestamp,
+                credentials: identified.contents.clone(),
+                usage: None,
+            });
+            self.store.write(&vault)?;
+            return Ok(Self::build_state(&vault, Some(&identified), false));
+        }
+        Ok(Self::build_state(&vault, Some(&current), false))
     }
 
     pub(crate) fn add_current_account(&self) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
-        let (vault, current) = self.reconcile(None)?;
+        let (vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
         let Some(current) = current else {
             return Err(
                 "Sign in with agy on this execution host, then save the current account."
@@ -227,7 +320,7 @@ impl AntigravityAccountService {
             .iter()
             .any(|entry| account_matches(entry, &current))
         {
-            return Ok(Self::build_state(&vault, Some(&current)));
+            return Ok(Self::build_state(&vault, Some(&current), false));
         }
         let identity = if let Some(id) = current.identity.clone() {
             id
@@ -244,7 +337,7 @@ impl AntigravityAccountService {
         };
         let mut identified = current;
         identified.identity = Some(identity.clone());
-        let mut latest = self.store.read()?;
+        let mut latest = self.store.read().map_err(VaultError::into_message)?;
         if !latest
             .accounts
             .iter()
@@ -264,13 +357,15 @@ impl AntigravityAccountService {
         }
         self.update_snapshot(&mut latest, &identified);
         self.store.write(&latest)?;
-        Ok(Self::build_state(&latest, Some(&identified)))
+        Ok(Self::build_state(&latest, Some(&identified), false))
     }
 
     pub(crate) fn select_account(&self, id: &str) -> Result<AntigravityAccountState, String> {
         crate::usage::direct::agy::run_account_op(|| {
             let _guard = lock(&self.op_lock);
-            let (vault, current) = self.reconcile(Some(id))?;
+            let (vault, current) = self
+                .reconcile(Some(id))
+                .map_err(ReconcileError::into_message)?;
             let selected = vault
                 .accounts
                 .iter()
@@ -292,7 +387,7 @@ impl AntigravityAccountService {
                         .to_owned(),
                 );
             };
-            let mut latest = self.store.read()?;
+            let mut latest = self.store.read().map_err(VaultError::into_message)?;
             if !latest
                 .accounts
                 .iter()
@@ -306,13 +401,13 @@ impl AntigravityAccountService {
             latest.selected_account_id = Some(id.to_owned());
             self.update_snapshot(&mut latest, &readback);
             self.store.write(&latest)?;
-            Ok(Self::build_state(&latest, Some(&readback)))
+            Ok(Self::build_state(&latest, Some(&readback), false))
         })
     }
 
     pub(crate) fn remove_account(&self, id: &str) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
-        let (mut vault, current) = self.reconcile(None)?;
+        let (mut vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
         let account = vault
             .accounts
             .iter()
@@ -332,13 +427,23 @@ impl AntigravityAccountService {
             vault.selected_account_id = None;
         }
         self.store.write(&vault)?;
-        Ok(Self::build_state(&vault, current.as_ref()))
+        Ok(Self::build_state(&vault, current.as_ref(), false))
     }
 
     #[cfg(any(not(target_os = "windows"), test))]
     pub(crate) fn prepare_for_launch(&self) -> Result<(), String> {
         let _guard = lock(&self.op_lock);
-        let (vault, current) = self.reconcile(None)?;
+        let (vault, current) = match self.reconcile(None) {
+            Ok(pair) => pair,
+            Err(ReconcileError::LegacyVaultLocked { status }) => {
+                tracing::warn!(
+                    status,
+                    "skipping Antigravity account launch check because legacy vault is ACL-locked"
+                );
+                return Ok(());
+            }
+            Err(ReconcileError::Other(msg)) => return Err(msg),
+        };
         let Some(selected_id) = vault.selected_account_id.as_deref() else {
             return Ok(());
         };
@@ -354,10 +459,23 @@ impl AntigravityAccountService {
 
     pub(crate) fn begin_usage_read(&self) -> Result<Option<AntigravityUsageReadStart>, String> {
         let _guard = lock(&self.op_lock);
-        if self.store.read()?.accounts.is_empty() {
-            return Ok(None);
+        match self.store.read() {
+            Ok(vault) if vault.accounts.is_empty() => return Ok(None),
+            Ok(_) => {}
+            Err(VaultError::LegacyAclLocked { status }) => {
+                tracing::warn!(
+                    status,
+                    "skipping Antigravity vault usage attribution because legacy vault is ACL-locked"
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into_message()),
         }
-        let (vault, current) = self.reconcile(None)?;
+        let (vault, current) = match self.reconcile(None) {
+            Ok(pair) => pair,
+            Err(ReconcileError::LegacyVaultLocked { .. }) => return Ok(None),
+            Err(ReconcileError::Other(msg)) => return Err(msg),
+        };
         let login = current.as_ref().map(|curr| {
             let acc = vault.accounts.iter().find(|e| account_matches(e, curr));
             antigravity_usage_login(acc, curr)
@@ -371,7 +489,7 @@ impl AntigravityAccountService {
         reading: Option<AntigravityStoredUsage>,
     ) -> Result<AntigravityUsageReadFinish, String> {
         let _guard = lock(&self.op_lock);
-        let (mut vault, current) = self.reconcile(None)?;
+        let (mut vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
         let now_login = current.as_ref().map(|curr| {
             let acc = vault.accounts.iter().find(|e| account_matches(e, curr));
             antigravity_usage_login(acc, curr)
@@ -400,7 +518,7 @@ impl AntigravityAccountService {
         selected_id: Option<&str>,
     ) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
-        let mut vault = self.store.read()?;
+        let mut vault = self.store.read().map_err(VaultError::into_message)?;
         for item in imported {
             let parsed = parse_antigravity_native_credential(&item.credentials)?;
             if let Some(existing) = vault
@@ -427,7 +545,7 @@ impl AntigravityAccountService {
         }
         self.store.write(&vault)?;
         let current = self.backend.read().ok().flatten();
-        Ok(Self::build_state(&vault, current.as_ref()))
+        Ok(Self::build_state(&vault, current.as_ref(), false))
     }
 
     fn identify_rewritten_login(
@@ -465,7 +583,8 @@ impl AntigravityAccountService {
     fn reconcile(
         &self,
         selected_id: Option<&str>,
-    ) -> Result<(AntigravityAccountVault, Option<AntigravityNativeCredential>), String> {
+    ) -> Result<(AntigravityAccountVault, Option<AntigravityNativeCredential>), ReconcileError>
+    {
         let initial_accounts = self.store.read()?.accounts;
         let raw_current = self.backend.read()?;
         let current = self.identify_rewritten_login(raw_current, &initial_accounts);
@@ -523,6 +642,7 @@ impl AntigravityAccountService {
     fn build_state(
         vault: &AntigravityAccountVault,
         current: Option<&AntigravityNativeCredential>,
+        vault_locked: bool,
     ) -> AntigravityAccountState {
         let active =
             current.and_then(|curr| vault.accounts.iter().find(|e| account_matches(e, curr)));
@@ -552,6 +672,7 @@ impl AntigravityAccountService {
                     identity_known,
                 }
             }),
+            vault_locked,
         }
     }
 }
@@ -579,7 +700,18 @@ pub(crate) fn prepare_antigravity_account_for_launch(
             return Ok(());
         }
         let store = EncryptedAntigravityAccountStore::new(path);
-        if store.read()?.selected_account_id.is_none() {
+        let vault = match store.read() {
+            Ok(v) => v,
+            Err(VaultError::LegacyAclLocked { status }) => {
+                tracing::warn!(
+                    status,
+                    "skipping Antigravity launch preflight because legacy vault is ACL-locked"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into_message()),
+        };
+        if vault.selected_account_id.is_none() {
             return Ok(());
         }
         let env_home = launch_env

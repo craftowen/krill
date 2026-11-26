@@ -9500,6 +9500,7 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     auth_method: "consumer".into(),
                     identity_known: true,
                 }),
+                vault_locked: false,
             });
             cx.notify();
         });
@@ -9511,6 +9512,34 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
     assert!(vcx.debug_bounds("admin-agy-current-usage").is_some());
     assert!(vcx.debug_bounds("admin-agy-row-signed-out").is_none());
     assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
+    assert!(vcx.debug_bounds("admin-agy-row-vault-locked").is_none());
+
+    // Locked legacy vault keeps current host login + usage refresh visible, hides normal Save, and renders recovery row + button.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.state = Some(AntigravityAccountState {
+                accounts: Vec::new(),
+                selected_account_id: None,
+                active_account_id: None,
+                current_account: Some(AntigravityCurrentAccount {
+                    email: Some("host@example.com".into()),
+                    subject: Some("sub-host".into()),
+                    auth_method: "consumer".into(),
+                    identity_known: true,
+                }),
+                vault_locked: true,
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-row-vault-locked").is_some());
+    assert!(vcx.debug_bounds("admin-agy-recover-vault").is_some());
+    assert!(vcx.debug_bounds("admin-agy-row-current").is_some());
+    assert!(vcx.debug_bounds("admin-agy-current-usage").is_some());
+    assert!(vcx.debug_bounds("admin-agy-save-current").is_none());
+    assert!(vcx.debug_bounds("admin-agy-row-error").is_none());
 
     // Saved accounts show Select rows, Active badge + usage refresh on active, Remove on inactive, and footer help.
     vcx.update(|window, cx| {
@@ -9554,6 +9583,7 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     auth_method: "consumer".into(),
                     identity_known: true,
                 }),
+                vault_locked: false,
             });
             cx.notify();
         });
@@ -9592,6 +9622,7 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     auth_method: "consumer".into(),
                     identity_known: true,
                 }),
+                vault_locked: false,
             });
             cx.notify();
         });

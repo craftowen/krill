@@ -64,6 +64,7 @@ pub(crate) fn handle_op(
             Ok(state)
         }
         AntigravityAccountOp::Remove { account_id } => svc.remove_account(account_id),
+        AntigravityAccountOp::ResetLockedVault => svc.reset_locked_vault(),
     }
 }
 

@@ -2,9 +2,10 @@
 //! Encrypted secret vault for Krill Bots (`<state_dir>/bots/secrets.enc`, mode `0o600`).
 //!
 //! Master key protection follows `crate::store::crypto`:
-//! - macOS (non-test): OS Keychain (`com.krill.bots-secret-key.v1`) with user interaction disabled.
+//! - macOS (non-test, real HOME): upgrade-resilient OS Keychain (`com.krill.bots-secret-key.v2`)
+//!   owned by `/usr/bin/security`, with transparent migration from legacy `com.krill.bots-secret-key.v1`.
 //! - Windows (non-test): DPAPI current-user sealed key file (`crate::sys::protect`/`unprotect`).
-//! - Linux / tests: `0o600` atomic key file in `<bots_root>/secrets.key`.
+//! - Linux / tests / isolated temp HOME: `0o600` atomic key file in `<bots_root>/secrets.key`.
 //!
 //! Secret payloads are authenticated with AES-256-GCM + per-write random 256-bit HKDF salt +
 //! 96-bit random nonce. Raw secret values are always returned inside [`Zeroizing<String>`] and
@@ -27,8 +28,6 @@ use ring::{
     rand::{SecureRandom as _, SystemRandom},
 };
 #[cfg(all(target_os = "macos", not(test)))]
-use security_framework::os::macos::keychain::SecKeychain;
-#[cfg(all(target_os = "macos", not(test)))]
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -42,17 +41,11 @@ const MAX_VAULT_BYTES: usize = 4 * 1024 * 1024;
 const VAULT_FILE: &str = "secrets.enc";
 
 #[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_SERVICE: &str = "com.krill.bots-secret-key.v1";
+const KEYCHAIN_SERVICE: &str = "com.krill.bots-secret-key.v2";
 #[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_NOT_FOUND: i32 = -25300;
-#[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_DUPLICATE: i32 = -25299;
-#[cfg(all(target_os = "macos", not(test)))]
-static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
+const LEGACY_KEYCHAIN_SERVICE: &str = "com.krill.bots-secret-key.v1";
 
-#[cfg(any(test, target_os = "linux", windows))]
 const KEY_FILE: &str = "secrets.key";
-#[cfg(any(test, target_os = "linux", windows))]
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 struct MasterKey(Zeroizing<[u8; 32]>);
@@ -82,46 +75,51 @@ impl MasterKey {
     }
 
     #[cfg(all(target_os = "macos", not(test)))]
-    fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+    fn load_or_create(
+        root: &Path,
+        allow_create: bool,
+        check_legacy: bool,
+    ) -> io::Result<Arc<Self>> {
+        if !crate::usage::accounts::agy_native::backend::is_real_home_for_state_path(root) {
+            return Self::load_or_create_file(root, allow_create);
+        }
         ensure_no_symlink_path(root)?;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(root)?;
-        let _gate = lock(&KEYCHAIN_GATE);
-        let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_err)? {
-            Some(SecKeychain::disable_user_interaction().map_err(keychain_err)?)
-        } else {
-            None
-        };
-        let keychain = SecKeychain::default().map_err(keychain_err)?;
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let account =
             crate::mobile::devices::hex(&Sha256::digest(canonical.as_os_str().as_bytes()));
-        match keychain.find_generic_password(KEYCHAIN_SERVICE, &account) {
-            Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
-            Err(err) if err.code() == KEYCHAIN_NOT_FOUND && allow_create => {
-                let mut bytes = Zeroizing::new([0u8; 32]);
-                SystemRandom::new()
-                    .fill(bytes.as_mut())
-                    .map_err(|_| io::Error::other("vault RNG failure"))?;
-                match keychain.add_generic_password(KEYCHAIN_SERVICE, &account, bytes.as_ref()) {
-                    Ok(()) => Ok(Arc::new(Self(bytes))),
-                    Err(dup) if dup.code() == KEYCHAIN_DUPLICATE => {
-                        let (existing, _) = keychain
-                            .find_generic_password(KEYCHAIN_SERVICE, &account)
-                            .map_err(keychain_err)?;
-                        Self::from_slice(existing.as_ref()).map(Arc::new)
-                    }
-                    Err(add_err) => Err(keychain_err(add_err)),
-                }
+        match crate::keychain_key::load_or_create_default(crate::keychain_key::KeychainSpec {
+            service: KEYCHAIN_SERVICE,
+            legacy_service: Some(LEGACY_KEYCHAIN_SERVICE),
+            account: &account,
+            allow_create,
+            check_legacy,
+        }) {
+            Ok(bytes) => Ok(Arc::new(Self(bytes))),
+            Err(err) => {
+                tracing::warn!(
+                    reason = err.log_kind(),
+                    status = ?err.os_status(),
+                    "failed to load bot secret vault master key from macOS Keychain"
+                );
+                Err(err.into_io_error("bot vault key unavailable"))
             }
-            Err(err) => Err(keychain_err(err)),
         }
     }
 
     #[cfg(any(test, target_os = "linux", windows))]
-    fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+    fn load_or_create(
+        root: &Path,
+        allow_create: bool,
+        _check_legacy: bool,
+    ) -> io::Result<Arc<Self>> {
+        Self::load_or_create_file(root, allow_create)
+    }
+
+    fn load_or_create_file(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
         use krill_proto::os::fs::OpenOptionsExt as _;
         use std::io::Write as _;
 
@@ -175,7 +173,6 @@ impl MasterKey {
     }
 }
 
-#[cfg(any(test, target_os = "linux", windows))]
 fn place_new_key_file(
     path: &Path,
     tmp: &Path,
@@ -216,20 +213,12 @@ fn place_new_key_file(
     }
 }
 
-#[cfg(all(target_os = "macos", not(test)))]
-fn keychain_err(err: security_framework::base::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("bot vault key unavailable (keychain status {})", err.code()),
-    )
-}
-
 #[cfg(all(windows, not(test)))]
 fn seal_key(raw: &[u8]) -> io::Result<Vec<u8>> {
     crate::sys::protect(raw)
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "matches Windows DPAPI sealing signature"
@@ -245,7 +234,7 @@ fn unseal_key(bytes: Vec<u8>) -> io::Result<MasterKey> {
     MasterKey::from_slice(&plain)
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn unseal_key(bytes: Vec<u8>) -> io::Result<MasterKey> {
     let bytes = Zeroizing::new(bytes);
     MasterKey::from_slice(&bytes)
@@ -417,7 +406,8 @@ impl SecretVault {
         if let Some(existing) = self.key.get() {
             return Ok(Arc::clone(existing));
         }
-        let loaded = MasterKey::load_or_create(&self.root, allow_create)?;
+        let vault_exists = self.vault_path.exists();
+        let loaded = MasterKey::load_or_create(&self.root, allow_create, vault_exists)?;
         self.key.set(Arc::clone(&loaded)).ok();
         Ok(loaded)
     }

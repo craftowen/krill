@@ -52,6 +52,11 @@ pub struct AntigravityAccountState {
     pub active_account_id: Option<String>,
     pub current_account: Option<AntigravityCurrentAccount>,
     pub selected_account_id: Option<String>,
+    /// True when an existing vault on disk cannot be decrypted because a previous
+    /// ad-hoc build's macOS Keychain ACL locked the legacy master key (`-25308`).
+    /// Host `current_account` is still reported so the user can recover in one click.
+    #[serde(default)]
+    pub vault_locked: bool,
 }
 
 impl AntigravityAccountState {
@@ -62,11 +67,18 @@ impl AntigravityAccountState {
     }
 }
 
-/// Native Antigravity account RPC action (`accounts.antigravity{List,AddCurrent,Select,Remove}`).
+/// Native Antigravity account RPC action (`accounts.antigravity{List,AddCurrent,Select,Remove,ResetLockedVault}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AntigravityAccountOp {
     List,
     AddCurrent,
-    Select { account_id: String },
-    Remove { account_id: String },
+    Select {
+        account_id: String,
+    },
+    Remove {
+        account_id: String,
+    },
+    /// Back up an ACL-locked legacy vault, reset it with a fresh upgrade-resilient key,
+    /// and re-save the current host `agy` login if signed in.
+    ResetLockedVault,
 }

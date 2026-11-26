@@ -315,11 +315,12 @@ fn keychain_child() {
         .password("mk097-temporary-test-only")
         .create(&keychain_path)
         .unwrap();
-    let first = Key::load_from(&root, || Ok(false), &keychain).unwrap();
+    let first = Key::load_from(&root, || Ok(false), &keychain, Some(&keychain_path)).unwrap();
     let second = Key::load_from(
         &root,
         || panic!("키가 있으면 기존 기록을 검사하지 않는다"),
         &keychain,
+        Some(&keychain_path),
     )
     .unwrap();
     let store = encrypted(&root, first);
@@ -344,17 +345,54 @@ fn keychain_child() {
         .password("mk097-temporary-test-only")
         .create(&lost_path)
         .unwrap();
-    assert!(Key::load_from(&root, || Ok(true), &lost).is_err());
+    assert!(Key::load_from(&root, || Ok(true), &lost, Some(&lost_path)).is_err());
     assert!(
-        lost.find_generic_password("com.krill.segment-key.v2", "nonexistent")
+        lost.find_generic_password(crypto::SERVICE, "nonexistent")
             .is_err()
     );
-    drop((keychain, lost));
+    // 기존 v2 항목이 읽기 가능하면 v3로 자동 마이그레이션되어 기존 키 바이트를 그대로 유지한다.
+    let legacy_dir = root.join("legacy-v2");
+    fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_kc_path = root.join("legacy.keychain");
+    let ephemeral_pass = format!("ephemeral-{}", std::process::id());
+    let legacy_kc = CreateOptions::new()
+        .password(&ephemeral_pass)
+        .create(&legacy_kc_path)
+        .unwrap();
+    let legacy_account = {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::ffi::OsStrExt as _;
+        crate::mobile::devices::hex(&Sha256::digest(
+            legacy_dir.canonicalize().unwrap().as_os_str().as_bytes(),
+        ))
+    };
+    let legacy_bytes = [0x42u8; 32];
+    legacy_kc
+        .add_generic_password(crypto::LEGACY_SERVICE, &legacy_account, &legacy_bytes)
+        .unwrap();
+    let migrated =
+        Key::load_from(&legacy_dir, || Ok(true), &legacy_kc, Some(&legacy_kc_path)).unwrap();
+    let legacy_store = encrypted(
+        &legacy_dir,
+        Key::from_slice(&legacy_bytes).map(Arc::new).unwrap(),
+    );
+    let mut legacy_rec = legacy_store.recorder(ID, SIZE).unwrap();
+    legacy_rec.append(b"legacy v2 segment\r\n");
+    legacy_rec.seal();
+    let legacy_raw = fs::read(path(&legacy_store)).unwrap();
+    assert!(
+        segment::decode(&legacy_raw, Some(&migrated))
+            .unwrap()
+            .unwrap()
+            .sealed
+    );
+    drop((keychain, lost, legacy_kc));
     assert!(
         Command::new("/usr/bin/security")
             .arg("delete-keychain")
             .arg(&keychain_path)
             .arg(&lost_path)
+            .arg(&legacy_kc_path)
             .status()
             .unwrap()
             .success()
