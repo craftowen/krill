@@ -164,6 +164,15 @@ impl RemoteConnector {
         self
     }
 
+    /// 사용자 문구 매퍼를 거친 뒤에도 순간 단절(소켓 없음 등)은 재시도할 수 있는 종류로 둔다.
+    /// 매퍼가 `NotFound`를 그대로 남기면 칸이 영구 실패로 보고 다시 붙지 않는다.
+    fn map_remote_error(&self, err: io::Error) -> io::Error {
+        normalize_remote_io_error(match &self.map_error {
+            Some(mapper) => mapper(err),
+            None => err,
+        })
+    }
+
     #[must_use]
     pub(crate) fn with_ensure_socket_epoch(
         mut self,
@@ -380,10 +389,7 @@ impl HostTarget {
                 match ensured {
                     Ok(pair) => pair,
                     Err(err) => {
-                        let err = match &c.map_error {
-                            Some(mapper) => mapper(err),
-                            None => normalize_remote_io_error(err),
-                        };
+                        let err = c.map_remote_error(err);
                         return Err(daemon::Error::Io(err));
                     }
                 }
@@ -406,8 +412,8 @@ impl HostTarget {
                 Ok((conn, epoch))
             }
             Err(err) => {
-                let norm = match self.connector.as_ref().and_then(|c| c.map_error.as_ref()) {
-                    Some(mapper) => mapper(err),
+                let norm = match &self.connector {
+                    Some(c) => c.map_remote_error(err),
                     None => normalize_remote_io_error(err),
                 };
                 if let Some(c) = &self.connector {
@@ -494,6 +500,30 @@ mod tests {
             "remote target must never create a local socket"
         );
         assert_eq!(target.upgrade(&hello).expect("upgrade noop"), None);
+    }
+
+    /// iroh 연결처럼 사용자 문구 매퍼를 단 커넥터도 소켓 부재를 재시도할 오류로 돌려준다.
+    /// `NotFound`가 남으면 칸이 영구 실패로 멈춰 연결이 복구돼도 오류 문구에 고정된다.
+    #[test]
+    fn mapped_connector_keeps_missing_socket_retryable() {
+        let sock = std::env::temp_dir().join(format!(
+            "krill-hosts-mapped-{}/missing.sock",
+            std::process::id()
+        ));
+        let missing = sock.clone();
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            sock,
+            RemoteConnector::new(move || Ok(missing.clone()), |_, _| {})
+                .with_error_mapper(|err| io::Error::new(err.kind(), "unavailable")),
+        );
+        let hello = daemon::client_hello(ClientRole::App, "krill-hosts-test");
+        let err = target.connect(&hello).expect_err("missing socket");
+        assert!(
+            matches!(err, daemon::Error::Io(ref e)
+                if e.kind() == io::ErrorKind::ConnectionRefused && e.to_string() == "unavailable"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
