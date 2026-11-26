@@ -39,15 +39,34 @@ class ShardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "helper_bins"):
                 verify(root, shards={"a": ("alpha", "beta")}, helper_bins={"a": ("ghost",)})
 
-    def test_commands_build_only_required_non_gui_helpers_in_test_profile(self):
+    def test_commands_build_only_required_helpers_in_test_profile(self):
         for shard in SHARDS:
             cmds = build_commands(shard, timings=(shard == "gui"))
             self.assertEqual(len(cmds), 2)
             build_cmd, nextest_cmd = cmds
-            self.assertEqual(build_cmd[:5], ["cargo", "build", "--profile", "test", "--locked"])
-            self.assertNotIn("krill-app", build_cmd)
-            for helper in HELPER_BINS[shard]:
-                self.assertIn(helper, build_cmd)
+            if shard == "gui":
+                self.assertEqual(
+                    build_cmd,
+                    [
+                        "cargo",
+                        "nextest",
+                        "run",
+                        "--profile",
+                        "ci",
+                        "--locked",
+                        "--no-tests=pass",
+                        "--cargo-profile",
+                        "test",
+                        "--no-run",
+                        "--workspace",
+                        "--tests",
+                    ],
+                )
+            else:
+                self.assertEqual(build_cmd[:5], ["cargo", "build", "--profile", "test", "--locked"])
+                self.assertNotIn("krill-app", build_cmd)
+                for helper in HELPER_BINS[shard]:
+                    self.assertIn(helper, build_cmd)
             self.assertIn("--cargo-profile", nextest_cmd)
             self.assertEqual(nextest_cmd[nextest_cmd.index("--cargo-profile") + 1], "test")
             if shard == "gui":

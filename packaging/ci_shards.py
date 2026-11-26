@@ -38,13 +38,19 @@ SHARDS = {
 }
 
 # Sibling binaries looked up in target/debug/ by integration tests outside the
-# binary's own package. Built with `--profile test` so they reuse the exact
-# `[profile.test]` dependency graph without compiling duplicate dev artifacts.
+# binary's own package.
+# - `gui` uses a single `--workspace --tests --no-run` pre-build so all 5 binaries
+#   (krill, krilld, krill-holder, krill-link, krill-app) compile under the exact
+#   same unified feature graph as `nextest` without compiling `krilld` unit tests
+#   or double-compiling 150+ shared crates.
+# - `daemon` and `core` never compile GPUI; they build only their needed non-GUI
+#   helper binaries in `--profile test`.
 HELPER_BINS = {
-    "gui": ("krill-holder", "krilld", "krill", "krill-link"),
+    "gui": (),
     "daemon": ("krill-holder", "krill"),
-    "core": ("krilld",),
+    "core": ("krilld", "krill", "krill-holder", "krill-link"),
 }
+WORKSPACE_TESTS_PREBUILD_SHARDS = frozenset({"gui"})
 
 NAME_RE = re.compile(r'(?ms)^\[package\]\n(?:[^\[]*\n)*?^name\s*=\s*"([^"]+)"')
 
@@ -98,6 +104,21 @@ def build_commands(shard, timings=False):
     if shard not in SHARDS:
         raise ValueError(f"unknown CI shard: {shard!r}")
     commands = []
+    if shard in WORKSPACE_TESTS_PREBUILD_SHARDS:
+        commands.append([
+            "cargo",
+            "nextest",
+            "run",
+            "--profile",
+            "ci",
+            "--locked",
+            "--no-tests=pass",
+            "--cargo-profile",
+            "test",
+            "--no-run",
+            "--workspace",
+            "--tests",
+        ])
     helpers = HELPER_BINS.get(shard, ())
     if helpers:
         build = ["cargo", "build", "--profile", "test", "--locked", "--bins"]
