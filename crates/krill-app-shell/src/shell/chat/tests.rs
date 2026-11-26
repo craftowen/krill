@@ -2576,3 +2576,215 @@ fn selection_quote_formatting_and_reusable_composer_hook() {
     assert_eq!(box_closed.draft, "Keep me");
     assert!(!box_closed.focused);
 }
+
+#[test]
+fn perf_bench_chat_hot_paths() {
+    let theme = gpui_component::highlighter::HighlightTheme::default_dark();
+    let rust_code = r"use std::collections::HashMap;
+use std::sync::Arc;
+
+pub struct CacheEntry<V> {
+    pub key: String,
+    pub value: Arc<V>,
+    pub updated_at_ms: u64,
+}
+
+pub fn lookup_or_insert<V>(
+    map: &mut HashMap<String, CacheEntry<V>>,
+    key: &str,
+    now_ms: u64,
+    build: impl FnOnce() -> V,
+) -> Arc<V> {
+    if let Some(entry) = map.get(key) {
+        if now_ms.saturating_sub(entry.updated_at_ms) < 60_000 {
+            return Arc::clone(&entry.value);
+        }
+    }
+    let val = Arc::new(build());
+    map.insert(
+        key.to_owned(),
+        CacheEntry {
+            key: key.to_owned(),
+            value: Arc::clone(&val),
+            updated_at_ms: now_ms,
+        },
+    );
+    val
+}
+";
+    let json_code = r#"{
+  "ok": true,
+  "data": {
+    "page_start": 4096,
+    "has_earlier": true,
+    "next_offset": 65536,
+    "agent": "claude",
+    "items": [
+      { "kind": "user", "text": "Optimize desktop rendering", "at": "2026-11-26T09:00:00Z" },
+      { "kind": "assistant", "text": "Profiling hot render loops now.", "at": "2026-11-26T09:00:02Z" }
+    ]
+  }
+}"#;
+    // Warmup 1st frame (Tree-sitter grammar compilation + first parse), then measure steady-state 200 frames.
+    let _ = code_view::highlight_code_runs_cached("rust", rust_code, &theme);
+    let _ = code_view::highlight_code_runs_cached("json", json_code, &theme);
+    let t_hl = std::time::Instant::now();
+    let mut hl_count = 0usize;
+    for _ in 0..200 {
+        hl_count += code_view::highlight_code_runs_cached("rust", rust_code, &theme).len();
+        hl_count += code_view::highlight_code_runs_cached("json", json_code, &theme).len();
+    }
+    let hl_elapsed = t_hl.elapsed();
+    assert!(hl_count > 0);
+
+    let msg = format!(
+        "Here is the optimization analysis and updated code:\n\n```rust\n{rust_code}```\n\nAnd the wire response:\n\n```json\n{json_code}\n```\n\nFinally run `cargo nextest run -p krill-app-shell` to verify."
+    );
+    let t_seg = std::time::Instant::now();
+    let mut seg_count = 0usize;
+    for _ in 0..2000 {
+        seg_count += body::parse_chat_segments_cached(&msg).len();
+    }
+    let seg_elapsed = t_seg.elapsed();
+    assert_eq!(seg_count, 2000 * 5);
+
+    // 128-item chat_poll JSON page payload
+    let mut json_items = Vec::new();
+    for i in 0..128 {
+        let kind = if i % 2 == 0 { "user" } else { "assistant" };
+        json_items.push(serde_json::json!({
+            "kind": kind,
+            "title": "",
+            "text": format!("Message #{i}: Detailed explanation of render pipeline caching, IPC pooling, and frame stability across workspaces."),
+            "tool_id": "",
+            "file_path": "",
+            "detail": "",
+            "at": "2026-11-26T09:10:00Z",
+            "options": [],
+            "multi_select": false,
+            "is_error": false,
+        }));
+    }
+    let raw_page = serde_json::json!({
+        "ok": true,
+        "data": {
+            "page_start": 1024,
+            "has_earlier": true,
+            "agent": "claude",
+            "session_id": "sess-123",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "next_offset": 98765,
+            "reset": false,
+            "bound": true,
+            "items": json_items,
+        }
+    })
+    .to_string();
+    let t_json = std::time::Instant::now();
+    let mut parsed_items = 0usize;
+    for _ in 0..200 {
+        let page = parse_chat_page(&raw_page).unwrap();
+        parsed_items += page.snapshot.items.len();
+    }
+    let json_elapsed = t_json.elapsed();
+    assert_eq!(parsed_items, 200 * 128);
+
+    // 400-item DisplayFeed per-frame scan benchmark (40 user turns, assistant replies, questions)
+    let mut feed_items = Vec::with_capacity(400);
+    for i in 0..400 {
+        let kind = if i % 10 == 0 {
+            ChatItemKind::User
+        } else {
+            ChatItemKind::Assistant
+        };
+        feed_items.push(Arc::new(ChatItem {
+            kind,
+            text: format!(
+                "Turn {i} with multiple   spaces and\nnewlines describing a detailed desktop optimization task for Krill GPUI rendering loop."
+            ),
+            ..ChatItem::default()
+        }));
+    }
+    let display_feed = work_run::DisplayFeed::project(0, &feed_items);
+    let t_scan = std::time::Instant::now();
+    let mut turn_total = 0usize;
+    for _ in 0..500 {
+        let user_turns = display_feed.user_turns();
+        let latest = display_feed.latest_assistant_abs_idx();
+        assert!(latest.is_some());
+        turn_total += user_turns.len();
+    }
+    let scan_elapsed = t_scan.elapsed();
+    assert_eq!(turn_total, 500 * 40);
+    assert_eq!(display_feed.user_turns()[0].2.len(), 48);
+    assert!(display_feed.question_other_keys().is_empty());
+
+    // Highlight cache must differentiate light vs dark themes cleanly.
+    let light_theme = gpui_component::highlighter::HighlightTheme::default_light();
+    let dark_runs = code_view::highlight_code_runs_cached("rust", rust_code, &theme);
+    let light_runs = code_view::highlight_code_runs_cached("rust", rust_code, &light_theme);
+    assert!(!dark_runs.is_empty());
+    assert!(!light_runs.is_empty());
+    assert_ne!(dark_runs.as_ref(), light_runs.as_ref());
+
+    eprintln!(
+        "[BENCH] chat_hot_paths: highlight x200={:.3} ms | parse_segments x2000={:.3} ms | parse_chat_page(128 items) x200={:.3} ms | feed_scan(400 rows) x500={:.3} ms",
+        hl_elapsed.as_secs_f64() * 1000.0,
+        seg_elapsed.as_secs_f64() * 1000.0,
+        json_elapsed.as_secs_f64() * 1000.0,
+        scan_elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+#[gpui::test]
+fn noop_chat_poll_reports_no_change(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+    cx.run_until_parked();
+
+    let now = std::time::Instant::now();
+    shell.update(cx, |this, _| {
+        let initial_changed = this.apply_chat_poll_for_host_with_state(
+            SessionId(42),
+            krill_app_core::hosts::HostId::Local,
+            ChatPollSnapshot {
+                agent: "agy".into(),
+                session_id: "sid-42".into(),
+                transcript_path: "/tmp/sid-42.jsonl".into(),
+                next_offset: 256,
+                reset: false,
+                bound: true,
+                items: vec![ChatItem {
+                    kind: ChatItemKind::Assistant,
+                    text: "Ready".into(),
+                    ..ChatItem::default()
+                }],
+            },
+            None,
+            krill_proto::control::AgentState::Unknown,
+            now,
+        );
+        assert!(initial_changed, "initial bind with items must notify");
+
+        let noop_changed = this.apply_chat_poll_for_host_with_state(
+            SessionId(42),
+            krill_app_core::hosts::HostId::Local,
+            ChatPollSnapshot {
+                agent: "agy".into(),
+                session_id: "sid-42".into(),
+                transcript_path: "/tmp/sid-42.jsonl".into(),
+                next_offset: 256,
+                reset: false,
+                bound: true,
+                items: Vec::new(),
+            },
+            None,
+            krill_proto::control::AgentState::Unknown,
+            now,
+        );
+        assert!(
+            !noop_changed,
+            "unchanged idle poll with empty items must not trigger redundant cx.notify()"
+        );
+    });
+}

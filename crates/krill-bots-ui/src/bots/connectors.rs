@@ -38,6 +38,10 @@ pub(super) struct ConnectorsState {
     pub(super) add_search: Option<Entity<InputState>>,
     pub(super) bot_statuses: Vec<BotConnectorStatus>,
     pub(super) bot_access_requests: Vec<BotAccessRequest>,
+    /// Per-bot cached connector statuses for instant SWR paint on bot switch.
+    pub(super) statuses_cache: std::collections::BTreeMap<BotId, Vec<BotConnectorStatus>>,
+    /// Per-bot cached access requests for instant SWR paint on bot switch.
+    pub(super) access_requests_cache: std::collections::BTreeMap<BotId, Vec<BotAccessRequest>>,
     pub(super) show_all_access_requests: bool,
     pub(super) default_tracker_bots: DefaultTrackerBots,
     pub(super) composio_connections: Vec<ComposioConnectionInfo>,

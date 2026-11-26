@@ -60,6 +60,8 @@ pub(super) struct SoulMemoryState {
     pub(super) look_around_config: BotLookAroundConfig,
     pub(super) look_around_focus_input: Option<Entity<InputState>>,
     pub(super) suggestions: Vec<BotSuggestion>,
+    /// Per-bot cached suggestions for instant SWR paint on bot switch.
+    pub(super) suggestions_cache: std::collections::BTreeMap<BotId, Vec<BotSuggestion>>,
     pub(super) busy: bool,
 }
 

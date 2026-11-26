@@ -974,12 +974,18 @@ impl Shell {
             });
             self.bot_ui.search_lang = Some(lang);
         }
-        let state_key: Vec<(HostId, BotId, bool)> = self
-            .sidebar_bots
-            .iter()
-            .map(|b| (b.host.clone(), b.id.clone(), b.paused))
-            .collect();
-        if state_key != self.bot_ui.up_next_bots_key {
+        let bots_changed = self.sidebar_bots.len() != self.bot_ui.up_next_bots_key.len()
+            || self
+                .sidebar_bots
+                .iter()
+                .zip(self.bot_ui.up_next_bots_key.iter())
+                .any(|(b, (kh, kid, paused))| &b.host != kh || &b.id != kid || b.paused != *paused);
+        if bots_changed {
+            let state_key: Vec<(HostId, BotId, bool)> = self
+                .sidebar_bots
+                .iter()
+                .map(|b| (b.host.clone(), b.id.clone(), b.paused))
+                .collect();
             self.bot_ui.up_next_unseen.retain(|(h, id), _| {
                 state_key
                     .iter()
@@ -994,12 +1000,26 @@ impl Shell {
     pub(super) fn refresh_bot_up_next(&mut self, cx: &mut Context<Self>) {
         self.bot_ui.up_next_gen = self.bot_ui.up_next_gen.wrapping_add(1);
         let generation = self.bot_ui.up_next_gen;
-        let mut by_host: Vec<(HostId, krill_bots_ui::bots::BotRpcCall, Vec<BotId>)> = Vec::new();
+        let mut by_host: Vec<(
+            HostId,
+            Option<krill_app_core::hosts::HostTarget>,
+            krill_bots_ui::bots::BotRpcCall,
+            Vec<BotId>,
+        )> = Vec::new();
         for b in self.sidebar_bots.iter().filter(|b| !b.paused) {
-            if let Some((_, _, ids)) = by_host.iter_mut().find(|(h, _, _)| h == &b.host) {
+            if let Some((_, _, _, ids)) = by_host.iter_mut().find(|(h, _, _, _)| h == &b.host) {
                 ids.push(b.id.clone());
             } else if let Some(rpc) = self.bot_rpc_on(&b.host) {
-                by_host.push((b.host.clone(), rpc, vec![b.id.clone()]));
+                #[cfg(test)]
+                let target: Option<krill_app_core::hosts::HostTarget> = None;
+                #[cfg(not(test))]
+                let target = self.target_for_host(&b.host).or_else(|| {
+                    b.host
+                        .is_local()
+                        .then(|| krill_app_core::hosts::HostTarget::local_dev().ok())
+                        .flatten()
+                });
+                by_host.push((b.host.clone(), target, rpc, vec![b.id.clone()]));
             }
         }
         if by_host.is_empty() {
@@ -1024,31 +1044,56 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     let mut out = Vec::new();
-                    for (host, rpc, bot_ids) in by_host {
+                    for (host, target, rpc, bot_ids) in by_host {
+                        // Pipeline 1× ListSuggestions(None) + N× GetBotUpcoming in a single batch/RTT
+                        // instead of 2N sequential round-trips.
+                        let mut reqs = Vec::with_capacity(1 + bot_ids.len());
+                        reqs.push(BotRpcRequest::ListSuggestions {
+                            bot_id: None,
+                            include_dismissed: false,
+                        });
+                        for bot_id in &bot_ids {
+                            reqs.push(BotRpcRequest::GetBotUpcoming {
+                                bot_id: bot_id.clone(),
+                            });
+                        }
+                        let Ok(list) = krill_bots_ui::bots::rpc::call_checked_batch_on(
+                            target.as_ref(),
+                            &rpc,
+                            &reqs,
+                            None,
+                        ) else {
+                            for bot_id in bot_ids {
+                                out.push(((host.clone(), bot_id), None));
+                            }
+                            continue;
+                        };
+                        let mut slots = list.into_iter();
+                        let all_suggestions = match slots.next() {
+                            Some(Ok(BotRpcResponse::Suggestions(rows))) => Some(rows),
+                            _ => None,
+                        };
+                        let mut by_bot: HashMap<BotId, Vec<u64>> = HashMap::new();
+                        if let Some(rows) = &all_suggestions {
+                            for s in rows {
+                                if !s.dismissed {
+                                    by_bot
+                                        .entry(s.bot_id.clone())
+                                        .or_default()
+                                        .push(s.created_at_ms);
+                                }
+                            }
+                        }
                         for bot_id in bot_ids {
-                            let seen_ms = match krill_bots_ui::bots::rpc::call_checked(
-                                &rpc,
-                                &BotRpcRequest::GetBotUpcoming {
-                                    bot_id: bot_id.clone(),
-                                },
-                            ) {
-                                Ok(BotRpcResponse::Upcoming(u)) => u.up_next_seen_ms,
+                            let seen_ms = match slots.next() {
+                                Some(Ok(BotRpcResponse::Upcoming(u))) => u.up_next_seen_ms,
                                 _ => 0,
                             };
-                            let unseen = match krill_bots_ui::bots::rpc::call_checked(
-                                &rpc,
-                                &BotRpcRequest::ListSuggestions {
-                                    bot_id: Some(bot_id.clone()),
-                                    include_dismissed: false,
-                                },
-                            ) {
-                                Ok(BotRpcResponse::Suggestions(rows)) => Some(
-                                    rows.iter()
-                                        .filter(|s| !s.dismissed && s.created_at_ms > seen_ms)
-                                        .count(),
-                                ),
-                                _ => None,
-                            };
+                            let unseen = all_suggestions.as_ref().map(|_| {
+                                by_bot.get(&bot_id).map_or(0, |times| {
+                                    times.iter().filter(|&&ts| ts > seen_ms).count()
+                                })
+                            });
                             out.push(((host.clone(), bot_id), unseen));
                         }
                     }

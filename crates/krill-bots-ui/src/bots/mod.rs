@@ -204,6 +204,8 @@ pub struct View {
     load_gen: u64,
     detail_gen: u64,
     host_gen: u64,
+    detail_in_flight: Option<(BotId, u8)>,
+    detail_loaded_scopes: Option<(BotId, u8)>,
     panel_switch_dismissed_for: Option<BotId>,
     load_task: Option<Task<()>>,
     detail_task: Option<Task<()>>,
@@ -355,6 +357,8 @@ impl View {
             load_gen: 0,
             detail_gen: 0,
             host_gen: 0,
+            detail_in_flight: None,
+            detail_loaded_scopes: None,
             panel_switch_dismissed_for: None,
             load_task: None,
             detail_task: None,
@@ -462,6 +466,8 @@ impl View {
             // Cancel in-flight per-host tasks and reset busy flags so stale host responses
             // cannot mutate the newly selected host's state.
             self.detail_task = None;
+            self.detail_in_flight = None;
+            self.detail_loaded_scopes = None;
             self.open_chat_task = None;
             self.tidy_task = None;
             self.look_tasks.clear();
@@ -496,6 +502,11 @@ impl View {
             self.items.cancel_tasks_on_switch();
             self.items.clear_all_seen();
             self.items.items_cache.clear();
+            self.items.upcoming_cache.clear();
+            self.soul_memory.suggestions_cache.clear();
+            self.connectors.statuses_cache.clear();
+            self.connectors.access_requests_cache.clear();
+            self.settings.avatar_stamp_cache.clear();
             self.soul_memory.busy = false;
             self.soul_memory.tidy_running = false;
             self.settings.saving = false;
@@ -773,6 +784,7 @@ impl View {
                 this.loading = false;
                 match outcome {
                     Ok((bots, open_items, statuses, access, relay, sessions, warnings)) => {
+                        let was_initial = this.bots_loaded_at_ms.is_none();
                         this.unsupported = None;
                         this.bots = bots;
                         this.bots_loaded_at_ms = Some(now_unix_ms());
@@ -799,7 +811,44 @@ impl View {
                         this.emit_badge(cx);
                         this.emit_sessions_changed(cx);
                         if let Some(bot_id) = this.selected_bot_id.clone() {
-                            this.load_selected_bot_detail(bot_id, cx);
+                            if let Some(cfg) = this.bots.iter().find(|b| b.id == bot_id).cloned() {
+                                this.soul_memory.sync_config_from_bot(&cfg);
+                                this.settings.sync_from_bot(&cfg);
+                            }
+                            let want = this.detail_scope_for_tab(this.detail_tab);
+                            let active_or_done = this
+                                .detail_in_flight
+                                .as_ref()
+                                .filter(|(id, _)| id == &bot_id)
+                                .map_or(0, |(_, s)| *s)
+                                | this
+                                    .detail_loaded_scopes
+                                    .as_ref()
+                                    .filter(|(id, _)| id == &bot_id)
+                                    .map_or(0, |(_, s)| *s);
+                            if was_initial && (active_or_done & (want & !DETAIL_SCOPE_AVATAR)) != 0
+                            {
+                                // Initial panel open already launched or completed the tab's core
+                                // detail batch before ListBots returned; only fetch newly discovered
+                                // avatar or missing scopes instead of duplicating the full batch.
+                                let missing = want & !active_or_done;
+                                let need_avatar = (want & DETAIL_SCOPE_AVATAR) != 0
+                                    && this.needs_avatar_fetch(&bot_id);
+                                let fetch_scope =
+                                    missing | if need_avatar { DETAIL_SCOPE_AVATAR } else { 0 };
+                                if fetch_scope != 0 {
+                                    let merged = fetch_scope
+                                        | this
+                                            .detail_in_flight
+                                            .as_ref()
+                                            .filter(|(id, _)| id == &bot_id)
+                                            .map_or(0, |(_, s)| *s);
+                                    this.load_selected_bot_detail_scope(bot_id, merged, cx);
+                                }
+                            } else {
+                                this.detail_loaded_scopes = None;
+                                this.load_selected_bot_detail(bot_id, cx);
+                            }
                         }
                     }
                     // An older krilld without bots is a state to explain, not an error.
@@ -868,7 +917,10 @@ impl View {
             self.tools.busy = false;
             self.items.cancel_tasks_on_switch();
             // Home's items, open item, filter, folds, dialogs and look error belong to the last bot.
-            self.items.clear_items();
+            // Hydrate per-bot SWR caches immediately on switch; clear stale previous-bot data on cache miss.
+            if !self.items.restore_cached(&bot_id) {
+                self.items.clear_items();
+            }
             self.items.open_uid = None;
             self.items.needs_you_only = false;
             self.items.folds.clear();
@@ -878,10 +930,27 @@ impl View {
             self.items.cancel_ask = None;
             self.items.stale_confirm = None;
             self.items.selected.clear();
-            self.items.upcoming = None;
-            self.soul_memory.suggestions.clear();
-            self.connectors.bot_statuses.clear();
-            self.connectors.bot_access_requests.clear();
+            self.items.upcoming = self.items.upcoming_cache.get(&bot_id).cloned();
+            self.soul_memory.suggestions = self
+                .soul_memory
+                .suggestions_cache
+                .get(&bot_id)
+                .cloned()
+                .unwrap_or_default();
+            self.connectors.bot_statuses = self
+                .connectors
+                .statuses_cache
+                .get(&bot_id)
+                .cloned()
+                .unwrap_or_default();
+            self.connectors.bot_access_requests = self
+                .connectors
+                .access_requests_cache
+                .get(&bot_id)
+                .cloned()
+                .unwrap_or_default();
+            self.detail_in_flight = None;
+            self.detail_loaded_scopes = None;
             self.connectors.adding = None;
             self.connectors.add_rail = 0;
             clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
@@ -912,6 +981,22 @@ impl View {
         }
         if tab == DetailTab::ToolsSharing {
             self.refresh_tool_relay_status(cx);
+        } else if let Some(bot_id) = self.selected_bot_id.clone() {
+            let need = self.detail_scope_for_tab(tab);
+            let loaded = self
+                .detail_loaded_scopes
+                .as_ref()
+                .filter(|(id, _)| id == &bot_id)
+                .map_or(0, |(_, s)| *s);
+            let in_flight = self
+                .detail_in_flight
+                .as_ref()
+                .filter(|(id, _)| id == &bot_id)
+                .map_or(0, |(_, s)| *s);
+            let missing = need & !(loaded | in_flight);
+            if missing != 0 {
+                self.load_selected_bot_detail_scope(bot_id, missing | in_flight, cx);
+            }
         }
         cx.notify();
     }
@@ -947,8 +1032,51 @@ impl View {
         cx.notify();
     }
 
+    const fn detail_scope_for_tab(&self, tab: DetailTab) -> u8 {
+        match (self.mode, tab) {
+            (Mode::Panel, DetailTab::Items) => DETAIL_SCOPE_HOME | DETAIL_SCOPE_AVATAR,
+            (Mode::Modal, DetailTab::Items) => {
+                DETAIL_SCOPE_HOME | DETAIL_SCOPE_SOUL_MEMORY | DETAIL_SCOPE_AVATAR
+            }
+            (_, DetailTab::SoulMemory) => DETAIL_SCOPE_SOUL_MEMORY,
+            (_, DetailTab::Connectors) => DETAIL_SCOPE_CONNECTORS,
+            (_, DetailTab::ToolsSharing) => DETAIL_SCOPE_TOOLS,
+            (_, DetailTab::Settings) => {
+                DETAIL_SCOPE_SOUL_MEMORY | DETAIL_SCOPE_CONNECTORS | DETAIL_SCOPE_AVATAR
+            }
+        }
+    }
+
+    fn needs_avatar_fetch(&self, bot_id: &BotId) -> bool {
+        let Some(cfg) = self.bots.iter().find(|b| &b.id == bot_id) else {
+            return false;
+        };
+        if avatar::Avatar::of(cfg) != avatar::Avatar::Upload {
+            return false;
+        }
+        !(self.settings.avatar_cache.contains_key(bot_id)
+            && self.settings.avatar_stamp_cache.get(bot_id) == Some(&cfg.updated_at_ms))
+    }
+
     pub(super) fn load_selected_bot_detail(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        let scope = self.detail_scope_for_tab(self.detail_tab);
+        self.load_selected_bot_detail_scope(bot_id, scope, cx);
+    }
+
+    fn load_selected_bot_detail_scope(&mut self, bot_id: BotId, scope: u8, cx: &mut Context<Self>) {
         if self.unsupported.is_some() {
+            return;
+        }
+        let bot_cfg = self.bots.iter().find(|b| b.id == bot_id).cloned();
+        let avatar_stamp = bot_cfg.as_ref().map(|b| b.updated_at_ms);
+        let fetch_avatar = (scope & DETAIL_SCOPE_AVATAR) != 0 && self.needs_avatar_fetch(&bot_id);
+        let composio_enabled = (scope & DETAIL_SCOPE_CONNECTORS) != 0
+            && bot_cfg
+                .as_ref()
+                .is_some_and(|b| b.connectors.composio.enabled);
+        let effective_scope =
+            (scope & !DETAIL_SCOPE_AVATAR) | if fetch_avatar { DETAIL_SCOPE_AVATAR } else { 0 };
+        if effective_scope == 0 {
             return;
         }
         self.detail_gen = self.detail_gen.wrapping_add(1);
@@ -966,73 +1094,131 @@ impl View {
             })
             .flatten();
         let host_name = self.host_label();
-        let bot_cfg = self.bots.iter().find(|b| b.id == bot_id).cloned();
-        let has_avatar = bot_cfg
-            .as_ref()
-            .is_some_and(|b| avatar::Avatar::of(b) == avatar::Avatar::Upload);
-        let composio_enabled = bot_cfg
-            .as_ref()
-            .is_some_and(|b| b.connectors.composio.enabled);
 
         if let Some(cfg) = &bot_cfg {
             self.soul_memory.sync_config_from_bot(cfg);
             self.settings.sync_from_bot(cfg);
         }
 
+        self.detail_in_flight = Some((bot_id.clone(), effective_scope));
+
         self.detail_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut reqs = vec![
-                        BotRpcRequest::ListItems {
-                            bot_id: Some(bot_id_bg.clone()),
-                            include_closed: true,
-                        },
-                        BotRpcRequest::GetSoul {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                        BotRpcRequest::GetMemory {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                        BotRpcRequest::ConnectorStatus {
-                            bot_id: Some(bot_id_bg.clone()),
-                        },
-                        BotRpcRequest::ListAccessRequests {
-                            bot_id: Some(bot_id_bg.clone()),
-                        },
-                        BotRpcRequest::ToolRelayStatus,
-                        BotRpcRequest::ListBotSessions { bot_id: None },
-                        BotRpcRequest::ListSuggestions {
-                            bot_id: Some(bot_id_bg.clone()),
-                            include_dismissed: false,
-                        },
-                        BotRpcRequest::GetMemoryHistory {
-                            bot_id: bot_id_bg.clone(),
-                            limit: Some(25),
-                        },
-                        BotRpcRequest::GetMemoryTidyStatus {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                        BotRpcRequest::ListMemoryTopics {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                        BotRpcRequest::GetDefaultTrackerBots,
-                        BotRpcRequest::GetBotUpcoming {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ];
-                    let composio_idx = composio_enabled.then(|| {
-                        let i = reqs.len();
-                        reqs.push(BotRpcRequest::ListComposioConnections {
-                            bot_id: bot_id_bg.clone(),
-                        });
-                        i
-                    });
-                    let avatar_idx = has_avatar.then(|| {
-                        let i = reqs.len();
-                        reqs.push(BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg });
-                        i
+                    let mut reqs = Vec::new();
+                    let push_req = |reqs: &mut Vec<BotRpcRequest>, req: BotRpcRequest| {
+                        let idx = reqs.len();
+                        reqs.push(req);
+                        idx
+                    };
+
+                    let (items_idx, sessions_idx, suggestions_idx, upcoming_idx) =
+                        if (effective_scope & DETAIL_SCOPE_HOME) != 0 {
+                            (
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ListItems {
+                                        bot_id: Some(bot_id_bg.clone()),
+                                        include_closed: true,
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ListBotSessions { bot_id: None },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ListSuggestions {
+                                        bot_id: Some(bot_id_bg.clone()),
+                                        include_dismissed: false,
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::GetBotUpcoming {
+                                        bot_id: bot_id_bg.clone(),
+                                    },
+                                )),
+                            )
+                        } else {
+                            (None, None, None, None)
+                        };
+
+                    let (soul_idx, memory_idx, history_idx, tidy_idx, topics_idx) =
+                        if (effective_scope & DETAIL_SCOPE_SOUL_MEMORY) != 0 {
+                            (
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::GetSoul {
+                                        bot_id: bot_id_bg.clone(),
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::GetMemory {
+                                        bot_id: bot_id_bg.clone(),
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::GetMemoryHistory {
+                                        bot_id: bot_id_bg.clone(),
+                                        limit: Some(25),
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::GetMemoryTidyStatus {
+                                        bot_id: bot_id_bg.clone(),
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ListMemoryTopics {
+                                        bot_id: bot_id_bg.clone(),
+                                    },
+                                )),
+                            )
+                        } else {
+                            (None, None, None, None, None)
+                        };
+
+                    let (statuses_idx, access_idx, tracker_idx, composio_idx) =
+                        if (effective_scope & DETAIL_SCOPE_CONNECTORS) != 0 {
+                            (
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ConnectorStatus {
+                                        bot_id: Some(bot_id_bg.clone()),
+                                    },
+                                )),
+                                Some(push_req(
+                                    &mut reqs,
+                                    BotRpcRequest::ListAccessRequests {
+                                        bot_id: Some(bot_id_bg.clone()),
+                                    },
+                                )),
+                                Some(push_req(&mut reqs, BotRpcRequest::GetDefaultTrackerBots)),
+                                composio_enabled.then(|| {
+                                    push_req(
+                                        &mut reqs,
+                                        BotRpcRequest::ListComposioConnections {
+                                            bot_id: bot_id_bg.clone(),
+                                        },
+                                    )
+                                }),
+                            )
+                        } else {
+                            (None, None, None, None)
+                        };
+
+                    let relay_idx = ((effective_scope & DETAIL_SCOPE_TOOLS) != 0)
+                        .then(|| push_req(&mut reqs, BotRpcRequest::ToolRelayStatus));
+
+                    let avatar_idx = fetch_avatar.then(|| {
+                        push_req(&mut reqs, BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg })
                     });
 
                     let mut slots: Vec<Result<BotRpcResponse, String>> =
@@ -1048,92 +1234,89 @@ impl View {
                         )
                     };
 
-                    let items_res = match take(0) {
+                    let items_res = items_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::Items(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ListItems: {other:?}")),
                         Err(e) => Err(e),
-                    };
-                    let soul_res = match take(1) {
+                    });
+                    let soul_res = soul_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
                         Ok(BotRpcResponse::Ok) => Ok(None),
                         Ok(other) => Err(format!("unexpected GetSoul: {other:?}")),
                         Err(e) => Err(e),
-                    };
-                    let memory_res = match take(2) {
+                    });
+                    let memory_res = memory_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
                         Ok(BotRpcResponse::Ok) => Ok(None),
                         Ok(other) => Err(format!("unexpected GetMemory: {other:?}")),
                         Err(e) => Err(e),
-                    };
-                    let statuses_res = match take(3) {
+                    });
+                    let statuses_res = statuses_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::ConnectorStatuses(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ConnectorStatus: {other:?}")),
                         Err(e) => Err(e),
-                    };
-                    let access_res = match take(4) {
+                    });
+                    let access_res = access_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::AccessRequests(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ListAccessRequests: {other:?}")),
                         Err(e) => Err(e),
-                    };
-                    let relay_res = match take(5) {
+                    });
+                    let relay_res = relay_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::ToolRelayStatus(st)) => Ok(Some(st)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let sessions_res = match take(6) {
+                    });
+                    let sessions_res = sessions_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::BotSessions(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let suggestions_res = match take(7) {
+                    });
+                    let suggestions_res = suggestions_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::Suggestions(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let history_res = match take(8) {
+                    });
+                    let history_res = history_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::MemoryHistory(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let tidy_status_res = match take(9) {
+                    });
+                    let tidy_status_res = tidy_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::MemoryTidyStatus(st)) => Ok(Some(st)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let topics_res = match take(10) {
+                    });
+                    let topics_res = topics_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::MemoryTopics(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
-                    };
-                    let tracker_res = match take(11) {
+                    });
+                    let tracker_res = tracker_idx.map(|idx| match take(idx) {
                         Ok(BotRpcResponse::DefaultTrackerBots(d)) => Ok(Some(d)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
+                    });
+                    let upcoming = match upcoming_idx {
+                        Some(idx) => match take(idx) {
+                            Ok(BotRpcResponse::Upcoming(up)) => UpcomingFetch::Loaded(up),
+                            _ => UpcomingFetch::Missing,
+                        },
+                        None => UpcomingFetch::Skipped,
                     };
-                    let upcoming = match take(12) {
-                        Ok(BotRpcResponse::Upcoming(up)) => Some(up),
+                    let composio_res = composio_idx.map(|idx| match take(idx) {
+                        Ok(BotRpcResponse::ComposioConnections(list)) => Ok(Some(list)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    });
+                    let avatar_img = avatar_idx.and_then(|idx| match take(idx) {
+                        Ok(BotRpcResponse::BotAvatar(data)) => decode_png_avatar(&data.png_bytes)
+                            .ok()
+                            .map(|img| (img, avatar_stamp.unwrap_or(0))),
                         _ => None,
-                    };
-                    let composio_res = match composio_idx {
-                        Some(idx) => match take(idx) {
-                            Ok(BotRpcResponse::ComposioConnections(list)) => Ok(Some(list)),
-                            Ok(_) => Ok(None),
-                            Err(e) => Err(e),
-                        },
-                        None => Ok(None),
-                    };
-                    let avatar_img = match avatar_idx {
-                        Some(idx) => match take(idx) {
-                            Ok(BotRpcResponse::BotAvatar(data)) => {
-                                decode_png_avatar(&data.png_bytes).ok()
-                            }
-                            _ => None,
-                        },
-                        None => None,
-                    };
+                    });
 
                     DetailBundle {
                         items_res,
@@ -1162,90 +1345,150 @@ impl View {
                 {
                     return;
                 }
+                this.detail_in_flight = None;
+                let prev_scopes = this
+                    .detail_loaded_scopes
+                    .as_ref()
+                    .filter(|(id, _)| id == &bot_id)
+                    .map_or(0, |(_, s)| *s);
+                this.detail_loaded_scopes = Some((bot_id.clone(), prev_scopes | effective_scope));
+
                 let mut errors = Vec::new();
                 let items_ok = match loaded.items_res {
-                    Ok(items) => {
+                    Some(Ok(items)) => {
                         this.items.set_items_for_bot(&bot_id, items);
                         true
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         errors.push(e);
                         false
                     }
+                    None => false,
                 };
-                let soul_opt = match loaded.soul_res {
-                    Ok(val) => val,
-                    Err(e) => {
-                        errors.push(e);
-                        None
-                    }
-                };
-                let mem_opt = match loaded.memory_res {
-                    Ok(val) => val,
-                    Err(e) => {
-                        errors.push(e);
-                        None
-                    }
-                };
-                // Preserve existing SOUL/MEMORY text when either section failed to load.
-                this.soul_memory
-                    .apply_loaded_sections(&bot_id, soul_opt, mem_opt);
+                if loaded.soul_res.is_some() || loaded.memory_res.is_some() {
+                    let soul_opt = match loaded.soul_res {
+                        Some(Ok(val)) => val,
+                        Some(Err(e)) => {
+                            errors.push(e);
+                            None
+                        }
+                        None => None,
+                    };
+                    let mem_opt = match loaded.memory_res {
+                        Some(Ok(val)) => val,
+                        Some(Err(e)) => {
+                            errors.push(e);
+                            None
+                        }
+                        None => None,
+                    };
+                    // Preserve existing SOUL/MEMORY text when either section failed to load.
+                    this.soul_memory
+                        .apply_loaded_sections(&bot_id, soul_opt, mem_opt);
+                }
 
-                match loaded.statuses_res {
-                    Ok(statuses) => this.connectors.bot_statuses = statuses,
-                    Err(e) => errors.push(e),
-                }
-                match loaded.access_res {
-                    Ok(access) => this.connectors.bot_access_requests = access,
-                    Err(e) => errors.push(e),
-                }
-                match loaded.relay_res {
-                    Ok(Some(st)) => this.tools.relay_status = Some(st),
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
-                }
-                match loaded.sessions_res {
-                    Ok(Some(list)) => {
-                        this.bot_sessions = list;
-                        this.emit_sessions_changed(cx);
+                if let Some(res) = loaded.statuses_res {
+                    match res {
+                        Ok(statuses) => {
+                            this.connectors
+                                .statuses_cache
+                                .insert(bot_id.clone(), statuses.clone());
+                            this.connectors.bot_statuses = statuses;
+                        }
+                        Err(e) => errors.push(e),
                     }
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
                 }
-                match loaded.suggestions_res {
-                    Ok(Some(list)) => this.soul_memory.suggestions = list,
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.access_res {
+                    match res {
+                        Ok(access) => {
+                            this.connectors
+                                .access_requests_cache
+                                .insert(bot_id.clone(), access.clone());
+                            this.connectors.bot_access_requests = access;
+                        }
+                        Err(e) => errors.push(e),
+                    }
                 }
-                match loaded.history_res {
-                    Ok(Some(list)) => this.soul_memory.memory_history = list,
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.relay_res {
+                    match res {
+                        Ok(Some(st)) => this.tools.relay_status = Some(st),
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
                 }
-                match loaded.tidy_status_res {
-                    Ok(Some(st)) => this.soul_memory.tidy_status = Some(st),
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.sessions_res {
+                    match res {
+                        Ok(Some(list)) => {
+                            this.bot_sessions = list;
+                            this.emit_sessions_changed(cx);
+                        }
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
                 }
-                match loaded.topics_res {
-                    Ok(Some(list)) => this.soul_memory.memory_topics = list,
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.suggestions_res {
+                    match res {
+                        Ok(Some(list)) => {
+                            this.soul_memory
+                                .suggestions_cache
+                                .insert(bot_id.clone(), list.clone());
+                            this.soul_memory.suggestions = list;
+                        }
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
                 }
-                match loaded.tracker_res {
-                    Ok(Some(d)) => this.connectors.default_tracker_bots = d,
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.history_res {
+                    match res {
+                        Ok(Some(list)) => this.soul_memory.memory_history = list,
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
                 }
-                match loaded.composio_res {
-                    Ok(Some(c)) => this.connectors.composio_connections = c,
-                    Ok(None) => {}
-                    Err(e) => errors.push(e),
+                if let Some(res) = loaded.tidy_status_res {
+                    match res {
+                        Ok(Some(st)) => this.soul_memory.tidy_status = Some(st),
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
                 }
-                if let Some(img) = loaded.avatar_img {
+                if let Some(res) = loaded.topics_res {
+                    match res {
+                        Ok(Some(list)) => this.soul_memory.memory_topics = list,
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
+                }
+                if let Some(res) = loaded.tracker_res {
+                    match res {
+                        Ok(Some(d)) => this.connectors.default_tracker_bots = d,
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
+                }
+                if let Some(res) = loaded.composio_res {
+                    match res {
+                        Ok(Some(c)) => this.connectors.composio_connections = c,
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
+                }
+                if let Some((img, stamp)) = loaded.avatar_img {
                     this.settings.avatar_cache.insert(bot_id.clone(), img);
+                    this.settings
+                        .avatar_stamp_cache
+                        .insert(bot_id.clone(), stamp);
                 }
-                this.items.upcoming = loaded.upcoming;
+                match loaded.upcoming {
+                    UpcomingFetch::Loaded(up) => {
+                        this.items.upcoming_cache.insert(bot_id.clone(), up.clone());
+                        this.items.upcoming = Some(up);
+                    }
+                    UpcomingFetch::Missing => {
+                        this.items.upcoming = None;
+                    }
+                    UpcomingFetch::Skipped => {}
+                }
 
                 this.connectors.needs_sync_from_bot = true;
                 if let Some(version) = errors.iter().find_map(|e| unsupported_version(e)) {
@@ -1689,7 +1932,12 @@ impl View {
                         this.all_connector_statuses.retain(|s| s.bot_id != bot_id);
                         this.bot_sessions.retain(|s| s.bot_id != bot_id);
                         this.items.items_cache.remove(&bot_id);
+                        this.items.upcoming_cache.remove(&bot_id);
+                        this.soul_memory.suggestions_cache.remove(&bot_id);
+                        this.connectors.statuses_cache.remove(&bot_id);
+                        this.connectors.access_requests_cache.remove(&bot_id);
                         this.settings.avatar_cache.remove(&bot_id);
+                        this.settings.avatar_stamp_cache.remove(&bot_id);
                         this.settings.extras.remove(&bot_id);
                         if this.selected_bot_id.as_ref() == Some(&bot_id) {
                             this.items.open_uid = None;
@@ -2813,23 +3061,34 @@ impl View {
     }
 }
 
+const DETAIL_SCOPE_HOME: u8 = 1 << 0;
+const DETAIL_SCOPE_SOUL_MEMORY: u8 = 1 << 1;
+const DETAIL_SCOPE_CONNECTORS: u8 = 1 << 2;
+const DETAIL_SCOPE_TOOLS: u8 = 1 << 3;
+const DETAIL_SCOPE_AVATAR: u8 = 1 << 4;
+
+enum UpcomingFetch {
+    Skipped,
+    Missing,
+    Loaded(krill_proto::bots::BotUpcoming),
+}
+
 struct DetailBundle {
-    items_res: Result<Vec<BotItem>, String>,
-    soul_res: Result<Option<String>, String>,
-    memory_res: Result<Option<String>, String>,
-    statuses_res: Result<Vec<BotConnectorStatus>, String>,
-    access_res: Result<Vec<BotAccessRequest>, String>,
-    relay_res: Result<Option<krill_proto::bots::BotToolRelayStatus>, String>,
-    sessions_res: Result<Option<Vec<BotSessionSummary>>, String>,
-    suggestions_res: Result<Option<Vec<krill_proto::bots::BotSuggestion>>, String>,
-    history_res: Result<Option<Vec<krill_proto::bots::BotMemoryHistoryEntry>>, String>,
-    tidy_status_res: Result<Option<krill_proto::bots::BotMemoryTidyStatus>, String>,
-    topics_res: Result<Option<Vec<krill_proto::bots::BotMemoryTopicInfo>>, String>,
-    tracker_res: Result<Option<krill_proto::bots::DefaultTrackerBots>, String>,
-    composio_res: Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>,
-    avatar_img: Option<std::sync::Arc<gpui::Image>>,
-    /// `None` from a krilld that predates it, too: Home then leaves times out.
-    upcoming: Option<krill_proto::bots::BotUpcoming>,
+    items_res: Option<Result<Vec<BotItem>, String>>,
+    soul_res: Option<Result<Option<String>, String>>,
+    memory_res: Option<Result<Option<String>, String>>,
+    statuses_res: Option<Result<Vec<BotConnectorStatus>, String>>,
+    access_res: Option<Result<Vec<BotAccessRequest>, String>>,
+    relay_res: Option<Result<Option<krill_proto::bots::BotToolRelayStatus>, String>>,
+    sessions_res: Option<Result<Option<Vec<BotSessionSummary>>, String>>,
+    suggestions_res: Option<Result<Option<Vec<krill_proto::bots::BotSuggestion>>, String>>,
+    history_res: Option<Result<Option<Vec<krill_proto::bots::BotMemoryHistoryEntry>>, String>>,
+    tidy_status_res: Option<Result<Option<krill_proto::bots::BotMemoryTidyStatus>, String>>,
+    topics_res: Option<Result<Option<Vec<krill_proto::bots::BotMemoryTopicInfo>>, String>>,
+    tracker_res: Option<Result<Option<krill_proto::bots::DefaultTrackerBots>, String>>,
+    composio_res: Option<Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>>,
+    avatar_img: Option<(std::sync::Arc<gpui::Image>, u64)>,
+    upcoming: UpcomingFetch,
 }
 
 impl Render for View {

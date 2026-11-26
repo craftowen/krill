@@ -2845,3 +2845,97 @@ fn bot_attention_facts_and_lifecycle_panel_reset_dedup_and_group_rename_rollback
         );
     });
 }
+
+#[gpui::test]
+fn refresh_bot_up_next_batches_suggestions_once_for_multiple_bots(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+    cx.run_until_parked();
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let calls_bg = calls.clone();
+    let rpc: krill_bots_ui::bots::BotRpcCall = std::sync::Arc::new(move |req| match req {
+        BotRpcRequest::ListSuggestions { bot_id, .. } => {
+            calls_bg
+                .lock()
+                .unwrap()
+                .push(format!("suggestions:{bot_id:?}"));
+            let mut rows = Vec::new();
+            for i in 0..4 {
+                rows.push(krill_proto::bots::BotSuggestion {
+                    id: format!("sug-{i}"),
+                    bot_id: BotId::new(format!("bot-{i}")).unwrap(),
+                    title: format!("Task {i}"),
+                    why: String::new(),
+                    ask: String::new(),
+                    link: None,
+                    source: None,
+                    created_at_ms: 500,
+                    dismissed: false,
+                });
+            }
+            Ok(BotRpcResponse::Suggestions(rows))
+        }
+        BotRpcRequest::GetBotUpcoming { bot_id } => {
+            calls_bg.lock().unwrap().push(format!("upcoming:{bot_id}"));
+            let seen_ms = if bot_id.as_str() == "bot-0" { 600 } else { 100 };
+            Ok(BotRpcResponse::Upcoming(krill_proto::bots::BotUpcoming {
+                up_next_seen_ms: seen_ms,
+                ..krill_proto::bots::BotUpcoming::default()
+            }))
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_overrides.clear();
+            s.bot_rpc_override = Some(rpc.clone());
+            let bots: Vec<_> = (0..4)
+                .map(|i| bot(&format!("bot-{i}"), &format!("Bot {i}"), "desc", vec![]))
+                .collect();
+            s.apply_sidebar_bots(0, bots, cx);
+            s.sync_bot_sidebar_ephemeral(window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|c| c.starts_with("suggestions:"))
+            .count(),
+        1,
+        "4 bots must issue exactly 1 ListSuggestions(None) call, not 4: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0], "suggestions:None",
+        "first request in batch must be global ListSuggestions(None)"
+    );
+    assert_eq!(
+        recorded.len(),
+        5,
+        "expected N+1=5 RPCs instead of 2N=8: {recorded:?}"
+    );
+    view.read_with(cx, |s, _| {
+        assert_eq!(
+            s.bot_ui
+                .up_next_unseen
+                .get(&(HostId::Local, BotId::new("bot-0").unwrap()))
+                .copied(),
+            None
+        );
+        for i in 1..4 {
+            assert_eq!(
+                s.bot_ui
+                    .up_next_unseen
+                    .get(&(HostId::Local, BotId::new(format!("bot-{i}")).unwrap()))
+                    .copied(),
+                Some(1)
+            );
+        }
+    });
+}

@@ -50,6 +50,8 @@ pub(super) struct SettingsState {
     pub(super) sched_cron_input: Option<Entity<InputState>>,
     pub(super) sched_prompt_input: Option<Entity<InputState>>,
     pub(super) avatar_cache: BTreeMap<BotId, Arc<gpui::Image>>,
+    /// `BotConfig::updated_at_ms` when `avatar_cache` was populated so unchanged uploads skip `GetBotAvatar`.
+    pub(super) avatar_stamp_cache: BTreeMap<BotId, u64>,
     pub(super) saving: bool,
     /// The panel's settings list or one of its pages (Orca's settings view).
     pub(super) page: super::settings_root::SettingsPage,
@@ -340,12 +342,18 @@ impl View {
                 let same_bot = this.selected_bot_id.as_ref() == Some(&bot_id);
                 match outcome {
                     Ok((updated, image)) => {
+                        this.settings
+                            .avatar_stamp_cache
+                            .insert(updated.id.clone(), updated.updated_at_ms);
                         this.settings.avatar_cache.insert(updated.id.clone(), image);
                         this.upsert_bot_config(updated);
                         // Orca #47278: drop cached avatars for bots no longer in the list.
                         let live: std::collections::HashSet<&BotId> =
                             this.bots.iter().map(|b| &b.id).collect();
                         this.settings.avatar_cache.retain(|id, _| live.contains(id));
+                        this.settings
+                            .avatar_stamp_cache
+                            .retain(|id, _| live.contains(id));
                         this.emit_badge(cx);
                         if same_bot {
                             this.notice = Some(SharedString::from(text::SAVED.get()));
@@ -412,6 +420,7 @@ impl View {
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
                         this.settings.avatar_cache.remove(&bot_id);
+                        this.settings.avatar_stamp_cache.remove(&bot_id);
                         this.upsert_bot_config(*updated);
                         this.emit_badge(cx);
                         if same_bot {
@@ -420,6 +429,7 @@ impl View {
                     }
                     Ok(_) => {
                         this.settings.avatar_cache.remove(&bot_id);
+                        this.settings.avatar_stamp_cache.remove(&bot_id);
                         this.emit_badge(cx);
                     }
                     Err(err) if same_bot => this.error = Some(SharedString::from(err)),

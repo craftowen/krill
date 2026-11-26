@@ -118,11 +118,13 @@ pub fn run() -> std::process::ExitCode {
                 .as_deref()
                 .and_then(krill_app_core::layout::Layout::peek_window_bounds);
             let paths = krill_proto::daemon::Paths::dev().ok();
-            let env = krill_app_core::onboarding::Env::discover_current();
-            (bounds, paths, env)
+            (bounds, paths)
         });
+        // Discover onboarding environment in parallel without blocking First Paint (`new_window`).
+        let env_discovery =
+            cx.background_spawn(async { krill_app_core::onboarding::Env::discover_current() });
         cx.spawn(async move |cx| {
-            let (bounds, paths, env) = startup.await;
+            let (bounds, paths) = startup.await;
             cx.update(|cx| {
                 #[cfg(target_os = "macos")]
                 krill_app_core::responsiveness::start(cx);
@@ -172,13 +174,25 @@ pub fn run() -> std::process::ExitCode {
                                 window,
                                 cx,
                             );
-                            if let Some(env) = env {
-                                krill_app_core::onboarding::offer(env.clone(), cx);
-                                krill_app_core::onboarding::spawn_quick_check(&env, cx);
-                                krill_app_core::accounts::installed::spawn_detect(env.shell, cx);
-                            }
                         })
                         .ok();
+                    cx.spawn(async move |cx| {
+                        let Some(env) = env_discovery.await else {
+                            return;
+                        };
+                        cx.update(|cx| {
+                            window
+                                .update(cx, |_, _, cx| {
+                                    krill_app_core::onboarding::offer(env.clone(), cx);
+                                    krill_app_core::onboarding::spawn_quick_check(&env, cx);
+                                    krill_app_core::accounts::installed::spawn_detect(
+                                        env.shell, cx,
+                                    );
+                                })
+                                .ok();
+                        });
+                    })
+                    .detach();
                 }
                 let opening = cx.global_mut::<OpeningWindow>();
                 opening.pending = false;

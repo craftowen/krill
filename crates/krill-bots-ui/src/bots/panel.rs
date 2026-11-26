@@ -44,10 +44,23 @@ impl View {
             super::clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
             // Another bot opens Settings on its list, with its own field values.
             self.settings.reset_pages();
+            if self.detail_tab != tab {
+                if self.detail_tab == DetailTab::Settings {
+                    self.settings.reset_pages();
+                }
+                self.detail_tab = tab;
+                if tab == DetailTab::Connectors {
+                    self.connectors.needs_sync_from_bot = true;
+                }
+                if tab == DetailTab::Settings {
+                    self.settings.needs_sync_from_bot = true;
+                }
+            }
             self.select_bot(bot_id.clone(), cx);
-            // A bot newer than this view's list: fetch the list again.
+            // A bot newer than this view's list: fetch the list again (skip if a reload is already in flight).
             if self.selected_bot_id.as_ref() == Some(bot_id)
                 && !self.bots.iter().any(|b| &b.id == bot_id)
+                && !self.loading
             {
                 self.reload(cx);
             }
