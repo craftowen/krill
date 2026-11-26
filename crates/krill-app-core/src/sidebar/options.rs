@@ -1722,8 +1722,9 @@ impl Sidebar {
         if let Some(custom) = self.worktree_hosts.get(path) {
             return Some(custom.clone());
         }
-        // 프로젝트 기준 보기에는 PC 단계가 없으니 원격 PC 것만 배지로 구분한다.
-        if self.options.group_by == GroupBy::Repo && host.is_local() {
+        // 프로젝트 기준 보기에서는 각 프로젝트 헤더 우측에 원격 기기명이 이미 표시되므로
+        // 하위 워크트리 카드에 중복 호스트 배지를 달지 않는다.
+        if self.options.group_by == GroupBy::Repo {
             return None;
         }
         match host {
@@ -1733,9 +1734,7 @@ impl Sidebar {
                     .find(|r| r.id == *id)
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
-            HostId::Local => (self.options.group_by != GroupBy::Repo
-                && self.has_connected_remote_hosts())
-            .then(|| {
+            HostId::Local => self.has_connected_remote_hosts().then(|| {
                 text::HOST_LOCAL
                     .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
                     .get()

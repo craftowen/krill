@@ -111,7 +111,7 @@ fn project_headers_drag_in_both_directions_and_restore_order(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn remote_projects_reorder_as_complete_merged_blocks(cx: &mut TestAppContext) {
+fn remote_projects_reorder_as_complete_host_separated_blocks(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     view.update(cx, |s, cx| {
@@ -120,7 +120,7 @@ fn remote_projects_reorder_as_complete_merged_blocks(cx: &mut TestAppContext) {
             ("/p/b".into(), vec!["/p/b".into()]),
         ]);
         s.collapsed
-            .extend(["/p/a", "/p/b", "/remote/c"].map(PathBuf::from));
+            .extend(["/p/a", "/p/b", "/remote/a", "/remote/c"].map(PathBuf::from));
         s.set_remote_snapshot_for_test(
             "studio",
             HostStatus::Connected,
@@ -139,19 +139,10 @@ fn remote_projects_reorder_as_complete_merged_blocks(cx: &mut TestAppContext) {
     view.update(cx, |s, cx| {
         assert_eq!(
             projects(s),
-            ["/remote/c", "/p/a", "/p/b"].map(PathBuf::from)
+            ["/remote/c", "/p/a", "/p/b", "/remote/a"].map(PathBuf::from)
         );
-        let index = s
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/p/a")))
-            .unwrap();
-        assert_eq!(
-            s.merged_projects.get(&index).unwrap(),
-            &vec![(HostId::Remote("studio".into()), PathBuf::from("/remote/a"))]
-        );
-        // Expanding a reordered project must reveal both PCs' worktrees together.
-        s.fold(Path::new("/p/a"), Some(true), cx);
+        // Expanding the local project reveals only local worktrees; the same-named remote project stays separate.
+        s.fold_on(&HostId::Local, Path::new("/p/a"), Some(true), cx);
         let index = s
             .rows
             .iter()
@@ -172,13 +163,25 @@ fn remote_projects_reorder_as_complete_merged_blocks(cx: &mut TestAppContext) {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            children,
-            vec![
-                (HostId::Local, PathBuf::from("/p/a")),
-                (HostId::Remote("studio".into()), PathBuf::from("/remote/a"))
-            ]
-        );
+        assert_eq!(children, vec![(HostId::Local, PathBuf::from("/p/a"))]);
+        // Expanding the remote same-named project independently reveals only its remote worktree.
+        let studio = HostId::Remote("studio".into());
+        s.fold_on(&studio, Path::new("/remote/a"), Some(true), cx);
+        let remote_index = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/remote/a")))
+            .unwrap();
+        let remote_children: Vec<_> = s.rows[remote_index + 1..]
+            .iter()
+            .zip(&s.row_hosts[remote_index + 1..])
+            .take_while(|(row, _)| project_key(row).is_none())
+            .filter_map(|(row, host)| match row {
+                Row::Worktree(path) => Some((host.clone(), path.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(remote_children, vec![(studio, PathBuf::from("/remote/a"))]);
         let order = s.project_order.clone();
         s.move_project(Path::new("/p/a"), Path::new("/p/a"), cx);
         s.move_project(Path::new("/missing"), Path::new("/p/a"), cx);
@@ -187,6 +190,6 @@ fn remote_projects_reorder_as_complete_merged_blocks(cx: &mut TestAppContext) {
     drag_header(&view, cx, "/remote/c", "/p/b");
     assert_eq!(
         view.read_with(cx, |s, _| projects(s)),
-        ["/p/a", "/p/b", "/remote/c"].map(PathBuf::from)
+        ["/p/a", "/p/b", "/remote/c", "/remote/a"].map(PathBuf::from)
     );
 }

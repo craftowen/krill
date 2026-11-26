@@ -1931,11 +1931,10 @@ fn idle_remote_hosts_are_hidden_with_disconnect_reasons(cx: &mut TestAppContext)
     );
 }
 
-/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 맨 위 단계다. 다른 PC의 같은 프로젝트는 한 머리줄로
-/// 합쳐지고, 연결된 PC의 상태 줄은 사라지며, 다시 연결이 필요한 프로젝트 없는 PC와
-/// 작업 폴더 모르는 세션(모든 PC 것을 한 묶음)만 프로젝트 뒤에 온다.
+/// 프로젝트 기준 보기에서는 Orca처럼 프로젝트가 맨 위 단계이며 호스트별로 행을 분리한다.
+/// 동명 프로젝트도 호스트별 독립 머리줄을 갖고, 작업 폴더 모르는 세션만 모든 PC 것을 한 묶음으로 끝에 둔다.
 #[gpui::test]
-fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) {
+fn project_rows_separate_hosts_and_follow_with_loose_sessions(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let remote = |id: &str, status, snapshot: Snapshot| RemoteHost {
@@ -2005,36 +2004,50 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rows, ["/local", "/tax", "/seol", "loose"]);
-        // The other PC's worktree sits inside the local project, before the next project.
-        let merged = s
+        assert_eq!(rows, ["/local", "/tax", "/Users/x/LOCAL", "/seol", "loose"]);
+        // Same-named remote repo gets its own project header row, separate from local `/local`.
+        let mbp_repo = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/Users/x/LOCAL")))
+            .unwrap();
+        let mbp_wt = s
             .rows
             .iter()
             .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
             .unwrap();
-        let tax = s
-            .rows
-            .iter()
-            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/tax")))
-            .unwrap();
-        assert!(merged < tax);
-        assert_eq!(s.row_host(merged), &mbp);
-        assert_eq!(
-            s.merged_projects.get(&0).map(Vec::as_slice),
-            Some(&[(mbp.clone(), PathBuf::from("/Users/x/LOCAL"))][..])
-        );
-        assert_eq!(
-            s.host_badge_for(&mbp, Path::new("/Users/x/LOCAL-wt")),
-            Some("mbp".into())
-        );
+        assert_eq!(s.row_host(mbp_repo), &mbp);
+        assert_eq!(s.row_host(mbp_wt), &mbp);
+        assert!(mbp_repo < mbp_wt);
+        // GroupBy::Repo omits duplicate worktree host badge because the project header shows the device inline.
+        assert_eq!(s.host_badge_for(&mbp, Path::new("/Users/x/LOCAL-wt")), None);
         let loose = s.rows.iter().position(|r| matches!(r, Row::Loose)).unwrap();
         let loose_hosts = (loose + 1..s.rows.len())
             .map(|i| s.row_host(i).as_key().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(loose_hosts, ["win"]);
     });
-    // Folding the merged header folds the other PC's part too.
-    view.update(cx, |s, cx| s.fold(Path::new("/local"), Some(false), cx));
+    // Folding the local header leaves the same-named remote project expanded.
+    view.update(cx, |s, cx| {
+        s.fold_on(&HostId::Local, Path::new("/local"), Some(false), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Worktree(p) if p == Path::new("/local/a")))
+        );
+        assert!(
+            s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Worktree(p) if p == Path::new("/Users/x/LOCAL-wt")))
+        );
+    });
+    // Folding the remote header independently collapses only the remote project's worktrees.
+    view.update(cx, |s, cx| {
+        s.fold_on(&mbp, Path::new("/Users/x/LOCAL"), Some(false), cx);
+    });
     cx.run_until_parked();
     view.read_with(cx, |s, _| {
         assert!(
@@ -2045,7 +2058,8 @@ fn project_rows_merge_hosts_and_follow_with_idle_hosts(cx: &mut TestAppContext) 
     });
 }
 
-/// Projects remain the root even with remote hosts; session IDs and selection stay host-scoped.
+/// Projects remain the root even with remote hosts; session IDs and selection stay host-scoped,
+/// and remote project headers display the connected device name inline while local ones stay clean.
 #[gpui::test]
 fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut TestAppContext) {
     use gpui::Modifiers;
@@ -2088,63 +2102,69 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
         s.rebuild(cx);
     });
     cx.run_until_parked();
-    let (local_tree, remote_repo, remote_only_repo, remote_tree) = cx.update(|_, cx| {
-        let s = view.read(cx);
-        assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
-        assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
-        assert_eq!(s.host_indent().to_bits(), 0_f32.to_bits());
-        assert_eq!(
-            s.host_badge_for(&HostId::Local, Path::new("/repo/mobile-ui")),
-            None
-        );
-        assert_eq!(
-            s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
-            Some("Studio".into())
-        );
-        assert_eq!(
-            s.host_badge_for(&remote, Path::new("/remote-only")),
-            Some("Studio".into())
-        );
-        // The same project on another PC merges into the one project header; remote-only stays its own project.
-        assert_eq!(
-            s.rows
-                .iter()
-                .filter(|r| matches!(r, Row::Repository(_)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            s.merged_projects.get(&0).map(Vec::as_slice),
-            Some(&[(remote.clone(), PathBuf::from("/repo"))][..])
-        );
-        let find = |host: &HostId, repo| {
-            s.rows
-                .iter()
-                .enumerate()
-                .position(|(i, r)| {
-                    s.row_host(i) == host
-                        && if repo {
-                            matches!(r, Row::Repository(_))
-                        } else {
-                            matches!(r, Row::Worktree(_))
-                        }
-                })
-                .unwrap()
-        };
-        (
-            find(&HostId::Local, false),
-            find(&HostId::Local, true),
-            find(&remote, true),
-            find(&remote, false),
-        )
-    });
+    let (local_tree, local_repo, remote_repo, remote_only_repo, remote_tree) =
+        cx.update(|_, cx| {
+            let s = view.read(cx);
+            assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
+            assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
+            assert_eq!(s.host_indent().to_bits(), 0_f32.to_bits());
+            // GroupBy::Repo shows the device inline on remote project headers, so worktree cards omit duplicate host badges.
+            assert_eq!(
+                s.host_badge_for(&HostId::Local, Path::new("/repo/mobile-ui")),
+                None
+            );
+            assert_eq!(
+                s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
+                None
+            );
+            assert_eq!(s.host_badge_for(&remote, Path::new("/remote-only")), None);
+            // Local `/repo`, remote `/repo`, and remote `/remote-only` are 3 separate project headers.
+            assert_eq!(
+                s.rows
+                    .iter()
+                    .filter(|r| matches!(r, Row::Repository(_)))
+                    .count(),
+                3
+            );
+            let find_repo = |host: &HostId, target: &str| {
+                s.rows
+                    .iter()
+                    .enumerate()
+                    .position(|(i, r)| {
+                        s.row_host(i) == host
+                            && matches!(r, Row::Repository(p) if p == Path::new(target))
+                    })
+                    .unwrap()
+            };
+            let find_wt = |host: &HostId, target: &str| {
+                s.rows
+                    .iter()
+                    .enumerate()
+                    .position(|(i, r)| {
+                        s.row_host(i) == host
+                            && matches!(r, Row::Worktree(p) if p == Path::new(target))
+                    })
+                    .unwrap()
+            };
+            (
+                find_wt(&HostId::Local, "/repo/mobile-ui"),
+                find_repo(&HostId::Local, "/repo"),
+                find_repo(&remote, "/repo"),
+                find_repo(&remote, "/remote-only"),
+                find_wt(&remote, "/repo/mobile-ui"),
+            )
+        });
     let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
-    // A connected PC shows on its cards, not as another badge on either merged or remote-only headers.
-    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    // Local project header renders no device label; both remote project headers render inline device labels.
+    assert!(cx.debug_bounds(sel("project-host", local_repo)).is_none());
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_some());
     assert!(
         cx.debug_bounds(sel("project-host", remote_only_repo))
-            .is_none()
+            .is_some()
     );
+    // Worktree cards under GroupBy::Repo omit duplicate host badges.
+    assert!(cx.debug_bounds(sel("host-badge", local_tree)).is_none());
+    assert!(cx.debug_bounds(sel("host-badge", remote_tree)).is_none());
     let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
@@ -2166,11 +2186,10 @@ fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut Te
     cx.run_until_parked();
     view.read_with(cx, |s, _| {
         assert!(s.row_hosts.iter().all(HostId::is_local));
-        assert!(s.merged_projects.is_empty());
     });
-    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_none());
+    assert!(cx.debug_bounds(sel("project-host", local_repo)).is_none());
     assert!(
-        cx.debug_bounds(sel("project-reconnect", remote_repo))
+        cx.debug_bounds(sel("project-reconnect", local_repo))
             .is_none()
     );
     assert!(
@@ -8150,4 +8169,482 @@ fn remote_worktree_hides_and_ignores_local_pin_and_rename(cx: &mut TestAppContex
             "rename shortcut on remote worktree must not open local rename editor"
         );
     });
+}
+
+#[gpui::test]
+fn inline_device_name_hides_on_local_and_shows_inline_on_remote_repo_and_folder(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    vcx.simulate_resize(gpui::size(gpui::px(240.), gpui::px(900.)));
+    let paired_host = HostId::Remote("tax-pc".into());
+    let ssh_host = HostId::Remote("ssh-prod".into());
+    view.update(vcx, |s, cx| {
+        let mut local_folder_sess = session(1, AgentState::Working, None);
+        local_folder_sess.cwd = Some(PathBuf::from("/local/notes"));
+        s.snapshot = Snapshot {
+            sessions: vec![local_folder_sess],
+            trees: BTreeMap::from([(
+                PathBuf::from("/local/sd-tax-system"),
+                vec![PathBuf::from("/local/sd-tax-system")],
+            )]),
+        };
+        let mut remote_folder_sess = session(2, AgentState::Working, None);
+        remote_folder_sess.cwd = Some(PathBuf::from("/remote/long-folder-name-for-truncation"));
+        s.remote_hosts = vec![
+            RemoteHost {
+                id: "tax-pc".into(),
+                label: "이상덕세무사사무소PC".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![remote_folder_sess],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/remote/sd-tax-system-very-long-name"),
+                        vec![PathBuf::from("/remote/sd-tax-system-very-long-name")],
+                    )]),
+                },
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            },
+            RemoteHost {
+                id: "ssh-prod".into(),
+                label: "prod-ssh".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/srv/api"),
+                        vec![PathBuf::from("/srv/api")],
+                    )]),
+                },
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            },
+        ];
+        s.remote_info.insert(
+            "tax-pc".into(),
+            krill_hosts::HostConnectionInfo {
+                status: HostStatus::Connected,
+                detail: Some("iroh://tax-pc-node".into()),
+                error: None,
+            },
+        );
+        s.remote_info.insert(
+            "ssh-prod".into(),
+            krill_hosts::HostConnectionInfo {
+                status: HostStatus::Connected,
+                detail: Some("prod-ssh".into()),
+                error: None,
+            },
+        );
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+
+    let (local_repo, local_folder, paired_repo, paired_folder, ssh_repo) =
+        view.read_with(vcx, |s, cx| {
+            let p = crate::ui::palette(cx);
+            let find = |host: &HostId, pred: fn(&Row) -> bool| {
+                s.rows
+                    .iter()
+                    .enumerate()
+                    .position(|(i, r)| s.row_host(i) == host && pred(r))
+                    .unwrap()
+            };
+            let lr = find(&HostId::Local, |r| matches!(r, Row::Repository(_)));
+            let lf = find(&HostId::Local, |r| matches!(r, Row::Folder(_)));
+            let pr = find(&paired_host, |r| matches!(r, Row::Repository(_)));
+            let pf = find(&paired_host, |r| matches!(r, Row::Folder(_)));
+            let sr = find(&ssh_host, |r| matches!(r, Row::Repository(_)));
+
+            // Tooltip metadata: local has name only; remote has "name — host" + detail when distinct.
+            let local_meta =
+                s.project_header_meta(&HostId::Local, Path::new("/local/sd-tax-system"), p);
+            assert_eq!(local_meta.host_label, None);
+            assert_eq!(local_meta.tip_headline, "sd-tax-system");
+            assert_eq!(local_meta.tip_detail, None);
+
+            let paired_meta = s.project_header_meta(
+                &paired_host,
+                Path::new("/remote/sd-tax-system-very-long-name"),
+                p,
+            );
+            assert_eq!(
+                paired_meta.host_label.as_deref(),
+                Some("이상덕세무사사무소PC")
+            );
+            assert_eq!(
+                paired_meta.tip_headline,
+                "sd-tax-system-very-long-name — 이상덕세무사사무소PC"
+            );
+            assert_eq!(
+                paired_meta.tip_detail.as_deref(),
+                Some("iroh://tax-pc-node")
+            );
+
+            // When detail equals label, second tooltip line is omitted.
+            let ssh_meta = s.project_header_meta(&ssh_host, Path::new("/srv/api"), p);
+            assert_eq!(ssh_meta.tip_headline, "api — prod-ssh");
+            assert_eq!(ssh_meta.tip_detail, None);
+
+            (lr, lf, pr, pf, sr)
+        });
+
+    let sel = |prefix: &str, idx: usize| -> &'static str { format!("{prefix}-{idx}").leak() };
+    assert!(vcx.debug_bounds(sel("project-host", local_repo)).is_none());
+    assert!(
+        vcx.debug_bounds(sel("project-host", local_folder))
+            .is_none()
+    );
+
+    // Connected paired & SSH remote repos and remote folders show inline device labels on the same row.
+    for (title_prefix, idx) in [
+        ("repo-title", paired_repo),
+        ("folder-title", paired_folder),
+        ("repo-title", ssh_repo),
+    ] {
+        let title_b = vcx
+            .debug_bounds(sel(title_prefix, idx))
+            .expect("title bounds");
+        let host_b = vcx
+            .debug_bounds(sel("project-host", idx))
+            .expect("inline remote device bounds");
+        assert!(
+            f32::from(title_b.size.width) > 20.,
+            "project title must stay readable alongside inline device name"
+        );
+        assert!(
+            f32::from(host_b.size.width) > 20.,
+            "inline device name must stay readable"
+        );
+        assert!(
+            host_b.origin.x >= title_b.right(),
+            "device name must sit to the right of project title"
+        );
+        let title_mid_y = f32::from(title_b.center().y);
+        let host_mid_y = f32::from(host_b.center().y);
+        assert!(
+            (title_mid_y - host_mid_y).abs() <= 4.,
+            "project title and device name must share a single inline row"
+        );
+    }
+
+    // With long project name and long device name inside 240pt sidebar, device label is capped at <= 50% width.
+    let header_b = vcx.debug_bounds(sel("repo-header", paired_repo)).unwrap();
+    let host_b = vcx.debug_bounds(sel("project-host", paired_repo)).unwrap();
+    assert!(
+        f32::from(host_b.size.width) <= f32::from(header_b.size.width) * 0.55,
+        "device name width ({}) must not exceed ~50% of header ({})",
+        f32::from(host_b.size.width),
+        f32::from(header_b.size.width),
+    );
+}
+
+#[gpui::test]
+fn same_name_local_and_remote_projects_isolate_rows_folds_and_visuals(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let tax = HostId::Remote("tax".into());
+    let studio = HostId::Remote("studio".into());
+    view.update(vcx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![],
+            trees: BTreeMap::from([(
+                PathBuf::from("/local/sd-tax-system"),
+                vec![
+                    PathBuf::from("/local/sd-tax-system"),
+                    PathBuf::from("/local/sd-tax-system/wt-local"),
+                ],
+            )]),
+        };
+        s.project_visuals.insert(
+            PathBuf::from("/local/sd-tax-system"),
+            external::ProjectVisualMeta {
+                display_name: Some("Local Tax".into()),
+                badge_color: Some("#6366f1".into()),
+                icon: Some(crate::ui::icons::ProjectIcon::Emoji("🏠".into())),
+            },
+        );
+        s.remote_visuals.insert(
+            (tax.clone(), PathBuf::from("/win/sd-tax-system")),
+            external::ProjectVisualMeta {
+                display_name: Some("Remote Tax".into()),
+                badge_color: Some("#f59e0b".into()),
+                icon: Some(crate::ui::icons::ProjectIcon::Emoji("🏢".into())),
+            },
+        );
+        s.remote_visuals.insert(
+            (studio.clone(), PathBuf::from("/srv/sd-tax-system")),
+            external::ProjectVisualMeta {
+                display_name: Some("Studio Tax".into()),
+                badge_color: Some("#10b981".into()),
+                icon: Some(crate::ui::icons::ProjectIcon::Emoji("🧪".into())),
+            },
+        );
+        s.remote_hosts = vec![
+            RemoteHost {
+                id: "tax".into(),
+                label: "이상덕세무".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/win/sd-tax-system"),
+                        vec![
+                            PathBuf::from("/win/sd-tax-system"),
+                            PathBuf::from("/win/sd-tax-system/wt-tax"),
+                        ],
+                    )]),
+                },
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            },
+            RemoteHost {
+                id: "studio".into(),
+                label: "Mac Studio".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/srv/sd-tax-system"),
+                        vec![PathBuf::from("/srv/sd-tax-system")],
+                    )]),
+                },
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            },
+        ];
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |s, _| {
+        let repo_hosts: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Row::Repository(_)))
+            .map(|(i, _)| s.row_host(i).clone())
+            .collect();
+        assert_eq!(repo_hosts, vec![HostId::Local, tax.clone(), studio.clone()]);
+
+        // Visual lookup is scoped to (HostId, PathBuf) without cross-host collision.
+        assert_eq!(
+            s.project_icon_on(&HostId::Local, Path::new("/local/sd-tax-system")),
+            Some(&crate::ui::icons::ProjectIcon::Emoji("🏠".into()))
+        );
+        assert_eq!(
+            s.project_icon_on(&tax, Path::new("/win/sd-tax-system")),
+            Some(&crate::ui::icons::ProjectIcon::Emoji("🏢".into()))
+        );
+        assert_eq!(
+            s.project_icon_on(&studio, Path::new("/srv/sd-tax-system")),
+            Some(&crate::ui::icons::ProjectIcon::Emoji("🧪".into()))
+        );
+        assert_eq!(
+            s.project_badge_color_on(&HostId::Local, Path::new("/local/sd-tax-system")),
+            Some("#6366f1")
+        );
+        assert_eq!(
+            s.project_badge_color_on(&tax, Path::new("/win/sd-tax-system")),
+            Some("#f59e0b")
+        );
+        assert_eq!(
+            s.project_header_name_on(&studio, Path::new("/srv/sd-tax-system")),
+            "Studio Tax"
+        );
+    });
+
+    // Folding one remote project does not fold local or another remote project.
+    view.update(vcx, |s, cx| {
+        s.fold_on(&tax, Path::new("/win/sd-tax-system"), Some(false), cx);
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |s, _| {
+        assert!(s.rows.iter().any(
+            |r| matches!(r, Row::Worktree(p) if p == Path::new("/local/sd-tax-system/wt-local"))
+        ));
+        assert!(
+            !s.rows.iter().any(
+                |r| matches!(r, Row::Worktree(p) if p == Path::new("/win/sd-tax-system/wt-tax"))
+            )
+        );
+        assert!(
+            s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Worktree(p) if p == Path::new("/srv/sd-tax-system")))
+        );
+    });
+}
+
+#[gpui::test]
+fn group_by_repo_omits_duplicate_host_badges_and_non_repo_keeps_them(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    vcx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(1000.)));
+    let remote = HostId::Remote("studio".into());
+    view.update(vcx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![],
+            trees: BTreeMap::from([(
+                PathBuf::from("/local/app"),
+                vec![PathBuf::from("/local/app")],
+            )]),
+        };
+        let mut folder_sess = session(10, AgentState::Working, None);
+        folder_sess.cwd = Some(PathBuf::from("/remote/folder"));
+        let loose_sess = session(11, AgentState::Done, None);
+        s.remote_hosts = vec![RemoteHost {
+            id: "studio".into(),
+            label: "Mac Studio".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![folder_sess, loose_sess],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/remote/app"),
+                    vec![PathBuf::from("/remote/app")],
+                )]),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        }];
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+
+    let sel = |prefix: &str, idx: usize| -> &'static str { format!("{prefix}-{idx}").leak() };
+    let (remote_wt_idx, folder_sess_idx, loose_sess_idx) = view.read_with(vcx, |s, _| {
+        let wt = s
+            .rows
+            .iter()
+            .enumerate()
+            .position(|(i, r)| s.row_host(i) == &remote && matches!(r, Row::Worktree(_)))
+            .unwrap();
+        let fs = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Session(sess, true) if sess.id == SessionId(10)))
+            .unwrap();
+        let ls = s
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Session(sess, false) if sess.id == SessionId(11)))
+            .unwrap();
+        assert_eq!(s.host_badge_for(&remote, Path::new("/remote/app")), None);
+        (wt, fs, ls)
+    });
+    // Under GroupBy::Repo, worktree card and folder-nested session omit duplicate host badges;
+    // loose session (under shared Row::Loose header) retains its host badge.
+    assert!(vcx.debug_bounds(sel("host-badge", remote_wt_idx)).is_none());
+    assert!(
+        vcx.debug_bounds(sel("session-host", folder_sess_idx))
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds(sel("session-host", loose_sess_idx))
+            .is_some()
+    );
+
+    // Non-Repo groupings retain host badges on worktree cards.
+    for group_by in [GroupBy::WorkspaceStatus, GroupBy::PrStatus, GroupBy::None] {
+        view.update(vcx, |s, cx| s.set_group_by(group_by, cx));
+        vcx.run_until_parked();
+        view.read_with(vcx, |s, _| {
+            assert_eq!(
+                s.host_badge_for(&remote, Path::new("/remote/app"))
+                    .as_deref(),
+                Some("Mac Studio"),
+                "remote worktree must keep host badge under {group_by:?}"
+            );
+            assert!(
+                s.host_badge_for(&HostId::Local, Path::new("/local/app"))
+                    .is_some(),
+                "local worktree must keep host badge under {group_by:?} when remote is connected"
+            );
+        });
+    }
+}
+
+#[gpui::test]
+fn project_header_hover_overlay_and_non_connected_host_controls(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    vcx.simulate_resize(gpui::size(gpui::px(240.), gpui::px(600.)));
+    let remote = HostId::Remote("office".into());
+    view.update(vcx, |s, cx| {
+        s.remote_hosts = vec![RemoteHost {
+            id: "office".into(),
+            label: "Office-Workstation-Long".into(),
+            status: HostStatus::Connected,
+            snapshot: Snapshot {
+                sessions: vec![],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/remote/long-repository-title"),
+                    vec![PathBuf::from("/remote/long-repository-title")],
+                )]),
+            },
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        }];
+        s.rebuild(cx);
+    });
+    vcx.run_until_parked();
+
+    // Hover action overlay is positioned at the right edge without stealing idle horizontal width.
+    let header_b = vcx.debug_bounds("repo-header-0").unwrap();
+    let host_b = vcx.debug_bounds("project-host-0").unwrap();
+    let actions_b = vcx.debug_bounds("repo-actions-0").unwrap();
+    assert!(
+        f32::from(host_b.right()) > f32::from(actions_b.left()),
+        "inline host label should use idle space beneath the absolute hover action overlay"
+    );
+    assert!(
+        (f32::from(header_b.right()) - f32::from(actions_b.right())).abs() <= 8.,
+        "hover action overlay must align to the right edge of the header"
+    );
+
+    // Non-connected statuses (Connecting, Disconnected, AuthFailed) keep inline host status & reconnect control.
+    for (status, expect_reconnect) in [
+        (HostStatus::Connecting, false),
+        (HostStatus::Disconnected, true),
+        (HostStatus::AuthFailed, true),
+    ] {
+        view.update(vcx, |s, cx| {
+            s.remote_hosts[0].status = status;
+            s.rows = vec![Row::Repository(PathBuf::from(
+                "/remote/long-repository-title",
+            ))];
+            s.row_hosts = vec![remote.clone()];
+            s.sync_viewport();
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("project-host-0").is_some(),
+            "project-host must render for {status:?}"
+        );
+        assert_eq!(
+            vcx.debug_bounds("project-reconnect-0").is_some(),
+            expect_reconnect,
+            "project-reconnect visibility mismatch for {status:?}"
+        );
+        view.read_with(vcx, |s, cx| {
+            let meta = s.project_header_meta(
+                &remote,
+                Path::new("/remote/long-repository-title"),
+                crate::ui::palette(cx),
+            );
+            assert!(
+                meta.tip_detail.is_some(),
+                "non-connected tooltip needs status detail for {status:?}"
+            );
+        });
+    }
 }
