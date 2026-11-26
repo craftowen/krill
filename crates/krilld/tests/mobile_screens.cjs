@@ -3262,11 +3262,14 @@ async function botInstantLoadingRegressions(){
  const wsCall=calls.find(c=>c.action==='bots.workspace');
  assert.equal(wsCall?.since,wsEtagB1,'revisit #/bots/b1 sends since etag');
  assert(d1AgainRoot.textContent.includes('Alpha Bot'),'unchanged:true preserves cached workspace UI');
- // Manual Refresh invalidates etag and omits since.
+ // Manual Refresh (via Orca header More actions sheet) invalidates etag and omits since.
  calls.length=0;
- const refreshBtn=d1AgainRoot.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Refresh');
- assert(refreshBtn,'Refresh button present on bot detail');
- await refreshBtn.action();
+ const moreBtn=d1AgainRoot.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='More actions');
+ assert(moreBtn,'More actions button present on bot detail');
+ await moreBtn.action();
+ const refreshAction=(bf.sheets.at(-1)?.[1]||[]).find(item=>item.label==='Refresh');
+ assert(refreshAction,'Refresh action present inside More actions sheet');
+ await refreshAction.action();
  await bf.flush();
  const freshWsCall=calls.find(c=>c.action==='bots.workspace');
  assert.equal(freshWsCall?.since,undefined,'manual refresh invalidates etag and omits since');
