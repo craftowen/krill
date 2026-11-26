@@ -64,6 +64,26 @@ pub struct WireDirListing {
     pub ignored: Vec<String>,
 }
 
+/// 원격 호스트 파일 시스템 찾아보기 항목(프로젝트 추가 모달용).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBrowseEntry {
+    #[serde(deserialize_with = "remote_text")]
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+/// 원격 호스트 파일 시스템 찾아보기 응답.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBrowseListing {
+    #[serde(deserialize_with = "remote_text")]
+    pub resolved_path: String,
+    /// `true`면 Windows 경로 문법(`C:\...`), `false`면 POSIX(`/...`).
+    pub is_windows: bool,
+    #[serde(deserialize_with = "browse_entries")]
+    pub entries: Vec<WireBrowseEntry>,
+}
+
 /// 파일 탐색기 쓰기 동작.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireExplorerOp {
@@ -179,6 +199,13 @@ pub enum RemoteFsRequest {
         path: Vec<u8>,
         stage_id: u64,
     },
+    /// 원격 호스트 파일 시스템 디렉터리 찾아보기(프로젝트 추가 모달용).
+    /// `dir`이 비어 있거나 `~`이면 원격 사용자 홈 디렉터리를 조회한다.
+    /// 구버전 데몬은 알 수 없는 variant를 `Failure::BadRequest`로 거절한다.
+    BrowseDir {
+        #[serde(deserialize_with = "remote_path")]
+        dir: Vec<u8>,
+    },
 }
 
 /// [`RemoteFsRequest`]의 응답. variant는 끝에만 붙인다.
@@ -202,6 +229,10 @@ pub enum RemoteFsReply {
     PortForwarded(#[serde(deserialize_with = "unit_result")] Result<(), String>),
     /// [`RemoteFsRequest::AbortStage`] 결과: 활성 스테이지를 실제로 지웠으면 `true`.
     StageAborted(bool),
+    /// [`RemoteFsRequest::BrowseDir`] 결과.
+    BrowseEntries(
+        #[serde(deserialize_with = "browse_listing_result")] Result<WireBrowseListing, String>,
+    ),
 }
 
 impl RemoteFsRequest {
@@ -216,6 +247,7 @@ impl RemoteFsRequest {
                 | Self::ReadDir { .. }
                 | Self::ScanWorktree { .. }
                 | Self::QuickOpenList { .. }
+                | Self::BrowseDir { .. }
         )
     }
 }
@@ -255,6 +287,12 @@ fn probed_paths<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Option<Vec
 
 fn dir_entries<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<WireDirEntry>, D::Error> {
     bounded::<D, WireDirEntry, MAX_DIR_ENTRIES>(d)
+}
+
+fn browse_entries<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<WireBrowseEntry>, D::Error> {
+    bounded::<D, WireBrowseEntry, MAX_DIR_ENTRIES>(d)
 }
 
 fn ignored_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -320,6 +358,12 @@ fn chunk_result<'de, D: serde::Deserializer<'de>>(
 fn dir_listing_result<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Result<WireDirListing, String>, D::Error> {
+    bounded_err_result(d)
+}
+
+fn browse_listing_result<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Result<WireBrowseListing, String>, D::Error> {
     bounded_err_result(d)
 }
 
@@ -500,6 +544,55 @@ mod tests {
             let raw = postcard::to_stdvec(&Reply::RemoteFs(reply)).unwrap();
             assert!(Reply::decode(crate::control::kind::REPLY, &raw).is_err());
         }
+    }
+
+    #[test]
+    fn browse_dir_roundtrip_read_only_and_limits() {
+        let req = RemoteFsRequest::BrowseDir {
+            dir: b"~/Documents".to_vec(),
+        };
+        assert!(req.is_read_only());
+        let encoded = Request::RemoteFs(req.clone()).encode().unwrap();
+        let (kind, body) = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        assert_eq!(
+            Request::decode(kind, &body).unwrap(),
+            Request::RemoteFs(req)
+        );
+
+        let reply = Reply::RemoteFs(RemoteFsReply::BrowseEntries(Ok(WireBrowseListing {
+            resolved_path: "/Users/macmini/Documents".to_owned(),
+            is_windows: false,
+            entries: vec![WireBrowseEntry {
+                name: "wProject".to_owned(),
+                is_dir: true,
+                is_symlink: false,
+            }],
+        })));
+        let encoded = reply.encode().unwrap();
+        let (kind, body) = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        assert_eq!(Reply::decode(kind, &body).unwrap(), reply);
+
+        let oversized_req = Request::RemoteFs(RemoteFsRequest::BrowseDir {
+            dir: vec![b'a'; MAX_REMOTE_PATH + 1],
+        });
+        let raw = postcard::to_stdvec(&oversized_req).unwrap();
+        assert!(Request::decode(crate::control::kind::REQUEST, &raw).is_err());
+
+        let oversized_reply =
+            Reply::RemoteFs(RemoteFsReply::BrowseEntries(Ok(WireBrowseListing {
+                resolved_path: "/".to_owned(),
+                is_windows: false,
+                entries: vec![
+                    WireBrowseEntry {
+                        name: "d".to_owned(),
+                        is_dir: true,
+                        is_symlink: false,
+                    };
+                    MAX_DIR_ENTRIES + 1
+                ],
+            })));
+        let raw = postcard::to_stdvec(&oversized_reply).unwrap();
+        assert!(Reply::decode(crate::control::kind::REPLY, &raw).is_err());
     }
 
     proptest::proptest! {

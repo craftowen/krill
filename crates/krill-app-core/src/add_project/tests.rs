@@ -330,3 +330,151 @@ fn tab_focused_host_chip_and_action_cards_activate_on_enter_and_space(cx: &mut T
     });
     assert!(events.lock().unwrap().is_empty());
 }
+
+#[test]
+fn remote_browser_path_helpers_handle_posix_and_windows() {
+    assert_eq!(
+        remote_breadcrumbs("/Users/macmini", false),
+        vec![
+            ("/".to_owned(), "/".to_owned()),
+            ("Users".to_owned(), "/Users".to_owned()),
+            ("macmini".to_owned(), "/Users/macmini".to_owned()),
+        ]
+    );
+    assert_eq!(remote_parent_path("/Users/macmini", false), "/Users");
+    assert_eq!(remote_parent_path("/Users", false), "/");
+    assert_eq!(remote_parent_path("/", false), "/");
+    assert_eq!(
+        join_remote_path("/Users/macmini", "Documents", false),
+        "/Users/macmini/Documents"
+    );
+    assert_eq!(join_remote_path("/", "Users", false), "/Users");
+
+    assert_eq!(
+        remote_breadcrumbs(r"C:\Users\dev", true),
+        vec![
+            ("/".to_owned(), "/".to_owned()),
+            (r"C:\".to_owned(), r"C:\".to_owned()),
+            ("Users".to_owned(), r"C:\Users".to_owned()),
+            ("dev".to_owned(), r"C:\Users\dev".to_owned()),
+        ]
+    );
+    assert_eq!(remote_parent_path(r"C:\Users\dev", true), r"C:\Users");
+    assert_eq!(remote_parent_path(r"C:\Users", true), r"C:\");
+    assert_eq!(remote_parent_path(r"C:\", true), "/");
+    assert_eq!(join_remote_path("/", r"C:\", true), r"C:\");
+    assert_eq!(join_remote_path(r"C:\", "Users", true), r"C:\Users");
+
+    assert!(!looks_like_browse_path("haesol", false));
+    assert!(looks_like_browse_path("/Users", false));
+    assert!(looks_like_browse_path("~", false));
+    assert!(looks_like_browse_path("..", false));
+    assert!(looks_like_browse_path(r"C:\work", true));
+}
+
+#[gpui::test]
+fn remote_folder_browser_loads_filters_navigates_and_selects_folder(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let remote = HostId::Remote("macmini".to_owned());
+    let browser: RemoteBrowserFn = Arc::new(|_host, dir| {
+        let dir_entry = |name: &str| WireBrowseEntry {
+            name: name.to_owned(),
+            is_dir: true,
+            is_symlink: false,
+        };
+        match dir {
+            "" | "~" | "/Users/macmini" => Ok(WireBrowseListing {
+                resolved_path: "/Users/macmini".to_owned(),
+                is_windows: false,
+                entries: vec![dir_entry("Desktop"), dir_entry("Documents")],
+            }),
+            "/Users/macmini/Documents" => Ok(WireBrowseListing {
+                resolved_path: "/Users/macmini/Documents".to_owned(),
+                is_windows: false,
+                entries: vec![dir_entry("wProject")],
+            }),
+            "/Users/macmini/Documents/wProject" => Ok(WireBrowseListing {
+                resolved_path: "/Users/macmini/Documents/wProject".to_owned(),
+                is_windows: false,
+                entries: vec![dir_entry("haesol-tax-system")],
+            }),
+            other => Err(format!("not found: {other}")),
+        }
+    });
+    let (dialog, cx) = cx.add_window_view(|window, cx| {
+        Dialog::new_with_hosts(
+            window,
+            cx,
+            vec![
+                (HostId::Local, "local".to_owned()),
+                (remote.clone(), "macmini".to_owned()),
+            ],
+            remote.clone(),
+        )
+        .with_remote_browser(browser)
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, e: &Event, _| {
+            sink.lock().unwrap().push(e.clone());
+        })
+        .detach();
+    });
+    cx.run_until_parked();
+
+    // Enter activates remote browse -> automatically loads remote home /Users/macmini
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let d = dialog.read(cx);
+        assert_eq!(d.step, Step::RemotePath(RemoteMode::Browse));
+        assert_eq!(d.browse_dir.as_deref(), Some("/Users/macmini"));
+        assert_eq!(d.visible_browse_entries(cx).len(), 2);
+    });
+
+    // Typing filter narrows visible folders to "Documents", Enter navigates into it
+    cx.simulate_input("doc");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let d = dialog.read(cx);
+        let names: Vec<&str> = d
+            .visible_browse_entries(cx)
+            .into_iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, ["Documents"]);
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            dialog.read(cx).browse_dir.as_deref(),
+            Some("/Users/macmini/Documents")
+        );
+    });
+
+    // Typing an explicit path jumps directly to /Users/macmini/Documents/wProject
+    cx.simulate_input("/Users/macmini/Documents/wProject");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            dialog.read(cx).browse_dir.as_deref(),
+            Some("/Users/macmini/Documents/wProject")
+        );
+    });
+
+    // Confirming opens the currently browsed folder on the remote host
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| d.confirm_remote_browser(window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [Event::OpenPath(
+            remote,
+            PathBuf::from("/Users/macmini/Documents/wProject")
+        )]
+    );
+}
