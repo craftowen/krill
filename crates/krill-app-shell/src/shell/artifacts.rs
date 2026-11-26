@@ -245,7 +245,8 @@ impl Shell {
                 let created = cx.new(|cx| {
                     let _ = &target;
                     let mut v =
-                        krill_bots_ui::bots::View::with_rpc(
+                        krill_bots_ui::bots::View::with_rpc_on_host(
+                            host.clone(),
                             self.bot_rpc_on(&host).unwrap_or_else(|| {
                                 Arc::new(|req| match req {
                                     krill_proto::bots::BotRpcRequest::ListBots => {
@@ -546,7 +547,14 @@ impl Shell {
         if sidebar.is_suppressed_remote_host(host) {
             return false;
         }
-        let in_sidebar = sidebar
+        if let Some((_, status)) = self.host_statuses.iter().find(|(s, _)| s.id == remote_id) {
+            return matches!(
+                status,
+                krill_app_core::hosts::HostStatus::Connected
+                    | krill_app_core::hosts::HostStatus::Connecting
+            );
+        }
+        sidebar
             .remote_hosts()
             .iter()
             .find(|r| r.id == remote_id)
@@ -556,19 +564,7 @@ impl Shell {
                     krill_app_core::hosts::HostStatus::Connected
                         | krill_app_core::hosts::HostStatus::Connecting
                 )
-            });
-        let in_statuses = self
-            .host_statuses
-            .iter()
-            .find(|(s, _)| s.id == remote_id)
-            .is_some_and(|(_, st)| {
-                matches!(
-                    st,
-                    krill_app_core::hosts::HostStatus::Connected
-                        | krill_app_core::hosts::HostStatus::Connecting
-                )
-            });
-        in_sidebar || in_statuses
+            })
     }
 
     fn prune_inactive_bot_hosts(
@@ -601,6 +597,63 @@ impl Shell {
         self.bot_ui
             .avatars
             .retain(|(host, _), _| !stale.contains(host));
+        self.bot_ui
+            .up_next_unseen
+            .retain(|(host, _), _| !stale.contains(host));
+        self.bot_ui
+            .opening
+            .retain(|(host, _)| !stale.contains(host));
+        if self
+            .bot_ui
+            .delete
+            .as_ref()
+            .is_some_and(|b| stale.contains(&b.host))
+        {
+            self.bot_ui.delete = None;
+        }
+        if self
+            .bot_ui
+            .delete_group
+            .as_ref()
+            .is_some_and(|(h, _)| stale.contains(h))
+        {
+            self.bot_ui.delete_group = None;
+        }
+        if self
+            .bot_ui
+            .renaming
+            .as_ref()
+            .is_some_and(|(h, ..)| stale.contains(h))
+        {
+            self.bot_ui.renaming = None;
+        }
+        if self
+            .bot_ui
+            .renaming_group
+            .as_ref()
+            .is_some_and(|(h, ..)| stale.contains(h))
+        {
+            self.bot_ui.renaming_group = None;
+        }
+        if self
+            .bot_ui
+            .panel
+            .shown
+            .as_ref()
+            .is_some_and(|(h, ..)| stale.contains(h))
+        {
+            self.bot_ui.panel.shown = None;
+        }
+        if self
+            .bot_ui
+            .panel
+            .view
+            .as_ref()
+            .is_some_and(|v| stale.contains(v.read(cx).host()))
+        {
+            self.bot_ui.panel.view = None;
+            self.bot_ui.panel.home_chrome = super::bot_panel::HomeChrome::default();
+        }
         self.rebuild_merged_sidebar_bots(active, false, cx);
     }
 

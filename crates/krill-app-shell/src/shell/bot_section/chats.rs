@@ -161,7 +161,12 @@ impl Shell {
                     .child({
                         let age_sel = format!("bot-chat-age-{}", chat.session.0);
                         let more_sel = format!("bot-chat-more-{}", chat.session.0);
-                        let more_dbg = more_sel.clone();
+                        let more_btn_id = if host.is_local() {
+                            more_sel.clone()
+                        } else {
+                            format!("bot-chat-more-btn-{}-{}", host.as_key(), chat.session.0)
+                        };
+                        let more_dbg = more_sel;
                         div()
                             .relative()
                             .min_w(px(24.))
@@ -190,7 +195,7 @@ impl Shell {
                                         cx.stop_propagation();
                                     })
                                     .child(
-                                        Button::new(SharedString::from(more_sel))
+                                        Button::new(SharedString::from(more_btn_id))
                                             .ghost()
                                             .xsmall()
                                             .icon(

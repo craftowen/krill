@@ -2788,6 +2788,7 @@ fn bot_attention_facts_and_lifecycle_panel_reset_dedup_and_group_rename_rollback
             s.bot_ui.panel.settings = Some(DetailTab::SoulMemory);
             s.bot_ui.panel.pending_draft = Some((HostId::Local, zed_id.clone(), "draft".into()));
             s.bot_ui.panel.home_chrome = HomeChrome {
+                host: Some(HostId::Local),
                 bot_id: Some(zed_id.clone()),
                 quiet_line: Some(("Running".into(), None, true)),
                 ..Default::default()
@@ -2937,5 +2938,399 @@ fn refresh_bot_up_next_batches_suggestions_once_for_multiple_bots(cx: &mut TestA
                 Some(1)
             );
         }
+    });
+}
+
+#[gpui::test]
+fn multi_host_bots_show_host_badge_route_actions_isolate_same_id_and_prune_on_disconnect(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::Mutex;
+
+    use crate::shell::bot_panel::HomeChrome;
+    use krill_app_core::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use krill_bots_ui::bots::DetailTab;
+    use krill_proto::bots::{
+        BotConfig, BotGroupChat, BotGroupReplyAudience, BotGroupSummary, BotRpcRequest,
+        BotRpcResponse,
+    };
+
+    let (view, cx) = open(cx, state_path("multi-host-bots-badge-routing-prune"));
+    cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+
+    let remote_host = HostId::Remote("oci-yd-bot".to_owned());
+    let shared_id = BotId::new("ai-owen").unwrap();
+    let local_only_id = BotId::new("local-helper").unwrap();
+
+    let mut local_shared_cfg = BotConfig::new(
+        shared_id.clone(),
+        "AI오웬 (로컬)",
+        "claude",
+        1_700_000_000_000,
+    )
+    .unwrap();
+    local_shared_cfg.description = "로컬 어시스턴트".to_owned();
+    local_shared_cfg.avatar = Some("A1".to_owned());
+
+    let mut local_only_cfg = BotConfig::new(
+        local_only_id.clone(),
+        "로컬 도우미",
+        "claude",
+        1_700_000_000_000,
+    )
+    .unwrap();
+    local_only_cfg.description = "로컬 전용".to_owned();
+    local_only_cfg.avatar = Some("B1".to_owned());
+
+    let mut remote_shared_cfg =
+        BotConfig::new(shared_id.clone(), "AI오웬", "claude", 1_700_000_000_000).unwrap();
+    remote_shared_cfg.description = "윤자동 원격 봇".to_owned();
+    remote_shared_cfg.avatar = Some("E1".to_owned());
+
+    let local_session = BotSessionSummary {
+        session_id: SessionId(501),
+        bot_id: shared_id.clone(),
+        link_id: None,
+        pid: 10,
+        live: true,
+        working: false,
+        label: "AI오웬 (로컬)".to_owned(),
+        created_at_ms: 1_700_000_001_000,
+    };
+    let remote_session = BotSessionSummary {
+        session_id: SessionId(501),
+        bot_id: shared_id.clone(),
+        link_id: None,
+        pid: 20,
+        live: true,
+        working: false,
+        label: "AI오웬".to_owned(),
+        created_at_ms: 1_700_000_001_000,
+    };
+    let remote_group = BotGroupSummary {
+        group: BotGroupChat {
+            id: "grp-shared".into(),
+            name: "윤자동 팀".into(),
+            bot_ids: vec![shared_id.clone()],
+            description: "원격 그룹".into(),
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: None,
+        active_turns: Vec::new(),
+    };
+
+    let local_mutations: Arc<Mutex<Vec<String>>> = Arc::default();
+    let remote_mutations: Arc<Mutex<Vec<String>>> = Arc::default();
+    let local_mut_bg = Arc::clone(&local_mutations);
+    let remote_mut_bg = Arc::clone(&remote_mutations);
+
+    let local_bots_rpc = vec![local_shared_cfg.clone(), local_only_cfg.clone()];
+    let local_sessions_rpc = vec![local_session];
+    let local_rpc: krill_bots_ui::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(local_bots_rpc.clone())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+        BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(Vec::new())),
+        BotRpcRequest::ListBotSessions { .. } => {
+            Ok(BotRpcResponse::BotSessions(local_sessions_rpc.clone()))
+        }
+        BotRpcRequest::ListGroupSummaries => Ok(BotRpcResponse::GroupSummaries(Vec::new())),
+        BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(Vec::new())),
+        BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+            krill_proto::bots::BotUpcoming::default(),
+        )),
+        BotRpcRequest::UpdateBot(p) => {
+            local_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("update:{}:{:?}:{:?}", p.bot_id, p.name, p.paused));
+            let mut updated = local_shared_cfg.clone();
+            if let Some(paused) = p.paused {
+                updated.paused = paused;
+            }
+            if let Some(name) = &p.name {
+                updated.name.clone_from(name);
+            }
+            Ok(BotRpcResponse::Bot(Box::new(updated)))
+        }
+        BotRpcRequest::StartBotSession { bot_id, .. } => {
+            local_mut_bg.lock().unwrap().push(format!("start:{bot_id}"));
+            Ok(BotRpcResponse::SessionStarted {
+                bot_id: bot_id.clone(),
+                session_id: SessionId(701),
+                pid: 701,
+            })
+        }
+        BotRpcRequest::StopBotSession { bot_id, session_id } => {
+            local_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("stop:{bot_id}:{}", session_id.0));
+            Ok(BotRpcResponse::Ok)
+        }
+        BotRpcRequest::DeleteBot { bot_id, .. } => {
+            local_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("delete:{bot_id}"));
+            Ok(BotRpcResponse::Deleted {
+                bot_id: bot_id.clone(),
+            })
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    let remote_bots_rpc = vec![remote_shared_cfg.clone()];
+    let remote_sessions_rpc = vec![remote_session];
+    let remote_groups_rpc = vec![remote_group];
+    let remote_rpc: krill_bots_ui::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(remote_bots_rpc.clone())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+        BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(Vec::new())),
+        BotRpcRequest::ListBotSessions { .. } => {
+            Ok(BotRpcResponse::BotSessions(remote_sessions_rpc.clone()))
+        }
+        BotRpcRequest::ListGroupSummaries => {
+            Ok(BotRpcResponse::GroupSummaries(remote_groups_rpc.clone()))
+        }
+        BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(Vec::new())),
+        BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+            krill_proto::bots::BotUpcoming::default(),
+        )),
+        BotRpcRequest::UpdateBot(p) => {
+            remote_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("update:{}:{:?}:{:?}", p.bot_id, p.name, p.paused));
+            let mut updated = remote_shared_cfg.clone();
+            if let Some(paused) = p.paused {
+                updated.paused = paused;
+            }
+            if let Some(name) = &p.name {
+                updated.name.clone_from(name);
+            }
+            Ok(BotRpcResponse::Bot(Box::new(updated)))
+        }
+        BotRpcRequest::StartBotSession { bot_id, .. } => {
+            remote_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("start:{bot_id}"));
+            Ok(BotRpcResponse::SessionStarted {
+                bot_id: bot_id.clone(),
+                session_id: SessionId(801),
+                pid: 801,
+            })
+        }
+        BotRpcRequest::StopBotSession { bot_id, session_id } => {
+            remote_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("stop:{bot_id}:{}", session_id.0));
+            Ok(BotRpcResponse::Ok)
+        }
+        BotRpcRequest::DeleteBot { bot_id, .. } => {
+            remote_mut_bg
+                .lock()
+                .unwrap()
+                .push(format!("delete:{bot_id}"));
+            Ok(BotRpcResponse::Deleted {
+                bot_id: bot_id.clone(),
+            })
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    let remote_spec = RemoteHostSpec {
+        id: "oci-yd-bot".to_owned(),
+        label: "윤자동-봇".to_owned(),
+        address: "ubuntu@oci-yd-bot".to_owned(),
+        port: None,
+        identity_file: None,
+        remote_socket: None,
+    };
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.link = crate::shell::Link::Up;
+            s.launch_host = HostId::Local;
+            s.panel_collapsed = false;
+            s.host_statuses = vec![(remote_spec.clone(), HostStatus::Connected)];
+            s.bot_rpc_overrides.insert(HostId::Local, local_rpc);
+            s.bot_rpc_overrides.insert(remote_host.clone(), remote_rpc);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "oci-yd-bot",
+                    HostStatus::Connected,
+                    sidebar::Snapshot::default(),
+                    cx,
+                );
+            });
+            s.refresh_bots_badge(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. Both local and remote bots (including duplicate BotId) and remote group appear,
+    //    with visible host badges on remote rows only.
+    assert!(
+        cx.debug_bounds("bot-row-host-ai-owen").is_some(),
+        "remote bot row must render visible host badge"
+    );
+    assert!(
+        cx.debug_bounds("bot-row-host-local-helper").is_none(),
+        "local bot row must not render remote host badge"
+    );
+    assert!(
+        cx.debug_bounds("bot-group-row-host-grp-shared").is_some(),
+        "remote group row must render visible host badge"
+    );
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.sidebar_bots.len(), 3);
+        assert!(
+            s.sidebar_bots
+                .iter()
+                .any(|b| b.host == HostId::Local && b.id == shared_id)
+        );
+        assert!(
+            s.sidebar_bots
+                .iter()
+                .any(|b| b.host == remote_host && b.id == shared_id)
+        );
+    });
+
+    // Search results also show the remote host badge for remote bots.
+    click(cx, "bots-section-search");
+    cx.simulate_input("AI오웬");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("bot-search-host-ai-owen").is_some(),
+        "remote bot search result must render visible host badge"
+    );
+    click(cx, "bots-section-search");
+
+    // 2. All remote bot actions route to `remote_host` RPC even while `launch_host == HostId::Local`.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert_eq!(s.launch_host, HostId::Local);
+            s.set_bot_paused_on(&remote_host, shared_id.clone(), true, cx);
+            s.rename_bot_on(&remote_host, shared_id.clone(), "AI오웬-수정".into(), cx);
+            s.stop_bot_chat_on(&remote_host, shared_id.clone(), SessionId(501), cx);
+            // Unpause before starting a new remote session.
+            s.set_bot_paused_on(&remote_host, shared_id.clone(), false, cx);
+            s.start_bot_session_on(&remote_host, shared_id.clone(), None, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        local_mutations.lock().unwrap().is_empty(),
+        "remote bot actions must never leak to local launch_host RPC: {:?}",
+        local_mutations.lock().unwrap()
+    );
+    {
+        let ops = remote_mutations.lock().unwrap();
+        assert!(ops.iter().any(|op| op == "update:ai-owen:None:Some(true)"));
+        assert!(
+            ops.iter()
+                .any(|op| op == "update:ai-owen:Some(\"AI오웬-수정\"):None")
+        );
+        assert!(ops.iter().any(|op| op == "stop:ai-owen:501"));
+        assert!(ops.iter().any(|op| op == "start:ai-owen"));
+    }
+
+    // 3. HomeChrome and worker-lineage isolation across hosts sharing BotId / SessionId.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let wt = "/remote/yd/.worktrees/worker-1";
+            s.orch_snapshot = Arc::new(worker_store(999, 1001, "/local/repo"));
+            s.remote_orch_snapshots
+                .insert(remote_host.clone(), Arc::new(worker_store(501, 1002, wt)));
+            assert!(
+                s.is_bot_chat_worker_session(&remote_host, SessionId(1002), cx),
+                "remote bot chat worker must be recognized on remote host"
+            );
+            // A local orchestration run whose coordinator has session_id 801 (remote-only bot chat)
+            // must NOT match the remote bot when queried on HostId::Local.
+            s.orch_snapshot = Arc::new(worker_store(801, 1003, "/local/repo"));
+            assert!(
+                !s.is_bot_chat_worker_session(&HostId::Local, SessionId(1003), cx),
+                "remote bot session_id must not falsely classify a local worker as a bot worker"
+            );
+
+            s.bot_ui.panel.home_chrome = HomeChrome {
+                host: Some(remote_host.clone()),
+                bot_id: Some(shared_id.clone()),
+                quiet_line: Some(("Remote running".into(), None, true)),
+                ..Default::default()
+            };
+            s.delete_bot_keep_folder_on(&HostId::Local, shared_id.clone(), cx);
+            assert_eq!(
+                s.bot_ui.panel.home_chrome.host.as_ref(),
+                Some(&remote_host),
+                "deleting local ai-owen must not clear remote ai-owen's HomeChrome"
+            );
+            assert_eq!(s.bot_ui.panel.home_chrome.bot_id.as_ref(), Some(&shared_id));
+        });
+    });
+    cx.run_until_parked();
+
+    // 4. Disconnecting the remote host prunes its bots, up_next, panel state, and delete dialog
+    //    while keeping local bots intact.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let remote_bot = s
+                .sidebar_bots
+                .iter()
+                .find(|b| b.host == remote_host && b.id == shared_id)
+                .cloned()
+                .expect("remote bot present before disconnect");
+            s.bot_ui
+                .up_next_unseen
+                .insert((remote_host.clone(), shared_id.clone()), 2);
+            s.bot_ui.delete = Some(remote_bot);
+            s.bot_ui.panel.shown = Some((remote_host.clone(), shared_id.clone(), DetailTab::Items));
+            let _ = s.bot_panel_view_on(&remote_host, cx);
+            assert!(s.bot_ui.panel.view.is_some());
+
+            // Simulate HostManager marking oci-yd-bot Disconnected (even before async sidebar sync).
+            s.host_statuses = vec![(remote_spec.clone(), HostStatus::Disconnected)];
+            s.bot_rpc_overrides.remove(&remote_host);
+            s.refresh_bots_badge(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.sidebar_bots.iter().any(|b| b.host == remote_host),
+            "disconnected remote host's bots must be pruned from sidebar"
+        );
+        assert!(
+            s.sidebar_bots
+                .iter()
+                .any(|b| b.host == HostId::Local && b.id == local_only_id),
+            "local bots must remain after remote disconnect"
+        );
+        assert!(
+            !s.bot_ui
+                .up_next_unseen
+                .contains_key(&(remote_host.clone(), shared_id.clone())),
+            "disconnected remote host's up_next_unseen must be pruned"
+        );
+        assert!(
+            s.bot_ui.delete.is_none(),
+            "pending delete dialog for disconnected remote host must be cleared"
+        );
+        assert!(
+            s.bot_ui.panel.shown.is_none(),
+            "panel.shown for disconnected remote host must be cleared"
+        );
+        assert!(
+            s.bot_ui.panel.view.is_none(),
+            "panel.view for disconnected remote host must be cleared"
+        );
     });
 }

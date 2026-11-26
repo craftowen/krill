@@ -31,6 +31,8 @@ mod rows;
 #[cfg(unix)]
 mod tests;
 
+pub(in crate::shell) use rows::render_remote_host_badge;
+
 /// A right-click menu action on the Shell.
 type ShellAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
 
@@ -906,7 +908,9 @@ impl Shell {
             self.bot_ui.panel.shown = None;
             self.bot_ui.panel.settings = None;
         }
-        if self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot_id) {
+        if self.bot_ui.panel.home_chrome.host.as_ref() == Some(&host_owned)
+            && self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot_id)
+        {
             self.bot_ui.panel.home_chrome = super::bot_panel::HomeChrome::default();
         }
         self.clear_pending_draft_for(&host_owned, &bot_id);
