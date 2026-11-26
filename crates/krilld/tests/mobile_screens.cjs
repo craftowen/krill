@@ -59,8 +59,8 @@ async function confirmationInbox(){
  const q={id:'human',from:'coordinator',to:'user',run_id:'current',task_id:'review',summary:'Choose the release scope',body:'Include the documentation fix?'},gate={id:'decision',status:'pending',run_id:'current',question:'Publish this release?',options:['Approve','Deny']};
  const store={runs:[active,finished,archived],tasks:[task,done],questions:[q,{...q,id:'internal',to:'coordinator',summary:'Internal worker exchange'},{...q,id:'answered',acked:true},{...q,id:'finished',run_id:'old',task_id:null},{...q,id:'orphan',run_id:'missing',task_id:null},{...q,id:'done',task_id:'done'}],gates:[gate,{...gate,id:'old-gate',run_id:'old'},{...gate,id:'archive-gate',run_id:'archived'},{...gate,id:'resolved',status:'resolved'}]};
  const f=fixture('orchestration',{state:{snapshot:{orchestration:store}}});assert.equal(f.headers[0].title,'Confirmation requests');assert.equal(f.all().filter(n=>n.classList.contains('gate-card')).length,2);assert(!f.root.textContent.includes('Internal worker exchange'));assert(!f.root.textContent.includes('Old project'));assert(!f.root.textContent.includes('Archived project'));const details=f.find('.gate-card').querySelector('details');assert(!details.open,'technical context starts collapsed');const input=f.find('textarea'),form=input.parentElement;input.value='Include the fix';emit(input,'input');active.status='completed';f.view.update();assert.equal(f.find('textarea'),null);assert.equal(f.find('.gate-card'),null);assert(f.root.textContent.includes('No requests waiting for you.'));emit(form,'submit');await f.flush();assert.equal(f.calls.length,0,'a stale detached form cannot submit to a finished run');assert.equal(store.questions.find(q=>q.id==='internal').acked,undefined,'projection never acknowledges worker mail');f.abort.abort();active.status='active';
- const h=fixture('bots'),one={id:'one',name:'First PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:store,sessions:[]}},two={id:'two',name:'Second PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:{gates:[{id:'decision',status:'pending'}]},sessions:[]}};h.ctx.connections=[one,two];h.view.update();const banner=()=>h.find('.todo-summary-banner');assert(banner(),'Bots home shows 1-line summary banner when requests exist');assert(banner().textContent.includes('3 requests need your attention'));await banner().action();assert.equal(h.routes.at(-1),'/up-next','banner routes straight to To Do tab');one.snapshot.orchestration.questions=[];one.snapshot.orchestration.gates=[];two.snapshot.orchestration.gates=[];h.view.update();assert(!banner(),'Bots home hides summary banner when 0 requests remain');h.abort.abort();
- const w=fixture('workspaces');assert.equal(w.byText('Orchestration'),undefined);assert(w.find('#workspace-confirmation-requests').hidden);w.state.snapshot.orchestration={gates:[{id:'decision',status:'pending'}]};w.view.update();const entry=w.find('#workspace-confirmation-requests');assert(!entry.hidden);await entry.action();assert.equal(w.routes.at(-1),'/up-next');w.abort.abort();
+ const h=fixture('bots'),one={id:'one',name:'First PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:store,sessions:[]}},two={id:'two',name:'Second PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:{gates:[{id:'decision',status:'pending'}]},sessions:[]}};h.ctx.connections=[one,two];h.view.update();const banner=()=>h.find('.todo-summary-banner');assert(banner(),'Bots home shows 1-line summary banner when requests exist');assert(banner().textContent.includes('3 requests need your attention'));await banner().action();assert.equal(h.routes.at(-1),'/todo','banner routes straight to To Do tab');one.snapshot.orchestration.questions=[];one.snapshot.orchestration.gates=[];two.snapshot.orchestration.gates=[];h.view.update();assert(!banner(),'Bots home hides summary banner when 0 requests remain');h.abort.abort();
+ const w=fixture('workspaces');assert.equal(w.byText('Orchestration'),undefined);assert(w.find('#workspace-confirmation-requests').hidden);w.state.snapshot.orchestration={gates:[{id:'decision',status:'pending'}]};w.view.update();const entry=w.find('#workspace-confirmation-requests');assert(!entry.hidden);await entry.action();assert.equal(w.routes.at(-1),'/todo');w.abort.abort();
  console.log('PASS confirmation inbox: human-only current requests, retired work, stale form rejection, collapsed context, Bots home banner, cached/offline disabling and contextual workspace entry');
 }
 
@@ -348,8 +348,13 @@ async function home(){
  const devBadges=proj.all().filter(n=>n.classList.contains('device-badge')&&!n.hidden).map(n=>n.textContent);
  assert.deepEqual(devBadges,['First PC','Second PC'],'multi-host projects display quiet device badges');
  proj.abort.abort();
- // 5) Unified Me hub (settings) hosts Connected Desktops (rename/reconnect/remove/pair/paste) + Usage + Settings
+ // 5) Settings hub hosts Connected Desktops + Accounts/Krill Drop/Terminal links + Voice + Preferences (without embedded usage bars)
  const me=fixture('settings');me.ctx.connections=[first,second];me.view.update();await me.flush();
+ assert.equal(me.headers[0].title,'Settings','Settings tab uses Settings header title');
+ assert.equal(me.find('.me-usage-section'),null,'Usage is promoted out of Settings into its own top-level tab');
+ assert(me.all().some(n=>n.tagName==='STRONG'&&n.textContent==='Accounts'),'Settings links to Accounts/Usage');
+ assert(me.all().some(n=>n.tagName==='STRONG'&&n.textContent==='Krill Drop'),'Settings links to Krill Drop');
+ assert(me.all().some(n=>n.tagName==='STRONG'&&n.textContent==='Terminal'),'Settings links to Terminal');
  assert.equal(me.find('.home-desktops').children.length,2);assert(me.root.textContent.includes('2/2'));
  assert(me.find('.home-desktop-group').contains(me.byText('Pair a desktop')));
  assert(me.find('.home-desktop-group').contains(me.byText('Paste pairing link')));
@@ -381,7 +386,7 @@ async function accounts(){const data={accounts:[{id:'work',provider:'Claude',lab
  const picker=fixture('accounts',{state:{snapshot:null,connection:{phase:'disconnected'}},rpc:()=>data}),active={id:'active',name:'Offline active',active:true,connection:{phase:'disconnected'}},live={id:'live',name:'Online desktop',connection:{phase:'ready'}},cached={id:'cached',name:'Cached desktop',connection:{phase:'ready'},cached:true};
  picker.ctx.connections=[active,live,cached,...['idle','connecting','disconnected'].map(phase=>({id:phase,name:phase,connection:{phase}}))];picker.view.update();const chooser=picker.byText('Choose desktop');assert(!chooser.hidden,'a single online alternative remains reachable from an offline account page');assert.equal(picker.calls.length,0);
  chooser.action();let choices=picker.sheets.at(-1)[1];assert.deepEqual(Array.from(choices,h=>h.label),['Online desktop'],'offline, reconnecting and cached hosts are omitted');
- live.connection.phase='disconnected';await choices[0].action();assert.equal(picker.ctx.selected,undefined,'an already-open picker cannot select a host that disconnected');assert(chooser.hidden);live.connection.phase='ready';picker.view.update();assert(!chooser.hidden);chooser.action();await picker.sheets.at(-1)[1][0].action();assert.equal(picker.ctx.selected,'live');assert.equal(picker.routes.at(-1),'/accounts');
+ live.connection.phase='disconnected';await choices[0].action();assert.equal(picker.ctx.selected,undefined,'an already-open picker cannot select a host that disconnected');assert(chooser.hidden);live.connection.phase='ready';picker.view.update();assert(!chooser.hidden);chooser.action();await picker.sheets.at(-1)[1][0].action();assert.equal(picker.ctx.selected,'live');assert.equal(picker.routes.at(-1),'/usage');
  picker.state.connection.phase='ready';active.connection.phase='ready';picker.view.update();chooser.action();assert.equal(picker.sheets.at(-1)[1].length,2);live.connection.phase='connecting';picker.view.update();assert(chooser.hidden,'other-host changes update the picker while the active connection stays ready');live.connection.phase='ready';picker.view.update();assert(!chooser.hidden);chooser.action();choices=picker.sheets.at(-1)[1];picker.abort.abort();await choices[1].action();assert.equal(picker.routes.length,1,'aborted screens cannot switch hosts');
  const A=f.M.accounts,now=1000000;assert.equal(A.usageWindow(null,now).percent,null);assert.equal(A.usageWindow({percent:88,resets_at:String(now-1)},now).text,'—');assert.equal(A.usageWindow({percent:40,resets_at:new Date((now+90)*1000).toISOString()},now).reset,'1m');assert.equal(A.countdown(2*86400+3600),'2d');assert.equal(A.countdown(5*3600),'5h');assert.equal(A.countdown(7*86400),'7d');assert.equal(A.usageWindow({percent:NaN},now).text,'—');
  let refreshes=0,handoffState={accounts:[{id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}}],statuses:[],connections:{supported:true,accounts:[{account_id:'agy-2',status:'connected'}]},details:{handoffs:[]}};
@@ -663,7 +668,7 @@ async function tabletRoutePreservation(){
  for(const key of ['button','icon','go','setRoute','back','backTo','t','install','dot','rollup','groupRoute','linkRow','sheet','closeSheet','longPress','savePreferences','rememberSession','resumeLastSession','scanQr','pasteLink','newWorkspace','sessionKey','selectHost','forgetHost','renameHost','hostRoute','getConnections','filteredConnections','openRecent','reconnectHost','photo','toast','error','act','createSession','setDeviceFilter','deviceFilterPill','syncDevicePills','syncTabBar','homeMode','rpcForHost','refreshHost','activateHost'])sandbox[key]=f.ctx[key]||(()=>{});sandbox.filteredConnections=()=>f.ctx.connections||[];sandbox.homeMode=()=>'bots';sandbox.deviceFilterPill=()=>new E('button');vm.createContext(sandbox);vm.runInContext(sidebar+'\n'+render+'\nglobalThis.render=render;',sandbox);sandbox.render();const list=f.find('.workspace-list'),signal=sidebarCtx.signal,oldSession=sessionCtx.signal;list.scrollTop=321;sandbox.location.hash='#/s/8';sandbox.render();assert.equal(mounted,1);assert.equal(cleaned,0);assert.equal(f.find('.workspace-list'),list);assert.equal(list.scrollTop,321);assert(oldSession.aborted);assert(!signal.aborted);await sidebarCtx.rpc({action:'git'});assert.equal(rpc.length,1,'sidebar RPC survives the previous session screen abort');assert(updates>=2);sandbox.state.cached=true;assert.throws(()=>sidebarCtx.rpc({action:'git'}),/Reconnect/);f.abort.abort();
  // Render the actual account screen through the app gate with an unavailable active host.
  sandbox.parseRoute=()=>({screen:'accounts'});sandbox.location.hash='#/accounts';sandbox.header=f.ctx.header;sandbox.M.screens.accounts=f.M.screens.accounts;f.ctx.connections=[{id:'pc',active:true,connection:{phase:'disconnected'}},{id:'other',name:'Online desktop',connection:{phase:'ready'}}];
- for(const cached of [false,true]){sandbox.state.snapshot=cached?{host:{display_name:'Cached PC'}}:null;sandbox.state.cached=cached;sandbox.state.connection={phase:'disconnected',message:'Reconnecting…'};transport.ready=false;sandbox.render();const choose=f.byText('Choose desktop');assert(choose&&!choose.hidden,'account host recovery survives missing/cached snapshots');choose.action();await f.sheets.at(-1)[1][0].action();assert.equal(f.ctx.selected,'other');assert.equal(f.routes.at(-1),'/accounts');}sandbox.abort.abort();
+ for(const cached of [false,true]){sandbox.state.snapshot=cached?{host:{display_name:'Cached PC'}}:null;sandbox.state.cached=cached;sandbox.state.connection={phase:'disconnected',message:'Reconnecting…'};transport.ready=false;sandbox.render();const choose=f.byText('Choose desktop');assert(choose&&!choose.hidden,'account host recovery survives missing/cached snapshots');choose.action();await f.sheets.at(-1)[1][0].action();assert.equal(f.ctx.selected,'other');assert.equal(f.routes.at(-1),'/usage');}sandbox.abort.abort();
  console.log('PASS CLS tablet: session routes reuse sidebar DOM/scroll and independent RPC lifetime');
 }
 
@@ -726,62 +731,97 @@ async function tabBarAndLayoutContracts(){
  assert(!css.includes('100dvh'),'app.css avoids 100dvh so overflow:hidden Android WebViews never inflate to 100lvh');
  assert(/\.home-list\{[^}]*padding-bottom:\s*calc\(140px\s*\+\s*env\(safe-area-inset-bottom\)\)/.test(css),'.home-list clears .home-fab and .tab-bar');
  assert(/\.workspace-bottom-bar\{[^}]*\bflex:\s*none\b/.test(css)&&/\.workspace-bottom-bar\{[^}]*\bflex-wrap:\s*nowrap\b/.test(css),'.workspace-bottom-bar stays flex:none and nowrap');
- const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),renderStart=source.indexOf(' function render(){'),renderEnd=source.indexOf(' // IME',renderStart);
- assert(renderStart>=0&&renderEnd>renderStart,'app.js render() slice markers must stay intact');
- const renderSrc=source.slice(renderStart,renderEnd);
- const makeSandbox=(routeFn,profilesFn,screens,loadScreenFn)=>{
+ assert(/\.tab-bar\{[^}]*background:\s*var\(--bg-base\)/.test(css)&&/\.tab-bar\{[^}]*border-top:\s*1px solid var\(--border-subtle\)/.test(css),'.tab-bar uses Orca bgBase + borderSubtle');
+ assert(/\.tab-bar\{[^}]*max\(env\(safe-area-inset-bottom\),16px\)/.test(css),'.tab-bar reserves >=16px safe-area bottom inset');
+ assert(/\.tab-icon-wrap\{[^}]*width:\s*30px;height:\s*26px/.test(css)&&/\.tab-icon-wrap>svg\{[^}]*width:\s*25px;height:\s*25px/.test(css),'.tab-icon-wrap matches Orca 30x26 container and 25px glyph');
+ assert(/\.tab-bar-item:active \.tab-icon-wrap,\.tab-bar-item\.is-pressed \.tab-icon-wrap\{[^}]*transform:\s*scale\(\.88\)/.test(css),'tab press scales icon glyph only to 0.88');
+ assert(/\.tab-badge\{[^}]*top:\s*-4px;left:\s*20px;min-width:\s*17px;height:\s*17px[^}]*background:\s*var\(--status-amber\);border:\s*1\.5px solid var\(--bg-base\);color:\s*#000/.test(css),'.tab-badge matches Orca amber pill spec');
+ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),renderStart=source.indexOf(' function render(){'),renderEnd=source.indexOf(' // IME',renderStart),syncTabLine=source.split('\n').find(l=>l.includes('function syncTabBar('));
+ assert(renderStart>=0&&renderEnd>renderStart&&syncTabLine,'app.js render() and syncTabBar() slice markers must stay intact');
+ const renderSrc=syncTabLine+'\n'+source.slice(renderStart,renderEnd);
+ const makeSandbox=(routeFn,profilesFn,screens,loadScreenFn,connsFn=()=>[])=>{
   const f=fixture('home'),E=f.root.constructor;
   const root=new E('main'),banner=new E('div');
   f.doc.body.append(banner,root);
   const box={
-   root,banner,document:f.doc,location:{hash:'#/accounts'},activeRouteScreen:'home',routeKey:'',
+   root,banner,document:f.doc,location:{hash:'#/usage'},activeRouteScreen:'home',routeKey:'',
    state:{snapshot:null,cached:false,connection:{phase:'idle',message:'Not connected'},preferences:{}},
    hostGeneration:1,transport:{ready:false},screen:null,abort:null,install:f.ctx.install,
-   endpoint:{profiles:profilesFn},routeAssets:{accounts:'screens/details.js',settings:'screens/settings.js',git:'screens/details.js'},
-   M:{screens},AbortController,matchMedia:()=>({matches:false}),parseRoute:routeFn,loadScreen:loadScreenFn,
+   endpoint:{profiles:profilesFn},routeAssets:{accounts:'screens/details.js',usage:'screens/details.js',settings:'screens/settings.js',git:'screens/details.js'},
+   M:{screens,todoCounts:f.M.todoCounts,normalizeTab:f.M.normalizeTab,legacyNoBots:f.M.legacyNoBots},AbortController,matchMedia:()=>({matches:false}),parseRoute:routeFn,loadScreen:loadScreenFn,
    el:(...v)=>new E(...v),header:title=>{const h=new E('header');h.append(new E('button'),new E('h1',title));return h;},
    button:(label,action,cls='')=>{const b=new E('button',label,cls);b.setAttribute('aria-label',label);b.action=action;return b;},
    t:s=>s,go(){},setRoute(){},back(){},backTo(){},icon:()=>new E('svg'),dot:()=>new E('span'),rollup:()=>'Unknown',
    groupRoute:()=>'/',linkRow:()=>new E('button'),sheet(){},closeSheet(){},longPress(){},savePreferences(){},
    rememberSession(){},resumeLastSession(){},scanQr(){},pasteLink(){},newWorkspace(){},sessionKey:()=>'k',
-   selectHost(){},forgetHost(){},renameHost(){},hostRoute:()=>'/host/local',getConnections:()=>[],filteredConnections:()=>[],openRecent(){},
+   selectHost(){},forgetHost(){},renameHost(){},hostRoute:()=>'/host/local',getConnections:connsFn,filteredConnections:connsFn,openRecent(){},
    reconnectHost(){},photo(){},toast(){},error(){},act:fn=>fn(),createSession(){},creating:()=>null,syncTablet(){},
-   setDeviceFilter(){},deviceFilterPill:()=>new E('button'),syncDevicePills(){},syncTabBar(){},homeMode:()=>'bots',
+   setDeviceFilter(){},deviceFilterPill:()=>new E('button'),syncDevicePills(){},homeMode:()=>'bots',
    rpcForHost:()=>Promise.resolve({}),refreshHost:()=>Promise.resolve(),activateHost(){},
    tabletList:null,tabletAbort:null,tabletContext:null,tabletShell:null,tabletBody:null,tabletSidebar:null,
    tabletHost:null,tabletCollapsed:false,tabletCtxRef:null
   };
-  vm.createContext(box);vm.runInContext(renderSrc+'\nglobalThis.render=render;',box);
+  vm.createContext(box);vm.runInContext(renderSrc+'\nglobalThis.render=render;globalThis.syncTabBar=syncTabBar;',box);
   return {box,root,f,cleanup:()=>{box.abort?.abort();f.abort.abort();}};
  };
- // 1) Lazy-loading top-level tabs keeps .tab-bar mounted during loading and on Retry failure.
+ // 1) Lazy-loading top-level tabs keeps Orca 5-tab bar mounted with tablist/tab ARIA roles during loading and on Retry failure.
  let loadDeferred=deferred(),currentRoute={screen:'accounts'};
  const loading=makeSandbox(()=>currentRoute,()=>[{id:'pc'}],{},()=>loadDeferred.promise);
  loading.box.render();
  assert(loading.root.querySelector('.screen'),'.screen exists while loading accounts');
  assert(loading.root.querySelector('.detail-list'),'.detail-list guards snapshot() from clobbering loading screen');
- assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading accounts');
- assert.deepEqual(loading.root.querySelectorAll('.tab-bar-item').map(b=>b.getAttribute('aria-label')),['Bots','Projects','To Do','Me'],'Variant B 4-tab bottom bar order');
- assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.getAttribute('aria-label'),'Me','/accounts compat highlights Me tab');
+ const navBar=loading.root.querySelector('.tab-bar');
+ assert(navBar&&navBar.getAttribute('role')==='tablist','.tab-bar has role=tablist while loading usage');
+ const tabItems=loading.root.querySelectorAll('.tab-bar-item');
+ assert.deepEqual(tabItems.map(b=>b.getAttribute('aria-label')),['Bots','Projects','To Do','Usage','Settings'],'Orca 5-tab bottom bar order');
+ assert(tabItems.every(b=>b.getAttribute('role')==='tab'&&b.querySelector('.tab-icon-wrap')&&b.querySelector('.tab-label')),'each tab exposes role=tab, icon wrap, and label');
+ assert.equal(tabItems.find(b=>b.getAttribute('aria-selected')==='true')?.getAttribute('aria-label'),'Usage','/usage and /accounts highlight Usage tab');
  loadDeferred.reject(Error('Network failed'));
  await loading.f.flush();
  assert(loading.root.querySelector('.tab-bar'),'.tab-bar remains visible on load error with Retry');
  assert(loading.root.querySelectorAll('button').some(b=>b.textContent==='Retry'));
  currentRoute={screen:'settings'};loading.box.location.hash='#/settings';loading.box.render();
  assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading settings');
- assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.getAttribute('aria-label'),'Me');
+ assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-selected')==='true')?.getAttribute('aria-label'),'Settings');
  currentRoute={screen:'settings',subpage:'terminal'};loading.box.location.hash='#/settings/terminal';loading.box.render();
  assert.equal(loading.root.querySelector('.tab-bar'),null,'settings subpages omit .tab-bar even while loading');
  currentRoute={screen:'bots',botId:'b1',subpage:'b1'};loading.box.location.hash='#/bots/b1';loading.box.render();
  assert.equal(loading.root.querySelector('.tab-bar'),null,'bot detail omits .tab-bar');
  loading.cleanup();
+ // 1b) Badges render independently on Bots (needs_you), Projects (waiting/gates/questions), and To Do (total, 99+ cap) with aria-label counts.
+ let badgeConns=[{id:'pc',active:true,connection:{phase:'ready'},snapshot:{capabilities:{bots:true},bots:{needs_you:2,pending_access:1},sessions:[{id:1,state:'Waiting'},{id:2,state:'Blocked'}],orchestration:{runs:[{id:'r1',status:'active'}],tasks:[],gates:[{id:'g1',run_id:'r1',status:'pending'}],questions:[]}}}];
+ const badged=makeSandbox(()=>({screen:'bots'}),()=>[{id:'pc'}],{bots:r=>{r.append(badged.box.el('section','','details bots screen'));return {};}},()=>Promise.resolve(),()=>badgeConns);
+ badged.box.location.hash='#/';badged.box.render();
+ const byTab=id=>badged.root.querySelectorAll('.tab-bar-item').find(b=>b.dataset.tab===id);
+ assert.equal(byTab('bots').querySelector('.tab-badge').hidden,false);
+ assert.equal(byTab('bots').querySelector('.tab-badge').textContent,'2');
+ assert.equal(byTab('bots').getAttribute('aria-label'),'Bots, 2');
+ assert.equal(byTab('projects').querySelector('.tab-badge').hidden,false);
+ assert.equal(byTab('projects').querySelector('.tab-badge').textContent,'3');
+ assert.equal(byTab('projects').getAttribute('aria-label'),'Projects, 3');
+ assert.equal(byTab('todo').querySelector('.tab-badge').hidden,false);
+ assert.equal(byTab('todo').querySelector('.tab-badge').textContent,'6');
+ assert.equal(byTab('todo').getAttribute('aria-label'),'To Do, 6');
+ assert.equal(byTab('usage').querySelector('.tab-badge'),null,'Usage tab has no badge');
+ assert.equal(byTab('settings').querySelector('.tab-badge'),null,'Settings tab has no badge');
+ badgeConns[0].snapshot.bots.needs_you=120;badged.box.syncTabBar();
+ assert.equal(byTab('bots').querySelector('.tab-badge').textContent,'99+','badge caps display at 99+');
+ assert.equal(byTab('bots').getAttribute('aria-label'),'Bots, 120','aria-label reports exact count');
+ badgeConns[0].snapshot.bots={needs_you:0,pending_access:0};badgeConns[0].snapshot.sessions=[];badgeConns[0].snapshot.orchestration={runs:[],tasks:[],gates:[],questions:[]};badged.box.syncTabBar();
+ for(const id of ['bots','projects','todo'])assert.equal(byTab(id).querySelector('.tab-badge').hidden,true,`${id} badge hides at 0`);
+ assert.equal(byTab('bots').getAttribute('aria-label'),'Bots');
+ // Legacy tab normalization contract
+ for(const [raw,expected] of [['home','bots'],['feed','bots'],['bots','bots'],['workspaces','projects'],['projects','projects'],['up-next','todo'],['todo','todo'],['accounts','usage'],['usage','usage'],['me','settings'],['settings','settings'],['unknown','bots']]){
+  assert.equal(badged.box.M.normalizeTab(raw),expected,`normalizeTab(${raw}) -> ${expected}`);
+ }
+ badged.cleanup();
  // 2) Rapid tab switching while loadScreen is pending suppresses stale double-render.
  const loads=[];let accountMounts=0;
  currentRoute={screen:'accounts'};
  const rapid=makeSandbox(()=>currentRoute,()=>[{id:'pc'}],{home:r=>{r.append(rapid.box.el('section','','home screen'));return {};}},()=>{const d=deferred();loads.push(d);return d.promise;});
- rapid.box.location.hash='#/accounts';rapid.box.render();
+ rapid.box.location.hash='#/usage';rapid.box.render();
  currentRoute={screen:'home'};rapid.box.location.hash='#/';rapid.box.render();
- currentRoute={screen:'accounts'};rapid.box.location.hash='#/accounts';rapid.box.render();
+ currentRoute={screen:'accounts'};rapid.box.location.hash='#/usage';rapid.box.render();
  rapid.box.M.screens.accounts=r=>{accountMounts++;r.append(rapid.box.el('section','','accounts screen'));return {};};
  loads[0].resolve();loads[1].resolve();
  await rapid.f.flush();
@@ -796,7 +836,7 @@ async function tabBarAndLayoutContracts(){
  assert.equal(unpaired.root.querySelector('.detail-list'),null,'unpaired fallback avoids .detail-list so snapshot() can replace it');
  assert(unpaired.root.querySelector('.screen-fallback'),'.screen-fallback stacks unpaired CTA cleanly above .tab-bar');
  unpaired.cleanup();
- console.log('PASS tab-bar and layout contracts: #mobile-app bottom:0, zero 100dvh, .home-list clearance, .tab-bar across loading/error/unpaired states');
+ console.log('PASS tab-bar and layout contracts: Orca 5-tab parity, badges, aria-selected, legacy migration, #mobile-app bottom:0, zero 100dvh, .home-list clearance');
 }
 async function botsScreens(){
  // 1. Security checks on bots.js + parseRoute coverage
@@ -811,10 +851,20 @@ async function botsScreens(){
  assert.deepEqual({...routeBox.parseRoute()},{screen:'bots',botId:'bot 1',subpage:'bot 1'});
  routeBox.location.hash='#/up-next';
  assert.deepEqual({...routeBox.parseRoute()},{screen:'up-next',subpage:undefined});
+ routeBox.location.hash='#/todo';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'up-next',subpage:undefined});
  routeBox.location.hash='#/projects';
  assert.deepEqual({...routeBox.parseRoute()},{screen:'workspaces'});
+ routeBox.location.hash='#/usage';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'accounts',subpage:undefined});
+ routeBox.location.hash='#/accounts';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'accounts',subpage:undefined});
  routeBox.location.hash='#/me';
  assert.deepEqual({...routeBox.parseRoute()},{screen:'settings',subpage:undefined});
+ routeBox.location.hash='#/home';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'home',subpage:undefined});
+ routeBox.location.hash='#/feed';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'home',subpage:undefined});
  routeBox.location.hash='#/bots/%E0%A4%A';
  assert.throws(()=>routeBox.parseRoute(),/Invalid bot link/);
 
@@ -831,7 +881,7 @@ async function botsScreens(){
  assert(hf.find('.todo-summary-banner'),'pending items show 1-line To Do summary banner on Bots home');
  assert(hf.find('.todo-summary-banner').textContent.includes('2 requests need your attention'));
  await hf.find('.todo-summary-banner').action();
- assert.equal(hf.routes.at(-1),'/up-next');
+ assert.equal(hf.routes.at(-1),'/todo');
  // Legacy fallback: all ready hosts without capabilities.bots fall back to Projects (workspaces)
  hf.ctx.connections=[{id:'old',active:true,name:'Legacy PC',connection:{phase:'ready'},snapshot:{capabilities:{},sessions:[],orchestration:{}}}];
  assert.equal(hf.M.legacyNoBots(hf.ctx.connections),true);

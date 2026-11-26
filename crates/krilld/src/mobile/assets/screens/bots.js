@@ -2918,7 +2918,7 @@ nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => { for (const
 } else {
 // Top 1-line conditional banner (shown only when >=1 attention item)
 if (totalAttention > 0) {
-const bannerBtn = button("", () => ctx.go("/up-next", true), "todo-summary-banner");
+const bannerBtn = button("", () => ctx.go("/todo", true), "todo-summary-banner");
 const label = t(
 totalAttention === 1 ? "{0} request needs your attention" : "{0} requests need your attention",
 totalAttention,
@@ -5443,4 +5443,5 @@ draw();
 },
 };
 };
+M.screens.todo = M.screens["up-next"];
 })();

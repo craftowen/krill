@@ -37,7 +37,8 @@ MEASURE = """(()=>{
  const composer=document.querySelector('.chat-view:not([hidden]) .chat-composer');
  const conversation=document.querySelector('.chat-view');
  const headerControls=[...document.querySelectorAll('.page-header button,.home-topbar button')].filter(visible).map(rect);
- return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,app:app?rect(app):null,tabBar:tabBar&&visible(tabBar)?rect(tabBar):null,wsBar:wsBar&&visible(wsBar)?rect(wsBar):null,composer:composer&&visible(composer)?rect(composer):null,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
+ const tabLabels=[...document.querySelectorAll('.tab-bar-item .tab-label')].filter(visible).map(n=>{const r=rect(n),p=rect(n.parentElement);return {text:n.textContent,w:r.w,h:r.h,scrollW:n.scrollWidth,clientW:n.clientWidth,overflowsParent:r.x<p.x-1||r.right>p.right+1};});
+ return {width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,controls,reading,overflow,headerControls,tabLabels,app:app?rect(app):null,tabBar:tabBar&&visible(tabBar)?rect(tabBar):null,wsBar:wsBar&&visible(wsBar)?rect(wsBar):null,composer:composer&&visible(composer)?rect(composer):null,conversation:conversation?rect(conversation):null,sheet:dialog?.classList.contains('sheet')?rect(dialog):null,scanner:dialog?.classList.contains('scanner')?rect(dialog):null,dock:dock?rect(dock):null};
 })()"""
 
 
@@ -49,6 +50,9 @@ def problems(m):
     small = [c['name'] for c in m['controls'] if min(c['w'], c['h']) < (27.9 if c['compact'] else 43.9)]
     if small:
         issues.append('touch target <44: ' + ', '.join(small))
+    bad_tabs = [t['text'] for t in m.get('tabLabels', []) if t['h'] > 22 or t['scrollW'] > t['clientW'] + 1 or t['overflowsParent']]
+    if bad_tabs:
+        issues.append('tab label wrap/clip: ' + ', '.join(bad_tabs))
     for item in m['reading']:
         limit = 960 if 'workspace-list' in item['name'] else 720
         if m['width'] >= 600 and item['w'] > limit + 1:
@@ -145,7 +149,7 @@ def main():
                     m = evaluate(MEASURE)
                     m.update(viewport=f'{width}x{height}', screen=name)
                     m['issues'] = problems(m)
-                    if name in ('home-empty', 'home', 'accounts', 'settings', 'accounts-ko-large-light', 'settings-ko-large-light') and not m.get('tabBar'):
+                    if name in ('home-empty', 'home', 'up-next', 'workspaces', 'accounts', 'settings', 'todo-ko-large-light', 'workspaces-ko-large-light', 'accounts-ko-large-light', 'settings-ko-large-light') and not m.get('tabBar'):
                         m['issues'].append('missing tab bar')
                     if name in ('workspaces', 'workspaces-ko-large-light') and not m.get('wsBar'):
                         m['issues'].append('missing workspace bottom bar')
@@ -371,7 +375,8 @@ def main():
                         for path, name in [('/settings', 'settings'),
                                            ('/settings/terminal', 'terminal-settings'),
                                            ('/host/local', 'workspaces'),
-                                           ('/accounts', 'accounts'), (route, 'session')]:
+                                           ('/todo', 'todo'),
+                                           ('/usage', 'accounts'), (route, 'session')]:
                             navigate(path)
                             if name == 'accounts':
                                 wait('!!document.querySelector(".account-row")')
