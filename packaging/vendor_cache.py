@@ -100,14 +100,19 @@ def main():
     parser.add_argument("--vendor-root", type=Path)
     args = parser.parse_args()
     if args.action == "stage":
-        if not all((args.case, args.cargo_home, args.vendor_root)):
-            parser.error("stage requires case, cargo-home and vendor-root")
-        record = stage(Path.cwd(), args.cargo_home, args.vendor_root, args.directory, args.case)
+        cargo_home = args.cargo_home
+        if not cargo_home or str(cargo_home).strip() == "":
+            cargo_home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+        if not all((args.case, args.vendor_root)):
+            parser.error("stage requires case and vendor-root")
+        record = stage(Path.cwd(), cargo_home, args.vendor_root, args.directory, args.case)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"vendor-hash={record['vendor_hash']}\nvendor-directory={record['vendor_directory']}\n")
             if sys.platform == "darwin":
                 sdk = subprocess.check_output(["xcrun", "--show-sdk-version"], text=True, timeout=30).strip()
                 output.write(f"sdk={sdk}\nimage={os.environ.get('ImageOS', 'macos')}-{os.environ.get('ImageVersion', 'local')}\n")
+            else:
+                output.write(f"sdk=none\nimage={os.environ.get('ImageOS', sys.platform)}-{os.environ.get('ImageVersion', 'local')}\n")
     else:
         verify_stage(args.directory)
 
