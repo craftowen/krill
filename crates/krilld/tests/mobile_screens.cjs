@@ -29,7 +29,7 @@ function fixture(screen='orchestration',options={}){
  }
  doc.body=new Element('body');doc.activeElement=doc.body;doc.createElementNS=(_,tag)=>new Element(tag);const root=new Element('main');doc.body.append(root);
  let timerId=0;const timers=new Map(),calls=[],errors=[],routes=[],headers=[],sheets=[],saved=[],buttons=[],abort=new AbortController();const state={snapshot:{host:{display_name:'Test desktop'},orchestration:{gates:[],questions:[],runs:[],tasks:[]},repositories:[]},connection:{phase:'ready'},groups:new Map(),sessions:new Map(),drafts:new Map(),preferences:{},logs:[],ui:{search:'',filter:'all'},...options.state};
- const el=(...args)=>new Element(...args),ctx={el,state,signal:abort.signal,route:options.route||{},t:(s,...values)=>{copyKeys.add(s);return options.t?.(s,...values)??s;},go:r=>routes.push(r),backTo:r=>routes.push(r),longPress:(node,action)=>{node._longPress=action;return ()=>{};},groupRoute:(g,id)=>`/host/local/group/${g?.key}/s/${id}`,rollup:s=>['Waiting','Blocked','Working','Done','Exited','Unknown'].find(v=>s.some(x=>(x.exited?'Exited':x.state)===v))||'Unknown',icon:()=>el('svg'),dot:v=>el('span',undefined,`status-dot ${String(v).toLowerCase()}`),button(label,action,cls=''){const b=el('button',ctx.t(label),cls);b.setAttribute('aria-label',ctx.t(label));b.action=action;buttons.push(b);return b;},header(title,fallback,onBack){headers.push({title,fallback,onBack});const h=el('header'),copy=el('div',undefined,'header-copy');copy.append(el('h1',ctx.t(title)));h.append(copy);return h;},linkRow(title,description,route){const b=ctx.button('',()=>ctx.go(route),'setting-link'),copy=el('span',undefined,'link-copy');copy.append(el('strong',ctx.t(title)));if(description)copy.append(el('small',ctx.t(description)));b.append(copy);return b;},sheet:(...v)=>sheets.push(v),act:fn=>Promise.resolve().then(fn).catch(e=>errors.push(e)),rpc:async req=>{calls.push(req);return options.rpc?.(req)??{};},createSession:(group,agent,req)=>{calls.push(req);routes.push(`/host/local/group/${group.key}/s/new`);},refresh:async()=>options.refresh?.(),error:e=>errors.push(e),savePreferences:patch=>{saved.push(patch);Object.assign(state.preferences,patch);},rerender(){ctx.rerenders++;},rerenders:0,scanQr(){ctx.scans++;},scans:0,pasteLink(){},install:{show(){ctx.installShown++;}},installShown:0,transport:{reconnect(){},resume(){}}};
+ const el=(...args)=>new Element(...args),ctx={el,state,signal:abort.signal,route:options.route||{},t:(s,...values)=>{copyKeys.add(s);return options.t?.(s,...values)??s;},go:r=>routes.push(r),backTo:r=>routes.push(r),longPress:(node,action)=>{node._longPress=action;return ()=>{};},groupRoute:(g,id)=>`/host/local/group/${g?.key}/s/${id}`,rollup:s=>['Waiting','Blocked','Working','Done','Exited','Unknown'].find(v=>s.some(x=>(x.exited?'Exited':x.state)===v))||'Unknown',icon:name=>{const s=el('svg');if(name)s.dataset.iconName=name;return s;},dot:v=>el('span',undefined,`status-dot ${String(v).toLowerCase()}`),button(label,action,cls=''){const b=el('button',ctx.t(label),cls);b.setAttribute('aria-label',ctx.t(label));b.action=action;buttons.push(b);return b;},header(title,fallback,onBack){headers.push({title,fallback,onBack});const h=el('header'),copy=el('div',undefined,'header-copy');copy.append(el('h1',ctx.t(title)));h.append(copy);return h;},linkRow(title,description,route){const b=ctx.button('',()=>ctx.go(route),'setting-link'),copy=el('span',undefined,'link-copy');copy.append(el('strong',ctx.t(title)));if(description)copy.append(el('small',ctx.t(description)));b.append(copy);return b;},sheet:(...v)=>sheets.push(v),act:fn=>Promise.resolve().then(fn).catch(e=>errors.push(e)),rpc:async req=>{calls.push(req);return options.rpc?.(req)??{};},createSession:(group,agent,req)=>{calls.push(req);routes.push(`/host/local/group/${group.key}/s/new`);},refresh:async()=>options.refresh?.(),error:e=>errors.push(e),savePreferences:patch=>{saved.push(patch);Object.assign(state.preferences,patch);},rerender(){ctx.rerenders++;},rerenders:0,scanQr(){ctx.scans++;},scans:0,pasteLink(){},install:{show(){ctx.installShown++;}},installShown:0,transport:{reconnect(){},resume(){}}};
  ctx.getConnections=()=>ctx.connections||[];ctx.selectHost=(id,after)=>{ctx.selected=id;after?.();};ctx.openRecent=(id,locator)=>{ctx.opened={id,locator};};ctx.reconnectHost=id=>{ctx.reconnected=id;};ctx.renameHost=id=>{ctx.renamed=id;};ctx.forgetHost=id=>{ctx.forgot=id;};
  const sandbox={document:doc,AbortController,Date,console,setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),setInterval:(fn,ms)=>{timers.set(++timerId,{fn,ms,interval:true});return timerId;},clearInterval:id=>timers.delete(id),KrillMobile:{terminal:{fontScales:[1,1.25],keys:[{id:'esc',label:'Esc'},{id:'tab',label:'Tab'}]},install:options.install||{offer:null}},navigator:{},...options.globals};vm.createContext(sandbox);for(const file of ['details','home','workspaces','session','settings','bots'])vm.runInContext(fs.readFileSync(path.join(options.assetRoot||path.join(__dirname,'../src/mobile/assets/screens'),`${file}.js`),'utf8'),sandbox);
  const view=sandbox.KrillMobile.screens[screen](root,ctx),all=()=>root.descendants(),find=(selector)=>root.querySelector(selector),byText=(label)=>all().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')===label),flush=async()=>{for(let i=0;i<40;i++)await Promise.resolve();};
@@ -341,12 +341,19 @@ async function home(){
  legacy.view.update();
  assert(legacy.find('.workspace-list'),'legacy daemons without bots capability fall back to Projects');
  legacy.abort.abort();
- // 4) Multi-host Projects view aggregates both desktops with quiet device badges and zero reconnect
+ // 4) Multi-host Projects view aggregates both desktops: primary omits inline device name, remote shows inline server icon + device name
  const proj=fixture('workspaces');proj.ctx.connections=[first,second];proj.view.update();
- const repoLabels=proj.all().filter(n=>n.classList.contains('repo-label')).map(n=>n.textContent);
+ const repoToggles=proj.all().filter(n=>n.classList.contains('repo-toggle'));
+ const repoLabels=repoToggles.map(n=>n.querySelector('.repo-label').textContent);
  assert.deepEqual(repoLabels,['krill','docs']);
- const devBadges=proj.all().filter(n=>n.classList.contains('device-badge')&&!n.hidden).map(n=>n.textContent);
- assert.deepEqual(devBadges,['First PC','Second PC'],'multi-host projects display quiet device badges');
+ assert.equal(proj.all().filter(n=>n.classList.contains('device-badge')&&!n.hidden).length,0,'project headers no longer render pill device badges');
+ assert.equal(repoToggles[0].querySelector('.repo-host').hidden,true,'primary/active host project omits inline device name');
+ assert.equal(repoToggles[0].title,'krill');
+ assert.equal(repoToggles[1].querySelector('.repo-host').hidden,false,'remote/secondary host project shows inline device name');
+ assert.equal(repoToggles[1].querySelector('.repo-host').querySelector('svg').dataset.iconName,'server','inline remote host uses server icon');
+ assert.equal(repoToggles[1].querySelector('.repo-host-name').textContent,'Second PC');
+ assert.equal(repoToggles[1].title,'docs — Second PC');
+ assert.equal(repoToggles[1].getAttribute('aria-label'),'docs — Second PC · 1 workspace');
  proj.abort.abort();
  // 5) Settings hub hosts Connected Desktops + Accounts/Krill Drop/Terminal links + Voice + Preferences (without embedded usage bars)
  const me=fixture('settings');me.ctx.connections=[first,second];me.view.update();await me.flush();
@@ -3375,5 +3382,87 @@ async function botInstantLoadingRegressions(){
  bf.abort.abort();
  console.log('PASS bot instant loading regressions: bots.hub/workspace/todo/avatars.read, 0ms SWR cache, chat-first ordering, ETag unchanged, localStorage seed scope & clearHost');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function projectInlineRemoteHost(){
+ const longProject='very-long-enterprise-monorepo-project-name';
+ const longDevice='Owen-MacBook-Pro-Production-Build-Server';
+ const hostA={id:'a',active:true,name:'Mac mini',connection:{phase:'ready'},snapshot:{repositories:[{key:'r1',label:'krill'}],workspaces:[{key:'w1',repo_key:'r1',label:'main',branch:'main',status:'in-progress'}],sessions:[]}};
+ const hostB={id:'b',active:false,name:longDevice,connection:{phase:'ready'},snapshot:{repositories:[{key:'r2',label:longProject}],workspaces:[{key:'w2',repo_key:'r2',label:'feat',branch:'feat/inline',status:'in-progress'}],sessions:[]}};
+ const hostC={id:'c',active:false,name:'Linux Box',connection:{phase:'ready'},snapshot:{repositories:[{key:'r3',label:'infra'}],workspaces:[{key:'w3',repo_key:'r3',label:'prod',branch:'main',status:'todo'}],sessions:[]}};
+
+ // 1) Single-host mode never renders inline remote host labels.
+ const single=fixture('workspaces');
+ single.ctx.connections=[hostA];
+ single.view.update();
+ const singleToggle=single.find('.repo-toggle');
+ assert.equal(singleToggle.querySelector('.repo-host').hidden,true,'single host hides inline device name');
+ assert.equal(singleToggle.title,'krill');
+ assert.equal(singleToggle.getAttribute('aria-label'),'krill · 1 workspace');
+ single.abort.abort();
+
+ // 2) Multi-host mode (All devices): primary host omits label; secondary/remote hosts show server icon + name + full title/aria-label.
+ const multi=fixture('workspaces');
+ multi.ctx.connections=[hostA,hostB,hostC];
+ multi.view.update();
+ const toggles=()=>multi.all().filter(n=>n.classList.contains('repo-toggle')&&!n.parentElement.hidden);
+ assert.deepEqual(toggles().map(t=>t.querySelector('.repo-label').textContent),['krill',longProject,'infra']);
+ assert.equal(toggles()[0].querySelector('.repo-host').hidden,true,'primary host omits inline device label');
+ assert.equal(toggles()[0].title,'krill');
+ for(const [idx,projName,devName] of [[1,longProject,longDevice],[2,'infra','Linux Box']]){
+  const hostEl=toggles()[idx].querySelector('.repo-host');
+  assert.equal(hostEl.hidden,false,`remote host ${devName} shows inline label`);
+  assert.equal(hostEl.getAttribute('aria-hidden'),'true','visual inline label defers screen-reader announcement to button aria-label');
+  assert.equal(hostEl.querySelector('svg').dataset.iconName,'server');
+  assert.equal(hostEl.querySelector('.repo-host-name').textContent,devName);
+  assert.equal(toggles()[idx].title,`${projName} — ${devName}`,'title keeps full untruncated project and device name');
+  assert.equal(toggles()[idx].getAttribute('aria-label'),`${projName} — ${devName} · 1 workspace`);
+ }
+
+ // 3) Active host change updates which host is primary without rebuilding sections.
+ hostA.active=false;hostB.active=true;
+ multi.view.update();
+ assert.equal(toggles()[0].querySelector('.repo-host').hidden,false,'former primary shows inline label after active host switches');
+ assert.equal(toggles()[0].querySelector('.repo-host-name').textContent,'Mac mini');
+ assert.equal(toggles()[0].title,'krill — Mac mini');
+ assert.equal(toggles()[1].querySelector('.repo-host').hidden,true,'newly active host omits inline label');
+ assert.equal(toggles()[1].title,longProject);
+
+ // 4) Filtering to a single remote host hides the redundant inline label.
+ multi.ctx.filteredConnections=()=>[hostC];
+ multi.view.update();
+ assert.equal(toggles().length,1);
+ assert.equal(toggles()[0].querySelector('.repo-host').hidden,true,'single filtered host omits redundant inline device label');
+ assert.equal(toggles()[0].title,'infra');
+
+ // 5) Flat/Status grouping appends remote host context only for non-primary hosts.
+ hostA.active=true;hostB.active=false;
+ multi.ctx.filteredConnections=()=>[hostA,hostB];
+ multi.state.preferences.workspaceViews={'workspace-view':{group_by:1}};
+ multi.view.update();
+ const statusRows=multi.all().filter(n=>n.classList.contains('workspace-row'));
+ const rowA=statusRows.find(n=>n.dataset.group==='w1');
+ const rowB=statusRows.find(n=>n.dataset.group==='w2');
+ assert(!rowA.textContent.includes('Mac mini'),'status grouping omits primary host suffix');
+ assert(rowB.textContent.includes(longDevice),'status grouping keeps remote host suffix');
+ multi.abort.abort();
+
+ // 6) Explicit local flag takes precedence over active flag when present.
+ const explicit=fixture('workspaces');
+ explicit.ctx.connections=[{...hostA,active:false,local:true},{...hostC,active:true}];
+ explicit.view.update();
+ const expToggles=explicit.all().filter(n=>n.classList.contains('repo-toggle'));
+ assert.equal(expToggles[0].querySelector('.repo-host').hidden,true,'explicit local host omits inline label');
+ assert.equal(expToggles[1].querySelector('.repo-host').hidden,false,'non-local host keeps inline label');
+ explicit.abort.abort();
+
+ // 7) CSS contract: inline server + muted ellipsis styling on .repo-host without altering bots .device-badge.
+ const css=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.css'),'utf8');
+ assert(css.includes('.workspaces .repo-title-row{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:0}'),'repo title row flex layout');
+ assert(css.includes('.workspaces .repo-label{display:block;font-size:calc(15px * var(--ui-scale,1));color:var(--foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'),'repo label single-line ellipsis');
+ assert(css.includes('.workspaces .repo-host{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;min-width:0;max-width:45%;color:var(--muted-foreground);font-size:var(--font-meta);font-weight:400;line-height:1.3;overflow:hidden}'),'inline remote host style');
+ assert(css.includes('.workspaces .repo-host>svg{width:calc(12px * var(--ui-scale,1));height:calc(12px * var(--ui-scale,1));flex:none;color:currentColor}'),'inline server icon sizing');
+ assert(css.includes('.workspaces .repo-host-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'),'inline remote host ellipsis');
+ assert(css.includes('.device-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:var(--radius-pill)'),'global .device-badge preserved for bots screen');
+ console.log('PASS project inline remote host: primary omitted, remote server+name inline, title/aria-label, active switch, single-host filter, status grouping & CSS contract');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await projectInlineRemoteHost();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};
