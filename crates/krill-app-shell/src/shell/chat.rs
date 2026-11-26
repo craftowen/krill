@@ -6308,9 +6308,7 @@ impl Shell {
                     this.notice = Some(err);
                 }
                 this.chat.bot_notes.retain(|(h, _), _| h != &host);
-                if host == this.launch_host {
-                    this.refresh_bots_badge(cx);
-                }
+                this.refresh_bots_for_host(&host, true, cx);
                 cx.notify();
             })
             .ok();

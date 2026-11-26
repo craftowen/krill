@@ -474,6 +474,19 @@ impl Shell {
         let reply_aud = summary.reply_audience.clone();
         let reply_aud_more = summary.reply_audience.clone();
 
+        let remote_host_badge = (!summary.host.is_local()).then(|| {
+            let label = self.host_display_label(&summary.host, cx);
+            super::bot_section::render_remote_host_badge(
+                format!(
+                    "bot-group-panel-host-{}-{}",
+                    summary.host.as_key(),
+                    group.id
+                ),
+                "bot-group-panel-host".to_owned(),
+                label,
+                p,
+            )
+        });
         div()
             .id("bot-group-panel-header")
             .debug_selector(|| "bot-group-panel-header".into())
@@ -494,11 +507,20 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(ui::TEXT_MD)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.sidebar_foreground)
-                            .child(group.name.clone()),
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_MD)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.sidebar_foreground)
+                                    .child(group.name.clone()),
+                            )
+                            .children(remote_host_badge),
                     )
                     .child(
                         div()

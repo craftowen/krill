@@ -20,6 +20,43 @@ use super::{Shell, ShellAction, now_secs};
 
 pub(super) const AVATAR: f32 = 32.;
 
+/// Compact remote host pill matching the Projects sidebar's remote host badge
+/// (`sidebar/view.rs`: `px-1 rounded-xs bg-worktree-sidebar-accent text-2xs text-muted-foreground`)
+/// with a server glyph and `"Runs on {host}"` tooltip.
+pub(in crate::shell) fn render_remote_host_badge(
+    elem_id: String,
+    dbg_sel: String,
+    host_label: SharedString,
+    p: &ui::Palette,
+) -> gpui::Stateful<gpui::Div> {
+    let tip: SharedString = text::SB_RUNS_ON
+        .format(&[("host", host_label.as_ref())])
+        .into();
+    div()
+        .id(SharedString::from(elem_id))
+        .debug_selector(move || dbg_sel.clone())
+        .flex_none()
+        .max_w(px(84.))
+        .px_1()
+        .rounded(ui::RADIUS_XS)
+        .bg(p.worktree_sidebar_accent)
+        .flex()
+        .items_center()
+        .gap_0p5()
+        .text_size(ui::TEXT_2XS)
+        .line_height(gpui::relative(1.2))
+        .text_color(p.muted_foreground)
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .child(ui::icons::svg_box(
+            ui::icons::SERVER_SVG,
+            10.,
+            p.muted_foreground,
+        ))
+        .child(div().min_w_0().truncate().child(host_label))
+}
+
 /// Orca `--color-worktree-sidebar-divider`: 15% foreground mixed over `--worktree-sidebar-border`.
 fn worktree_sidebar_divider(p: &ui::Palette) -> gpui::Hsla {
     p.worktree_sidebar_border
@@ -568,6 +605,13 @@ impl Shell {
         };
         let stop_tip = facts.limit.as_ref().map(|l| l.tip(&bot.agent_id));
 
+        let is_renaming = renaming.is_some();
+        let remote_host_badge = (!is_renaming && !bot.host.is_local()).then(|| {
+            let host_sel = format!("bot-row-host-{}", bot.id.as_str());
+            let host_elem_id = format!("bot-row-host-{}-{}", bot.host.as_key(), bot.id.as_str());
+            let label = self.host_display_label(&bot.host, cx);
+            render_remote_host_badge(host_elem_id, host_sel, label, p)
+        });
         // Orca BotSidebarRow title: `text-[13px] leading-5`; unread is semibold, read is 80%.
         let name: AnyElement = match renaming {
             Some(input) => {
@@ -600,7 +644,6 @@ impl Shell {
                     .into_any_element()
             }
             None => div()
-                .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_size(ui::TEXT_MD)
@@ -623,7 +666,7 @@ impl Shell {
             )
         } else if bot_working {
             Some(
-                self.render_row_working_mark(bot.id.as_str(), cx)
+                self.render_row_working_mark(&bot.host, bot.id.as_str(), cx)
                     .into_any_element(),
             )
         } else {
@@ -715,7 +758,16 @@ impl Shell {
                                     .min_w_0()
                                     .items_center()
                                     .gap_1p5()
-                                    .child(name)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(name)
+                                            .children(remote_host_badge),
+                                    )
                                     .when_some(age, |d, age| {
                                         let age_sel = format!("bot-row-age-{}", bot.id.as_str());
                                         d.child(
@@ -737,8 +789,9 @@ impl Shell {
             .context_menu(self.bot_row_menu(bot, facts, cx.weak_entity()))
     }
 
-    /// Orca `BotRowLineView` + `BotUpNextCount`: optional host icon, place in foreground + words
-    /// (or purpose fallback), and trailing unseen suggestions badge.
+    /// Orca `BotRowLineView` + `BotUpNextCount`: place in foreground + words (or purpose
+    /// fallback), and trailing unseen suggestions badge. Remote host identity lives on the title
+    /// row badge (`bot-row-host-*`) so activity text always keeps full line width.
     fn render_bot_line(
         &self,
         bot: &SidebarBot,
@@ -754,7 +807,6 @@ impl Shell {
                 .as_ref()
                 .map_or_else(|| (None, bot.description.clone()), line_words)
         };
-        let remote_label = (!bot.host.is_local()).then(|| self.host_display_label(&bot.host, cx));
         let up_next = if bot.paused {
             0
         } else {
@@ -764,12 +816,9 @@ impl Shell {
                 .copied()
                 .unwrap_or(0)
         };
-        if words.is_empty() && place.is_none() && remote_label.is_none() && up_next == 0 {
+        if words.is_empty() && place.is_none() && up_next == 0 {
             return None;
         }
-        let host_tip: Option<SharedString> = remote_label
-            .as_ref()
-            .map(|host| text::SB_RUNS_ON.format(&[("host", host.as_ref())]).into());
         let up_next_el: Option<gpui::Stateful<gpui::Div>> = (up_next > 0).then(|| {
             let tip: SharedString = if up_next == 1 {
                 text::SB_UP_NEXT_NEW_ONE.get().into()
@@ -836,19 +885,12 @@ impl Shell {
                 .child(" · ")
                 .child(div().min_w_0().truncate().child(words))
         } else {
-            let fallback_text = if words.is_empty() {
-                remote_label
-                    .as_ref()
-                    .map_or_else(String::new, ToString::to_string)
-            } else {
-                words
-            };
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .when(facts.unread, |d| d.text_color(p.foreground))
-                .child(fallback_text)
+                .child(words)
         };
         Some(
             div()
@@ -859,33 +901,6 @@ impl Shell {
                 .text_size(ui::TEXT_SM)
                 .line_height(px(16.))
                 .text_color(p.muted_foreground)
-                // A paired server's bot: a server glyph, its name in tooltip & hover card.
-                .when_some(host_tip, |d, tip| {
-                    let host_sel = format!("bot-row-host-{}", bot.id.as_str());
-                    let host_elem_id = if bot.host.is_local() {
-                        host_sel.clone()
-                    } else {
-                        format!("bot-row-host-{}-{}", bot.host.as_key(), bot.id.as_str())
-                    };
-                    let tip_tt = tip.clone();
-                    d.child(
-                        div()
-                            .id(SharedString::from(host_elem_id))
-                            .debug_selector(move || host_sel.clone())
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(tip_tt.clone())
-                                    .build(window, cx)
-                            })
-                            .child(ui::icons::svg_box(
-                                ui::icons::SERVER_SVG,
-                                ui::ICON_XS,
-                                p.muted_foreground,
-                            )),
-                    )
-                })
                 .child(text_el)
                 .children(up_next_el),
         )
@@ -895,13 +910,19 @@ impl Shell {
     /// followed by a chevron-wide spacer so every working spinner in the sidebar sits in one column.
     pub(super) fn render_row_working_mark(
         &self,
+        host: &krill_app_core::hosts::HostId,
         id: &str,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let sel = format!("bot-row-working-{id}");
+        let elem_id = if host.is_local() {
+            sel.clone()
+        } else {
+            format!("bot-row-working-{}-{id}", host.as_key())
+        };
         let mark_sel = format!("bot-row-working-mark-{id}");
         div()
-            .id(SharedString::from(sel.clone()))
+            .id(SharedString::from(elem_id))
             .debug_selector(move || sel.clone())
             .role(gpui::Role::Image)
             .aria_label(text::STATUS_WORKING.get())
@@ -1501,7 +1522,21 @@ impl Shell {
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(p.foreground)
                                                     .child(bot.name.clone()),
-                                            ),
+                                            )
+                                            .when(is_remote, |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .max_w(px(96.))
+                                                        .truncate()
+                                                        .px_1()
+                                                        .rounded(ui::RADIUS_XS)
+                                                        .bg(p.worktree_sidebar_accent)
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(host_label.clone()),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()

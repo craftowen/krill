@@ -588,6 +588,15 @@ impl Shell {
                 let sel_dbg = sel.clone();
                 let member_names: Vec<&str> =
                     face_members.iter().map(|m| m.bot.name.as_str()).collect();
+                let remote_host_badge = (!group_host.is_local()).then(|| {
+                    let label = self.host_display_label(&group_host, cx);
+                    super::rows::render_remote_host_badge(
+                        format!("bot-group-search-host-{}-{gid}", group_host.as_key()),
+                        format!("bot-group-search-host-{gid}"),
+                        label,
+                        p,
+                    )
+                });
                 list = list.child(
                     div()
                         .id(SharedString::from(elem_id))
@@ -623,11 +632,20 @@ impl Shell {
                                 .flex_col()
                                 .child(
                                     div()
-                                        .truncate()
-                                        .text_size(ui::TEXT_MD)
-                                        .line_height(px(20.))
-                                        .text_color(p.foreground)
-                                        .child(marked(&group.name, &ranges, p)),
+                                        .flex()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(ui::TEXT_MD)
+                                                .line_height(px(20.))
+                                                .text_color(p.foreground)
+                                                .child(marked(&group.name, &ranges, p)),
+                                        )
+                                        .children(remote_host_badge),
                                 )
                                 .when(!member_names.is_empty(), |d| {
                                     d.child(
@@ -777,6 +795,15 @@ impl Shell {
                 bot.id.as_str()
             )
         };
+        let remote_host_badge = (!bot.host.is_local()).then(|| {
+            let label = self.host_display_label(&bot.host, cx);
+            super::rows::render_remote_host_badge(
+                format!("bot-search-host-{}-{}", bot.host.as_key(), bot.id.as_str()),
+                format!("bot-search-host-{}", bot.id.as_str()),
+                label,
+                p,
+            )
+        });
         div()
             .id(SharedString::from(elem_id))
             .debug_selector(move || sel.clone())
@@ -826,15 +853,24 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(ui::TEXT_MD)
-                            .line_height(px(20.))
-                            .text_color(if bot.paused {
-                                p.muted_foreground
-                            } else {
-                                p.foreground
-                            })
-                            .child(marked(&bot.name, &m.name_ranges, p)),
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_MD)
+                                    .line_height(px(20.))
+                                    .text_color(if bot.paused {
+                                        p.muted_foreground
+                                    } else {
+                                        p.foreground
+                                    })
+                                    .child(marked(&bot.name, &m.name_ranges, p)),
+                            )
+                            .children(remote_host_badge),
                     )
                     .when(bot.paused || detail.is_some(), |d| {
                         d.child(

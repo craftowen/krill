@@ -502,7 +502,7 @@ fn is_terminal_only_agent(agent: &str) -> bool {
 impl Shell {
     /// True when `session` on `host` is an orchestration worker whose ancestor coordinator is a
     /// bot chat, so it defaults to Chat view unless explicitly set to Terminal.
-    pub(super) fn is_bot_chat_worker_session(
+    pub(in crate::shell) fn is_bot_chat_worker_session(
         &self,
         host: &HostId,
         session: SessionId,
@@ -513,11 +513,9 @@ impl Shell {
         };
         let sidebar = self.sidebar.read(cx);
         is_bot_chat_worker_lineage(store, session, |candidate| {
-            (host.is_local()
-                && self
-                    .sidebar_bots
-                    .iter()
-                    .any(|b| b.sessions.iter().any(|s| s.session_id == candidate)))
+            self.sidebar_bots
+                .iter()
+                .any(|b| &b.host == host && b.sessions.iter().any(|s| s.session_id == candidate))
                 || sidebar.bot_session_meta_on(host, candidate).is_some()
                 || self
                     .chat

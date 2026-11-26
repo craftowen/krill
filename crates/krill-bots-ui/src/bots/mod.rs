@@ -414,6 +414,11 @@ impl View {
     }
 
     #[must_use]
+    pub fn target(&self) -> Option<&HostTarget> {
+        self.target.as_ref()
+    }
+
+    #[must_use]
     pub fn selected_bot(&self) -> Option<&BotConfig> {
         let id = self.selected_bot_id.as_ref()?;
         self.bots.iter().find(|b| &b.id == id)

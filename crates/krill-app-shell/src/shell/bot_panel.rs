@@ -143,6 +143,7 @@ pub(super) struct BotPanel {
 
 #[derive(Default, PartialEq, Eq)]
 pub(super) struct HomeChrome {
+    pub host: Option<HostId>,
     pub bot_id: Option<BotId>,
     pub filter: Option<krill_bots_ui::bots::HomeFilter>,
     pub item_open: bool,
@@ -315,9 +316,23 @@ impl Shell {
         host: &HostId,
         cx: &mut Context<Self>,
     ) -> Option<Entity<krill_bots_ui::bots::View>> {
+        #[cfg(not(test))]
+        let target = {
+            let target = self.target_for_host(host);
+            // A remote host still connecting has no target yet; don't fall back to this Mac.
+            if !host.is_local() && target.is_none() {
+                return None;
+            }
+            target
+        };
         if let Some(view) = &self.bot_ui.panel.view
             && view.read(cx).host() == host
         {
+            #[cfg(not(test))]
+            if view.read(cx).target() == target.as_ref() {
+                return Some(view.clone());
+            }
+            #[cfg(test)]
             return Some(view.clone());
         }
         #[cfg(test)]
@@ -331,11 +346,6 @@ impl Shell {
         #[cfg(not(test))]
         let view = {
             let host = host.clone();
-            let target = self.target_for_host(&host);
-            // A remote host still connecting has no target yet; don't fall back to this Mac.
-            if !host.is_local() && target.is_none() {
-                return None;
-            }
             cx.new(|cx| krill_bots_ui::bots::View::new_on_host(host, target, None, cx).into_panel())
         };
         Self::subscribe_bots_view(&view, false, cx);
@@ -354,6 +364,7 @@ impl Shell {
         cx.observe(&view, |this, view, cx| {
             let v = view.read(cx);
             let chrome = HomeChrome {
+                host: Some(v.host().clone()),
                 bot_id: v.selected_bot_id().cloned(),
                 filter: v.home_filter(),
                 item_open: v.home_item_open(),
@@ -720,15 +731,16 @@ impl Shell {
         let quiet_line = match view {
             Some(v) => {
                 let v = v.read(cx);
-                if v.selected_bot_id() == Some(&bot.id) {
+                if v.host() == &bot.host && v.selected_bot_id() == Some(&bot.id) {
                     v.home_quiet_line()
                 } else {
                     None
                 }
             }
-            None => (self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot.id))
-                .then(|| self.bot_ui.panel.home_chrome.quiet_line.clone())
-                .flatten(),
+            None => (self.bot_ui.panel.home_chrome.host.as_ref() == Some(&bot.host)
+                && self.bot_ui.panel.home_chrome.bot_id.as_ref() == Some(&bot.id))
+            .then(|| self.bot_ui.panel.home_chrome.quiet_line.clone())
+            .flatten(),
         };
         let automation_running = quiet_line.as_ref().is_some_and(|q| q.2);
         let status = if quiet || activity.trim().is_empty() {
@@ -841,6 +853,15 @@ impl Shell {
         let folder = self.bot_folder(bot);
         let this = cx.weak_entity();
         let share = view.cloned().map(|v| (v, bot.id.clone()));
+        let remote_host_badge = (!bot.host.is_local()).then(|| {
+            let label = self.host_display_label(&bot.host, cx);
+            super::bot_section::render_remote_host_badge(
+                format!("bot-panel-host-{}-{}", bot.host.as_key(), bot.id.as_str()),
+                "bot-panel-host".to_owned(),
+                label,
+                p,
+            )
+        });
         div()
             .id("bot-panel-header")
             .debug_selector(|| "bot-panel-header".into())
@@ -862,11 +883,20 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(ui::TEXT_SM)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.sidebar_foreground)
-                            .child(bot.name.clone()),
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_SM)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.sidebar_foreground)
+                                    .child(bot.name.clone()),
+                            )
+                            .children(remote_host_badge),
                     )
                     .child(
                         div()
@@ -1676,6 +1706,7 @@ impl Shell {
             .panel
             .view
             .as_ref()
+            .filter(|v| v.read(cx).host() == &host)
             .map(|v| v.read(cx).chat_worker_links(&bot.id))
             .unwrap_or_default();
         let mut list = div()

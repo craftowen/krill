@@ -195,9 +195,19 @@ impl Shell {
             .then(|| avatar_badge(facts.status, None, surface_bg, p, cx))
             .flatten();
         let trailing_working = (!facts.all_paused && facts.status == RowStatus::Working)
-            .then(|| self.render_row_working_mark(&format!("group-{gid}"), cx));
+            .then(|| self.render_row_working_mark(&host, &format!("group-{gid}"), cx));
 
         let unread = facts.status == RowStatus::Permission;
+        let is_renaming = renaming.is_some();
+        let remote_host_badge = (!is_renaming && !host.is_local()).then(|| {
+            let label = self.host_display_label(&host, cx);
+            super::rows::render_remote_host_badge(
+                format!("bot-group-row-host-{}-{gid}", host.as_key()),
+                format!("bot-group-row-host-{gid}"),
+                label,
+                p,
+            )
+        });
         let name: AnyElement = match renaming {
             Some(input) => {
                 let esc_input = input.clone();
@@ -226,7 +236,6 @@ impl Shell {
                     .into_any_element()
             }
             None => div()
-                .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_size(ui::TEXT_MD)
@@ -239,7 +248,6 @@ impl Shell {
                 .into_any_element(),
         };
 
-        let remote_label = (!host.is_local()).then(|| self.host_display_label(&host, cx));
         let second_line = if let Some(ref line) = facts.preview {
             Some(line.clone())
         } else if !group.description.trim().is_empty() {
@@ -248,39 +256,21 @@ impl Shell {
             let names: Vec<&str> = face_members.iter().map(|m| m.bot.name.as_str()).collect();
             (!names.is_empty()).then(|| names.join(", "))
         };
-        let line_el = match (remote_label.as_ref(), second_line) {
-            (None, None) => None,
-            (remote, line) => {
-                let text = match (remote, line) {
-                    (Some(h), Some(l)) => format!("{h} · {l}"),
-                    (Some(h), None) => h.to_string(),
-                    (None, Some(l)) => l,
-                    (None, None) => String::new(),
-                };
-                Some(
-                    div()
-                        .flex()
-                        .min_w_0()
-                        .items_center()
-                        .gap_1p5()
-                        .text_size(ui::TEXT_SM)
-                        .line_height(px(16.))
-                        .text_color(if facts.status == RowStatus::Permission {
-                            p.foreground
-                        } else {
-                            p.muted_foreground
-                        })
-                        .when(remote.is_some(), |d| {
-                            d.child(ui::icons::svg_box(
-                                ui::icons::SERVER_SVG,
-                                ui::ICON_XS,
-                                p.muted_foreground,
-                            ))
-                        })
-                        .child(div().flex_1().min_w_0().truncate().child(text)),
-                )
-            }
-        };
+        let line_el = second_line.map(|text| {
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap_1p5()
+                .text_size(ui::TEXT_SM)
+                .line_height(px(16.))
+                .text_color(if facts.status == RowStatus::Permission {
+                    p.foreground
+                } else {
+                    p.muted_foreground
+                })
+                .child(div().flex_1().min_w_0().truncate().child(text))
+        });
 
         let hover = self.group_hover_card(summary, facts, cx);
 
@@ -359,7 +349,16 @@ impl Shell {
                                     .min_w_0()
                                     .items_center()
                                     .gap_1p5()
-                                    .child(name)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(name)
+                                            .children(remote_host_badge),
+                                    )
                                     .when_some(age, |d, age| {
                                         let age_sel = format!("bot-group-row-age-{gid}");
                                         d.child(
@@ -386,9 +385,10 @@ impl Shell {
         &self,
         summary: &SidebarGroup,
         facts: &GroupFacts,
-        _cx: &gpui::App,
+        cx: &gpui::App,
     ) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + Clone + 'static {
         let host = &summary.host;
+        let remote_label = (!host.is_local()).then(|| self.host_display_label(host, cx));
         let group = summary.group.clone();
         let preview = facts.preview.clone();
         let age = (facts.activity_ms > 0)
@@ -418,6 +418,7 @@ impl Shell {
                 .collect();
         move |window, cx| {
             let group = group.clone();
+            let remote_label = remote_label.clone();
             let preview = preview.clone();
             let age = age.clone();
             let members = members.clone();
@@ -441,11 +442,39 @@ impl Shell {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_MD)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.popover_foreground)
-                                    .child(group.name.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_MD)
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(p.popover_foreground)
+                                            .child(group.name.clone()),
+                                    )
+                                    .when_some(remote_label.clone(), |d, label| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .max_w(px(96.))
+                                                .px_1()
+                                                .rounded(ui::RADIUS_XS)
+                                                .bg(p.worktree_sidebar_accent)
+                                                .flex()
+                                                .items_center()
+                                                .gap_0p5()
+                                                .text_size(ui::TEXT_2XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(ui::icons::svg_box(
+                                                    ui::icons::SERVER_SVG,
+                                                    10.,
+                                                    p.muted_foreground,
+                                                ))
+                                                .child(div().min_w_0().truncate().child(label)),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
