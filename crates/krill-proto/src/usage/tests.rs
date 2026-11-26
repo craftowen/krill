@@ -1651,17 +1651,44 @@ fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
             identity_known: true,
         }),
         selected_account_id: Some("acct-1".into()),
+        vault_locked: false,
     };
     assert!(!state.native_account_changed());
     let mut changed = state.clone();
     changed.active_account_id = None;
     assert!(changed.native_account_changed());
 
-    let reply = UsageReply::AntigravityAccounts(Ok(state));
+    let reply = UsageReply::AntigravityAccounts(Ok(state.clone()));
     let frame = reply.encode().unwrap();
     let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
     assert_eq!(body[0], 7, "appended after SessionSwitchPlan");
     assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+
+    // Locked vault appends trailing `true` flag and roundtrips cleanly.
+    let mut locked_state = state;
+    locked_state.vault_locked = true;
+    let locked_reply = UsageReply::AntigravityAccounts(Ok(locked_state));
+    let locked_frame = locked_reply.encode().unwrap();
+    let (lkind, lbody) = ipc::read_frame(&mut locked_frame.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(lbody.len(), body.len() + 1, "only appends trailing bool");
+    assert_eq!(UsageReply::decode(lkind, &lbody).unwrap(), locked_reply);
+
+    // Err variant and ResetLockedVault op roundtrip cleanly.
+    let err_reply = UsageReply::AntigravityAccounts(Err("vault error".into()));
+    let err_frame = err_reply.encode().unwrap();
+    let (ekind, ebody) = ipc::read_frame(&mut err_frame.as_slice()).unwrap().unwrap();
+    assert_eq!(UsageReply::decode(ekind, &ebody).unwrap(), err_reply);
+
+    let reset_req = UsageRequest::AntigravityAccounts(AntigravityAccountOp::ResetLockedVault);
+    assert!(!reset_req.is_read());
+    let reset_frame = reset_req.encode().unwrap();
+    let (rkind, rbody) = ipc::read_frame(&mut reset_frame.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(UsageRequest::decode(rkind, &rbody).unwrap(), reset_req);
+
     assert_eq!(
         reply
             .clone()

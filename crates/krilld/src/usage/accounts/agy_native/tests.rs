@@ -22,7 +22,7 @@ use super::service::{
     AntigravityAccountService, AntigravityUsageReadFinish, migrate_legacy_agy_profiles_once,
 };
 use super::store::{
-    AntigravityAccountStore, AntigravityAccountVault, EncryptedAntigravityAccountStore,
+    AntigravityAccountStore, AntigravityAccountVault, EncryptedAntigravityAccountStore, VaultError,
 };
 use super::*;
 use crate::usage::accounts::{AccountsFile, StoredAccount};
@@ -122,12 +122,17 @@ struct MemoryStore {
 }
 
 impl AntigravityAccountStore for MemoryStore {
-    fn read(&self) -> Result<AntigravityAccountVault, String> {
+    fn read(&self) -> Result<AntigravityAccountVault, VaultError> {
         Ok(self.vault.lock().unwrap().clone())
     }
 
     fn write(&self, vault: &AntigravityAccountVault) -> Result<(), String> {
         *self.vault.lock().unwrap() = vault.clone();
+        Ok(())
+    }
+
+    fn reset_locked_vault(&self) -> Result<(), String> {
+        *self.vault.lock().unwrap() = AntigravityAccountVault::default();
         Ok(())
     }
 }
@@ -1030,6 +1035,197 @@ fn refresh_accounts_with_native_login_hides_legacy_ghost_rows_without_vault() {
     assert_eq!(
         snap.connection_for("agy-host"),
         krill_proto::usage::ConnectionStatus::Connected
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+struct LockableMemoryStore {
+    vault: Arc<Mutex<AntigravityAccountVault>>,
+    locked_status: Arc<Mutex<Option<i32>>>,
+    reset_calls: Arc<Mutex<usize>>,
+}
+
+impl AntigravityAccountStore for LockableMemoryStore {
+    fn read(&self) -> Result<AntigravityAccountVault, VaultError> {
+        if let Some(status) = *self.locked_status.lock().unwrap() {
+            return Err(VaultError::LegacyAclLocked { status });
+        }
+        Ok(self.vault.lock().unwrap().clone())
+    }
+
+    fn write(&self, vault: &AntigravityAccountVault) -> Result<(), String> {
+        if let Some(status) = *self.locked_status.lock().unwrap() {
+            return Err(VaultError::LegacyAclLocked { status }.into_message());
+        }
+        *self.vault.lock().unwrap() = vault.clone();
+        Ok(())
+    }
+
+    fn reset_locked_vault(&self) -> Result<(), String> {
+        *self.reset_calls.lock().unwrap() += 1;
+        *self.locked_status.lock().unwrap() = None;
+        *self.vault.lock().unwrap() = AntigravityAccountVault::default();
+        Ok(())
+    }
+}
+
+#[test]
+fn locked_legacy_vault_preserves_host_login_and_recovers_cleanly() {
+    let host_cred = agy_credential_json(
+        "sub-host",
+        "owner@example.test",
+        "acc-host",
+        "ref-host",
+        true,
+    );
+    let backend_raw = Arc::new(Mutex::new(Some(host_cred.clone())));
+    let locked_status = Arc::new(Mutex::new(Some(-25308)));
+    let reset_calls = Arc::new(Mutex::new(0));
+    let vault = Arc::new(Mutex::new(AntigravityAccountVault::default()));
+    let svc = AntigravityAccountService::new(
+        Box::new(LockableMemoryStore {
+            vault: vault.clone(),
+            locked_status: locked_status.clone(),
+            reset_calls: reset_calls.clone(),
+        }),
+        Box::new(MemoryBackend {
+            raw: backend_raw.clone(),
+        }),
+        Box::new(|| 1_700_000_000_000),
+        Box::new(|_| Err("offline".to_owned())),
+    );
+
+    // 1. Listing while locked returns Ok with vault_locked=true and real host login.
+    let listed = svc.list_accounts().unwrap();
+    assert!(listed.vault_locked);
+    assert!(listed.accounts.is_empty());
+    assert_eq!(
+        listed
+            .current_account
+            .as_ref()
+            .and_then(|c| c.email.as_deref()),
+        Some("owner@example.test")
+    );
+
+    // 2. Usage read and launch preflight do NOT error while vault is locked.
+    assert!(svc.begin_usage_read().unwrap().is_none());
+    svc.prepare_for_launch().unwrap();
+
+    // 3. Recovery resets locked vault, re-saves host login, and leaves host credential untouched.
+    let recovered = svc.reset_locked_vault().unwrap();
+    assert!(!recovered.vault_locked);
+    assert_eq!(*reset_calls.lock().unwrap(), 1);
+    assert_eq!(recovered.accounts.len(), 1);
+    assert_eq!(
+        recovered.accounts[0].email.as_deref(),
+        Some("owner@example.test")
+    );
+    assert_eq!(
+        recovered.active_account_id.as_deref(),
+        Some(recovered.accounts[0].id.as_str())
+    );
+    assert_eq!(
+        backend_raw.lock().unwrap().as_deref(),
+        Some(host_cred.as_str())
+    );
+
+    // 4. Calling recover again on a healthy unlocked vault is a safe no-op and keeps saved accounts.
+    let idempotent = svc.reset_locked_vault().unwrap();
+    assert!(!idempotent.vault_locked);
+    assert_eq!(*reset_calls.lock().unwrap(), 1);
+    assert_eq!(idempotent.accounts.len(), 1);
+}
+
+#[test]
+fn encrypted_store_reset_locked_vault_backs_up_unreadable_file_and_preserves_other_accounts() {
+    let root =
+        std::env::temp_dir().join(format!("krill-agy-recover-backup-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // Seed Claude/Codex accounts.toml and host agy token — none may be modified by recovery.
+    let accounts_file = AccountsFile {
+        accounts: vec![
+            StoredAccount {
+                id: "claude-work".into(),
+                provider: "claude".into(),
+                label: "Work".into(),
+                email: Some("work@example.test".into()),
+                profile_dir: String::new(),
+            },
+            StoredAccount {
+                id: "codex-personal".into(),
+                provider: "codex".into(),
+                label: "Personal".into(),
+                email: Some("codex@example.test".into()),
+                profile_dir: String::new(),
+            },
+        ],
+        ..AccountsFile::default()
+    };
+    crate::usage::accounts::save_file(&home, Some(&state), &accounts_file).unwrap();
+    let host_cred = agy_credential_json("sub-1", "alice@example.test", "acc-1", "ref-1", true);
+    let host_token_path = antigravity_token_file_path(&home);
+    write_atomic_0600(&host_token_path, host_cred.as_bytes()).unwrap();
+
+    // Write an unreadable/corrupted vault file (simulating a vault encrypted under an unreachable key).
+    let vpath = vault_path(&home, Some(&state));
+    std::fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+    write_atomic_0600(&vpath, b"unreadable-legacy-ciphertext").unwrap();
+
+    let store = EncryptedAntigravityAccountStore::new(vpath.clone());
+    assert!(store.read().is_err());
+
+    let recovered =
+        handle_op(&home, Some(&state), &AntigravityAccountOp::ResetLockedVault).unwrap();
+    assert!(!recovered.vault_locked);
+    assert_eq!(recovered.accounts.len(), 1);
+    assert_eq!(
+        recovered.accounts[0].email.as_deref(),
+        Some("alice@example.test")
+    );
+
+    // Verify backup file exists with exact old ciphertext.
+    let backups: Vec<_> = std::fs::read_dir(vpath.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| {
+                n.starts_with("vault.locked-")
+                    && std::path::Path::new(n)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+            })
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "expected exactly one vault backup");
+    assert_eq!(
+        std::fs::read(backups[0].path()).unwrap(),
+        b"unreadable-legacy-ciphertext"
+    );
+
+    // Verify host agy token and Claude/Codex accounts.toml are completely untouched.
+    assert_eq!(
+        std::fs::read_to_string(&host_token_path).unwrap(),
+        host_cred
+    );
+    let after_accounts = crate::usage::accounts::load_file(&home, Some(&state));
+    assert_eq!(after_accounts.accounts.len(), 2);
+    assert!(
+        after_accounts
+            .accounts
+            .iter()
+            .any(|a| a.id == "claude-work")
+    );
+    assert!(
+        after_accounts
+            .accounts
+            .iter()
+            .any(|a| a.id == "codex-personal")
     );
 
     std::fs::remove_dir_all(root).ok();

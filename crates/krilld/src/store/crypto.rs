@@ -6,28 +6,25 @@ use std::io;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(test, target_os = "linux", windows))]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use ring::{
     aead, hkdf,
     rand::{SecureRandom as _, SystemRandom},
 };
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 use security_framework::os::macos::keychain::SecKeychain;
 #[cfg(target_os = "macos")]
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
-const SERVICE: &str = "com.krill.segment-key.v2";
+pub(super) const SERVICE: &str = "com.krill.segment-key.v3";
 #[cfg(target_os = "macos")]
-const NOT_FOUND: i32 = -25300;
-#[cfg(target_os = "macos")]
-const DUPLICATE: i32 = -25299;
+pub(super) const LEGACY_SERVICE: &str = "com.krill.segment-key.v2";
 pub(super) const SALT_LEN: usize = 32;
-// Keychain의 UI 허용 상태는 프로세스 단위다. 이 모듈의 동시 조회를 직렬화한다.
-#[cfg(target_os = "macos")]
-static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
 /// Linux·Windows 파일 기반 키 로드의 프로세스 내 직렬화.
 #[cfg(any(test, target_os = "linux", windows))]
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
@@ -49,14 +46,12 @@ impl Key {
         root: &Path,
         existing: impl FnOnce() -> io::Result<bool>,
     ) -> io::Result<Arc<Self>> {
-        let _gate = crate::session::lock(&KEYCHAIN_GATE);
-        let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_error)? {
-            Some(SecKeychain::disable_user_interaction().map_err(keychain_error)?)
-        } else {
-            None
-        };
-        let keychain = SecKeychain::default().map_err(keychain_error)?;
-        Self::load_from(root, existing, &keychain)
+        let account = crate::mobile::devices::hex(&Sha256::digest(
+            root.canonicalize()?.as_os_str().as_bytes(),
+        ));
+        Self::load_with_keychain(&account, existing, |spec| {
+            crate::keychain_key::load_or_create_default(spec)
+        })
     }
 
     /// 헤드리스 Linux VM에는 키체인이 없다. 키를 상태 디렉터리의 0600 파일에 둔다(디스크 권한만큼만 보호된다).
@@ -133,39 +128,64 @@ impl Key {
     }
 
     /// 명시한 키체인만 검색한다. 테스트는 임시 키체인으로 같은 경로를 검증한다.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     pub(super) fn load_from(
         root: &Path,
         existing: impl FnOnce() -> io::Result<bool>,
         keychain: &SecKeychain,
+        keychain_path: Option<&Path>,
     ) -> io::Result<Arc<Self>> {
         let account = crate::mobile::devices::hex(&Sha256::digest(
             root.canonicalize()?.as_os_str().as_bytes(),
         ));
-        let found = keychain.find_generic_password(SERVICE, &account);
-        match found {
-            Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
-            Err(e) if e.code() == NOT_FOUND && !existing()? => {
-                let mut bytes = Zeroizing::new([0; 32]);
-                SystemRandom::new()
-                    .fill(bytes.as_mut())
-                    .map_err(crypto_error)?;
-                // add만 쓴다. 경쟁하는 생성자가 기존 키를 덮어쓰면 이전 세그먼트를 잃는다.
-                match keychain.add_generic_password(SERVICE, &account, bytes.as_ref()) {
-                    Ok(()) => Ok(Arc::new(Self(bytes))),
-                    Err(e) if e.code() == DUPLICATE => {
-                        let (bytes, _) = keychain
-                            .find_generic_password(SERVICE, &account)
-                            .map_err(keychain_error)?;
-                        Self::from_slice(bytes.as_ref()).map(Arc::new)
-                    }
-                    Err(e) => Err(keychain_error(e)),
+        Self::load_with_keychain(&account, existing, |spec| {
+            crate::keychain_key::load_or_create_in_keychain(spec, keychain, keychain_path)
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_with_keychain(
+        account: &str,
+        existing: impl FnOnce() -> io::Result<bool>,
+        mut fetch: impl FnMut(
+            crate::keychain_key::KeychainSpec<'_>,
+        ) -> Result<Zeroizing<[u8; 32]>, crate::keychain_key::KeyLoadError>,
+    ) -> io::Result<Arc<Self>> {
+        // First attempt read-only lookup (checks upgrade-resilient v3, then auto-migrates readable v2).
+        match fetch(crate::keychain_key::KeychainSpec {
+            service: SERVICE,
+            legacy_service: Some(LEGACY_SERVICE),
+            account,
+            allow_create: false,
+            check_legacy: true,
+        }) {
+            Ok(bytes) => Ok(Arc::new(Self(bytes))),
+            Err(err)
+                if matches!(
+                    err.kind,
+                    crate::keychain_key::KeyLoadErrorKind::NotFound
+                        | crate::keychain_key::KeyLoadErrorKind::LegacyAclLocked(_)
+                ) =>
+            {
+                if existing()? {
+                    return Err(err.into_io_error("segment key unavailable"));
                 }
+                // No encrypted v2 segments exist on disk yet: create a fresh upgrade-resilient v3 key.
+                fetch(crate::keychain_key::KeychainSpec {
+                    service: SERVICE,
+                    legacy_service: None,
+                    account,
+                    allow_create: true,
+                    check_legacy: false,
+                })
+                .map(|bytes| Arc::new(Self(bytes)))
+                .map_err(|create_err| create_err.into_io_error("segment key unavailable"))
             }
-            Err(e) => Err(keychain_error(e)),
+            Err(err) => Err(err.into_io_error("segment key unavailable")),
         }
     }
 
+    #[cfg(any(test, target_os = "linux", windows))]
     pub(super) fn from_slice(bytes: &[u8]) -> io::Result<Self> {
         let bytes = bytes.try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid segment key length")
@@ -181,14 +201,6 @@ impl Key {
             .map_err(crypto_error)?;
         Ok(aead::LessSafeKey::new(aead::UnboundKey::from(okm)))
     }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_error(e: security_framework::base::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("segment key unavailable (keychain status {})", e.code()),
-    )
 }
 
 #[cfg(any(test, target_os = "linux", windows))]
@@ -240,7 +252,10 @@ impl Keyring {
             .get_or_init(|| {
                 Key::load(&self.root, || Ok(true))
                     .inspect_err(|e| {
-                        tracing::warn!(kind = ?e.kind(), "encrypted history found without a segment key");
+                        tracing::warn!(
+                            kind = ?e.kind(),
+                            "encrypted history found without a segment key"
+                        );
                     })
                     .ok()
             })

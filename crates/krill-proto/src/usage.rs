@@ -1272,6 +1272,30 @@ impl Msg for UsageReply {
                 }
             }
             ipc::encode_frame(Self::KIND, &body)
+        } else if let Self::AntigravityAccounts(result) = self {
+            match result {
+                Ok(state) => {
+                    // Keep the N-1 4-field prefix unchanged; append `vault_locked` only when true
+                    // so older decoders reading normal unlocked states receive identical bytes.
+                    let mut body = postcard::to_stdvec(&(
+                        7_u8,
+                        0_u8,
+                        &state.accounts,
+                        &state.active_account_id,
+                        &state.current_account,
+                        &state.selected_account_id,
+                    ))
+                    .map_err(Error::Codec)?;
+                    if state.vault_locked {
+                        body.extend(postcard::to_stdvec(&true).map_err(Error::Codec)?);
+                    }
+                    ipc::encode_frame(Self::KIND, &body)
+                }
+                Err(err) => {
+                    let body = postcard::to_stdvec(&(7_u8, 1_u8, err)).map_err(Error::Codec)?;
+                    ipc::encode_frame(Self::KIND, &body)
+                }
+            }
         } else {
             ipc::encode(Self::KIND, self)
         }
@@ -1319,6 +1343,39 @@ impl Msg for UsageReply {
                 connections: Box::new(connections),
                 details: Box::new(details),
             }))
+        } else if kind == Self::KIND && body.first() == Some(&7) {
+            if body.get(1) == Some(&0) {
+                type LegacyAntigravityOk = (
+                    u8,
+                    u8,
+                    Vec<AntigravityAccountSummary>,
+                    Option<String>,
+                    Option<AntigravityCurrentAccount>,
+                    Option<String>,
+                );
+                let (
+                    (_, _, accounts, active_account_id, current_account, selected_account_id),
+                    tail,
+                ) = postcard::take_from_bytes::<LegacyAntigravityOk>(body).map_err(Error::Codec)?;
+                let vault_locked = if tail.is_empty() {
+                    false
+                } else {
+                    postcard::take_from_bytes::<bool>(tail)
+                        .map_err(Error::Codec)?
+                        .0
+                };
+                Ok(Self::AntigravityAccounts(Ok(AntigravityAccountState {
+                    accounts,
+                    active_account_id,
+                    current_account,
+                    selected_account_id,
+                    vault_locked,
+                })))
+            } else {
+                let ((_, _, err), _) =
+                    postcard::take_from_bytes::<(u8, u8, String)>(body).map_err(Error::Codec)?;
+                Ok(Self::AntigravityAccounts(Err(err)))
+            }
         } else {
             ipc::decode(Self::KIND, kind, body)
         }

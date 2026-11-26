@@ -17,6 +17,8 @@ mod cli;
 pub mod git;
 pub mod holder;
 pub mod ipc;
+#[cfg(target_os = "macos")]
+pub(crate) mod keychain_key;
 pub mod login_guard;
 pub mod mobile;
 pub mod monitor;

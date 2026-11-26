@@ -3,9 +3,11 @@
 //! Encrypted Antigravity (`agy`) account vault (`<state_dir>/antigravity-accounts/vault`, mode `0o600`).
 //!
 //! Master key protection mirrors `crate::bots::secrets`:
-//! - macOS (non-test): OS Keychain (`com.krill.antigravity-accounts-key.v1`) with UI disabled.
+//! - macOS (non-test, real HOME): upgrade-resilient OS Keychain (`com.krill.antigravity-accounts-key.v2`)
+//!   owned by Apple-signed `/usr/bin/security` (`-i` stdin, `-T "/usr/bin/security"`), with transparent
+//!   read-only migration from legacy `com.krill.antigravity-accounts-key.v1` (`SecKeychain`, UI disabled).
 //! - Windows (non-test): DPAPI current-user sealed key file (`crate::sys::protect`/`unprotect`).
-//! - Linux / tests: `0o600` key file in `<vault_dir>/vault.key`.
+//! - Linux / tests / isolated temp HOME: `0o600` key file in `<vault_dir>/vault.key`.
 //!
 //! Payloads are authenticated with AES-256-GCM + per-write random 256-bit HKDF salt + 96-bit nonce.
 
@@ -16,6 +18,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::usage::{AntigravityAccountSummary, AntigravityStoredUsage};
@@ -23,8 +26,6 @@ use ring::{
     aead, hkdf,
     rand::{SecureRandom as _, SystemRandom},
 };
-#[cfg(all(target_os = "macos", not(test)))]
-use security_framework::os::macos::keychain::SecKeychain;
 use serde::{Deserialize, Serialize};
 #[cfg(all(target_os = "macos", not(test)))]
 use sha2::{Digest as _, Sha256};
@@ -43,20 +44,38 @@ const VAULT_FILE_NAME: &str = "vault";
 const READ_ERR: &str =
     "Antigravity account snapshots could not be read; the existing vault was preserved.";
 const WRITE_ERR: &str = "Antigravity account snapshots could not be saved.";
+const STORAGE_UNAVAILABLE_ERR: &str =
+    "Protected secret storage is unavailable; Antigravity accounts were not changed.";
+pub(crate) const LOCKED_RECOVERY_ERR: &str = "Saved Antigravity accounts from a previous version are locked by macOS Keychain ACL. Reset the locked vault in Settings or run `krill account recover agy` to back it up and re-save your current account.";
 
 #[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_SERVICE: &str = "com.krill.antigravity-accounts-key.v1";
+const KEYCHAIN_SERVICE: &str = "com.krill.antigravity-accounts-key.v2";
 #[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_NOT_FOUND: i32 = -25300;
-#[cfg(all(target_os = "macos", not(test)))]
-const KEYCHAIN_DUPLICATE: i32 = -25299;
-#[cfg(all(target_os = "macos", not(test)))]
-static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
+const LEGACY_KEYCHAIN_SERVICE: &str = "com.krill.antigravity-accounts-key.v1";
 
 const KEY_FILE: &str = "vault.key";
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 static VAULT_IO_LOCK: Mutex<()> = Mutex::new(());
+
+/// Structured failure from reading the encrypted Antigravity vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VaultError {
+    /// Existing vault on disk cannot be decrypted because a previous ad-hoc macOS build's
+    /// Keychain ACL blocked reading the legacy master key (typically `OSStatus` `-25308`).
+    LegacyAclLocked { status: i32 },
+    /// Generic vault error with safe user-facing text.
+    Other(String),
+}
+
+impl VaultError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::LegacyAclLocked { .. } => LOCKED_RECOVERY_ERR.to_owned(),
+            Self::Other(msg) => msg,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredAntigravityAccount {
@@ -106,8 +125,9 @@ pub(crate) struct AntigravityAccountVault {
 }
 
 pub(crate) trait AntigravityAccountStore: Send + Sync {
-    fn read(&self) -> Result<AntigravityAccountVault, String>;
+    fn read(&self) -> Result<AntigravityAccountVault, VaultError>;
     fn write(&self, vault: &AntigravityAccountVault) -> Result<(), String>;
+    fn reset_locked_vault(&self) -> Result<(), String>;
 }
 
 pub(crate) fn vault_path(home: &Path, state_dir: Option<&Path>) -> PathBuf {
@@ -124,44 +144,12 @@ impl EncryptedAntigravityAccountStore {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path }
     }
-}
 
-impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
-    fn read(&self) -> Result<AntigravityAccountVault, String> {
-        let _guard = lock(&VAULT_IO_LOCK);
-        let meta = match fs::symlink_metadata(&self.path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(AntigravityAccountVault::default());
-            }
-            Err(_) => return Err(READ_ERR.to_owned()),
-        };
-        if !meta.is_file()
-            || meta.file_type().is_symlink()
-            || meta.len() > u64::try_from(MAX_VAULT_BYTES).unwrap_or(u64::MAX)
-        {
-            return Err(READ_ERR.to_owned());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(READ_ERR.to_owned());
-            }
-        }
-        let dir = self.path.parent().ok_or_else(|| READ_ERR.to_owned())?;
-        let key = MasterKey::load_or_create(dir, false).map_err(|_| {
-            "Protected secret storage is unavailable; Antigravity accounts were not changed."
-                .to_owned()
-        })?;
-        let sealed = fs::read(&self.path).map_err(|_| READ_ERR.to_owned())?;
-        let plaintext = key.decrypt(&sealed).map_err(|_| READ_ERR.to_owned())?;
-        let vault = parse_and_validate_vault(&plaintext).map_err(|_| READ_ERR.to_owned())?;
-        Ok(vault)
-    }
-
-    fn write(&self, vault: &AntigravityAccountVault) -> Result<(), String> {
-        let _guard = lock(&VAULT_IO_LOCK);
+    fn write_locked(
+        &self,
+        vault: &AntigravityAccountVault,
+        check_legacy: bool,
+    ) -> Result<(), String> {
         validate_vault(vault).map_err(|_| WRITE_ERR.to_owned())?;
         let dir = self.path.parent().ok_or_else(|| WRITE_ERR.to_owned())?;
         fs::DirBuilder::new()
@@ -169,9 +157,13 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
             .mode(0o700)
             .create(dir)
             .map_err(|_| WRITE_ERR.to_owned())?;
-        let key = MasterKey::load_or_create(dir, true).map_err(|_| {
-            "Protected secret storage is unavailable; Antigravity accounts were not changed."
-                .to_owned()
+        let key = MasterKey::load_or_create(dir, true, check_legacy).map_err(|err| {
+            tracing::warn!(
+                reason = err.reason(),
+                status = ?err.os_status(),
+                "failed to obtain Antigravity vault master key for write"
+            );
+            err.into_user_message()
         })?;
         let json = Zeroizing::new(serde_json::to_vec(vault).map_err(|_| WRITE_ERR.to_owned())?);
         let encrypted = key.encrypt(&json).map_err(|_| WRITE_ERR.to_owned())?;
@@ -192,6 +184,144 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
         }
         Ok(())
     }
+}
+
+impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
+    fn read(&self) -> Result<AntigravityAccountVault, VaultError> {
+        let _guard = lock(&VAULT_IO_LOCK);
+        let meta = match fs::symlink_metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(AntigravityAccountVault::default());
+            }
+            Err(err) => {
+                tracing::warn!(kind = ?err.kind(), "failed to stat Antigravity vault");
+                return Err(VaultError::Other(READ_ERR.to_owned()));
+            }
+        };
+        if !meta.is_file()
+            || meta.file_type().is_symlink()
+            || meta.len() > u64::try_from(MAX_VAULT_BYTES).unwrap_or(u64::MAX)
+        {
+            return Err(VaultError::Other(READ_ERR.to_owned()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if meta.permissions().mode() & 0o077 != 0 {
+                return Err(VaultError::Other(READ_ERR.to_owned()));
+            }
+        }
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| VaultError::Other(READ_ERR.to_owned()))?;
+        let key = MasterKey::load_or_create(dir, false, true).map_err(|err| {
+            tracing::warn!(
+                reason = err.reason(),
+                status = ?err.os_status(),
+                "failed to load Antigravity vault master key"
+            );
+            err.into_vault_error()
+        })?;
+        let sealed = fs::read(&self.path).map_err(|_| VaultError::Other(READ_ERR.to_owned()))?;
+        let plaintext = key
+            .decrypt(&sealed)
+            .map_err(|_| VaultError::Other(READ_ERR.to_owned()))?;
+        let vault = parse_and_validate_vault(&plaintext)
+            .map_err(|_| VaultError::Other(READ_ERR.to_owned()))?;
+        Ok(vault)
+    }
+
+    fn write(&self, vault: &AntigravityAccountVault) -> Result<(), String> {
+        let _guard = lock(&VAULT_IO_LOCK);
+        let vault_exists = fs::symlink_metadata(&self.path).is_ok();
+        self.write_locked(vault, vault_exists)
+    }
+
+    fn reset_locked_vault(&self) -> Result<(), String> {
+        let _guard = lock(&VAULT_IO_LOCK);
+        let dir = self.path.parent().ok_or_else(|| WRITE_ERR.to_owned())?;
+        ensure_no_symlink(dir).map_err(|_| WRITE_ERR.to_owned())?;
+        ensure_no_symlink(&self.path).map_err(|_| WRITE_ERR.to_owned())?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|_| WRITE_ERR.to_owned())?;
+        // If a local file key is unreadable/corrupted (non-macOS or sandbox), back it up first.
+        let key_path = dir.join(KEY_FILE);
+        if key_path.is_file() && MasterKey::load_or_create_file(dir, false).is_err() {
+            let key_backup = unique_backup_path(dir, KEY_FILE);
+            fs::rename(&key_path, &key_backup).ok();
+        }
+        // Obtain/create the upgrade-resilient key FIRST (bypassing locked legacy key) so we
+        // never move the existing vault aside if protected storage itself is currently unavailable.
+        let key = MasterKey::load_or_create(dir, true, false).map_err(|err| {
+            tracing::warn!(
+                reason = err.reason(),
+                status = ?err.os_status(),
+                "failed to obtain Antigravity vault master key during locked-vault recovery"
+            );
+            err.into_user_message()
+        })?;
+        let empty = AntigravityAccountVault::default();
+        let json = Zeroizing::new(serde_json::to_vec(&empty).map_err(|_| WRITE_ERR.to_owned())?);
+        let encrypted = key.encrypt(&json).map_err(|_| WRITE_ERR.to_owned())?;
+        if encrypted.len() > MAX_VAULT_BYTES {
+            return Err(WRITE_ERR.to_owned());
+        }
+        if let Ok(meta) = fs::symlink_metadata(&self.path)
+            && meta.is_file()
+        {
+            let backup = unique_backup_path(dir, VAULT_FILE_NAME);
+            fs::rename(&self.path, &backup).map_err(|err| {
+                tracing::warn!(
+                    kind = ?err.kind(),
+                    "failed to back up locked Antigravity vault before reset"
+                );
+                WRITE_ERR.to_owned()
+            })?;
+            let backup_name = backup
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("vault.locked.bak");
+            tracing::warn!(
+                backup_name,
+                "backed up locked Antigravity vault before recovery reset"
+            );
+        }
+        write_atomic_0600(&self.path, &encrypted).map_err(|_| WRITE_ERR.to_owned())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&self.path)
+                .map_err(|_| WRITE_ERR.to_owned())?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(WRITE_ERR.to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unique_backup_path(dir: &Path, stem: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u64, |d| d.as_secs());
+    let base = dir.join(format!("{stem}.locked-{ts}.bak"));
+    if !base.exists() {
+        return base;
+    }
+    for idx in 1_u32..=1000 {
+        let candidate = dir.join(format!("{stem}.locked-{ts}-{idx}.bak"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}.locked-{ts}-{}.bak", std::process::id()))
 }
 
 fn parse_and_validate_vault(plaintext: &[u8]) -> Result<AntigravityAccountVault, String> {
@@ -246,6 +376,53 @@ fn validate_vault(vault: &AntigravityAccountVault) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Master key + AEAD encryption (AES-256-GCM + HKDF-SHA256)
 // ---------------------------------------------------------------------------
+
+enum MasterKeyError {
+    #[cfg(all(target_os = "macos", not(test)))]
+    LegacyAclLocked(i32),
+    Unavailable {
+        reason: &'static str,
+        status: Option<i32>,
+    },
+}
+
+impl MasterKeyError {
+    const fn unavailable(reason: &'static str, status: Option<i32>) -> Self {
+        Self::Unavailable { reason, status }
+    }
+
+    const fn reason(&self) -> &'static str {
+        match self {
+            #[cfg(all(target_os = "macos", not(test)))]
+            Self::LegacyAclLocked(_) => "legacy_acl_locked",
+            Self::Unavailable { reason, .. } => reason,
+        }
+    }
+
+    const fn os_status(&self) -> Option<i32> {
+        match self {
+            #[cfg(all(target_os = "macos", not(test)))]
+            Self::LegacyAclLocked(status) => Some(*status),
+            Self::Unavailable { status, .. } => *status,
+        }
+    }
+
+    fn into_vault_error(self) -> VaultError {
+        match self {
+            #[cfg(all(target_os = "macos", not(test)))]
+            Self::LegacyAclLocked(status) => VaultError::LegacyAclLocked { status },
+            Self::Unavailable { .. } => VaultError::Other(STORAGE_UNAVAILABLE_ERR.to_owned()),
+        }
+    }
+
+    fn into_user_message(self) -> String {
+        match self {
+            #[cfg(all(target_os = "macos", not(test)))]
+            Self::LegacyAclLocked(_) => LOCKED_RECOVERY_ERR.to_owned(),
+            Self::Unavailable { .. } => STORAGE_UNAVAILABLE_ERR.to_owned(),
+        }
+    }
+}
 
 struct MasterKey(Zeroizing<[u8; 32]>);
 
@@ -327,51 +504,51 @@ impl MasterKey {
     }
 
     #[cfg(all(target_os = "macos", not(test)))]
-    fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+    fn load_or_create(
+        root: &Path,
+        allow_create: bool,
+        check_legacy: bool,
+    ) -> Result<Arc<Self>, MasterKeyError> {
         // Isolated E2E / temp HOME sandboxes must never pollute the real macOS user Keychain.
         if !super::backend::is_real_home_for_state_path(root) {
-            return Self::load_or_create_file(root, allow_create);
+            return Self::load_or_create_file(root, allow_create)
+                .map_err(|_| MasterKeyError::unavailable("file_key_unavailable", None));
         }
-        ensure_no_symlink(root)?;
+        ensure_no_symlink(root)
+            .map_err(|_| MasterKeyError::unavailable("vault_dir_symlink", None))?;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(root)?;
-        let _gate = lock(&KEYCHAIN_GATE);
-        let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_err)? {
-            Some(SecKeychain::disable_user_interaction().map_err(keychain_err)?)
-        } else {
-            None
-        };
-        let keychain = SecKeychain::default().map_err(keychain_err)?;
+            .create(root)
+            .map_err(|_| MasterKeyError::unavailable("vault_dir_create_failed", None))?;
         let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let account =
             crate::mobile::devices::hex(&Sha256::digest(canonical.as_os_str().as_bytes()));
-        match keychain.find_generic_password(KEYCHAIN_SERVICE, &account) {
-            Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
-            Err(err) if err.code() == KEYCHAIN_NOT_FOUND && allow_create => {
-                let mut bytes = Zeroizing::new([0u8; 32]);
-                SystemRandom::new()
-                    .fill(bytes.as_mut())
-                    .map_err(|_| io::Error::other("vault RNG failure"))?;
-                match keychain.add_generic_password(KEYCHAIN_SERVICE, &account, bytes.as_ref()) {
-                    Ok(()) => Ok(Arc::new(Self(bytes))),
-                    Err(dup) if dup.code() == KEYCHAIN_DUPLICATE => {
-                        let (existing, _) = keychain
-                            .find_generic_password(KEYCHAIN_SERVICE, &account)
-                            .map_err(keychain_err)?;
-                        Self::from_slice(existing.as_ref()).map(Arc::new)
-                    }
-                    Err(add_err) => Err(keychain_err(add_err)),
+        match crate::keychain_key::load_or_create_default(crate::keychain_key::KeychainSpec {
+            service: KEYCHAIN_SERVICE,
+            legacy_service: Some(LEGACY_KEYCHAIN_SERVICE),
+            account: &account,
+            allow_create,
+            check_legacy,
+        }) {
+            Ok(bytes) => Ok(Arc::new(Self(bytes))),
+            Err(err) => match err.kind {
+                crate::keychain_key::KeyLoadErrorKind::LegacyAclLocked(status) => {
+                    Err(MasterKeyError::LegacyAclLocked(status))
                 }
-            }
-            Err(err) => Err(keychain_err(err)),
+                _ => Err(MasterKeyError::unavailable(err.log_kind(), err.os_status())),
+            },
         }
     }
 
     #[cfg(any(test, target_os = "linux", windows))]
-    fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
+    fn load_or_create(
+        root: &Path,
+        allow_create: bool,
+        _check_legacy: bool,
+    ) -> Result<Arc<Self>, MasterKeyError> {
         Self::load_or_create_file(root, allow_create)
+            .map_err(|_| MasterKeyError::unavailable("file_key_unavailable", None))
     }
 
     fn load_or_create_file(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
@@ -418,14 +595,6 @@ fn ensure_no_symlink(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn keychain_err(err: security_framework::base::Error) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("vault key unavailable (keychain status {})", err.code()),
-    )
 }
 
 #[cfg(all(windows, not(test)))]
