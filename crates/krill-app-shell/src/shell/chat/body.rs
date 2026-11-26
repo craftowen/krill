@@ -1,9 +1,31 @@
 //! Fenced code in both completed messages and unfinished streaming output.
 
-#[derive(Debug, PartialEq, Eq)]
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash as _, Hasher as _};
+use std::sync::Arc;
+
+use gpui::SharedString;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ChatBodySegment {
-    Text(String),
-    Code { lang: String, code: String },
+    Text(SharedString),
+    Code {
+        lang: SharedString,
+        code: SharedString,
+    },
+}
+
+const MAX_SEGMENT_CACHE_ENTRIES: usize = 256;
+const MAX_SEGMENT_CACHE_BYTES: usize = 64 * 1024;
+
+type SegmentCacheKey = (u64, usize);
+type SegmentCacheEntry = (String, Arc<[ChatBodySegment]>);
+
+#[derive(Default)]
+struct SegmentCache {
+    map: HashMap<SegmentCacheKey, SegmentCacheEntry>,
+    order: VecDeque<SegmentCacheKey>,
 }
 
 // A fence may be indented by at most three spaces. Backticks inside code are
@@ -24,7 +46,56 @@ fn fence(line: &str) -> Option<(char, usize, &str)> {
     Some((marker, length, trimmed.get(length..)?.trim()))
 }
 
+pub(super) fn parse_chat_segments_cached(text: &str) -> Arc<[ChatBodySegment]> {
+    if text.len() > MAX_SEGMENT_CACHE_BYTES {
+        return Arc::from(parse_chat_segments_uncached(text));
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = (hasher.finish(), text.len());
+
+    thread_local! {
+        static CACHE: RefCell<SegmentCache> = RefCell::new(SegmentCache::default());
+    }
+
+    if let Some(hit) = CACHE.with(|cell| {
+        cell.borrow()
+            .map
+            .get(&key)
+            .filter(|(raw, _)| raw == text)
+            .map(|(_, segs)| Arc::clone(segs))
+    }) {
+        return hit;
+    }
+
+    let segs: Arc<[ChatBodySegment]> = Arc::from(parse_chat_segments_uncached(text));
+    CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if !cache.map.contains_key(&key) {
+            while cache.map.len() >= MAX_SEGMENT_CACHE_ENTRIES {
+                let Some(oldest) = cache.order.pop_front() else {
+                    break;
+                };
+                cache.map.remove(&oldest);
+            }
+            cache.order.push_back(key);
+        }
+        cache.map.insert(key, (text.to_owned(), Arc::clone(&segs)));
+    });
+    segs
+}
+
+#[cfg(test)]
 pub(super) fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
+    parse_chat_segments_cached(text).to_vec()
+}
+
+fn parse_chat_segments_uncached(text: &str) -> Vec<ChatBodySegment> {
+    if !text.contains("```") && !text.contains("~~~") {
+        let trimmed = text.trim_matches('\n');
+        let out = if trimmed.is_empty() { text } else { trimmed };
+        return vec![ChatBodySegment::Text(SharedString::from(out.to_owned()))];
+    }
     let mut segments = Vec::new();
     let mut lines = Vec::new();
     let mut opening: Option<(char, usize, String)> = None;
@@ -34,8 +105,8 @@ pub(super) fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
                 if marker == *open_marker && length >= *open_length && suffix.is_empty() {
                     if let Some((_, _, lang)) = opening.take() {
                         segments.push(ChatBodySegment::Code {
-                            lang,
-                            code: lines.join("\n"),
+                            lang: SharedString::from(lang),
+                            code: SharedString::from(lines.join("\n")),
                         });
                         lines.clear();
                     }
@@ -43,8 +114,11 @@ pub(super) fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
                 }
             } else if marker != '`' || !suffix.contains('`') {
                 let prose = lines.join("\n");
-                if !prose.trim_matches('\n').is_empty() {
-                    segments.push(ChatBodySegment::Text(prose.trim_matches('\n').to_owned()));
+                let trimmed = prose.trim_matches('\n');
+                if !trimmed.is_empty() {
+                    segments.push(ChatBodySegment::Text(SharedString::from(
+                        trimmed.to_owned(),
+                    )));
                 }
                 lines.clear();
                 opening = Some((marker, length, suffix.to_owned()));
@@ -55,17 +129,20 @@ pub(super) fn parse_chat_segments(text: &str) -> Vec<ChatBodySegment> {
     }
     if let Some((_, _, lang)) = opening {
         segments.push(ChatBodySegment::Code {
-            lang,
-            code: lines.join("\n"),
+            lang: SharedString::from(lang),
+            code: SharedString::from(lines.join("\n")),
         });
     } else {
         let prose = lines.join("\n");
-        if !prose.trim_matches('\n').is_empty() {
-            segments.push(ChatBodySegment::Text(prose.trim_matches('\n').to_owned()));
+        let trimmed = prose.trim_matches('\n');
+        if !trimmed.is_empty() {
+            segments.push(ChatBodySegment::Text(SharedString::from(
+                trimmed.to_owned(),
+            )));
         }
     }
     if segments.is_empty() {
-        segments.push(ChatBodySegment::Text(text.to_owned()));
+        segments.push(ChatBodySegment::Text(SharedString::from(text.to_owned())));
     }
     segments
 }

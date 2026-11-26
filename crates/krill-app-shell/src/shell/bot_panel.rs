@@ -171,13 +171,46 @@ pub(super) fn chat_title(bot: &SidebarBot, s: &BotSessionSummary) -> SharedStrin
     }
 }
 
+const CANONICAL_PATH_CACHE_MAX: usize = 512;
+const CANONICAL_PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+type CanonicalPathEntry = (std::time::Instant, Option<std::sync::Arc<std::path::Path>>);
+type CanonicalPathMap = std::collections::HashMap<std::path::PathBuf, CanonicalPathEntry>;
+
+fn cached_canonical_path(path: &std::path::Path) -> Option<std::sync::Arc<std::path::Path>> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<CanonicalPathMap> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let now = std::time::Instant::now();
+    CACHE.with(|cell| {
+        if let Some((at, cached)) = cell.borrow().get(path)
+            && now.saturating_duration_since(*at) < CANONICAL_PATH_CACHE_TTL
+        {
+            return cached.clone();
+        }
+        let resolved = std::fs::canonicalize(path)
+            .ok()
+            .map(std::sync::Arc::<std::path::Path>::from);
+        let mut map = cell.borrow_mut();
+        if map.len() >= CANONICAL_PATH_CACHE_MAX && !map.contains_key(path) {
+            map.retain(|_, (at, _)| now.saturating_duration_since(*at) < CANONICAL_PATH_CACHE_TTL);
+            if map.len() >= CANONICAL_PATH_CACHE_MAX {
+                map.clear();
+            }
+        }
+        map.insert(path.to_path_buf(), (now, resolved.clone()));
+        resolved
+    })
+}
+
 fn same_bot_folder(bot_dir: &std::path::Path, candidate: &std::path::Path) -> bool {
     if krill_proto::path::equivalent(bot_dir, candidate) {
         return true;
     }
     matches!(
-        (std::fs::canonicalize(bot_dir), std::fs::canonicalize(candidate)),
-        (Ok(a), Ok(b)) if krill_proto::path::equivalent(&a, &b)
+        (cached_canonical_path(bot_dir), cached_canonical_path(candidate)),
+        (Some(a), Some(b)) if krill_proto::path::equivalent(&a, &b)
     )
 }
 
@@ -186,8 +219,8 @@ fn path_within_bot_folder(file: &std::path::Path, bot_dir: &std::path::Path) -> 
         return true;
     }
     matches!(
-        (std::fs::canonicalize(file), std::fs::canonicalize(bot_dir)),
-        (Ok(f), Ok(b)) if f.starts_with(&b)
+        (cached_canonical_path(file), cached_canonical_path(bot_dir)),
+        (Some(f), Some(b)) if f.starts_with(&b)
     )
 }
 
@@ -2069,5 +2102,51 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn perf_bench_same_bot_folder_calls() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-perf-bot-folder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut bot_dirs = Vec::new();
+        let mut ws_dirs = Vec::new();
+        for i in 0..10 {
+            let bd = root.join("bots").join(format!("bot-{i}"));
+            let wd = root.join("workspaces").join(format!("ws-{i}"));
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::create_dir_all(&wd).unwrap();
+            bot_dirs.push(bd);
+            ws_dirs.push(wd);
+        }
+        let t0 = std::time::Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..20 {
+            for wd in &ws_dirs {
+                for bd in &bot_dirs {
+                    if same_bot_folder(bd, wd) {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(hits, 0);
+        eprintln!(
+            "[BENCH] same_bot_folder x2000 (10 bots x 10 non-bot panes x 20 frames): {:.3} ms ({:.2} us/call)",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / 2000.0
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
