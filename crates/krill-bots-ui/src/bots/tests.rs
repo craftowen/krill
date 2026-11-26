@@ -4284,3 +4284,140 @@ fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppConte
         );
     }
 }
+
+#[gpui::test]
+fn perf_bench_bot_panel_open_and_switch(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let mut bot_a = sample_bot("alpha", "Alpha");
+    bot_a.avatar = Some(super::avatar::UPLOAD_AVATAR.to_owned());
+    bot_a.connectors.composio.enabled = true;
+    let mut bot_b = sample_bot("beta", "Beta");
+    bot_b.avatar = Some(super::avatar::UPLOAD_AVATAR.to_owned());
+    bot_b.connectors.composio.enabled = true;
+    let item_a = sample_item("alpha", "item-a", 1, BotItemStatus::NeedsYou);
+    let item_b = sample_item("beta", "item-b", 2, BotItemStatus::NeedsYou);
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot_a.clone(), bot_b.clone()],
+        items: vec![item_a, item_b],
+        soul: "Original soul".to_owned(),
+        memory: "Original memory".to_owned(),
+        suggestions: vec![
+            BotSuggestion {
+                id: "sug-a".to_owned(),
+                bot_id: bot_a.id.clone(),
+                title: "Alpha suggestion".to_owned(),
+                why: "Reason".to_owned(),
+                ask: "Ask".to_owned(),
+                source: None,
+                link: None,
+                created_at_ms: 1_000,
+                dismissed: false,
+            },
+            BotSuggestion {
+                id: "sug-b".to_owned(),
+                bot_id: bot_b.id.clone(),
+                title: "Beta suggestion".to_owned(),
+                why: "Reason".to_owned(),
+                ask: "Ask".to_owned(),
+                source: None,
+                link: None,
+                created_at_ms: 2_000,
+                dismissed: false,
+            },
+        ],
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state.clone());
+    // Simulate first bot panel open: View::with_rpc().into_panel() followed immediately by show_in_panel
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&bot_a.id, DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let first_open_rpcs = state.lock().unwrap().requests.len();
+    state.lock().unwrap().requests.clear();
+
+    // Switch to Bot B
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&bot_b.id, DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let switch_to_b_reqs = state.lock().unwrap().requests.clone();
+    let switch_to_b_rpcs = switch_to_b_reqs.len();
+    assert!(
+        !switch_to_b_reqs.iter().any(|r| matches!(
+            r,
+            BotRpcRequest::GetSoul { .. }
+                | BotRpcRequest::GetMemory { .. }
+                | BotRpcRequest::GetMemoryHistory { .. }
+                | BotRpcRequest::GetMemoryTidyStatus { .. }
+                | BotRpcRequest::ListMemoryTopics { .. }
+                | BotRpcRequest::GetDefaultTrackerBots
+                | BotRpcRequest::ListComposioConnections { .. }
+                | BotRpcRequest::ToolRelayStatus
+        )),
+        "Home-tab bot switch must not fetch Soul/Memory/Connectors/Tools RPCs: {switch_to_b_reqs:?}"
+    );
+    state.lock().unwrap().requests.clear();
+
+    // Switch back to Bot A (check immediate SWR hydration BEFORE run_until_parked!)
+    let (immediate_items, immediate_suggestions) = vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.hydrate_cached_items(&bot_a.id, cx);
+            v.show_in_panel(&bot_a.id, DetailTab::Items, cx);
+        });
+        let v = view.read(cx);
+        (v.items.items.len(), v.soul_memory.suggestions.len())
+    });
+    vcx.run_until_parked();
+    let switch_back_a_rpcs = state.lock().unwrap().requests.len();
+    eprintln!(
+        "[BENCH] bot_panel: first_open_rpcs={first_open_rpcs}, switch_to_b_rpcs={switch_to_b_rpcs}, switch_back_a_rpcs={switch_back_a_rpcs}, immediate_items_on_back={immediate_items}, immediate_suggestions_on_back={immediate_suggestions}"
+    );
+    assert!(
+        first_open_rpcs <= 12,
+        "expected deduplicated first panel open <= 12 RPCs, got {first_open_rpcs}"
+    );
+    assert!(
+        switch_to_b_rpcs <= 6,
+        "expected Home-scoped bot switch <= 6 RPCs, got {switch_to_b_rpcs}"
+    );
+    assert!(
+        switch_back_a_rpcs <= 5,
+        "expected cached switch back <= 5 RPCs, got {switch_back_a_rpcs}"
+    );
+    assert_eq!(
+        immediate_items, 1,
+        "switching back to a visited bot must immediately show cached items before RPC completes"
+    );
+    assert_eq!(
+        immediate_suggestions, 1,
+        "switching back to a visited bot must immediately show cached suggestions before RPC completes"
+    );
+
+    // Lazy tab scopes: entering SoulMemory and Connectors fetches their data on demand.
+    state.lock().unwrap().requests.clear();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_detail_tab(DetailTab::SoulMemory, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.soul_memory.soul_loaded, "Original soul");
+        assert_eq!(v.soul_memory.memory_loaded, "Original memory");
+    });
+    let soul_reqs = state.lock().unwrap().requests.clone();
+    assert!(
+        soul_reqs
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::GetSoul { .. })),
+        "switching to SoulMemory tab must lazily fetch GetSoul"
+    );
+}
