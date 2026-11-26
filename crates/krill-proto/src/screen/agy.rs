@@ -92,8 +92,8 @@ fn is_empty_composer_row(cells: &[Cell]) -> bool {
 }
 
 /// Locates Antigravity's interactive composer box (`───` / `> ...` / `───`) near the bottom
-/// of the screen, returning `(top_border_row, composer_is_empty)`.
-fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
+/// of the screen, returning `(top_border_row, bottom_border_row, composer_is_empty)`.
+fn find_composer_box_bounds(screen: &Screen) -> Option<(usize, usize, bool)> {
     let rows = &screen.rows;
     if rows.len() < 3 {
         return None;
@@ -117,12 +117,18 @@ fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
             if first_interior.starts_with('>') {
                 let single_row = bottom == top.saturating_add(2);
                 let empty = single_row && is_empty_composer_row(interior);
-                return Some((top, empty));
+                return Some((top, bottom, empty));
             }
             break;
         }
     }
     None
+}
+
+/// Locates Antigravity's interactive composer box (`───` / `> ...` / `───`) near the bottom
+/// of the screen, returning `(top_border_row, composer_is_empty)`.
+fn find_composer_box(screen: &Screen) -> Option<(usize, bool)> {
+    find_composer_box_bounds(screen).map(|(top, _, empty)| (top, empty))
 }
 
 fn normalize_ws(text: &str) -> String {
@@ -278,6 +284,37 @@ pub fn empty_composer_ready(screen: &Screen) -> bool {
         return false;
     }
     find_composer_box(screen).is_some_and(|(_, empty)| empty)
+}
+
+/// Returns the visible draft text inside Antigravity's interactive composer box:
+/// - `None` if no composer box is visible or an auth/login screen is active,
+/// - `Some("")` if the composer is visible and empty (placeholder-only),
+/// - `Some(text)` if non-empty draft text is sitting in the composer.
+#[must_use]
+pub fn composer_draft_text(screen: &Screen) -> Option<String> {
+    if auth_login_screen(screen) {
+        return None;
+    }
+    let (top, bottom, empty) = find_composer_box_bounds(screen)?;
+    if empty {
+        return Some(String::new());
+    }
+    let mut lines = Vec::new();
+    for y in top.saturating_add(1)..bottom {
+        let Some(cells) = screen.rows.get(y) else {
+            break;
+        };
+        let raw = row_text(cells);
+        let text = if y == top.saturating_add(1)
+            && let Some(rest) = raw.strip_prefix('>')
+        {
+            rest.trim_start().to_owned()
+        } else {
+            raw
+        };
+        lines.push(text);
+    }
+    Some(lines.join("\n").trim().to_owned())
 }
 
 /// Counts how many contiguous `▸ ` queued rows directly above Antigravity's composer currently
@@ -601,5 +638,18 @@ mod tests {
         ]);
         assert!(!auth_login_screen(&normal_chat));
         assert!(empty_composer_ready(&normal_chat));
+        assert_eq!(composer_draft_text(&normal_chat), Some(String::new()));
+        assert_eq!(composer_draft_text(&stage1), None);
+
+        let multiline_draft = screen_from_lines(&[
+            (BORDER, None),
+            ("> check daily error audit", None),
+            ("  include summary", None),
+            (BORDER, None),
+        ]);
+        assert_eq!(
+            composer_draft_text(&multiline_draft).as_deref(),
+            Some("check daily error audit\n  include summary")
+        );
     }
 }
