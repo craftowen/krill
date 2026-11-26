@@ -67,7 +67,19 @@ html:has(.session.screen),html:has(.session.screen) body{overscroll-behavior:non
 .activity-line{font-size:var(--font-meta);color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .account-list{padding:8px 16px calc(24px + env(safe-area-inset-bottom))}
 .account-section{margin-bottom:24px}
-.account-heading{display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:var(--font-meta);font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.5px}
+.account-heading{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 0 8px;padding:0 4px;font-size:var(--font-meta);font-weight:600;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.5px}
+.account-heading-main{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.account-heading-aside{font-size:calc(11px * var(--ui-scale,1));font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-muted);white-space:nowrap;flex:none}
+.account-head-row{display:flex;align-items:center;gap:8px;min-width:0}
+.account-head-row>.account-title{min-width:0;flex:0 1 auto}
+.account-active-pill{flex:none;padding:2px 8px;border-radius:var(--radius-pill);background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent);font-size:calc(11px * var(--ui-scale,1));font-weight:600;line-height:1.3}
+.usage-host-bar{display:flex;align-items:center;margin:4px 0 14px}
+.usage-host-pill{display:inline-flex;align-items:center;gap:8px;min-height:var(--touch-target);max-width:100%;padding:0 14px;border-radius:var(--radius-pill);background:var(--group-surface);border:1px solid var(--border);color:var(--foreground);font-size:var(--font-meta);font-weight:500}
+.usage-host-pill:disabled{opacity:1;cursor:default}
+.usage-host-pill>.status-dot{width:10px;height:10px}
+.usage-host-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usage-host-pill>svg{width:14px;height:14px;color:var(--text-muted);flex:none}
+.settings-quick-links{margin-top:16px;margin-bottom:4px}
 .brand-icon{width:14px;height:14px;fill:currentColor}
 .brand-claude{color:var(--brand-claude)}
 .brand-codex{color:var(--brand-codex)}
@@ -85,7 +97,7 @@ button.account-row:disabled{opacity:1}
 .usage-column{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
 .usage-bar{display:flex;align-items:center;gap:4px}
 .usage-label{flex:none;width:22px;font-size:var(--font-meta);color:var(--text-muted)}
-.usage-track{flex:1;min-width:0;height:6px;border-radius:3px;background:var(--surface-raised);overflow:hidden}
+.usage-track{flex:1;min-width:0;height:6px;border-radius:3px;background:var(--translucent-fill);overflow:hidden}
 .usage-fill{display:block;height:100%;border-radius:3px;background:var(--text-muted)}
 .usage-fill.low{background:var(--status-green)}
 .usage-fill.mid{background:var(--status-amber)}
@@ -829,12 +841,22 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .workspace-agent-pill{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:var(--radius-pill);background:var(--surface-raised);font-size:calc(11px * var(--ui-scale,1));color:var(--foreground);max-width:100%}
 .workspace-agent-pill>.status-dot{width:8px;height:8px;--spin-w:1.6px}
 .workspace-agent-pill>svg{width:12px;height:12px}
-/* Orca mobile v0.0.64 parity (measured on a 412dp Android screen, 2026-11-05): bottom tabs, large page titles,
-   titled inset groups and a floating New workspace button. Colors stay Krill tokens (STYLEGUIDE §1). */
-.tab-bar{order:100;flex:none;display:flex;border-top:1px solid var(--border);background:var(--surface-base);padding:0 max(8px,env(safe-area-inset-right)) max(0px, calc(env(safe-area-inset-bottom) - var(--keyboard-inset,0px))) max(8px,env(safe-area-inset-left))}
-.tab-bar-item{position:relative;flex:1;min-width:0;min-height:56px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--text-muted);font-size:calc(11px * var(--ui-scale,1));font-weight:500}
-.tab-bar-item svg{width:24px;height:24px;stroke-width:1.7}.tab-bar-item[aria-current=page]{color:var(--foreground);font-weight:600}.tab-bar-item:active{opacity:.6}
-.tab-badge{position:absolute;top:5px;right:calc(50% - 22px);min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:18px;text-align:center;font-variant-numeric:tabular-nums}
+/* Orca MobileHomeTabBar 1:1 parity: 5 equal tabs, 52px bar + safe area, icon-only press scale, amber badges. */
+.tab-bar{order:100;flex:none;display:flex;flex-direction:row;border-top:1px solid var(--border-subtle);background:var(--bg-base);padding:6px max(4px,env(safe-area-inset-right)) max(0px, calc(max(env(safe-area-inset-bottom),16px) - var(--keyboard-inset,0px))) max(4px,env(safe-area-inset-left))}
+@media(min-resolution:2dppx){.tab-bar{border-top-width:.5px}}
+.tab-bar-item{position:relative;flex:1 1 0;min-width:0;min-height:46px;padding:2px 0 0;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:3px;color:var(--text-muted);background:transparent}
+.tab-bar-item[aria-selected=true],.tab-bar-item[aria-current=page]{color:var(--text-primary)}
+.tab-bar-item:active{background:transparent;opacity:1}
+.tab-icon-wrap{position:relative;width:30px;height:26px;display:inline-flex;align-items:center;justify-content:center;flex:none;transition:transform 160ms cubic-bezier(.23,1,.32,1);will-change:transform}
+.tab-bar-item:active .tab-icon-wrap,.tab-bar-item.is-pressed .tab-icon-wrap{transform:scale(.88);transition-duration:90ms}
+.tab-icon-wrap>svg{width:25px;height:25px;stroke-width:1.8}
+.tab-bar-item[aria-selected=true] .tab-icon-wrap>svg,.tab-bar-item[aria-current=page] .tab-icon-wrap>svg{stroke-width:2.2}
+.tab-label{font-size:clamp(10.5px,calc(10.5px * var(--ui-scale,1)),13px);font-weight:500;letter-spacing:.1px;line-height:1.2;white-space:nowrap;max-width:100%}
+@media(max-width:360px){.tab-label{font-size:clamp(10.5px,calc(10.5px * var(--ui-scale,1)),11.5px);letter-spacing:0}}
+.tab-badge{position:absolute;top:-4px;left:20px;min-width:17px;height:17px;padding:0 4px;border-radius:var(--radius-pill);display:inline-flex;align-items:center;justify-content:center;background:var(--status-amber);border:1.5px solid var(--bg-base);color:#000;font-size:11px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums;pointer-events:none;box-sizing:border-box}
+@keyframes tab-badge-pop{0%{opacity:.6;transform:scale(.65)}50%{opacity:1;transform:scale(1.18)}100%{opacity:1;transform:scale(1)}}
+.tab-badge.is-popping{animation:tab-badge-pop 300ms cubic-bezier(.23,1,.32,1)}
+@media(prefers-reduced-motion:reduce){.tab-icon-wrap{transition:none}.tab-bar-item:active .tab-icon-wrap,.tab-bar-item.is-pressed .tab-icon-wrap{transform:none}.tab-badge.is-popping{animation:none}}
 .home-topbar,.page-header.title-header{display:flex;align-items:center;gap:8px;min-height:56px;padding:8px 20px 4px;border:0;background:transparent;flex:none}
 .page-title,.page-header.title-header h1{font-size:calc(28px * var(--ui-scale,1));font-weight:700;letter-spacing:-.4px;line-height:1.2;margin:0}
 .page-header.title-header .header-copy{flex:1}.page-header.title-header>.icon-button:first-child{display:none}
@@ -908,7 +930,7 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .settings-choices>.setting-block>.setting-row{min-height:52px;padding:0 16px;border-radius:16px;background:var(--surface-panel)}.settings-choices>.setting-block>p,.settings-choices>.setting-block>a{margin:8px 4px 0}
 .settings-choices a.setting-link{display:inline;min-height:0;padding:0;border:0;background:transparent;color:var(--accent)}
 /* Rounded groups use --group-surface defined at :root (light uses --surface-raised). */
-.inset-group,.settings-group.settings-menu,.settings-choices .segmented,.settings-choices>.setting-block>.setting-row{background-color:var(--group-surface)}
+.inset-group,.account-card-group,.settings-group.settings-menu,.settings-choices .segmented,.settings-choices>.setting-block>.setting-row{background-color:var(--group-surface)}
 .workspace-bottom-bar>.workspace-search{background:var(--group-surface)}
 .startup-stall{color:var(--status-blocked)}
 .chat-code-wrap{display:flex;flex-direction:column;min-width:0;max-width:100%;border:1px solid var(--border);border-radius:var(--radius-row);background:var(--editor-surface);overflow:hidden}

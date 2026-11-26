@@ -78,10 +78,13 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 # Chromium treats loopback as secure, while LAN IPs are insecure.
                 # mobile_pwa.cjs separately exercises encryption without subtle.
                 assert security['subtle'] == ('object' if security['secure'] else 'undefined'), security
-                assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Bots"')
+                assert evaluate('document.querySelector(".tab-bar")?.getAttribute("role")==="tablist"')
+                assert evaluate('[...document.querySelectorAll(".tab-bar-item")].map(b=>b.dataset.tab)') == ['bots', 'projects', 'todo', 'usage', 'settings']
+                assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="bots"')
                 shot('home')
                 navigate('/me')
                 wait('!!document.querySelector(".host-card")')
+                assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="settings"')
                 assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
                 browser('click','.host-main')
                 wait('document.querySelectorAll(".workspace-row").length===4')

@@ -95,6 +95,9 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             def click(name):
                 browser('find', 'role', 'button', 'click', '--name', name, '--exact')
 
+            def click_tab(name):
+                browser('find', 'role', 'tab', 'click', '--name', name, '--exact')
+
             def home():
                 evaluate("KrillMobile.app.navigate('/');true")
                 wait('!!document.querySelector(".bots-list,.home-list,.home-empty,.workspace-list")')
@@ -177,17 +180,24 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == hosts[1]['id']
             assert evaluate('KrillMobile.store.sessions.get('+str(hosts[1]['session'])+').cwd') == hosts[1]['cwd']
             home()
-            assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Bots"')
+            assert evaluate('document.querySelector(".tab-bar")?.getAttribute("role")==="tablist"')
+            assert evaluate('[...document.querySelectorAll(".tab-bar-item")].map(b=>b.dataset.tab)') == ['bots', 'projects', 'todo', 'usage', 'settings']
+            assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="bots"')
             browser('screenshot', str(shots / 'home.png'))
-            click('Me')
+            click_tab('Usage')
             wait('!!document.querySelector(".account-row")')
+            assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="usage"')
             assert evaluate('document.querySelectorAll(".usage-bar").length>=2')
             assert evaluate('[...document.querySelectorAll(".usage-column")].every(n=>n.getBoundingClientRect().height<32)')
             assert evaluate('[...document.querySelectorAll(".usage-label")].every(n=>["5h","7d"].includes(n.textContent))')
-            assert evaluate('!document.querySelector(".account-list,.me-usage-body").innerText.includes("until reset")')
+            assert evaluate('!document.querySelector(".account-list").innerText.includes("until reset")')
             browser('screenshot', str(shots / 'accounts.png'))
+            click_tab('Settings')
+            wait('!!document.querySelector(".host-card")')
+            assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="settings"')
             evaluate("KrillMobile.app.navigate('/accounts');true")
             wait('!!document.querySelector(".account-row")')
+            assert evaluate('document.querySelector(".tab-bar [aria-selected=true]")?.dataset.tab==="usage"')
             click('Choose desktop')
             wait('document.querySelector("#action-sheet").open')
             evaluate("document.querySelector('.sheet-action').click();true")
