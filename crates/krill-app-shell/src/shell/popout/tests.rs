@@ -1064,10 +1064,13 @@ fn status_windows_normalizes_raw_minute_meter_labels() {
         stale: false,
         usage: krill_proto::usage::Snapshot::default(),
     };
-    let snap = AccountsSnapshot {
-        accounts: vec![account.clone()],
-        meters: vec![krill_proto::usage::AccountMeters {
+    let mut snap = AccountsSnapshot::default();
+    snap.accounts.push(account.clone());
+    snap.details
+        .accounts
+        .push(krill_proto::usage::AccountMeters {
             account_id: "codex-1".into(),
+            plan: None,
             meters: vec![krill_proto::usage::UsageMeter {
                 key: "primary_window".into(),
                 label: "43200m".into(),
@@ -1077,10 +1080,7 @@ fn status_windows_normalizes_raw_minute_meter_labels() {
                 }),
                 value: None,
             }],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+        });
     let windows = status_windows(&snap, &account);
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].label, "30d");
