@@ -16,6 +16,8 @@ struct Forward {
     window: AtomicU64,
     // 디스플레이 잠자기·헤드리스 중 반복되는 display-link 생성 실패(-6661 등) 쿨다운 상태.
     display_link_create: AtomicU64,
+    // 디스플레이 링크 중지 실패(-6672 등) 쿨다운 상태.
+    display_link_stop: AtomicU64,
     // 디스플레이 링크 정지(subscribed: false) 재시작 경고 쿨다운 상태.
     display_link_stall: AtomicU64,
 }
@@ -27,6 +29,7 @@ impl Forward {
         Self {
             window: AtomicU64::new(0),
             display_link_create: AtomicU64::new(0),
+            display_link_stop: AtomicU64::new(0),
             display_link_stall: AtomicU64::new(0),
         }
     }
@@ -52,6 +55,8 @@ impl Forward {
     fn display_link_slot(&self, message: &str) -> Option<&AtomicU64> {
         if message.starts_with("could not create display link, code: ") {
             Some(&self.display_link_create)
+        } else if message.starts_with("could not stop display link, code: ") {
+            Some(&self.display_link_stop)
         } else if message.starts_with("display link stalled ")
             && message.contains("subscribed: false")
         {
@@ -537,5 +542,43 @@ mod tests {
             module_from_source_path("crates/krill-app/src/terminal.rs").as_deref(),
             Some("krill_app::terminal")
         );
+    }
+
+    #[test]
+    fn coalesces_repeated_display_link_stop_errors() {
+        let dir = std::env::temp_dir().join(format!("krill-log-dl-stop-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let writer = crate::RollingLog::open(&dir, crate::Component::App).unwrap();
+        let forward = Forward::new();
+
+        tracing::subscriber::with_default(crate::subscriber::Logger::new(writer), || {
+            for i in 0..5_u64 {
+                forward.log_at(
+                    &log::Record::builder()
+                        .level(log::Level::Error)
+                        .target("gpui_pre_macos::display_link")
+                        .args(format_args!("could not stop display link, code: -6672"))
+                        .build(),
+                    100 + i * 30,
+                );
+            }
+            forward.log_at(
+                &log::Record::builder()
+                    .level(log::Level::Error)
+                    .target("gpui_pre_macos::display_link")
+                    .args(format_args!("could not stop display link, code: -6672"))
+                    .build(),
+                100 + DISPLAY_LINK_COOLDOWN_SECS,
+            );
+        });
+
+        let text = std::fs::read_to_string(dir.join("krill-app.log")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let stop_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("could not stop display link, code: -6672"))
+            .collect();
+        assert_eq!(stop_lines.len(), 2, "{text}");
+        assert!(stop_lines[1].contains("coalesced=4"), "{text}");
     }
 }

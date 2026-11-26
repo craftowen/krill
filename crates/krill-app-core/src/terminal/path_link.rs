@@ -248,11 +248,39 @@ pub fn sanitize_external_url(raw: &str) -> Option<String> {
     if !allowed {
         return None;
     }
-    if candidate.is_ascii() {
-        Some(candidate.to_owned())
+    let base = if candidate.is_ascii() {
+        candidate.to_owned()
     } else {
-        Some(parsed.into())
+        parsed.into()
+    };
+    Some(percent_encode_nsurl_unsafe(&base))
+}
+
+/// Percent-encodes ASCII characters that WHATWG `url::Url` allows in paths/queries/fragments
+/// but macOS `NSURL::URLWithString:` (RFC 3986) rejects.
+fn percent_encode_nsurl_unsafe(url: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if !url.bytes().any(is_nsurl_unsafe_ascii) {
+        return url.to_owned();
     }
+    let mut out = String::with_capacity(url.len() + 8);
+    for byte in url.bytes() {
+        if is_nsurl_unsafe_ascii(byte) {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0f)] as char);
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
+const fn is_nsurl_unsafe_ascii(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'"' | b'<' | b'>' | b'`' | b'{' | b'}' | b'|' | b'^' | b'\\'
+    )
 }
 
 /// Sanitizes an untrusted external URL for `cx.open_url`, allowing only `http://` and `https://`

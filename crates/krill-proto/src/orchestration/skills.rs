@@ -346,11 +346,7 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
                 {
                     break;
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::AlreadyExists
-                        && error.to_string()
-                            == "skill paths belong to external skills or symlinks" =>
-                {
+                Err(error) if is_external_skill_conflict(&error) => {
                     report.skipped_external.push(format!(
                         "{} ({}): {error}",
                         skill.name,
@@ -366,6 +362,14 @@ pub fn sync_builtin_skills(directories: &[PathBuf]) -> SkillSyncReport {
         }
     }
     report
+}
+
+fn is_external_skill_conflict(error: &io::Error) -> bool {
+    let msg = error.to_string();
+    (error.kind() == io::ErrorKind::AlreadyExists
+        && msg == "skill paths belong to external skills or symlinks")
+        || (error.kind() == io::ErrorKind::InvalidInput
+            && msg == "skill directory must not traverse a symlink")
 }
 
 pub fn sync_builtin_skills_at(home: &Path) -> SkillSyncReport {

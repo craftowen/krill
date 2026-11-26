@@ -902,6 +902,8 @@ impl Shell {
                 let mut fetch_orch = false;
                 let mut refresh_up_next = false;
                 let mut retry_delay = None;
+                let host_online =
+                    host_owned.is_local() || this.can_query_remote_bot_host(&host_owned);
                 {
                     let Some(state) = this.bot_ui.hosts.get_mut(&host_owned) else {
                         return;
@@ -964,7 +966,13 @@ impl Shell {
                                 state.consecutive_failures.saturating_add(1);
                             let delay = bot_retry_backoff(state.consecutive_failures);
                             state.next_retry_at = Some(std::time::Instant::now() + delay);
-                            if state.consecutive_failures == 1 {
+                            if !host_online {
+                                tracing::debug!(
+                                    host = %host_owned,
+                                    error = %err,
+                                    "bot list refresh skipped for offline remote host; preserving cached bots"
+                                );
+                            } else if state.consecutive_failures == 1 {
                                 tracing::warn!(
                                     host = %host_owned,
                                     error = %err,
@@ -973,7 +981,7 @@ impl Shell {
                                 );
                             }
                             state.last_error = Some(err);
-                            if state.consecutive_failures <= 3 {
+                            if host_online && state.consecutive_failures <= 3 {
                                 retry_delay = Some(delay);
                             }
                         }

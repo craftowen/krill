@@ -1779,15 +1779,18 @@ impl View {
         let unseen = others_last_event(item) > self.seen_mark(bot);
         let row_group: SharedString = format!("bot-home-row-group-{uid}").into();
         let check_group: SharedString = format!("bot-home-check-{uid}").into();
-        // Needs you's question or Waiting's note shows in the row's hover card.
-        let question = (group == Group::NeedsYou)
+        // Needs you's question or Waiting's note shows in the row's single hover card.
+        let hover_card = (group == Group::NeedsYou)
             .then(|| super::home_item::waiting_question(item))
             .flatten()
-            .cloned();
-        let wait_text = (question.is_none() && group != Group::Snoozed)
-            .then(|| waiting_note(item))
-            .flatten()
-            .map(str::to_owned);
+            .cloned()
+            .map(RowHoverCard::Question)
+            .or_else(|| {
+                (group != Group::Snoozed)
+                    .then(|| waiting_note(item))
+                    .flatten()
+                    .map(|note| RowHoverCard::Wait(note.to_owned()))
+            });
         let open_uid = uid.clone();
         let mut row = div()
             .id(SharedString::from(sel))
@@ -1814,13 +1817,12 @@ impl View {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_home_item(open_uid.clone(), cx);
             }))
-            .when_some(question, |d, q| {
+            .when_some(hover_card, |d, card| {
                 let title = item.title.clone();
-                d.tooltip(move |window, cx| question_card(&title, &q, window, cx))
-            })
-            .when_some(wait_text, |d, note| {
-                let title = item.title.clone();
-                d.tooltip(move |window, cx| wait_hover_card(&title, &note, window, cx))
+                d.tooltip(move |window, cx| match &card {
+                    RowHoverCard::Question(q) => question_card(&title, q, window, cx),
+                    RowHoverCard::Wait(note) => wait_hover_card(&title, note, window, cx),
+                })
             })
             .child(
                 div()
@@ -2153,6 +2155,11 @@ fn wait_hover_card(
             )
     })
     .build(window, cx)
+}
+
+enum RowHoverCard {
+    Question(krill_proto::bots::BotItemEvent),
+    Wait(String),
 }
 
 /// The row's hover card while it needs you: the title, then each question line with its quick

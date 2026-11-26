@@ -516,6 +516,14 @@ fn url_at_and_sanitize_strip_delimiter_cjk_suffix_and_percent_encode_utf8() {
         sanitize_external_url("http://localhost:3000").as_deref(),
         Some("http://localhost:3000")
     );
+    assert_eq!(
+        sanitize_external_url("http://127.0.0.1:8787/?q={a}|b^c").as_deref(),
+        Some("http://127.0.0.1:8787/?q=%7Ba%7D%7Cb%5Ec")
+    );
+    assert_eq!(
+        sanitize_external_url("http://127.0.0.1:8787/a\"b<c>").as_deref(),
+        Some("http://127.0.0.1:8787/a%22b%3Cc%3E")
+    );
     assert_eq!(sanitize_external_url("javascript:alert(1)"), None);
 }
 

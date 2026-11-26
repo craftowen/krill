@@ -170,20 +170,26 @@ fn is_session_or_worktree_muted(state: &AlertState, session: &Session) -> bool {
             .is_some_and(|p| state.muted_worktrees.contains(p))
 }
 
+/// Stop the sleep-assertion worker off GPUI. Safe to call before `cx.quit()` so
+/// `on_app_quit` has no blocking thread join left inside GPUI's shutdown timeout.
+pub fn shutdown(cx: &mut App) -> gpui::Task<()> {
+    let worker = cx
+        .has_global::<AlertState>()
+        .then(|| cx.global_mut::<AlertState>().awake.take())
+        .flatten();
+    cx.background_executor().spawn(async move {
+        if let Some(AwakeWorker { send, task }) = worker {
+            drop(send);
+            task.join().ok();
+        }
+    })
+}
+
 fn ensure_state(cx: &mut App) {
     if cx.try_global::<AlertState>().is_none() {
         cx.set_app_identity(krill_proto::daemon::BUNDLE_ID, "Krill");
         cx.set_global(AlertState::default());
-        cx.on_app_quit(|cx| {
-            let worker = cx.global_mut::<AlertState>().awake.take();
-            cx.background_executor().spawn(async move {
-                if let Some(AwakeWorker { send, task }) = worker {
-                    drop(send);
-                    task.join().ok();
-                }
-            })
-        })
-        .detach();
+        cx.on_app_quit(shutdown).detach();
     }
 }
 

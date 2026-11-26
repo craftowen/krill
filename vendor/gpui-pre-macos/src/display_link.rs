@@ -308,16 +308,18 @@ pub fn recreate_display_link(display_id: CGDirectDisplayID) -> Result<()> {
             display_id as usize as *mut c_void,
         )?
     };
-    let (mut old_link, link_to_start) = {
+    let (mut old_link, was_running, link_to_start) = {
         let mut registry = lock_registry();
         // A never-started `new_link` dropped here has no io thread, so releasing it is safe.
         let Some(entry) = registry.displays.get_mut(&display_id) else {
             return Ok(());
         };
         let old_link = std::mem::replace(&mut entry.link, new_link);
-        (old_link, entry.running.then(|| entry.link.clone()))
+        (old_link, entry.running, entry.running.then(|| entry.link.clone()))
     };
-    unsafe { old_link.stop().log_err() };
+    if was_running {
+        unsafe { old_link.stop().log_err() };
+    }
     std::mem::forget(old_link);
     if let Some(mut link) = link_to_start
         && let Err(error) = unsafe { link.start() }
@@ -581,8 +583,13 @@ mod sys {
         /// Apple docs: [CVDisplayLinkStop](https://developer.apple.com/documentation/corevideo/1457281-cvdisplaylinkstop?language=objc)
         pub unsafe fn stop(&mut self) -> Result<()> {
             unsafe {
+                const DISPLAY_LINK_NOT_RUNNING: i32 = -6672;
                 let code = CVDisplayLinkStop(self);
-                anyhow::ensure!(code == 0, "could not stop display link, code: {}", code);
+                anyhow::ensure!(
+                    code == 0 || code == DISPLAY_LINK_NOT_RUNNING,
+                    "could not stop display link, code: {}",
+                    code
+                );
                 Ok(())
             }
         }

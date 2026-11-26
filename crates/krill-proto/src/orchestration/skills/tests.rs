@@ -426,3 +426,29 @@ fn readonly_root_with_foreign_orca_skill_checks_every_remaining_skill() {
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.unchanged, builtin_skills().len());
 }
+
+#[cfg(unix)]
+#[test]
+fn symlinked_skill_root_is_classified_as_skipped_external_not_failure() {
+    use std::os::unix::fs::symlink;
+
+    let home = home("symlinked-root");
+    let real_dir = home.join("real-skills");
+    let link_dir = home.join("linked-skills");
+    fs::create_dir_all(&real_dir).unwrap();
+    symlink(&real_dir, &link_dir).unwrap();
+
+    let report = sync_builtin_skills(std::slice::from_ref(&link_dir));
+    fs::remove_dir_all(home).ok();
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.skipped_external.len(), builtin_skills().len());
+    assert!(
+        report
+            .skipped_external
+            .iter()
+            .all(|entry| entry.contains("must not traverse a symlink")),
+        "{:?}",
+        report.skipped_external
+    );
+}
