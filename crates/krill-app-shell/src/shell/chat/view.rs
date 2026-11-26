@@ -4030,7 +4030,6 @@ impl Shell {
             self.recompute_chat_find(&key);
         }
         let unread = host.is_local() && self.sidebar.read(cx).is_unread(session);
-        let poll_failed = self.chat.poll_failed.contains(&key);
 
         let (bound, revision, epoch, display_feed, active_elapsed_label) =
             match self.chat.logs.get_mut(&key) {
@@ -4130,43 +4129,24 @@ impl Shell {
             hasher.finish()
         };
 
-        let persona = (!poll_failed)
-            .then(|| self.chat_bot(&key))
-            .flatten()
-            .map(|bot| {
-                let avatar = self.bot_avatar(bot, 56., ui::RADIUS_XL, palette);
-                let name = [("name", bot.name.as_str())];
-                // Orca `BotHomeChat` / `BotFirstScreen`: avatar + bot name only (no greeting suffix)
-                // + SOUL.md first paragraph in muted_foreground.
-                let subtitle = self
-                    .chat
-                    .bot_souls
-                    .get(&(host.clone(), bot.id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| ctext::BOT_EMPTY_SUBTITLE.format(&name));
-                let agent_label = super::composer::agent_display_name(
-                    krill_proto::agent::canonical_id(&bot.agent_id),
-                );
-                let first_setup =
-                    !bound && agent_state == krill_proto::control::AgentState::Working;
-                (avatar, bot.name.clone(), subtitle, agent_label, first_setup)
-            });
+        let persona = self.chat_bot(&key).map(|bot| {
+            let avatar = self.bot_avatar(bot, 56., ui::RADIUS_XL, palette);
+            let name = [("name", bot.name.as_str())];
+            // Orca `BotHomeChat` / `BotFirstScreen`: avatar + bot name only (no greeting suffix)
+            // + SOUL.md first paragraph in muted_foreground.
+            let subtitle = self
+                .chat
+                .bot_souls
+                .get(&(host.clone(), bot.id.clone()))
+                .cloned()
+                .unwrap_or_else(|| ctext::BOT_EMPTY_SUBTITLE.format(&name));
+            let agent_label = super::composer::agent_display_name(
+                krill_proto::agent::canonical_id(&bot.agent_id),
+            );
+            let first_setup = !bound && agent_state == krill_proto::control::AgentState::Working;
+            (avatar, bot.name.clone(), subtitle, agent_label, first_setup)
+        });
         if display_feed.is_empty() && pending_len == 0 {
-            let badge_bg = if poll_failed {
-                palette.destructive.opacity(0.1)
-            } else {
-                palette.accent
-            };
-            let badge_icon = if poll_failed {
-                IconName::TriangleAlert
-            } else {
-                IconName::MessageSquare
-            };
-            let badge_fg = if poll_failed {
-                palette.destructive
-            } else {
-                muted_fg
-            };
             feed = feed.child(
                 div()
                     .id("chat-empty")
@@ -4251,14 +4231,14 @@ impl Shell {
                                 div()
                                     .size(gpui::px(48.))
                                     .rounded_full()
-                                    .bg(badge_bg)
+                                    .bg(palette.accent)
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(
-                                        gpui_component::Icon::new(badge_icon)
+                                        gpui_component::Icon::new(IconName::MessageSquare)
                                             .with_size(ui::ICON_XL)
-                                            .text_color(badge_fg),
+                                            .text_color(muted_fg),
                                     ),
                             )
                             .child(
@@ -4275,9 +4255,7 @@ impl Shell {
                                     .text_align(gpui::TextAlign::Center)
                                     .text_size(ui::TEXT_SM)
                                     .text_color(muted_fg)
-                                    .child(if poll_failed {
-                                        ctext::POLL_FAILED.get()
-                                    } else if bound {
+                                    .child(if bound {
                                         ctext::EMPTY_BOUND.get()
                                     } else {
                                         ctext::EMPTY_UNBOUND.get()

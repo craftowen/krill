@@ -12875,6 +12875,8 @@ impl SettingsView {
                     .ghost()
                     .xsmall()
                     .flex_none()
+                    .tooltip(crate::i18n::catalog::add_project::CLOSE.get())
+                    .accessibility_label(crate::i18n::catalog::add_project::CLOSE.get())
                     .debug_selector(|| "admin-modal-close".into())
                     .on_click(cx.listener(|_, _, window, cx| {
                         close_settings_page_for(Some(cx.entity_id()), window, cx);

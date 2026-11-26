@@ -817,8 +817,8 @@ impl Shell {
                 )
                 .child(up_next.to_string())
         });
-        let text_el: gpui::Div = match place {
-            Some(place) => div()
+        let text_el: gpui::Div = if let Some(place) = place {
+            div()
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
@@ -834,13 +834,21 @@ impl Shell {
                         .child(place),
                 )
                 .child(" · ")
-                .child(div().min_w_0().truncate().child(words)),
-            None => div()
+                .child(div().min_w_0().truncate().child(words))
+        } else {
+            let fallback_text = if words.is_empty() {
+                remote_label
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string)
+            } else {
+                words
+            };
+            div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .when(facts.unread, |d| d.text_color(p.foreground))
-                .child(words),
+                .child(fallback_text)
         };
         Some(
             div()
