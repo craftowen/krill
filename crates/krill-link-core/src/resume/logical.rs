@@ -164,6 +164,7 @@ impl Logical {
         let mut disconnected = Some((Instant::now(), now_unix_ms()));
         let mut outage_counted = false;
         let mut resume_target: Option<(u64, u64, Instant)> = None;
+        let mut completed_at: Option<Instant> = None;
         let mut tick = tokio::time::interval(ACK_DELAY);
         loop {
             if *stop.borrow() {
@@ -233,6 +234,13 @@ impl Logical {
                         && task.is_finished() {
                         if let Some(task)=network.take() { task.await.ok(); }
                         resume_target=None;
+                        if self.is_closed() {
+                            break;
+                        }
+                        if self.with(|l| Ok(l.finished())).unwrap_or(false) {
+                            self.close("complete");
+                            break;
+                        }
                         if !outage_counted {
                             outage_counted=true;
                             disconnected=Some((Instant::now(),now_unix_ms()));
@@ -260,9 +268,18 @@ impl Logical {
                         self.close("resume grace expired"); break;
                     }
                     if self.with(|l| Ok(l.finished())).unwrap_or(false) {
-                        // Let the last FIN ACK reach QUIC before retaining a closed registry entry.
-                        tokio::time::sleep(ACK_DELAY.saturating_mul(2)).await;
-                        self.close("complete"); break;
+                        // Wake send_frames so it flushes the final FIN-ACK and calls send.finish(),
+                        // then wait for clean QUIC delivery instead of aborting after a fixed 40ms.
+                        self.changed.notify_waiters();
+                        if network.is_none()
+                            || completed_at
+                                .get_or_insert_with(Instant::now)
+                                .elapsed()
+                                >= HANDSHAKE_TIMEOUT
+                        {
+                            self.close("complete");
+                            break;
+                        }
                     }
                 }
             }
@@ -273,7 +290,11 @@ impl Logical {
                 .close_reason
                 .unwrap_or_else(|| "stream stopped".to_owned()),
         );
-        if let Some(task) = network {
+        if let Some(mut task) = network
+            && tokio::time::timeout(Duration::from_millis(300), &mut task)
+                .await
+                .is_err()
+        {
             task.abort();
             task.await.ok();
         }
@@ -367,13 +388,87 @@ impl Logical {
         generation: u64,
         incoming: mpsc::Sender<Incoming>,
     ) {
-        let reader = self.receive_frames(&mut recv, incoming);
-        let writer = self.send_frames(&mut send, cursor);
-        tokio::pin!(reader, writer);
-        tokio::select! {
-            _=conn.closed()=>{},
-            result=&mut reader=> { if result.as_ref().is_err_and(|e| matches!(e, Error::Protocol(_))) && self.with(|l|Ok(l.generation==generation)).unwrap_or(false) { self.close("invalid peer frame"); } },
-            result=&mut writer=> { if result.as_ref().is_err_and(|e| matches!(e, Error::Protocol(_))) && self.with(|l|Ok(l.generation==generation)).unwrap_or(false) { self.close("invalid replay state"); } },
+        let mut stop = self.stop.subscribe();
+        let mut send_reset = false;
+        let mut flush_final_ack = false;
+        {
+            let reader = self.receive_frames(&mut recv, incoming);
+            let writer = self.send_frames(&mut send, cursor);
+            tokio::pin!(reader, writer);
+            tokio::select! {
+                _ = conn.closed() => {}
+                _ = stop.changed() => {
+                    if *stop.borrow()
+                        && conn.close_reason().is_none()
+                        && !self.with(|l| Ok(l.finished())).unwrap_or(false)
+                    {
+                        send_reset = true;
+                    }
+                }
+                result = &mut reader => {
+                    let same_gen = self.with(|l| Ok(l.generation == generation)).unwrap_or(false);
+                    if same_gen {
+                        if result.as_ref().is_err_and(|e| matches!(e, Error::Protocol(_))) {
+                            self.close("invalid peer frame");
+                        } else if conn.close_reason().is_none()
+                            && self.with(|l| Ok(l.peer_completed_cleanly())).unwrap_or(false)
+                        {
+                            // Older peers (e.g. pre-fix `krill-link connect`) drop their SendStream
+                            // 40ms after seeing our FIN, cancelling their final FIN-ACK over high-RTT
+                            // links. Because the QUIC connection is still healthy and every byte was
+                            // already ACKed after both FINs, complete cleanly instead of suspending
+                            // for the full resume grace window.
+                            flush_final_ack = true;
+                            self.close("complete");
+                        }
+                    }
+                }
+                result = &mut writer => {
+                    let same_gen = self.with(|l| Ok(l.generation == generation)).unwrap_or(false);
+                    if same_gen {
+                        if result.is_ok() {
+                            self.close("complete");
+                        } else if result.as_ref().is_err_and(|e| matches!(e, Error::Protocol(_))) {
+                            self.close("invalid replay state");
+                        }
+                    }
+                }
+            }
+        }
+        if flush_final_ack && conn.close_reason().is_none() {
+            if let Ok(ack) = self.with(|l| Ok(l.rx_committed)) {
+                let frame = Header {
+                    kind: Kind::Ack,
+                    offset: ack,
+                    len: 0,
+                    fin: true,
+                }
+                .encode();
+                tokio::time::timeout(Duration::from_millis(200), async {
+                    if send.write_all(&frame).await.is_ok() {
+                        send.finish().ok();
+                        send.stopped().await.ok();
+                    }
+                })
+                .await
+                .ok();
+            }
+        } else if send_reset && conn.close_reason().is_none() {
+            let frame = Header {
+                kind: Kind::Reset,
+                offset: 0,
+                len: 0,
+                fin: false,
+            }
+            .encode();
+            tokio::time::timeout(Duration::from_millis(200), async {
+                if send.write_all(&frame).await.is_ok() {
+                    send.finish().ok();
+                    send.stopped().await.ok();
+                }
+            })
+            .await
+            .ok();
         }
         self.changed.notify_waiters();
     }
@@ -500,7 +595,21 @@ impl Logical {
                 )
                 .await
                 .map_err(|e| Error::Transport(e.to_string()))?;
+                self.with(|l| {
+                    l.tx_fin_sent = true;
+                    Ok(())
+                })?;
                 fin_sent = true;
+            }
+            if previous_ack == Some((ack, true)) && tx_fin_acked {
+                // Both halves are complete and the final FIN-ACK has been written.
+                // Finish the QUIC SendStream cleanly (never drop unfinished -> RESET_STREAM)
+                // and wait for peer delivery confirmation so the server does not suspend.
+                send.finish().ok();
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, send.stopped())
+                    .await
+                    .ok();
+                return Ok(());
             }
             tokio::select! { ()=notified=>{}, _=tick.tick()=>{} }
         }

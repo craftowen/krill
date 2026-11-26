@@ -41,9 +41,22 @@ fn estimated_chat_item_wire_bytes(item: &ChatItem) -> usize {
     let options_bytes: usize = item
         .options
         .iter()
-        .map(|opt| opt.label.len() + opt.description.len() + 8)
+        .map(|opt| opt.label.len() + opt.description.len() + 16)
+        .sum();
+    // JSON workflow envelopes escape quotes/backslashes/newlines (+1) and control chars (+5).
+    // Counting escape expansion keeps escaped payloads safely under ipc::MAX_FRAME (1 MiB)
+    // without inflating plain-text items above the 48-byte base overhead.
+    let json_escape_extra: usize = item
+        .text
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' => 1,
+            0x00..=0x1f => 5,
+            _ => 0,
+        })
         .sum();
     item.text.len()
+        + json_escape_extra
         + item.title.len()
         + item.tool_name.len()
         + item.tool_id.len()
@@ -341,6 +354,13 @@ pub(crate) fn replay_page(
     ))
 }
 
+struct AcceptedTailLine {
+    bytes: u64,
+    codex_record: Option<bool>,
+    agy_media: Vec<String>,
+    items: Vec<ChatItem>,
+}
+
 /// A bounded tail window for mobile's first paint, or the page before its oldest row.
 /// The resolved snapshot supplies the path; the client only supplies a byte boundary.
 pub(crate) fn latest_page(
@@ -439,7 +459,7 @@ pub(crate) fn latest_page(
     }
     let mut count = 0usize;
     let mut page_bytes = 0usize;
-    let mut accepted: Vec<(u64, Option<bool>, Vec<ChatItem>)> = Vec::new();
+    let mut accepted: Vec<AcceptedTailLine> = Vec::new();
     for line in bytes
         .get(leading..complete)
         .unwrap_or_default()
@@ -448,6 +468,7 @@ pub(crate) fn latest_page(
     {
         let mut line_items = Vec::new();
         let mut codex_record = None;
+        let mut agy_media = Vec::new();
         let trimmed = trim_ascii_whitespace(line);
         if !trimmed.is_empty()
             && let Ok(value) = serde_json::from_slice::<Value>(trimmed)
@@ -458,6 +479,8 @@ pub(crate) fn latest_page(
                     Some("event_msg") => Some(true),
                     _ => None,
                 };
+            } else if agent == VaultAgent::Agy {
+                agy_media = agy_media_image_paths(&value);
             }
             parse_line_into_items(agent, &value, &mut line_items);
         }
@@ -473,7 +496,12 @@ pub(crate) fn latest_page(
         count = count.saturating_add(line_items.len());
         page_bytes = page_bytes.saturating_add(line_bytes);
         start = start.saturating_sub(line_len);
-        accepted.push((line_len, codex_record, line_items));
+        accepted.push(AcceptedTailLine {
+            bytes: line_len,
+            codex_record,
+            agy_media,
+            items: line_items,
+        });
         if count >= MAX_CHAT_ITEMS || page_bytes >= MAX_CHAT_RESPONSE_BYTES {
             break;
         }
@@ -483,7 +511,16 @@ pub(crate) fn latest_page(
     let mut out_bytes = 0usize;
     let mut items: Vec<ChatItem> = Vec::new();
     let mut previous_codex_record = None;
-    for (n_u64, codex_record, mut line_items) in accepted {
+    for AcceptedTailLine {
+        bytes: n_u64,
+        codex_record,
+        agy_media,
+        items: mut line_items,
+    } in accepted
+    {
+        if !agy_media.is_empty() {
+            apply_agy_media_fallback(&mut items, &agy_media);
+        }
         // Claude names a prompt's pasted images in the next record: fold them into that prompt.
         if let [only] = line_items.as_slice()
             && only.kind == ChatItemKind::User
@@ -688,6 +725,12 @@ fn poll_transcript_file_until(
         };
         let mut line_items = Vec::new();
         parse_line_into_items(agent, &val, &mut line_items);
+        if agent == VaultAgent::Agy {
+            let agy_media = agy_media_image_paths(&val);
+            if !agy_media.is_empty() {
+                apply_agy_media_fallback(&mut items, &agy_media);
+            }
+        }
         // Claude names a prompt's pasted images in the next record: fold them into that prompt.
         if let [only] = line_items.as_slice()
             && only.kind == ChatItemKind::User
@@ -3475,6 +3518,78 @@ fn take_leading_image_paths(item: &mut ChatItem) {
     add_image_paths(item, &paths);
 }
 
+/// Extracts local image paths from Antigravity `GENERIC` `media: [{"uri": "file://..."}]` records.
+fn agy_media_image_paths(v: &Value) -> Vec<String> {
+    let Some(media) = v.get("media").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in media {
+        let Some(uri) = entry.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(raw_path) = uri.trim().strip_prefix("file://") else {
+            continue;
+        };
+        let path_str = if cfg!(windows)
+            && raw_path.starts_with('/')
+            && matches!(
+                raw_path.as_bytes().get(1..3),
+                Some(&[drive, b':']) if drive.is_ascii_alphabetic()
+            ) {
+            raw_path.strip_prefix('/').unwrap_or(raw_path)
+        } else {
+            raw_path
+        };
+        if !path_str.is_empty() && Path::new(path_str).is_absolute() {
+            out.push(path_str.to_owned());
+        }
+    }
+    out
+}
+
+/// When an earlier Antigravity `USER_INPUT` points at a temp paste image (e.g. `$TMPDIR/krill-paste`)
+/// that has since been purged from disk, substitutes the surviving `.system_generated/logs/media/`
+/// copy captured by `read_file` in the same turn. Existing original files are left untouched.
+fn apply_agy_media_fallback(items: &mut [ChatItem], media_paths: &[String]) {
+    let surviving: Vec<&str> = media_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| Path::new(p).is_file())
+        .collect();
+    if surviving.is_empty() {
+        return;
+    }
+    let Some(user) = items
+        .iter_mut()
+        .rev()
+        .find(|item| item.kind == ChatItemKind::User && !item.file_path.is_empty())
+    else {
+        return;
+    };
+    let mut media_iter = surviving.into_iter();
+    let mut changed = false;
+    let mut updated = Vec::new();
+    for line in user.file_path.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if Path::new(trimmed).is_file() {
+            updated.push(trimmed.to_owned());
+        } else if let Some(fallback) = media_iter.next() {
+            updated.push(fallback.to_owned());
+            changed = true;
+        } else {
+            updated.push(trimmed.to_owned());
+        }
+    }
+    if changed {
+        user.file_path.clear();
+        add_image_paths(user, &updated);
+    }
+}
+
 /// Adds `paths` to a user item's `file_path` (one path per line), skipping repeats.
 fn add_image_paths(item: &mut ChatItem, paths: &[String]) {
     if item.file_path.len() > MAX_TEXT {
@@ -5428,6 +5543,185 @@ mod performance_tests {
         assert_eq!(
             forward.items.last().unwrap().text,
             tail.items.last().unwrap().text
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn agy_41932_like_transcript_paginates_within_frame_budget_and_falls_back_to_media_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-agy-41932-fixture-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let logs_dir = root.join("brain/conv-41932-synth/.system_generated/logs");
+        let media_dir = logs_dir.join("media");
+        fs::create_dir_all(&media_dir).unwrap();
+        let media_jpg = media_dir.join("step_2_media_0.jpg");
+        fs::write(&media_jpg, b"\xff\xd8\xff\xe0synthetic-jpeg").unwrap();
+        let existing_paste = root.join("existing-paste.png");
+        fs::write(&existing_paste, b"\x89PNG\r\n\x1a\nsynthetic-png").unwrap();
+
+        let missing_paste = root.join("missing-krill-paste/clipboard-gone.png");
+        let transcript = logs_dir.join("transcript_full.jsonl");
+        let mut raw = String::new();
+
+        // Turn 1: user message whose temp krill-paste path was purged, followed by Antigravity's
+        // GENERIC media record capturing step_2_media_0.jpg so media fallback must resolve it.
+        let user1 = serde_json::json!({
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-11-26T04:00:00Z",
+            "content": format!("{} pi does not respond", missing_paste.display())
+        });
+        raw.push_str(&user1.to_string());
+        raw.push('\n');
+        let media_rec = serde_json::json!({
+            "source": "TOOL",
+            "type": "GENERIC",
+            "created_at": "2026-11-26T04:00:01Z",
+            "tool_call_id": "call-img",
+            "output": "read image",
+            "media": [
+                { "uri": format!("file://{}", media_jpg.display()), "mimeType": "image/jpeg" }
+            ]
+        });
+        raw.push_str(&media_rec.to_string());
+        raw.push('\n');
+
+        // Turn 2: user message whose pasted image still exists on disk (must stay untouched).
+        let user2 = serde_json::json!({
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-11-26T04:00:05Z",
+            "content": format!("{} second image still present", existing_paste.display())
+        });
+        raw.push_str(&user2.to_string());
+        raw.push('\n');
+
+        // Many tool call/result records with heavy JSON escaping (quotes + newlines) resembling 41932.
+        let escaped_chunk = format!("line \"quoted\" \\\n{}", "x\"\\n".repeat(1_200));
+        for idx in 0..160usize {
+            let call = serde_json::json!({
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T04:01:00Z",
+                "tool_calls": [
+                    {
+                        "id": format!("call-{idx}"),
+                        "name": "read_file",
+                        "args": { "Path": format!("/repo/src/mod_{idx}.rs") }
+                    }
+                ]
+            });
+            let result = serde_json::json!({
+                "source": "TOOL",
+                "type": "GENERIC",
+                "created_at": "2026-11-26T04:01:01Z",
+                "tool_call_id": format!("call-{idx}"),
+                "output": format!("step-{idx}: {escaped_chunk}")
+            });
+            raw.push_str(&call.to_string());
+            raw.push('\n');
+            raw.push_str(&result.to_string());
+            raw.push('\n');
+        }
+
+        // Final assistant reply.
+        let final_reply = serde_json::json!({
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-26T04:10:00Z",
+            "content": "clippy and test binary compilation passed."
+        });
+        raw.push_str(&final_reply.to_string());
+        raw.push('\n');
+        fs::write(&transcript, &raw).unwrap();
+
+        let seed = ChatPollSnapshot {
+            agent: "agy".into(),
+            session_id: "conv-41932-synth".into(),
+            transcript_path: transcript.to_string_lossy().into_owned(),
+            next_offset: 0,
+            reset: false,
+            bound: true,
+            items: Vec::new(),
+        };
+
+        // Walk backwards with latest_page from EOF down to 0, verifying every page fits MAX_FRAME
+        // in both postcard and workflow JSON envelopes.
+        let mut end = None;
+        let mut pages = Vec::new();
+        loop {
+            let (page, start) = latest_page(seed.clone(), end).unwrap();
+            let postcard_bytes = postcard::to_allocvec(&krill_proto::control::Reply::AgentHistory(
+                krill_proto::agent_history::Response::ChatPolled(page.clone()),
+            ))
+            .unwrap();
+            assert!(
+                postcard_bytes.len() <= krill_proto::ipc::MAX_FRAME,
+                "postcard page exceeded MAX_FRAME: {}",
+                postcard_bytes.len()
+            );
+            let json_bytes = serde_json::to_vec(&serde_json::json!({
+                "ok": true,
+                "data": {
+                    "agent": page.agent,
+                    "session_id": page.session_id,
+                    "transcript_path": page.transcript_path,
+                    "next_offset": page.next_offset,
+                    "page_start": start,
+                    "has_earlier": start > 0,
+                    "reset": page.reset,
+                    "bound": page.bound,
+                    "items": page.items,
+                }
+            }))
+            .unwrap();
+            assert!(
+                json_bytes.len() <= krill_proto::ipc::MAX_FRAME,
+                "workflow JSON page exceeded MAX_FRAME: {}",
+                json_bytes.len()
+            );
+            pages.push((start, page));
+            if start == 0 {
+                break;
+            }
+            end = Some(start);
+        }
+
+        assert!(
+            pages.len() >= 2,
+            "large 41932-like fixture should span multiple pages"
+        );
+        // Latest page reaches EOF and contains the final assistant reply.
+        assert_eq!(pages[0].1.next_offset, raw.len() as u64);
+        assert_eq!(
+            pages[0].1.items.last().unwrap().text,
+            "clippy and test binary compilation passed."
+        );
+        // Earliest page contains both user prompts with proper image paths.
+        let earliest_items = &pages.last().unwrap().1.items;
+        let u1 = earliest_items
+            .iter()
+            .find(|i| i.kind == ChatItemKind::User && i.text.contains("pi does not respond"))
+            .expect("first user message present");
+        assert_eq!(
+            u1.file_path,
+            media_jpg.to_string_lossy(),
+            "missing temp krill-paste image must fall back to .system_generated/logs/media/"
+        );
+        let u2 = earliest_items
+            .iter()
+            .find(|i| i.kind == ChatItemKind::User && i.text.contains("second image still present"))
+            .expect("second user message present");
+        assert_eq!(
+            u2.file_path,
+            existing_paste.to_string_lossy(),
+            "existing pasted image path must be preserved untouched"
         );
 
         fs::remove_dir_all(&root).ok();

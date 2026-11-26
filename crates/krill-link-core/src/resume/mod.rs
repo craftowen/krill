@@ -7,7 +7,7 @@ mod state;
 pub(crate) mod wire;
 pub(crate) use logical::{Attachment, HANDSHAKE_TIMEOUT, Logical};
 
-pub const MAX_STREAMS: usize = 32;
+pub const MAX_STREAMS: usize = 64;
 pub const DEFAULT_STREAM_BUFFER_LIMIT: usize = 1024 * 1024;
 /// Shared across every server and tunnel in this process, including in-flight frames.
 pub const PROCESS_BUFFER_LIMIT: usize = 4 * 1024 * 1024;

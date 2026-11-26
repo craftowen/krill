@@ -68,12 +68,17 @@ pub fn add(offset: u64, len: usize) -> Result<u64, Error> {
 }
 
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "tracks independent local/wire FIN and ACK half-close state flags"
+)]
 pub struct Ledger {
     pub tx: VecDeque<Chunk>,
     pub tx_next: u64,
     pub tx_acked: u64,
     pub tx_exposed: u64,
     pub tx_fin: bool,
+    pub tx_fin_sent: bool,
     pub tx_fin_acked: bool,
     pub rx_committed: u64,
     pub rx_fin: bool,
@@ -155,6 +160,12 @@ impl Ledger {
     }
     pub fn finished(&self) -> bool {
         self.tx_fin_acked && self.rx_fin
+    }
+    /// Both endpoints have sent FIN and every outbound payload byte has been acknowledged.
+    /// Used when an older peer closes a single stream on a healthy QUIC connection
+    /// before its final FIN-ACK arrives.
+    pub fn peer_completed_cleanly(&self) -> bool {
+        self.rx_fin && self.tx_fin && self.tx_fin_sent && self.tx_acked == self.tx_next
     }
 }
 

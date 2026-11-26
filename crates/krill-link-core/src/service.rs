@@ -113,9 +113,9 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, Error> {
     Ok(runtime.block_on(future))
 }
 
-/// 서버 빌드가 이 빌드보다 오래됐는지. 업데이트 뒤에도 구 서버가 남아 Windows에서는 `Krill.prev`의 실행 파일을 쥐고 있다.
-/// 빌드를 알리지 않는 구 서버(빈 값)도 오래된 것으로 본다. 응답이 없으면 교체하지 않는다.
-fn is_stale_build(running: &str) -> bool {
+/// 서버·터널 빌드가 이 빌드보다 오래됐는지. 업데이트 뒤에도 구 바이너리가 남아 Windows에서는 `Krill.prev`의 실행 파일을 쥐고 있다.
+/// 빌드를 알리지 않는 구 바이너리(빈 값)도 오래된 것으로 본다.
+pub fn is_stale_build(running: &str) -> bool {
     running.is_empty()
         || krill_proto::control::is_newer(krill_proto::build_id(), running) == Some(true)
 }

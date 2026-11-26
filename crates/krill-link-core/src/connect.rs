@@ -61,6 +61,9 @@ pub struct HostTunnelStatus {
     pub reconnect_attempt: u32,
     pub updated_at_ms: u64,
     pub pid: Option<u32>,
+    /// 실행 중인 `krill-link connect`의 `krill_proto::build_id()`. 구버전 상태 파일은 빈 문자열이다.
+    #[serde(default)]
+    pub build: String,
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_kind: Option<TunnelErrorKind>,

@@ -612,6 +612,7 @@ pub(crate) struct ChatState {
     pub(super) outage_since: BTreeMap<String, std::time::Instant>,
     poll_timer: Option<Task<()>>,
     poll_failed: BTreeSet<ChatKey>,
+    poll_failure_reasons: BTreeMap<ChatKey, String>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
     focus_pending: Option<ChatFocus>,
     pub logs: BTreeMap<ChatKey, SessionChatLog>,
@@ -1004,6 +1005,48 @@ fn parse_chat_page(raw: &str) -> Option<ChatPage> {
         has_earlier: has_earlier?,
         snapshot,
     })
+}
+
+/// Produces a short, redacted summary of a failed workflow JSON poll response without logging chat text.
+fn summarize_workflow_json_error(raw: &str, mode: &'static str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => {
+            if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+                let err = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let bounded: String = err.chars().take(120).collect();
+                format!("{mode}_rpc_error: {bounded}")
+            } else {
+                format!("{mode}_parse_failed(len={})", raw.len())
+            }
+        }
+        Err(_) => format!("{mode}_invalid_json(len={})", raw.len()),
+    }
+}
+
+/// Summarizes why a `ChatPoll` IPC exchange failed without including chat content or paths.
+fn summarize_poll_failure(reply: Option<&std::io::Result<Reply>>) -> String {
+    match reply {
+        None => "no_reply".to_owned(),
+        Some(Err(err)) => {
+            let msg = err.to_string();
+            let bounded: String = msg.chars().take(120).collect();
+            format!("io({:?}): {bounded}", err.kind())
+        }
+        Some(Ok(Reply::Failed(failure))) => format!("daemon_failed({failure:?})"),
+        Some(Ok(Reply::AgentHistory(other))) => {
+            let kind = match other {
+                Response::Scanned(_) => "Scanned",
+                Response::Resumed { .. } => "Resumed",
+                Response::Searched(_) => "Searched",
+                Response::ChatPolled(_) => "ChatPolled",
+            };
+            format!("unexpected_history_reply({kind})")
+        }
+        Some(Ok(_)) => "unexpected_control_reply".to_owned(),
+    }
 }
 
 fn rebase_tool_key(key: &str, delta: usize) -> String {
@@ -2278,6 +2321,7 @@ impl Shell {
         chat.poll_tasks.remove(&old_key);
         chat.poll_generations.remove(&old_key);
         chat.poll_failed.remove(&old_key);
+        chat.poll_failure_reasons.remove(&old_key);
         chat.composer_tasks.remove(&old_key);
         chat.composer_models_in_flight.remove(&old_key);
         chat.last_composer_poll.remove(&old_key);
@@ -2525,6 +2569,7 @@ impl Shell {
         let keep = |key: &ChatKey| shown.contains(key);
         chat.pane_widths.retain(|pane, _| live_panes.contains(pane));
         chat.poll_failed.retain(keep);
+        chat.poll_failure_reasons.retain(|key, _| keep(key));
         chat.poll_tasks.retain(|key, _| keep(key));
         chat.poll_generations.retain(|key, _| keep(key));
         chat.cached_bots.retain(|key, _| keep(key));
@@ -2924,7 +2969,22 @@ impl Shell {
         }
         self.ensure_chat_poll_timer(cx);
         let Some(target) = self.target_for_host(&host) else {
-            if self.chat.poll_failed.insert(key) {
+            let reason = "missing_host_target";
+            let reason_changed =
+                self.chat.poll_failure_reasons.get(&key).map(String::as_str) != Some(reason);
+            let inserted = self.chat.poll_failed.insert(key.clone());
+            if inserted || reason_changed {
+                tracing::warn!(
+                    host = %key.0,
+                    session = key.1.0,
+                    reason,
+                    "chat history poll failed"
+                );
+                self.chat
+                    .poll_failure_reasons
+                    .insert(key, reason.to_owned());
+            }
+            if inserted {
                 cx.notify();
             }
             return;
@@ -2958,24 +3018,56 @@ impl Shell {
         let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
             let seeding = seed.is_some();
-            let (page, reply, meta) = cx
+            let (page, reply, meta, workflow_err) = cx
                 .background_executor()
                 .spawn(async move {
                     #[cfg(test)]
                     if let Some(gate) = gate {
                         gate.await.ok();
                     }
-                    let page = seed.and_then(|workflow| {
-                        parse_chat_page(&workflow(&chat_tail_request(session, None)).ok()?)
-                    });
+                    let mut workflow_err: Option<String> = None;
+                    let page = match seed {
+                        Some(workflow) => match workflow(&chat_tail_request(session, None)) {
+                            Ok(raw) => {
+                                let parsed = parse_chat_page(&raw);
+                                if parsed.is_none() {
+                                    workflow_err =
+                                        Some(summarize_workflow_json_error(&raw, "tail"));
+                                }
+                                parsed
+                            }
+                            Err(err) => {
+                                workflow_err = Some(format!("tail_io({:?}): {}", err.kind(), err));
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     let reply = if page.is_some() {
                         None
                     } else {
-                        let json_snap = incremental_workflow.and_then(|workflow| {
-                            parse_chat_snapshot(
-                                &workflow(&chat_incremental_poll_request(session, offset)).ok()?,
-                            )
-                        });
+                        let json_snap = match incremental_workflow {
+                            Some(workflow) => {
+                                match workflow(&chat_incremental_poll_request(session, offset)) {
+                                    Ok(raw) => {
+                                        let parsed = parse_chat_snapshot(&raw);
+                                        if parsed.is_none() {
+                                            workflow_err = Some(summarize_workflow_json_error(
+                                                &raw,
+                                                "incremental",
+                                            ));
+                                        }
+                                        parsed
+                                    }
+                                    Err(err) => {
+                                        workflow_err =
+                                            Some(format!("inc_io({:?}): {}", err.kind(), err));
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
                         if let Some(snap) = json_snap {
                             Some(Ok(Reply::AgentHistory(Response::ChatPolled(snap))))
                         } else {
@@ -2992,7 +3084,7 @@ impl Shell {
                         }
                         _ => None,
                     };
-                    (page, reply, meta)
+                    (page, reply, meta, workflow_err)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -3011,7 +3103,17 @@ impl Shell {
                     let now = std::time::Instant::now();
                     let mut should_notify = false;
                     if let Some(page) = page {
-                        this.chat.poll_failed.remove(&task_key);
+                        if this.chat.poll_failed.remove(&task_key) {
+                            this.chat.poll_failure_reasons.remove(&task_key);
+                            this.chat
+                                .images
+                                .clear_transient_remote_failures(&task_key.0);
+                            tracing::info!(
+                                host = %task_key.0,
+                                session = task_key.1.0,
+                                "chat history poll recovered"
+                            );
+                        }
                         this.apply_chat_tail(session, host, page, meta, agent_state, now);
                         this.refresh_chat_composer(&task_key, false, cx);
                         this.flush_queued_chat_prompt_if_ready(&task_key, cx);
@@ -3037,6 +3139,17 @@ impl Shell {
                                 .get(&task_key)
                                 .is_none_or(|t| t.elapsed() >= composer_interval);
                         let cleared_failure = this.chat.poll_failed.remove(&task_key);
+                        if cleared_failure {
+                            this.chat.poll_failure_reasons.remove(&task_key);
+                            this.chat
+                                .images
+                                .clear_transient_remote_failures(&task_key.0);
+                            tracing::info!(
+                                host = %task_key.0,
+                                session = task_key.1.0,
+                                "chat history poll recovered"
+                            );
+                        }
                         let poll_changed = this.apply_chat_poll_for_host_with_state(
                             session,
                             host,
@@ -3058,8 +3171,32 @@ impl Shell {
                         }
                         this.flush_queued_chat_prompt_if_ready(&task_key, cx);
                         should_notify = cleared_failure || poll_changed || seeded_changed;
-                    } else if this.chat.poll_failed.insert(task_key.clone()) {
-                        should_notify = true;
+                    } else {
+                        let reason = summarize_poll_failure(reply.as_ref());
+                        let reason_changed = this
+                            .chat
+                            .poll_failure_reasons
+                            .get(&task_key)
+                            .map(String::as_str)
+                            != Some(reason.as_str());
+                        let inserted = this.chat.poll_failed.insert(task_key.clone());
+                        if inserted || reason_changed {
+                            tracing::warn!(
+                                host = %task_key.0,
+                                session = task_key.1.0,
+                                offset,
+                                seeded = !seeding,
+                                reason = %reason,
+                                workflow_reason = ?workflow_err,
+                                "chat history poll failed"
+                            );
+                            this.chat
+                                .poll_failure_reasons
+                                .insert(task_key.clone(), reason);
+                        }
+                        if inserted {
+                            should_notify = true;
+                        }
                     }
                     this.load_earlier_chat(pane, &task_key, cx);
                     if should_notify {

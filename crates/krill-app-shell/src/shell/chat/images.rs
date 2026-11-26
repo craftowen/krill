@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -38,6 +39,52 @@ const VIEWER_MAX_SIDE: u32 = 2560;
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// ponytail: the cache is cleared whole past this; an LRU if long chats re-decode visibly.
 const MAX_CACHED_THUMBS: usize = 256;
+const MAX_LOCAL_THUMB_RETRIES: u8 = 3;
+const LOCAL_THUMB_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_REMOTE_IMAGE_RETRIES: u8 = 5;
+
+#[derive(Clone, Copy, Debug)]
+enum RemoteFetchState {
+    Loading,
+    Failed {
+        at: Instant,
+        attempts: u8,
+        permanent: bool,
+    },
+}
+
+fn remote_fetch_backoff(attempts: u8) -> Duration {
+    let shift = u32::from(attempts.saturating_sub(1).min(4));
+    Duration::from_secs(2u64.saturating_mul(1u64 << shift).min(30))
+}
+
+fn is_permanent_remote_image_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::StorageFull
+    ) {
+        return true;
+    }
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("not a regular file")
+        || lower.contains("no such file")
+        || lower.contains("too large")
+        || lower.contains("size limit")
+}
+
+#[cfg(test)]
+pub(super) type RemoteImageFetcher = Arc<
+    dyn Fn(
+            &krill_app_core::hosts::HostTarget,
+            &krill_app_core::hosts::HostId,
+            &Path,
+        ) -> std::io::Result<PathBuf>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub(super) enum Loaded {
@@ -101,8 +148,12 @@ fn png_bytes(path: &Path) -> Option<Vec<u8>> {
 #[derive(Default)]
 pub(crate) struct ChatImages {
     thumbs: HashMap<PathBuf, Loaded>,
+    thumb_failed: HashMap<PathBuf, (Instant, u8)>,
     remote_previews: HashMap<PathBuf, PathBuf>,
+    remote_fetches: HashMap<(krill_app_core::hosts::HostId, PathBuf), RemoteFetchState>,
     pub(super) viewer: Option<ImageViewer>,
+    #[cfg(test)]
+    pub(super) remote_fetcher: Option<RemoteImageFetcher>,
 }
 
 impl ChatImages {
@@ -113,6 +164,23 @@ impl ChatImages {
             self.remote_previews.clear();
         }
         self.remote_previews.insert(remote, local);
+    }
+
+    /// Clears transient remote image download failures for `host` (e.g. after reconnect or
+    /// `poll_failed` recovery) so previously failing `#1` chips automatically retry.
+    pub(super) fn clear_transient_remote_failures(&mut self, host: &krill_app_core::hosts::HostId) {
+        self.remote_fetches.retain(|(h, _), state| {
+            if h != host {
+                return true;
+            }
+            !matches!(
+                state,
+                RemoteFetchState::Failed {
+                    permanent: false,
+                    ..
+                }
+            )
+        });
     }
 
     pub(super) fn resolve_remote_preview(&self, remote: &Path) -> Option<&Path> {
@@ -397,9 +465,22 @@ pub(super) fn image_tile(
 
 impl Shell {
     /// The thumbnail for `path`, starting its decode the first time it is asked for.
+    /// Transient decode failures (e.g. a file still being written) retry with a short backoff.
     pub(super) fn chat_thumbnail(&mut self, path: &Path, cx: &mut Context<Self>) -> Loaded {
         if let Some(loaded) = self.chat.images.thumbs.get(path) {
-            return loaded.clone();
+            let can_retry = matches!(loaded, Loaded::Failed)
+                && self
+                    .chat
+                    .images
+                    .thumb_failed
+                    .get(path)
+                    .is_some_and(|(at, attempts)| {
+                        *attempts < MAX_LOCAL_THUMB_RETRIES
+                            && at.elapsed() >= LOCAL_THUMB_RETRY_BACKOFF
+                    });
+            if !can_retry {
+                return loaded.clone();
+            }
         }
         if self.chat.images.thumbs.len() >= MAX_CACHED_THUMBS {
             for (_, loaded) in self.chat.images.thumbs.drain() {
@@ -407,6 +488,7 @@ impl Shell {
                     cx.drop_image(image, None);
                 }
             }
+            self.chat.images.thumb_failed.clear();
         }
         self.chat
             .images
@@ -420,7 +502,23 @@ impl Shell {
                 .spawn(async move { decode(&read, THUMB_SIDE, true) })
                 .await;
             this.update(cx, |this, cx| {
-                let loaded = decoded.map_or(Loaded::Failed, |image| Loaded::Ready(Arc::new(image)));
+                let loaded = if let Some(image) = decoded {
+                    this.chat.images.thumb_failed.remove(&owned);
+                    Loaded::Ready(Arc::new(image))
+                } else {
+                    let attempts = this
+                        .chat
+                        .images
+                        .thumb_failed
+                        .get(&owned)
+                        .map_or(0, |(_, n)| *n)
+                        .saturating_add(1);
+                    this.chat
+                        .images
+                        .thumb_failed
+                        .insert(owned.clone(), (Instant::now(), attempts));
+                    Loaded::Failed
+                };
                 if let Some(Loaded::Ready(old)) = this.chat.images.thumbs.insert(owned, loaded) {
                     cx.drop_image(old, None);
                 }
@@ -430,6 +528,140 @@ impl Shell {
         })
         .detach();
         Loaded::Loading
+    }
+
+    /// Resolves a remote chat image path to a locally cached preview, fetching it lazily via
+    /// `RemoteFs` if it was not uploaded during this app session (e.g. after restart or attached
+    /// from another device/local host). Transient network failures retry with bounded backoff.
+    pub(super) fn resolve_or_fetch_remote_chat_image(
+        &mut self,
+        host: &krill_app_core::hosts::HostId,
+        remote_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
+        if let Some(local) = self.chat.images.resolve_remote_preview(remote_path) {
+            return Some(local.to_path_buf());
+        }
+        let fetch_key = (host.clone(), remote_path.to_path_buf());
+        let prev_attempts = match self.chat.images.remote_fetches.get(&fetch_key).copied() {
+            Some(
+                RemoteFetchState::Loading
+                | RemoteFetchState::Failed {
+                    permanent: true, ..
+                },
+            ) => return None,
+            Some(RemoteFetchState::Failed {
+                at,
+                attempts,
+                permanent: false,
+            }) => {
+                if attempts >= MAX_REMOTE_IMAGE_RETRIES
+                    || at.elapsed() < remote_fetch_backoff(attempts)
+                {
+                    return None;
+                }
+                attempts
+            }
+            None => 0,
+        };
+        let Some(target) = self.target_for_host(host) else {
+            let attempts = prev_attempts.saturating_add(1);
+            self.chat.images.remote_fetches.insert(
+                fetch_key,
+                RemoteFetchState::Failed {
+                    at: Instant::now(),
+                    attempts,
+                    permanent: false,
+                },
+            );
+            return None;
+        };
+        if self.chat.images.remote_fetches.len() >= MAX_CACHED_THUMBS
+            && !self.chat.images.remote_fetches.contains_key(&fetch_key)
+        {
+            self.chat
+                .images
+                .remote_fetches
+                .retain(|_, s| matches!(s, RemoteFetchState::Loading));
+        }
+        self.chat
+            .images
+            .remote_fetches
+            .insert(fetch_key.clone(), RemoteFetchState::Loading);
+        let host_owned = host.clone();
+        let path_owned = remote_path.to_path_buf();
+        #[cfg(test)]
+        let custom_fetcher = self.chat.images.remote_fetcher.clone();
+        cx.spawn(async move |this, cx| {
+            let host_for_io = host_owned.clone();
+            let path_for_io = path_owned.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(fetcher) = custom_fetcher {
+                        return fetcher(&target, &host_for_io, &path_for_io);
+                    }
+                    krill_app_core::remote_fs::stage_to_local_cache(
+                        &target,
+                        &host_for_io,
+                        &path_for_io,
+                        MAX_IMAGE_BYTES,
+                    )
+                    .map(|(local, _)| local)
+                })
+                .await;
+            let retry_after = this
+                .update(cx, |this, cx| match result {
+                    Ok(local) => {
+                        this.chat.images.remote_fetches.remove(&fetch_key);
+                        this.chat
+                            .images
+                            .register_remote_preview(path_owned.clone(), local.clone());
+                        if matches!(this.chat.images.thumbs.get(&local), Some(Loaded::Failed)) {
+                            this.chat.images.thumbs.remove(&local);
+                        }
+                        this.chat.images.thumb_failed.remove(&local);
+                        cx.notify();
+                        None
+                    }
+                    Err(err) => {
+                        let permanent = is_permanent_remote_image_error(&err);
+                        let attempts = prev_attempts.saturating_add(1);
+                        let file_name = path_owned
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            host = %host_owned,
+                            file = %file_name,
+                            kind = ?err.kind(),
+                            attempts,
+                            permanent,
+                            "remote chat image preview fetch failed"
+                        );
+                        this.chat.images.remote_fetches.insert(
+                            fetch_key,
+                            RemoteFetchState::Failed {
+                                at: Instant::now(),
+                                attempts,
+                                permanent,
+                            },
+                        );
+                        cx.notify();
+                        (!permanent && attempts < MAX_REMOTE_IMAGE_RETRIES)
+                            .then(|| remote_fetch_backoff(attempts))
+                    }
+                })
+                .ok()
+                .flatten();
+            if let Some(delay) = retry_after {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            }
+        })
+        .detach();
+        None
     }
 
     /// A row of message image tiles that open the viewer (Orca `NativeChatImageAttachments`:
