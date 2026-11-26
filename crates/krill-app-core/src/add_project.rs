@@ -1,23 +1,31 @@
 //! OWE-723 프로젝트 추가 대화상자. 사이드바 폴더 아이콘·빈 상태 '폴더 열기'로 연다.
 //! 모양은 Orca `AddRepoDialog` 시작 단계(주 동작 카드 + '다른 추가 방법' 목록)를 따르되 Krill에 있는 것만 둔다.
 //! Orca처럼 위에서 실행 위치(내 Mac + 연결된 원격 호스트)를 고른다. 원격 호스트를 고르면
-//! 폴더 찾아보기·복제 위치·새 프로젝트 경로를 호스트에 직접 입력받는다. 실제 동작은 셸이 [`Event`]를 받아 한다.
+//! 서버 파일 시스템 찾아보기 모달로 디렉터리를 탐색하거나 경로를 직접 입력할 수 있다. 실제 동작은 셸이 [`Event`]를 받아 한다.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
     Subscription, Window, div, prelude::*,
 };
+use gpui_component::Disableable as _;
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_kit_assets::IconName;
+use krill_proto::remote_fs::{WireBrowseEntry, WireBrowseListing};
 
 use crate::hosts::HostId;
 use crate::i18n::catalog::add_project as text;
 use crate::ui;
+
+/// 원격 호스트 디렉터리 조회 콜백(백그라운드 스레드에서 실행).
+pub type RemoteBrowserFn =
+    Arc<dyn Fn(&HostId, &str) -> Result<WireBrowseListing, String> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -54,6 +62,7 @@ enum Step {
 enum RemoteMode {
     Browse,
     Create,
+    CloneDest,
 }
 
 pub struct Dialog {
@@ -65,6 +74,15 @@ pub struct Dialog {
     remote_path: Entity<InputState>,
     remote_mode: RemoteMode,
     error: Option<&'static str>,
+    remote_browser: Option<RemoteBrowserFn>,
+    browse_dir: Option<String>,
+    browse_is_windows: bool,
+    browse_entries: Vec<WireBrowseEntry>,
+    browse_cache: HashMap<(HostId, String), WireBrowseListing>,
+    browse_loading: bool,
+    browse_error: Option<String>,
+    browse_selected: usize,
+    browse_seq: u64,
     focus: FocusHandle,
     _enter_url: Subscription,
     _enter_dest: Subscription,
@@ -109,6 +127,125 @@ fn host_path(raw: &str) -> Option<PathBuf> {
         parts.next().is_some_and(normal) && parts.next().is_some_and(normal) && parts.any(normal)
     });
     (unix || drive || unc).then(|| PathBuf::from(raw))
+}
+
+fn is_windows_drive_path(raw: &str) -> bool {
+    matches!(
+        raw.as_bytes(),
+        [letter, b':'] | [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic()
+    )
+}
+
+fn is_windows_drive_root(raw: &str) -> bool {
+    matches!(
+        raw.as_bytes(),
+        [letter, b':'] | [letter, b':', b'/' | b'\\'] if letter.is_ascii_alphabetic()
+    )
+}
+
+fn normalize_windows_drive_root(raw: &str) -> String {
+    let letter = raw.chars().next().map_or('C', |c| c.to_ascii_uppercase());
+    format!("{letter}:\\")
+}
+
+/// 원격 탐색기 상단 브레드크럼 `(표시 라벨, 이동 경로)` 목록.
+fn remote_breadcrumbs(path: &str, is_windows: bool) -> Vec<(String, String)> {
+    if is_windows {
+        if path == "/" || path.is_empty() {
+            return vec![("/".to_owned(), "/".to_owned())];
+        }
+        if is_windows_drive_path(path) {
+            let root = normalize_windows_drive_root(path);
+            let mut crumbs = vec![
+                ("/".to_owned(), "/".to_owned()),
+                (root.clone(), root.clone()),
+            ];
+            let rest = path.get(2..).unwrap_or("");
+            let mut acc = root;
+            for seg in rest.split(['\\', '/']).filter(|s| !s.is_empty()) {
+                acc = join_remote_path(&acc, seg, true);
+                crumbs.push((seg.to_owned(), acc.clone()));
+            }
+            return crumbs;
+        }
+    }
+    let mut crumbs = vec![("/".to_owned(), "/".to_owned())];
+    let mut acc = String::new();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        acc.push('/');
+        acc.push_str(seg);
+        crumbs.push((seg.to_owned(), acc.clone()));
+    }
+    crumbs
+}
+
+fn remote_parent_path(path: &str, is_windows: bool) -> String {
+    if is_windows {
+        if path == "/" || path.is_empty() || is_windows_drive_root(path) {
+            return "/".to_owned();
+        }
+        if is_windows_drive_path(path) {
+            let trimmed = path.trim_end_matches(['\\', '/']);
+            if let Some((prefix, _)) = trimmed.rsplit_once(['\\', '/']) {
+                if prefix.ends_with(':') {
+                    return normalize_windows_drive_root(prefix);
+                }
+                return prefix.to_owned();
+            }
+            return "/".to_owned();
+        }
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_owned();
+    }
+    match trimmed.rsplit_once('/') {
+        Some(("", _)) | None => "/".to_owned(),
+        Some((prefix, _)) => prefix.to_owned(),
+    }
+}
+
+fn join_remote_path(base: &str, child: &str, is_windows: bool) -> String {
+    if is_windows {
+        if base == "/" || base.is_empty() {
+            return child.to_owned();
+        }
+        let clean = base.trim_end_matches(['\\', '/']);
+        return format!("{clean}\\{child}");
+    }
+    if base == "/" || base.is_empty() {
+        format!("/{child}")
+    } else {
+        format!("{}/{child}", base.trim_end_matches('/'))
+    }
+}
+
+fn looks_like_browse_path(raw: &str, is_windows: bool) -> bool {
+    raw == "~"
+        || raw == "."
+        || raw == ".."
+        || raw.contains('/')
+        || (is_windows && (raw.contains('\\') || is_windows_drive_path(raw)))
+}
+
+fn resolve_typed_browse_path(raw: &str, current: Option<&str>, is_windows: bool) -> String {
+    let trimmed = raw.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        return trimmed.to_owned();
+    }
+    if trimmed == "." {
+        return current.unwrap_or("~").to_owned();
+    }
+    if trimmed == ".." {
+        return current.map_or_else(|| "~".to_owned(), |c| remote_parent_path(c, is_windows));
+    }
+    if trimmed.starts_with('/') || (is_windows && is_windows_drive_path(trimmed)) {
+        return trimmed.to_owned();
+    }
+    current.map_or_else(
+        || trimmed.to_owned(),
+        |c| join_remote_path(c, trimmed, is_windows),
+    )
 }
 
 impl Dialog {
@@ -160,12 +297,24 @@ impl Dialog {
         let enter_path = cx.subscribe_in(
             &remote_path,
             window,
-            |d, input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. })
-                    && !crate::jump::entity_input_is_composing(input, window, cx)
-                {
-                    d.submit_remote_path(cx);
+            |d, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    if d.is_remote_browser_active() {
+                        d.browse_selected = 0;
+                        d.error = None;
+                        cx.notify();
+                    }
                 }
+                InputEvent::PressEnter { .. }
+                    if !crate::jump::entity_input_is_composing(input, window, cx) =>
+                {
+                    if d.is_remote_browser_active() {
+                        d.on_remote_browser_enter(window, cx);
+                    } else {
+                        d.submit_remote_path(cx);
+                    }
+                }
+                _ => {}
             },
         );
         let focus = cx.focus_handle();
@@ -179,11 +328,186 @@ impl Dialog {
             remote_path,
             remote_mode: RemoteMode::Browse,
             error: None,
+            remote_browser: None,
+            browse_dir: None,
+            browse_is_windows: false,
+            browse_entries: Vec::new(),
+            browse_cache: HashMap::new(),
+            browse_loading: false,
+            browse_error: None,
+            browse_selected: 0,
+            browse_seq: 0,
             focus,
             _enter_url: enter_url,
             _enter_dest: enter_dest,
             _enter_path: enter_path,
             selected: 0,
+        }
+    }
+
+    /// 원격 호스트 디렉터리 탐색 콜백을 연결한다(연결되면 원격 찾아보기에서 서버 파일 시스템 모달을 연다).
+    #[must_use]
+    pub fn with_remote_browser(mut self, browser: RemoteBrowserFn) -> Self {
+        self.remote_browser = Some(browser);
+        self
+    }
+
+    fn is_remote_browser_active(&self) -> bool {
+        self.remote_browser.is_some()
+            && matches!(
+                self.step,
+                Step::RemotePath(RemoteMode::Browse | RemoteMode::CloneDest)
+            )
+    }
+
+    fn visible_browse_entries(&self, cx: &gpui::App) -> Vec<&WireBrowseEntry> {
+        let raw = self.remote_path.read(cx).value().trim().to_owned();
+        let filter = if raw.is_empty() || looks_like_browse_path(&raw, self.browse_is_windows) {
+            None
+        } else {
+            Some(raw.to_ascii_lowercase())
+        };
+        self.browse_entries
+            .iter()
+            .filter(|entry| {
+                entry.is_dir
+                    && filter
+                        .as_deref()
+                        .is_none_or(|q| entry.name.to_ascii_lowercase().contains(q))
+            })
+            .collect()
+    }
+
+    fn open_remote_browser(
+        &mut self,
+        mode: RemoteMode,
+        initial_dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_mode = mode;
+        self.step = Step::RemotePath(mode);
+        self.error = None;
+        self.browse_error = None;
+        self.browse_selected = 0;
+        self.remote_path.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.navigate_remote_dir(initial_dir, window, cx);
+        cx.notify();
+    }
+
+    fn navigate_remote_dir(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(browser) = self.remote_browser.clone() else {
+            return;
+        };
+        let host = self.host.clone();
+        self.error = None;
+        self.browse_error = None;
+        self.browse_selected = 0;
+        self.remote_path
+            .update(cx, |input, cx| input.set_value("", window, cx));
+
+        if let Some(cached) = self.browse_cache.get(&(host.clone(), dir.clone())).cloned() {
+            self.apply_browse_listing(&host, &dir, cached);
+            cx.notify();
+            return;
+        }
+
+        self.browse_seq = self.browse_seq.wrapping_add(1);
+        let seq = self.browse_seq;
+        self.browse_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let host_for_rpc = host.clone();
+            let dir_for_rpc = dir.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { browser(&host_for_rpc, &dir_for_rpc) })
+                .await;
+            this.update(cx, |d, cx| {
+                if d.browse_seq != seq || d.host != host {
+                    return;
+                }
+                d.browse_loading = false;
+                match result {
+                    Ok(listing) => d.apply_browse_listing(&host, &dir, listing),
+                    Err(err) => {
+                        d.browse_error = Some(err);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_browse_listing(&mut self, host: &HostId, requested: &str, listing: WireBrowseListing) {
+        let resolved = listing.resolved_path.clone();
+        self.browse_cache
+            .insert((host.clone(), resolved.clone()), listing.clone());
+        if requested != resolved {
+            self.browse_cache
+                .insert((host.clone(), requested.to_owned()), listing.clone());
+        }
+        self.browse_dir = Some(resolved);
+        self.browse_is_windows = listing.is_windows;
+        self.browse_entries = listing.entries;
+        self.browse_loading = false;
+        self.browse_error = None;
+        self.browse_selected = 0;
+    }
+
+    fn on_remote_browser_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.remote_path.read(cx).value().trim().to_owned();
+        if !raw.is_empty() && looks_like_browse_path(&raw, self.browse_is_windows) {
+            if self.browse_error.is_some() && host_path(&raw).is_some() {
+                self.confirm_remote_browser(window, cx);
+                return;
+            }
+            let target =
+                resolve_typed_browse_path(&raw, self.browse_dir.as_deref(), self.browse_is_windows);
+            self.navigate_remote_dir(target, window, cx);
+            return;
+        }
+        let target_name = {
+            let visible = self.visible_browse_entries(cx);
+            let idx = self.browse_selected.min(visible.len().saturating_sub(1));
+            visible.get(idx).map(|entry| entry.name.clone())
+        };
+        if let (Some(base), Some(name)) = (self.browse_dir.as_deref(), target_name) {
+            let next = join_remote_path(base, &name, self.browse_is_windows);
+            self.navigate_remote_dir(next, window, cx);
+        }
+    }
+
+    fn confirm_remote_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.remote_path.read(cx).value().trim().to_owned();
+        let chosen = if !raw.is_empty() && looks_like_browse_path(&raw, self.browse_is_windows) {
+            host_path(&raw)
+        } else {
+            self.browse_dir.as_deref().and_then(host_path)
+        };
+        let Some(path) = chosen else {
+            self.error = Some(text::REMOTE_PATH_BAD.get());
+            cx.notify();
+            return;
+        };
+        match self.remote_mode {
+            RemoteMode::Browse => cx.emit(Event::OpenPath(self.host.clone(), path)),
+            RemoteMode::Create => cx.emit(Event::CreateAt(self.host.clone(), path)),
+            RemoteMode::CloneDest => {
+                let text_path = path.to_string_lossy().into_owned();
+                self.dest
+                    .update(cx, |input, cx| input.set_value(text_path, window, cx));
+                self.step = Step::Clone;
+                self.error = None;
+                self.dest.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            }
         }
     }
 
@@ -198,6 +522,13 @@ impl Dialog {
     }
 
     fn set_host(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host != host {
+            self.browse_dir = None;
+            self.browse_entries.clear();
+            self.browse_error = None;
+            self.browse_loading = false;
+            self.browse_selected = 0;
+        }
         self.host = host;
         self.error = None;
         if self.step == Step::Clone && self.host.is_local() {
@@ -211,6 +542,9 @@ impl Dialog {
     fn browse_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.host.is_local() {
             cx.emit(Event::Browse(self.host.clone()));
+        } else if self.remote_browser.is_some() {
+            let initial = self.browse_dir.clone().unwrap_or_default();
+            self.open_remote_browser(RemoteMode::Browse, initial, window, cx);
         } else {
             self.remote_mode = RemoteMode::Browse;
             self.step = Step::RemotePath(RemoteMode::Browse);
@@ -219,6 +553,18 @@ impl Dialog {
                 .update(cx, |input, cx| input.focus(window, cx));
             cx.notify();
         }
+    }
+
+    fn browse_clone_dest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let initial = {
+            let current = self.dest.read(cx).value().trim().to_owned();
+            if current.is_empty() {
+                self.browse_dir.clone().unwrap_or_default()
+            } else {
+                current
+            }
+        };
+        self.open_remote_browser(RemoteMode::CloneDest, initial, window, cx);
     }
 
     fn create_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +644,21 @@ impl Dialog {
         match self.remote_mode {
             RemoteMode::Browse => cx.emit(Event::OpenPath(self.host.clone(), path)),
             RemoteMode::Create => cx.emit(Event::CreateAt(self.host.clone(), path)),
+            RemoteMode::CloneDest => {
+                self.step = Step::Clone;
+                cx.notify();
+            }
+        }
+    }
+
+    fn leave_remote_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.step == Step::RemotePath(RemoteMode::CloneDest) {
+            self.step = Step::Clone;
+            self.error = None;
+            self.dest.update(cx, |input, cx| input.focus(window, cx));
+            cx.notify();
+        } else {
+            self.show_start(window, cx);
         }
     }
 
@@ -324,8 +685,8 @@ impl Dialog {
                 if self.step == Step::Start {
                     cx.emit(Event::Close);
                 } else {
-                    // OWE-852: 하위 단계 Esc는 모달을 닫지 않고 시작 단계로 복귀한다.
-                    self.show_start(window, cx);
+                    // OWE-852: 하위 단계 Esc는 모달을 닫지 않고 이전 단계로 복귀한다.
+                    self.leave_remote_step(window, cx);
                 }
             }
             "up" if self.step == Step::Start && self.focus.is_focused(window) => {
@@ -347,6 +708,42 @@ impl Dialog {
             "enter" if self.step == Step::Start && self.focus.is_focused(window) => {
                 cx.stop_propagation();
                 self.activate_selected(window, cx);
+            }
+            "up" if self.is_remote_browser_active() => {
+                let count = self.visible_browse_entries(cx).len();
+                if count > 0 {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    self.browse_selected = if self.browse_selected == 0 {
+                        count - 1
+                    } else {
+                        self.browse_selected - 1
+                    };
+                    cx.notify();
+                }
+            }
+            "down" if self.is_remote_browser_active() => {
+                let count = self.visible_browse_entries(cx).len();
+                if count > 0 {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    self.browse_selected = (self.browse_selected + 1) % count;
+                    cx.notify();
+                }
+            }
+            "backspace"
+                if self.is_remote_browser_active()
+                    && !self.browse_loading
+                    && self.remote_path.read(cx).value().is_empty() =>
+            {
+                if let Some(current) = self.browse_dir.as_deref() {
+                    let parent = remote_parent_path(current, self.browse_is_windows);
+                    if parent != current {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        self.navigate_remote_dir(parent, window, cx);
+                    }
+                }
             }
             _ => {}
         }
@@ -405,6 +802,254 @@ impl Dialog {
                 .child(ui::field_label(text::LOCATION.get(), None, p))
                 .child(div().flex().flex_wrap().gap_2().children(chips)),
         )
+    }
+
+    fn render_remote_breadcrumbs(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let current = self.browse_dir.as_deref().unwrap_or("");
+        let is_windows = self.browse_is_windows;
+        let can_up = !current.is_empty() && remote_parent_path(current, is_windows) != current;
+        let parent_target = remote_parent_path(current, is_windows);
+        let crumbs = if current.is_empty() {
+            Vec::new()
+        } else {
+            remote_breadcrumbs(current, is_windows)
+        };
+        let crumb_len = crumbs.len();
+        let mut bar = div()
+            .id("remote-browse-breadcrumbs")
+            .debug_selector(|| "remote-browse-breadcrumbs".into())
+            .flex_none()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_1()
+            .child(
+                Button::new("remote-browse-up")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ArrowUp)
+                    .disabled(!can_up || self.browse_loading)
+                    .accessibility_label(text::SERVER_BROWSE_UP.get())
+                    .on_click(cx.listener(move |d, _, window, cx| {
+                        d.navigate_remote_dir(parent_target.clone(), window, cx);
+                    })),
+            )
+            .child(
+                Button::new("remote-browse-home")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::House)
+                    .disabled(self.browse_loading)
+                    .accessibility_label(text::SERVER_BROWSE_HOME.get())
+                    .on_click(cx.listener(|d, _, window, cx| {
+                        d.navigate_remote_dir(String::new(), window, cx);
+                    })),
+            );
+
+        for (idx, (label, path)) in crumbs.into_iter().enumerate() {
+            if idx > 0 {
+                bar = bar.child(
+                    div()
+                        .flex_none()
+                        .text_color(p.muted_foreground)
+                        .child(Icon::new(IconName::ChevronRight).xsmall()),
+                );
+            }
+            let is_last = idx + 1 == crumb_len;
+            let seg = div()
+                .id(("remote-browse-crumb", idx))
+                .px_1()
+                .py_0p5()
+                .rounded(ui::RADIUS_SM)
+                .text_size(ui::TEXT_SM)
+                .when(is_last, |d| {
+                    d.font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.foreground)
+                })
+                .when(!is_last, |d| {
+                    d.text_color(p.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|h| h.text_color(p.foreground).bg(p.accent))
+                        .on_click(cx.listener(move |d, _, window, cx| {
+                            d.navigate_remote_dir(path.clone(), window, cx);
+                        }))
+                })
+                .child(label);
+            bar = bar.child(seg);
+        }
+        bar
+    }
+
+    fn render_remote_browser_body(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let visible: Vec<(String, bool)> = self
+            .visible_browse_entries(cx)
+            .into_iter()
+            .map(|entry| (entry.name.clone(), entry.is_symlink))
+            .collect();
+        let selected = self.browse_selected.min(visible.len().saturating_sub(1));
+        let has_filter = {
+            let raw = self.remote_path.read(cx).value();
+            let trimmed = raw.trim();
+            !trimmed.is_empty() && !looks_like_browse_path(trimmed, self.browse_is_windows)
+        };
+        let current = self.browse_dir.clone().unwrap_or_default();
+        let is_windows = self.browse_is_windows;
+
+        let list_content: gpui::AnyElement = if self.browse_loading {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .py_6()
+                .text_size(ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(Icon::new(IconName::LoaderCircle).xsmall())
+                .child(text::SERVER_BROWSE_LOADING.get())
+                .into_any_element()
+        } else if let Some(err) = self.browse_error.as_deref() {
+            div()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(ui::error_banner(p, err))
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::SERVER_BROWSE_UNAVAILABLE.get()),
+                )
+                .into_any_element()
+        } else if visible.is_empty() {
+            div()
+                .py_6()
+                .flex()
+                .justify_center()
+                .text_size(ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(if has_filter {
+                    text::SERVER_BROWSE_NO_MATCH.get()
+                } else {
+                    text::SERVER_BROWSE_EMPTY.get()
+                })
+                .into_any_element()
+        } else {
+            let rows = visible.into_iter().enumerate().map(|(idx, (name, _))| {
+                let is_selected = idx == selected;
+                let next_path = join_remote_path(&current, &name, is_windows);
+                let label = name.clone();
+                div()
+                    .id(("remote-browse-row", idx))
+                    .debug_selector(move || format!("remote-browse-row-{idx}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(label.clone())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.foreground)
+                    .when(is_selected, |d| d.bg(p.accent))
+                    .when(!is_selected, |d| d.hover(|h| h.bg(p.accent)))
+                    .on_click(cx.listener(move |d, _, window, cx| {
+                        d.navigate_remote_dir(next_path.clone(), window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(p.muted_foreground)
+                                    .child(Icon::new(IconName::Folder).small()),
+                            )
+                            .child(div().min_w_0().flex_1().truncate().child(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(p.muted_foreground)
+                            .child(Icon::new(IconName::ChevronRight).xsmall()),
+                    )
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .children(rows)
+                .into_any_element()
+        };
+
+        let preview_path = {
+            let raw = self.remote_path.read(cx).value().trim().to_owned();
+            if !raw.is_empty() && looks_like_browse_path(&raw, self.browse_is_windows) {
+                raw
+            } else {
+                self.browse_dir.clone().unwrap_or_default()
+            }
+        };
+        let footer_caption = (!preview_path.is_empty()).then(|| {
+            let tmpl = match self.remote_mode {
+                RemoteMode::CloneDest => text::SERVER_BROWSE_FOOTER_CLONE,
+                RemoteMode::Browse | RemoteMode::Create => text::SERVER_BROWSE_FOOTER_OPEN,
+            };
+            tmpl.format(&[("path", &preview_path)])
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .min_h_0()
+            .child(self.render_remote_breadcrumbs(p, cx))
+            .child(
+                Input::new(&self.remote_path).prefix(
+                    div()
+                        .text_color(p.muted_foreground)
+                        .child(Icon::new(IconName::Search).xsmall()),
+                ),
+            )
+            .child(
+                div()
+                    .id("remote-browse-list")
+                    .debug_selector(|| "remote-browse-list".into())
+                    .h(gpui::px(260.))
+                    .min_h(gpui::px(120.))
+                    .overflow_y_scroll()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(p.input)
+                    .bg(p.background)
+                    .p_1()
+                    .child(list_content),
+            )
+            .children(footer_caption.map(|caption| {
+                div()
+                    .id("remote-browse-caption")
+                    .debug_selector(|| "remote-browse-caption".into())
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .truncate()
+                    .child(caption)
+            }))
+            .children(self.error.map(|e| ui::error_banner(p, e)))
     }
 }
 
@@ -489,6 +1134,7 @@ fn selected_card(
 
 impl Render for Dialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let remote_browser_active = self.is_remote_browser_active();
         crate::i18n::sync_input_placeholder(&self.url, text::URL_PLACEHOLDER.get(), window, cx);
         crate::i18n::sync_input_placeholder(
             &self.dest,
@@ -498,7 +1144,11 @@ impl Render for Dialog {
         );
         crate::i18n::sync_input_placeholder(
             &self.remote_path,
-            text::REMOTE_PATH_PLACEHOLDER.get(),
+            if remote_browser_active {
+                text::SERVER_BROWSE_FILTER_PLACEHOLDER.get()
+            } else {
+                text::REMOTE_PATH_PLACEHOLDER.get()
+            },
             window,
             cx,
         );
@@ -506,10 +1156,17 @@ impl Render for Dialog {
         let title = match self.step {
             Step::Start => text::TITLE.get(),
             Step::Clone => text::CLONE.get(),
-            Step::RemotePath(RemoteMode::Browse) => text::BROWSE.get(),
+            Step::RemotePath(RemoteMode::Browse | RemoteMode::CloneDest)
+                if remote_browser_active =>
+            {
+                text::SERVER_BROWSE_TITLE.get()
+            }
+            Step::RemotePath(RemoteMode::Browse | RemoteMode::CloneDest) => text::BROWSE.get(),
             Step::RemotePath(RemoteMode::Create) => text::CREATE.get(),
         };
+        let subtitle = remote_browser_active.then(|| text::SERVER_BROWSE_SUBTITLE.get());
         let host_selector = self.host_selector(p, cx);
+        let has_remote_browser = self.remote_browser.is_some();
         let body = div()
             .id("add-project-body")
             .debug_selector(|| "add-project-body".into())
@@ -600,10 +1257,33 @@ impl Render for Dialog {
                                 .flex_col()
                                 .gap_1()
                                 .child(ui::field_label(text::REMOTE_DEST.get(), None, p))
-                                .child(Input::new(&self.dest)),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div().flex_1().min_w_0().child(Input::new(&self.dest)),
+                                        )
+                                        .when(has_remote_browser, |row| {
+                                            row.child(
+                                                Button::new("add-project-clone-browse-dest")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(IconName::FolderOpen)
+                                                    .label(text::SERVER_BROWSE_BROWSE_BTN.get())
+                                                    .on_click(cx.listener(|d, _, window, cx| {
+                                                        d.browse_clone_dest(window, cx);
+                                                    })),
+                                            )
+                                        }),
+                                ),
                         )
                     })
                     .children(self.error.map(|e| ui::error_banner(p, e)))
+            }
+            Step::RemotePath(_) if remote_browser_active => {
+                body.child(self.render_remote_browser_body(p, cx))
             }
             Step::RemotePath(_) => body
                 .child(
@@ -616,11 +1296,11 @@ impl Render for Dialog {
                 )
                 .children(self.error.map(|e| ui::error_banner(p, e))),
         };
-        let back = || {
+        let back = |label: &'static str| {
             Button::new("add-project-back")
                 .ghost()
-                .label(text::BACK.get())
-                .on_click(cx.listener(|d, _, window, cx| d.show_start(window, cx)))
+                .label(label)
+                .on_click(cx.listener(|d, _, window, cx| d.leave_remote_step(window, cx)))
         };
         let footer = || {
             div()
@@ -635,7 +1315,7 @@ impl Render for Dialog {
         let actions = match self.step {
             Step::Start => None,
             Step::Clone => Some(
-                footer().child(back()).child(
+                footer().child(back(text::BACK.get())).child(
                     Button::new("add-project-clone-submit")
                         .primary()
                         .label(if self.host.is_remote() {
@@ -647,14 +1327,28 @@ impl Render for Dialog {
                         .on_click(cx.listener(|d, _, _, cx| d.submit_clone(cx))),
                 ),
             ),
+            Step::RemotePath(_) if remote_browser_active => Some(
+                footer()
+                    .child(back(text::SERVER_BROWSE_CANCEL.get()))
+                    .child(
+                        Button::new("add-project-remote-submit")
+                            .primary()
+                            .label(text::SERVER_BROWSE_SELECT.get())
+                            .debug_selector(|| "add-project-remote-submit".into())
+                            .on_click(cx.listener(|d, _, window, cx| {
+                                d.confirm_remote_browser(window, cx);
+                            })),
+                    ),
+            ),
             Step::RemotePath(mode) => Some(
-                footer().child(back()).child(
+                footer().child(back(text::BACK.get())).child(
                     Button::new("add-project-remote-submit")
                         .primary()
                         .label(match mode {
-                            RemoteMode::Browse => text::OPEN_SUBMIT.get(),
+                            RemoteMode::Browse | RemoteMode::CloneDest => text::OPEN_SUBMIT.get(),
                             RemoteMode::Create => text::CREATE_SUBMIT.get(),
                         })
+                        .debug_selector(|| "add-project-remote-submit".into())
                         .on_click(cx.listener(|d, _, _, cx| d.submit_remote_path(cx))),
                 ),
             ),
@@ -703,22 +1397,34 @@ impl Render for Dialog {
                 div()
                     .flex_none()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .text_size(ui::TEXT_LG)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(SharedString::from(title)),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                Button::new("add-project-close")
+                                    .ghost()
+                                    .small()
+                                    .icon(gpui_component::IconName::Close)
+                                    .accessibility_label(text::CLOSE.get())
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
+                            ),
                     )
-                    .child(
-                        Button::new("add-project-close")
-                            .ghost()
-                            .small()
-                            .icon(gpui_component::IconName::Close)
-                            .accessibility_label(text::CLOSE.get())
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
-                    ),
+                    .children(subtitle.map(|desc| {
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(desc)
+                    })),
             )
             .child(body)
             .children(actions);

@@ -20,8 +20,9 @@ use krill_proto::os::fs::OpenOptionsExt as _;
 use krill_proto::os::net::UnixStream;
 use krill_proto::remote_fs::{
     MAX_DIR_ENTRIES, MAX_PROBE_PATHS, MAX_QUICK_OPEN_FILES, MAX_REMOTE_CHUNK, MAX_REMOTE_PATH,
-    MAX_REMOTE_TEXT, RemoteFsReply, RemoteFsRequest, WireDirEntry, WireDirListing, WireExplorerOp,
-    WireReadChunk, WireStamp, WireStat, WireWriteOutcome,
+    MAX_REMOTE_TEXT, RemoteFsReply, RemoteFsRequest, WireBrowseEntry, WireBrowseListing,
+    WireDirEntry, WireDirListing, WireExplorerOp, WireReadChunk, WireStamp, WireStat,
+    WireWriteOutcome,
 };
 
 /// 프레임 크기 상한(`1MiB`)을 절대 넘지 않도록 디렉터리·목록 응답의 누적 경로 바이트를 제한한다.
@@ -177,6 +178,9 @@ pub fn serve_on_conn(conn_id: u64, req: RemoteFsRequest) -> RemoteFsReply {
             let p = PathBuf::from(OsStr::from_bytes(&path));
             RemoteFsReply::StageAborted(abort_stage_on_conn(conn_id, &p, stage_id))
         }
+        RemoteFsRequest::BrowseDir { dir } => RemoteFsReply::BrowseEntries(
+            browse_dir_listing(&dir).map_err(|e| truncate_text(e.to_string())),
+        ),
     }
 }
 
@@ -769,6 +773,128 @@ fn read_dir_listing(repo: &Path, dir: &Path) -> io::Result<WireDirListing> {
     let rels: Vec<String> = entries.iter().map(|e| e.relative_path.clone()).collect();
     let ignored = query_git_ignored(repo, &rels);
     Ok(WireDirListing { entries, ignored })
+}
+
+#[cfg(windows)]
+fn list_windows_drives() -> WireBrowseListing {
+    let mut entries = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:\\", char::from(letter));
+        if Path::new(&drive).is_dir() {
+            entries.push(WireBrowseEntry {
+                name: drive,
+                is_dir: true,
+                is_symlink: false,
+            });
+        }
+    }
+    WireBrowseListing {
+        resolved_path: "/".to_owned(),
+        is_windows: true,
+        entries,
+    }
+}
+
+fn resolve_browse_path(raw: &str, home: &Path) -> io::Result<PathBuf> {
+    if raw.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path cannot contain null bytes",
+        ));
+    }
+    let trimmed = raw.trim();
+    let candidate = if trimmed.is_empty() || trimmed == "~" {
+        clean_path(home)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        clean_path(&home.join(rest))
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            clean_path(p)
+        } else {
+            clean_path(&home.join(p))
+        }
+    };
+    Ok(candidate)
+}
+
+fn browse_dir_listing(raw_dir: &[u8]) -> io::Result<WireBrowseListing> {
+    let home = crate::usage::accounts::default_home();
+    browse_dir_listing_with_home(raw_dir, &home)
+}
+
+fn browse_dir_listing_with_home(raw_dir: &[u8], home: &Path) -> io::Result<WireBrowseListing> {
+    if raw_dir.len() > MAX_REMOTE_PATH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory path exceeds limit",
+        ));
+    }
+    let raw_str = std::str::from_utf8(raw_dir)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid UTF-8 directory path"))?;
+    #[cfg(windows)]
+    if raw_str.trim() == "/" {
+        return Ok(list_windows_drives());
+    }
+    let resolved = resolve_browse_path(raw_str, home)?;
+    let meta = fs::metadata(&resolved)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "path is not a directory",
+        ));
+    }
+    let resolved_path = truncate_text(resolved.to_string_lossy().into_owned());
+    let rd = fs::read_dir(&resolved)?;
+    let mut dirs = Vec::new();
+    for entry in rd.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
+        if name.is_empty() || name == "." || name == ".." || name.len() > MAX_REMOTE_TEXT {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let is_symlink = ft.is_symlink();
+        let is_dir =
+            ft.is_dir() || (is_symlink && fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()));
+        if !is_dir {
+            continue;
+        }
+        dirs.push(WireBrowseEntry {
+            name,
+            is_dir: true,
+            is_symlink,
+        });
+    }
+    dirs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut entries = Vec::new();
+    let mut used_bytes = resolved_path.len().saturating_add(32);
+    for entry in dirs {
+        if entries.len() >= MAX_DIR_ENTRIES {
+            break;
+        }
+        let cost = entry.name.len().saturating_add(8);
+        if used_bytes.saturating_add(cost) > MAX_LISTING_WIRE_BYTES {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(cost);
+        entries.push(entry);
+    }
+    Ok(WireBrowseListing {
+        resolved_path,
+        is_windows: cfg!(windows),
+        entries,
+    })
 }
 
 fn scan_worktree_listing(repo: &Path, limit: u32) -> io::Result<WireDirListing> {
@@ -2053,5 +2179,54 @@ mod tests {
                 "missing env_remove for {var}"
             );
         }
+    }
+
+    #[test]
+    fn browse_dir_resolves_home_filters_to_dirs_and_sorts_case_insensitively() {
+        let dir = TestDir::new("browse-dir");
+        let home = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("Beta")).unwrap();
+        fs::create_dir_all(home.join("alpha/nested")).unwrap();
+        fs::create_dir_all(home.join(".hidden")).unwrap();
+        fs::write(home.join("file.txt"), b"hello").unwrap();
+
+        let listing = browse_dir_listing_with_home(b"", &home).unwrap();
+        assert_eq!(listing.resolved_path, home.to_string_lossy());
+        assert_eq!(listing.is_windows, cfg!(windows));
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, [".hidden", "alpha", "Beta"]);
+        assert!(listing.entries.iter().all(|e| e.is_dir));
+
+        let tilde = browse_dir_listing_with_home(b"~/alpha", &home).unwrap();
+        assert_eq!(tilde.resolved_path, home.join("alpha").to_string_lossy());
+        let sub_names: Vec<&str> = tilde.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(sub_names, ["nested"]);
+
+        assert!(browse_dir_listing_with_home(b"~/file.txt", &home).is_err());
+        assert!(browse_dir_listing_with_home(b"~/missing", &home).is_err());
+        assert!(browse_dir_listing_with_home(b"/bad\0path", &home).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browse_dir_includes_symlinks_pointing_to_directories() {
+        let dir = TestDir::new("browse-symlink");
+        let home = dir.path().canonicalize().unwrap();
+        let target = home.join("real-dir");
+        let file = home.join("real-file.txt");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&file, b"ok").unwrap();
+        std::os::unix::fs::symlink(&target, home.join("link-to-dir")).unwrap();
+        std::os::unix::fs::symlink(&file, home.join("link-to-file")).unwrap();
+
+        let listing = browse_dir_listing_with_home(b"~", &home).unwrap();
+        let link = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "link-to-dir")
+            .unwrap();
+        assert!(link.is_dir);
+        assert!(link.is_symlink);
+        assert!(!listing.entries.iter().any(|e| e.name == "link-to-file"));
     }
 }

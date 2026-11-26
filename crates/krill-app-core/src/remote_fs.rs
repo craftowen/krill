@@ -22,8 +22,8 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use krill_proto::remote_fs::{
-    MAX_REMOTE_CHUNK, RemoteFsReply, RemoteFsRequest, WireDirListing, WireExplorerOp,
-    WireReadChunk, WireStamp, WireStat, WireWriteOutcome,
+    MAX_REMOTE_CHUNK, RemoteFsReply, RemoteFsRequest, WireBrowseListing, WireDirListing,
+    WireExplorerOp, WireReadChunk, WireStamp, WireStat, WireWriteOutcome,
 };
 use krill_proto::screen::Msg as _;
 
@@ -1083,6 +1083,24 @@ pub fn read_dir(target: &HostTarget, repo: &Path, dir: &Path) -> io::Result<Wire
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected read_dir reply",
+        )),
+    }
+}
+
+/// 원격 호스트의 임의 디렉터리 목록을 조회한다(프로젝트 추가 모달 원격 탐색기용).
+/// `dir`이 비어 있거나 `~`이면 원격 사용자 홈 디렉터리를 조회한다.
+pub fn browse_dir(target: &HostTarget, dir: &str) -> io::Result<WireBrowseListing> {
+    match request(
+        target,
+        RemoteFsRequest::BrowseDir {
+            dir: dir.as_bytes().to_vec(),
+        },
+    )? {
+        RemoteFsReply::BrowseEntries(Ok(listing)) => Ok(listing),
+        RemoteFsReply::BrowseEntries(Err(e)) => Err(io::Error::other(e)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected browse_dir reply",
         )),
     }
 }

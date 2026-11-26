@@ -163,7 +163,28 @@ impl Shell {
         self.close_dashboard(None, cx);
         let hosts = self.execution_locations(cx);
         let initial = self.launch_host.clone();
-        let dialog = cx.new(|cx| add_project::Dialog::new_with_hosts(window, cx, hosts, initial));
+        let remote_targets: std::collections::HashMap<_, _> = hosts
+            .iter()
+            .filter_map(|(id, _)| {
+                id.is_remote()
+                    .then(|| self.target_for_host(id).map(|t| (id.clone(), t)))
+                    .flatten()
+            })
+            .collect();
+        let browser: add_project::RemoteBrowserFn = std::sync::Arc::new(move |host, dir| {
+            let Some(target) = remote_targets.get(host) else {
+                return Err(
+                    krill_app_core::i18n::catalog::add_project::SERVER_BROWSE_UNAVAILABLE
+                        .get()
+                        .to_owned(),
+                );
+            };
+            krill_app_core::remote_fs::browse_dir(target, dir).map_err(|e| e.to_string())
+        });
+        let dialog = cx.new(|cx| {
+            add_project::Dialog::new_with_hosts(window, cx, hosts, initial)
+                .with_remote_browser(browser)
+        });
         let events = cx.subscribe_in(
             &dialog,
             window,
