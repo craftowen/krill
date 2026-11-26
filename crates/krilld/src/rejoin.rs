@@ -102,11 +102,6 @@ pub fn link_lost(reg: &Arc<Registry>, sock: &Path, holder: Option<u32>, done: &S
             thread::park();
         }
     }
-    if reg.running().is_empty() {
-        tracing::info!("holder link lost and holder gone with no running sessions; exiting");
-        done.send(()).ok();
-        return;
-    }
     tracing::warn!("holder link lost and holder gone; serving as orphan");
     if orphan(reg, sock).is_ok() {
         done.send(()).ok();

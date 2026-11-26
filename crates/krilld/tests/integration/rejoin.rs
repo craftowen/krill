@@ -892,30 +892,6 @@ fn empty_holder_gives_up_when_handover_keeps_failing() {
     fs::remove_dir_all(dir).ok();
 }
 
-/// 실행 중인 세션이 없는 상태에서 holder가 죽으면 krilld는 고아로 남지 않고 조용히 종료한다.
-#[test]
-fn holder_crash_with_no_running_sessions_exits_cleanly() {
-    let dir = tmp("idle-orphan-exit");
-    let sock = dir.join("run/krilld.sock");
-    let mut kids = Kids::default();
-    kids.socket = Some(sock.clone());
-    kids.holders.push(holder(&dir, &sock));
-    let (_c, k1) = wait_daemon(&sock, 0);
-    kids.pids.push(k1);
-
-    let mut h1 = kids.holders.remove(0);
-    h1.kill().unwrap();
-    h1.wait().unwrap();
-
-    wait_until("idle krilld exited cleanly", || !alive(k1));
-    assert!(
-        !dir.join("run/krilld.sock.hnd").exists(),
-        "idle daemon unexpectedly created a handoff socket"
-    );
-    drop(kids);
-    fs::remove_dir_all(dir).ok();
-}
-
 /// holder가 띄운 krilld가 0700 권한 위반 등 재시도 불가능한 설정 오류를 만나면
 /// `KRILLD_FATAL_CONFIG`로 종료해 holder가 5회 재시도 루프를 돌지 않고 즉시 멈춘다.
 #[test]
