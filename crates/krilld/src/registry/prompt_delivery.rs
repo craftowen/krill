@@ -227,11 +227,13 @@ pub(crate) fn wait_for_agent_ready(
         if pulse.closed {
             return ReadyWaitOutcome::Closed;
         }
-        let screen = tap.capture().0;
-        if krill_proto::screen::agy::auth_login_screen(&screen) {
-            return ReadyWaitOutcome::AuthRequired;
-        }
         if pulse.end > 0 {
+            let screen = tap.capture().0;
+            if tap.quiet_ms() >= STRUCTURED_READY_QUIET_MS
+                && krill_proto::screen::agy::auth_login_screen(&screen)
+            {
+                return ReadyWaitOutcome::AuthRequired;
+            }
             let text = screen_plain_text(&screen);
             if !blocking_or_loading_screen(canonical, &text) {
                 if structured {

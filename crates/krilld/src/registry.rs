@@ -6804,6 +6804,53 @@ mod orchestration_delivery_tests {
     }
 
     #[test]
+    fn deliver_input_to_tap_allows_agy_1517_authenticated_composer_with_leftover_welcome_banner()
+    -> io::Result<()> {
+        use std::io::Write as _;
+
+        let look = Arc::new(Appearance::load(PathBuf::new()));
+        let (master, mut terminal) = UnixStream::pair()?;
+        terminal.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let session = Session::start(
+            SessionId(41_909),
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&look),
+            None,
+        )?;
+        let tap = session.tap();
+        terminal.write_all(
+            b"Welcome to the Antigravity CLI. You are currently not signed in.\r\n\
+              Antigravity CLI 1.5.17\r\n\
+              ----------------------------------------------------------------\r\n\
+              > \r\n",
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tap.capture().0.rows.iter().any(|row| {
+            row.iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .contains("Antigravity CLI 1.5.17")
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for agy 1.5.17 authenticated banner"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !krill_proto::screen::agy::auth_login_screen(&tap.capture().0),
+            "leftover welcome banner above authenticated agy session must not block input"
+        );
+        Registry::deliver_input_to_tap(&tap, b"run bot task", true)?;
+        let mut buf = [0_u8; 64];
+        let n = terminal.read(&mut buf)?;
+        assert!(n > 0, "expected prompt bytes delivered to PTY");
+        drop(session);
+        Ok(())
+    }
+
+    #[test]
     fn deliver_input_to_tap_paces_unbracketed_and_delayed_echo_submit() -> io::Result<()> {
         use std::io::Write as _;
 

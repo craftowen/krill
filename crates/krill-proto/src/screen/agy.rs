@@ -229,12 +229,26 @@ fn count_matching_rows_above(
 #[must_use]
 pub fn auth_login_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("welcome to the antigravity cli. you are currently not signed in")
-        || lower.contains("you are not logged into antigravity")
+    // Note: `agy` >=1.5.17 unconditionally prints
+    // "Welcome to the Antigravity CLI. You are currently not signed in." followed by
+    // "Signing in..." during normal signed-in startup before drawing the authenticated banner
+    // and composer. That welcome line alone must NOT classify as an unauthenticated login screen;
+    // require an actual login method selector, OAuth redirect/code prompt, or legacy sign-in screen.
+    if lower.contains("you are not logged into antigravity")
         || lower.contains("click here to authenticate")
         || lower.contains("log in with google")
         || lower.contains("if you aren't automatically redirected, paste the authorization code")
         || lower.contains("enter the redirect url (if redirect failed)")
+    {
+        return true;
+    }
+    if lower.contains("welcome to the antigravity cli. you are currently not signed in")
+        && !lower.contains("signing in...")
+        && (lower.contains("google oauth")
+            || lower.contains("google cloud project")
+            || lower.contains("paste authorization code")
+            || lower.contains("enter authorization code")
+            || lower.contains("sign in with google"))
     {
         return true;
     }
@@ -651,5 +665,43 @@ mod tests {
             composer_draft_text(&multiline_draft).as_deref(),
             Some("check daily error audit\n  include summary")
         );
+    }
+
+    #[test]
+    fn ignores_agy_1517_normal_signed_in_boot_and_leftover_welcome_banner() {
+        let bare_boot = screen_from_lines(&[(
+            "Welcome to the Antigravity CLI. You are currently not signed in.",
+            None,
+        )]);
+        assert!(!auth_login_screen(&bare_boot));
+        assert!(!empty_composer_ready(&bare_boot));
+
+        let signing_in_boot = screen_from_lines(&[
+            (
+                "Welcome to the Antigravity CLI. You are currently not signed in.",
+                None,
+            ),
+            ("", None),
+            ("⣷  Signing in...", None),
+        ]);
+        assert!(!auth_login_screen(&signing_in_boot));
+        assert!(!empty_composer_ready(&signing_in_boot));
+
+        let tall_terminal_after_signin = screen_from_lines(&[
+            (
+                "Welcome to the Antigravity CLI. You are currently not signed in.",
+                None,
+            ),
+            ("▄▀▀▄        Antigravity CLI 1.5.17", None),
+            ("▀▀▀▀▀▀       user@example.com", None),
+            (BORDER, None),
+            (
+                "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+                Some(2),
+            ),
+            (BORDER, None),
+        ]);
+        assert!(!auth_login_screen(&tall_terminal_after_signin));
+        assert!(empty_composer_ready(&tall_terminal_after_signin));
     }
 }
