@@ -1309,6 +1309,7 @@ catalog! {
         COPY => ("페어링 링크 복사", "Copy pairing link"),
         COPIED => ("복사됨", "Copied"),
         NEW_QR => ("새 QR 발급", "New QR code"),
+        QR_PLACEHOLDER => ("QR 코드가 여기에 표시됩니다", "QR code will appear here"),
         REFRESH => ("기기 새로고침", "Refresh devices"),
         DEVICES_TITLE => ("페어링된 기기, 권한 회수 후 새 QR 필요", "Paired devices, rescan QR after revoking access"),
         DEVICES_EMPTY => ("아직 페어링된 기기가 없습니다. 아래 QR을 스캔하면 여기에 표시됩니다.", "No devices paired yet. Scan the QR code below to connect."),

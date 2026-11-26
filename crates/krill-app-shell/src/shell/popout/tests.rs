@@ -1052,6 +1052,41 @@ fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
 }
 
 #[test]
+fn status_windows_normalizes_raw_minute_meter_labels() {
+    let account = AccountInfo {
+        id: "codex-1".into(),
+        provider: ProviderKind::Codex,
+        label: "Codex".into(),
+        email: None,
+        profile_dir: String::new(),
+        active: true,
+        host_default: false,
+        stale: false,
+        usage: krill_proto::usage::Snapshot::default(),
+    };
+    let snap = AccountsSnapshot {
+        accounts: vec![account.clone()],
+        meters: vec![krill_proto::usage::AccountMeters {
+            account_id: "codex-1".into(),
+            meters: vec![krill_proto::usage::UsageMeter {
+                key: "primary_window".into(),
+                label: "43200m".into(),
+                window: Some(krill_proto::usage::Window {
+                    percent: 100,
+                    resets_at: None,
+                }),
+                value: None,
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let windows = status_windows(&snap, &account);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].label, "30d");
+}
+
+#[test]
 fn preview_is_bounded_and_keeps_combining_characters() {
     let cell = krill_proto::screen::Cell {
         ch: 'ᄒ',

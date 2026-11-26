@@ -1336,6 +1336,7 @@ impl View {
                             .ghost()
                             .small()
                             .tooltip(text::CLOSE.get())
+                            .accessibility_label(text::CLOSE.get())
                             .debug_selector(|| "automations-close".into())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Close))),
                     ),

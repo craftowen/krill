@@ -70,6 +70,25 @@ pub fn meters_summary(meters: &krill_proto::usage::AccountMeters, now: u64) -> S
         .join(" · ")
 }
 
+/// Normalizes raw minute-based window labels (e.g. `"43200m"` from older daemons) into
+/// compact hour/day units (`"30d"`, `"7d"`, `"5h"`) so both status chips and settings rows
+/// display human-readable periods.
+pub fn normalize_window_label(raw: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(mins) = raw
+        .strip_suffix('m')
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u64>().ok())
+    {
+        if mins > 0 && mins.is_multiple_of(1440) {
+            return std::borrow::Cow::Owned(format!("{}d", mins / 1440));
+        }
+        if mins > 0 && mins.is_multiple_of(60) {
+            return std::borrow::Cow::Owned(format!("{}h", mins / 60));
+        }
+    }
+    std::borrow::Cow::Borrowed(raw)
+}
+
 pub fn meter_label(meter: &krill_proto::usage::UsageMeter) -> String {
     if meter
         .key
@@ -81,7 +100,8 @@ pub fn meter_label(meter: &krill_proto::usage::UsageMeter) -> String {
             .unwrap_or("—");
         return text::METER_RESET_CREDIT_EXPIRY.format(&[("count", count)]);
     }
-    let label = match meter.label.as_str() {
+    let normalized = normalize_window_label(&meter.label);
+    let label = match normalized.as_ref() {
         "5h" => text::WINDOW_5H.get(),
         "7d" => text::WINDOW_7D.get(),
         "30d" => text::WINDOW_MONTHLY.get(),
@@ -417,6 +437,26 @@ mod tests {
             100,
         );
         assert!(summary.contains(&local_expiry));
+    }
+
+    #[test]
+    fn raw_minute_window_labels_normalize_to_hours_and_days() {
+        assert_eq!(normalize_window_label("43200m"), "30d");
+        assert_eq!(normalize_window_label("10080m"), "7d");
+        assert_eq!(normalize_window_label("300m"), "5h");
+        assert_eq!(normalize_window_label("1440m"), "1d");
+        assert_eq!(normalize_window_label("45m"), "45m");
+        assert_eq!(normalize_window_label("Credits"), "Credits");
+        let monthly = krill_proto::usage::UsageMeter {
+            key: "primary_window".into(),
+            label: "43200m".into(),
+            window: Some(Window {
+                percent: 100,
+                resets_at: None,
+            }),
+            value: None,
+        };
+        assert_eq!(meter_label(&monthly), text::WINDOW_MONTHLY.get());
     }
 
     #[test]

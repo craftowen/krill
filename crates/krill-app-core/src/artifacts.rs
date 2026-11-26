@@ -1023,8 +1023,8 @@ impl View {
             )
             .child(div().w(px(84.)).flex_none().child(text::COL_TYPE.get()))
             .child(div().w(px(72.)).flex_none().child(text::COL_SIZE.get()))
-            .child(div().w(px(116.)).flex_none().child(text::COL_UPDATED.get()))
-            .child(div().w(px(116.)).flex_none().child(text::COL_EXPIRES.get()))
+            .child(div().w(px(136.)).flex_none().child(text::COL_UPDATED.get()))
+            .child(div().w(px(136.)).flex_none().child(text::COL_EXPIRES.get()))
             .child(
                 div()
                     .w(gpui::rems(13.))
@@ -1245,7 +1245,7 @@ impl Render for View {
                         )
                         .child(
                             div()
-                                .w(px(116.))
+                                .w(px(136.))
                                 .flex_none()
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
@@ -1254,7 +1254,7 @@ impl Render for View {
                         )
                         .child(
                             div()
-                                .w(px(116.))
+                                .w(px(136.))
                                 .flex_none()
                                 .text_size(ui::TEXT_XS)
                                 .text_color(p.muted_foreground)

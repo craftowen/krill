@@ -835,12 +835,21 @@ impl Shell {
                 )
                 .child(" · ")
                 .child(div().min_w_0().truncate().child(words)),
-            None => div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .when(facts.unread, |d| d.text_color(p.foreground))
-                .child(words),
+            None => {
+                let fallback_text = if words.is_empty() {
+                    remote_label
+                        .as_ref()
+                        .map_or_else(String::new, ToString::to_string)
+                } else {
+                    words
+                };
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(facts.unread, |d| d.text_color(p.foreground))
+                    .child(fallback_text)
+            }
         };
         Some(
             div()

@@ -546,15 +546,18 @@ fn status_windows<'a>(
         .meters
         .iter()
         .filter(|m| m.value.is_none())
-        .filter_map(|m| Some((m.label.as_str(), m.window.as_ref()?)))
+        .filter_map(|m| {
+            let label = krill_app_core::accounts::display::normalize_window_label(&m.label);
+            Some((label, m.window.as_ref()?))
+        })
         .collect();
-    let pick = |label: &str| windows.iter().find(|(l, _)| *l == label);
+    let pick = |label: &str| windows.iter().find(|(l, _)| l.as_ref() == label);
     out.extend(
         ["5h", "7d"]
             .into_iter()
             .filter_map(pick)
             .map(|(label, window)| StatusWindow {
-                label: (*label).into(),
+                label: label.as_ref().to_owned(),
                 window,
             }),
     );
@@ -563,7 +566,7 @@ fn status_windows<'a>(
             pick("30d").or_else(|| windows.iter().max_by_key(|(_, w)| w.percent))
     {
         out.push(StatusWindow {
-            label: (*label).into(),
+            label: label.as_ref().to_owned(),
             window,
         });
     }
@@ -1200,7 +1203,18 @@ impl Shell {
                 if !list.iter().any(|(existing, _, _)| existing == h)
                     && !sidebar.is_suppressed_remote_host(h)
                 {
-                    let label = h.remote_id().unwrap_or_else(|| h.as_key()).to_owned();
+                    let label = h
+                        .remote_id()
+                        .and_then(|id| {
+                            sidebar
+                                .remote_hosts()
+                                .iter()
+                                .find(|r| r.id == id)
+                                .map(|r| r.label.trim())
+                                .filter(|l| !l.is_empty())
+                        })
+                        .unwrap_or_else(|| h.remote_id().unwrap_or_else(|| h.as_key()))
+                        .to_owned();
                     list.push((h.clone(), label, s.clone()));
                 }
             }
@@ -2206,10 +2220,17 @@ impl Dashboard {
                 let detail = match &host {
                     krill_app_core::hosts::HostId::Local => detail,
                     krill_app_core::hosts::HostId::Remote(id) => {
+                        let host_label = sidebar
+                            .remote_hosts()
+                            .iter()
+                            .find(|r| r.id == *id)
+                            .map(|r| r.label.trim())
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or(id.as_str());
                         if detail.is_empty() {
-                            id.clone()
+                            host_label.to_owned()
                         } else {
-                            format!("{id} · {detail}")
+                            format!("{host_label} · {detail}")
                         }
                     }
                 };
