@@ -113,14 +113,18 @@ class ValidationTests(unittest.TestCase):
             key = root / "key"
             key.write_text(os.urandom(32).hex())
             calls = []
-            state = {"fail_gate": True, "missing": False, "mutate": False}
+            calls_lock = threading.Lock()
+            state = {"fail_gate": True, "missing": False, "mutate": False, "fail_windows": False}
 
             seen_envs = []
 
             def run(args, **kwargs):
                 args = list(map(str, args))
-                calls.append(args)
-                seen_envs.append((args, kwargs.get("env")))
+                with calls_lock:
+                    calls.append(args)
+                    seen_envs.append((args, kwargs.get("env")))
+                if args[:2] == ["/bin/bash", "scripts/check-windows.sh"] and state["fail_windows"]:
+                    raise subprocess.CalledProcessError(1, args)
                 if args[:3] == ["git", "rev-parse", "HEAD"]:
                     return HEAD
                 if args[:2] == ["cargo", "test"]:
@@ -178,6 +182,10 @@ class ValidationTests(unittest.TestCase):
                 state.update(missing=False, mutate=True)
                 with self.assertRaisesRegex(ValueError, "binaries changed"):
                     rc.validate(HEAD, root / "stage4", key)
+                state.update(mutate=False, fail_windows=True)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    rc.validate(HEAD, root / "stage5", key)
+                self.assertFalse((root / "stage5/validation.json").exists())
 
 
 class MobileBrowserGateTests(unittest.TestCase):

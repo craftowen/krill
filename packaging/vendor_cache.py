@@ -30,7 +30,7 @@ def digest_tree(root):
 
 
 def patches(root):
-    text = (root / "Cargo.toml").read_text()
+    text = (root / "Cargo.toml").read_text(encoding="utf-8")
     section = text.split("[patch.crates-io]\n", 1)[1].split("\n[", 1)[0]
     result = {}
     for line in section.splitlines():
@@ -67,19 +67,20 @@ def stage(root, cargo_home, vendor_root, directory, case):
                           for name, relative in sorted(mapping.items()))
         cargo_home.mkdir(parents=True, exist_ok=True)
         config_path = cargo_home / "config.toml"
-        if (cargo_home / "config").exists() or (config_path.exists() and config_path.read_text() != config):
+        config_bytes = config.encode("utf-8")
+        if (cargo_home / "config").exists() or (config_path.exists() and config_path.read_bytes() != config_bytes):
             raise ValueError("refusing to replace an existing Cargo home configuration")
-        config_path.write_text(config)
-        config_hash = hashlib.sha256(config.encode()).hexdigest()
+        config_path.write_bytes(config_bytes)
+        config_hash = hashlib.sha256(config_bytes).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
     record = {"case": case, "vendor_hash": vendor_hash, "patches": mapping,
               "vendor_directory": str(destination), "cargo_home": str(cargo_home), "config_sha256": config_hash}
-    (directory / "vendor.json").write_text(json.dumps(record, indent=2) + "\n")
+    (directory / "vendor.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return record
 
 
 def verify_stage(directory):
-    record = json.loads((directory / "vendor.json").read_text())
+    record = json.loads((directory / "vendor.json").read_text(encoding="utf-8"))
     if record["case"] != "control":
         if digest_tree(Path(record["vendor_directory"])) != record["vendor_hash"]:
             raise ValueError("restored vendor differs from tracked source content or modes")
@@ -100,14 +101,19 @@ def main():
     parser.add_argument("--vendor-root", type=Path)
     args = parser.parse_args()
     if args.action == "stage":
-        if not all((args.case, args.cargo_home, args.vendor_root)):
-            parser.error("stage requires case, cargo-home and vendor-root")
-        record = stage(Path.cwd(), args.cargo_home, args.vendor_root, args.directory, args.case)
-        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+        cargo_home = args.cargo_home
+        if not cargo_home or str(cargo_home).strip() == "":
+            cargo_home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+        if not all((args.case, args.vendor_root)):
+            parser.error("stage requires case and vendor-root")
+        record = stage(Path.cwd(), cargo_home, args.vendor_root, args.directory, args.case)
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as output:
             output.write(f"vendor-hash={record['vendor_hash']}\nvendor-directory={record['vendor_directory']}\n")
             if sys.platform == "darwin":
                 sdk = subprocess.check_output(["xcrun", "--show-sdk-version"], text=True, timeout=30).strip()
                 output.write(f"sdk={sdk}\nimage={os.environ.get('ImageOS', 'macos')}-{os.environ.get('ImageVersion', 'local')}\n")
+            else:
+                output.write(f"sdk=none\nimage={os.environ.get('ImageOS', sys.platform)}-{os.environ.get('ImageVersion', 'local')}\n")
     else:
         verify_stage(args.directory)
 

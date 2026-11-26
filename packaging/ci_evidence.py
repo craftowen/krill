@@ -17,10 +17,23 @@ CANDIDATE_BRANCH = "release/nightly"
 CANDIDATE_PREFIX = "release/"
 CHECKS = {
     "ci.yml": {"hygiene"},
-    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest (macos-15)",
-                     "packaging regressions (macos-15)"},
-    "ci-windows.yml": {"check (MSVC)", "nextest (MSVC)", "release app (fxc shaders)"},
-    "release.yml": {"build-windows"},
+    "ci-macos.yml": {
+        "changes",
+        "ci-macos",
+        "clippy (macos-15)",
+        "nextest (macos-15, gui)",
+        "nextest (macos-15, daemon)",
+        "nextest (macos-15, core)",
+        "packaging regressions (macos-15)",
+    },
+    "ci-windows.yml": {
+        "check (MSVC)",
+        "nextest (MSVC, gui)",
+        "nextest (MSVC, daemon)",
+        "nextest (MSVC, core)",
+        "release app (fxc shaders)",
+    },
+    "release.yml": {"build-windows", "audit-windows"},
 }
 REUSE_JOBS = {
     "ci.yml": "reuse-hygiene-ci",
