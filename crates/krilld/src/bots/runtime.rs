@@ -44,8 +44,14 @@ use crate::session::lock;
 use crate::status;
 
 const STACK_SIZE: usize = 128 * 1024;
-const PREAMBLE_READY_WAIT: Duration = Duration::from_secs(15);
-const PREAMBLE_SERIAL_WAIT: Duration = Duration::from_secs(17);
+#[cfg(not(test))]
+const PREAMBLE_READY_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PREAMBLE_READY_WAIT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const PREAMBLE_SERIAL_WAIT: Duration = Duration::from_secs(32);
+#[cfg(test)]
+const PREAMBLE_SERIAL_WAIT: Duration = Duration::from_secs(4);
 const JSONL_FLUSH_RETRIES: usize = 5;
 const JSONL_FLUSH_SLEEP: Duration = Duration::from_millis(45);
 const RUNTIME_BINDINGS_FILE: &str = "runtime-bindings.json";
@@ -1155,60 +1161,61 @@ impl BotRuntime {
             let ctrl_thread = Arc::clone(&ctrl);
             let inner_thread = Arc::clone(&self.inner);
             let bot_id_thread = bot.id.clone();
-            let is_agy = krill_proto::agent::canonical_id(&bot.agent_id) == "agy";
+            let canonical_agent = krill_proto::agent::canonical_id(&bot.agent_id).to_owned();
+            let is_agy = canonical_agent == "agy";
             let spawn_res = std::thread::Builder::new()
                 .name(format!("bot-preamble-{}", session_id.0))
                 .stack_size(STACK_SIZE)
                 .spawn(move || {
+                    use crate::registry::prompt_delivery::{
+                        ReadyWaitOutcome, blocking_or_loading_screen, deliver_and_confirm_submit,
+                        screen_plain_text, wait_for_agent_ready,
+                    };
                     let failure_reason: Option<String> = {
                         let _ready_guard = ReadyDropGuard(Arc::clone(&ctrl_thread));
                         let _serial = lock(&ctrl_thread.delivery_lock);
-                        let deadline = Instant::now() + PREAMBLE_READY_WAIT;
-                        let mut ready_seen = false;
-                        let mut auth_blocked = false;
-                        while Instant::now() < deadline {
-                            let p = tap.pulse();
-                            if p.closed {
-                                break;
-                            }
-                            if is_agy {
-                                // Antigravity CLI pauses >150ms during "Signing in..." before rendering
-                                // its interactive `> ` composer; wait for the composer to appear, and
-                                // abort immediately if it falls into the OAuth login screen.
-                                let screen = tap.capture().0;
-                                if krill_proto::screen::agy::auth_login_screen(&screen) {
-                                    auth_blocked = true;
-                                    break;
-                                }
-                                if p.end > 0
-                                    && tap.quiet_ms() >= 150
-                                    && crate::mobile::agy_composer_ready(&screen)
-                                {
-                                    ready_seen = true;
-                                    break;
-                                }
-                            } else if p.end > 0 && tap.quiet_ms() >= 150 {
-                                ready_seen = true;
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        if auth_blocked {
+                        let outcome = wait_for_agent_ready(
+                            &tap,
+                            Some(&canonical_agent),
+                            PREAMBLE_READY_WAIT,
+                        );
+                        if outcome == ReadyWaitOutcome::AuthRequired {
                             Some(
                                 "auth_required: Antigravity session requires sign-in before accepting prompts"
                                     .to_owned(),
                             )
                         } else if let Some(bytes) = bytes {
-                            if tap.pulse().closed {
+                            if outcome == ReadyWaitOutcome::Closed || tap.pulse().closed {
                                 Some("pty closed before initial prompt delivery".to_owned())
-                            } else if is_agy && !ready_seen {
+                            } else if is_agy && outcome != ReadyWaitOutcome::Ready {
                                 Some("agy composer did not become ready within timeout".to_owned())
-                            } else if let Err(err) =
-                                Registry::deliver_input_to_tap(&tap, &bytes, true)
+                            } else if outcome == ReadyWaitOutcome::TimedOut
+                                && blocking_or_loading_screen(
+                                    &canonical_agent,
+                                    &screen_plain_text(&tap.capture().0),
+                                )
                             {
-                                Some(format!("deliver_input_to_tap failed: {err}"))
+                                Some(format!(
+                                    "{canonical_agent} session remained on a blocking/loading screen"
+                                ))
                             } else {
-                                None
+                                if outcome == ReadyWaitOutcome::TimedOut {
+                                    tracing::warn!(
+                                        session = session_id.0,
+                                        agent = %canonical_agent,
+                                        "bot composer not detected before timeout; falling back to input delivery"
+                                    );
+                                }
+                                if let Err(err) = deliver_and_confirm_submit(
+                                    &tap,
+                                    Some(&canonical_agent),
+                                    &bytes,
+                                    &|| false,
+                                ) {
+                                    Some(format!("deliver_input_to_tap failed: {err}"))
+                                } else {
+                                    None
+                                }
                             }
                         } else {
                             None

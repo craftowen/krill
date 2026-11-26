@@ -30,6 +30,12 @@ pub const PRECHECK_TIMEOUT: Duration =
 #[cfg(test)]
 pub const PRECHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Maximum wait for a newly spawned scheduled agent TUI to render its interactive composer.
+#[cfg(not(test))]
+const SCHEDULE_AGENT_READY_WAIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SCHEDULE_AGENT_READY_WAIT: Duration = Duration::from_secs(2);
+
 const PRECHECK_STREAM_LIMIT: usize = MAX_OUTPUT_BYTES.saturating_add(64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,12 +491,55 @@ impl Registry {
                             journal.append(&run)?;
                             break;
                         }
+                        let canonical = self
+                            .agents
+                            .stored(id)
+                            .ok()
+                            .flatten()
+                            .map(|stored| {
+                                krill_proto::agent::canonical_id(&stored.profile).to_owned()
+                            })
+                            .or_else(|| {
+                                entry
+                                    .resolved_agent()
+                                    .map(|a| krill_proto::agent::canonical_id(a).to_owned())
+                            });
+                        let agy_baseline = if canonical.as_deref() == Some("agy") {
+                            krill_proto::screen::agy::count_queued_matches(
+                                &tap.capture().0,
+                                &entry.prompt,
+                            )
+                            .count
+                        } else {
+                            0
+                        };
                         if let Err(e) =
                             Registry::deliver_input_to_tap(&tap, entry.prompt.as_bytes(), true)
                         {
                             run.phase = "failed".into();
                             run.error = Some(format!("session input failed: {e}"));
                         } else {
+                            let after_ns = tap.last_input_ns();
+                            if canonical
+                                .as_deref()
+                                .is_some_and(super::prompt_delivery::has_structured_composer)
+                            {
+                                let confirm_tap = tap.clone();
+                                let confirm_prompt = entry.prompt.clone();
+                                std::thread::Builder::new()
+                                    .name(format!("sched-confirm-{}", id.0))
+                                    .spawn(move || {
+                                        let _ = super::prompt_delivery::confirm_submit_or_nudge(
+                                            &confirm_tap,
+                                            canonical.as_deref(),
+                                            &confirm_prompt,
+                                            after_ns,
+                                            agy_baseline,
+                                            &|| false,
+                                        );
+                                    })
+                                    .ok();
+                            }
                             run.phase = "spawned".into();
                             run.session = Some(id.0);
                             run.cwd = Some(entry.cwd.clone());
@@ -606,49 +655,75 @@ impl Registry {
                     && let Some(tap) = self.tap(&peer, session)
                 {
                     let prompt_bytes = prompt.into_bytes();
-                    let is_agy = resolved_agent
+                    let canonical_agent = resolved_agent
                         .as_ref()
-                        .is_some_and(|(canon, _)| canon == "agy");
+                        .map(|(canon, _)| krill_proto::agent::canonical_id(canon).to_owned());
+                    let is_agy = canonical_agent.as_deref() == Some("agy");
                     std::thread::Builder::new()
                         .name(format!("sched-prompt-{}", session.0))
                         .spawn(move || {
-                            let deadline = Instant::now() + Duration::from_secs(15);
-                            let mut ready_seen = false;
-                            let mut auth_blocked = false;
-                            while Instant::now() < deadline {
-                                let p = tap.pulse();
-                                if p.closed {
-                                    break;
+                            use super::prompt_delivery::{
+                                ReadyWaitOutcome, blocking_or_loading_screen,
+                                deliver_and_confirm_submit, screen_plain_text,
+                                wait_for_agent_ready,
+                            };
+                            let outcome = wait_for_agent_ready(
+                                &tap,
+                                canonical_agent.as_deref(),
+                                SCHEDULE_AGENT_READY_WAIT,
+                            );
+                            match outcome {
+                                ReadyWaitOutcome::AuthRequired => {
+                                    tracing::warn!(
+                                        session = session.0,
+                                        "aborted scheduled prompt delivery: Antigravity sign-in screen detected (auth_required)"
+                                    );
                                 }
-                                if is_agy {
+                                ReadyWaitOutcome::Closed => {}
+                                ReadyWaitOutcome::TimedOut if is_agy => {
+                                    tracing::warn!(
+                                        session = session.0,
+                                        "aborted scheduled agy prompt delivery: composer did not become ready within timeout"
+                                    );
+                                }
+                                ReadyWaitOutcome::TimedOut | ReadyWaitOutcome::Ready => {
+                                    let canonical_str = canonical_agent.as_deref().unwrap_or("");
                                     let screen = tap.capture().0;
-                                    if krill_proto::screen::agy::auth_login_screen(&screen) {
-                                        auth_blocked = true;
+                                    if krill_proto::screen::agy::auth_login_screen(&screen)
+                                        || (outcome == ReadyWaitOutcome::TimedOut
+                                            && blocking_or_loading_screen(
+                                                canonical_str,
+                                                &screen_plain_text(&screen),
+                                            ))
+                                    {
                                         tracing::warn!(
                                             session = session.0,
-                                            "aborted scheduled agy prompt delivery: Antigravity sign-in screen detected (auth_required)"
+                                            agent = canonical_str,
+                                            "aborted scheduled prompt delivery: blocking/auth screen active"
                                         );
-                                        break;
+                                        return;
                                     }
-                                    if p.end > 0
-                                        && tap.quiet_ms() >= 150
-                                        && crate::mobile::agy_composer_ready(&screen)
-                                    {
-                                        ready_seen = true;
-                                        break;
+                                    if outcome == ReadyWaitOutcome::TimedOut {
+                                        tracing::warn!(
+                                            session = session.0,
+                                            agent = canonical_str,
+                                            "scheduled agent composer not detected before timeout; falling back to input delivery"
+                                        );
                                     }
-                                } else if p.end > 0 && tap.quiet_ms() >= 150 {
-                                    ready_seen = true;
-                                    break;
+                                    if let Err(err) = deliver_and_confirm_submit(
+                                        &tap,
+                                        canonical_agent.as_deref(),
+                                        &prompt_bytes,
+                                        &|| false,
+                                    ) {
+                                        tracing::warn!(
+                                            session = session.0,
+                                            agent = canonical_str,
+                                            error = %err,
+                                            "scheduled prompt delivery failed"
+                                        );
+                                    }
                                 }
-                                std::thread::sleep(Duration::from_millis(50));
-                            }
-                            if !tap.pulse().closed
-                                && !auth_blocked
-                                && (!is_agy || ready_seen)
-                                && !krill_proto::screen::agy::auth_login_screen(&tap.capture().0)
-                            {
-                                drop(Registry::deliver_input_to_tap(&tap, &prompt_bytes, true));
                             }
                         })
                         .ok();

@@ -54,6 +54,7 @@ mod hibernation;
 mod hook_identity;
 mod orch_cache;
 pub(crate) mod persistence;
+pub(crate) mod prompt_delivery;
 mod schedule;
 mod session_ids;
 mod sidebar;
@@ -4732,7 +4733,22 @@ impl Registry {
         let tap = self
             .session_tap(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bot session not live"))?;
-        Self::deliver_input_to_tap(&tap, bytes, submit)
+        if !submit {
+            return Self::deliver_input_to_tap(&tap, bytes, false);
+        }
+        let canonical = self
+            .agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .map(|stored| krill_proto::agent::canonical_id(&stored.profile).to_owned())
+            .or_else(|| {
+                let agent = self.status.get(id).agent;
+                (!agent.is_empty()).then(|| krill_proto::agent::canonical_id(&agent).to_owned())
+            });
+        prompt_delivery::deliver_and_confirm_submit(&tap, canonical.as_deref(), bytes, &|| {
+            self.status.get(id).state == control::AgentState::Working
+        })
     }
 
     /// Captures the trailing non-empty plain-text lines from a session's PTY screen (reply fallback),
