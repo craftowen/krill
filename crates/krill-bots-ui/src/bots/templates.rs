@@ -223,7 +223,7 @@ pub fn category_label(cat: BotTemplateCategory) -> &'static str {
 
 pub struct Templates {
     focus: FocusHandle,
-    search: Entity<InputState>,
+    pub(super) search: Entity<InputState>,
     query: String,
     category: Option<BotTemplateCategory>,
     selected: Option<&'static str>,
@@ -309,9 +309,10 @@ impl Templates {
                 self.keep_selection_visible();
                 cx.notify();
             }
-            InputEvent::PressEnter { .. }
-                if !crate::jump::entity_input_is_composing(input, window, cx) =>
-            {
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } if !crate::jump::entity_input_is_composing(input, window, cx) => {
                 self.use_selected(cx);
             }
             _ => {}

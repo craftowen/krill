@@ -1049,7 +1049,7 @@ impl View {
         })
     }
 
-    fn start_inline_name_edit(
+    pub(super) fn start_inline_name_edit(
         &mut self,
         bot: &BotConfig,
         window: &mut Window,
@@ -1065,12 +1065,17 @@ impl View {
         self.settings.inline_name_sub =
             Some(
                 cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, window, cx| {
-                    if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let plain_enter = matches!(
+                        ev,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        }
+                    );
+                    if !plain_enter && !matches!(ev, InputEvent::Blur) {
                         return;
                     }
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && crate::jump::entity_input_is_composing(ent, window, cx)
-                    {
+                    if plain_enter && crate::jump::entity_input_is_composing(ent, window, cx) {
                         return;
                     }
                     this.commit_inline_name_edit(cx);

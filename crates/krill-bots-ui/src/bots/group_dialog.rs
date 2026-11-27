@@ -110,7 +110,7 @@ pub struct BotGroupMembersDialog {
     bots: Vec<SidebarBot>,
     avatars: HashMap<BotId, Option<Arc<Image>>>,
     picked: Vec<BotId>,
-    name_input: Entity<InputState>,
+    pub(super) name_input: Entity<InputState>,
     name_value: String,
     filter_input: Entity<InputState>,
     filter_value: String,
@@ -207,9 +207,10 @@ impl BotGroupMembersDialog {
                     this.name_value = input.read(cx).value().to_string();
                     cx.notify();
                 }
-                InputEvent::PressEnter { .. }
-                    if !crate::jump::entity_input_is_composing(input, window, cx) =>
-                {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } if !crate::jump::entity_input_is_composing(input, window, cx) => {
                     this.submit(cx);
                 }
                 _ => {}

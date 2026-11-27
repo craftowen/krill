@@ -99,11 +99,15 @@ fn project_headers_drag_in_both_directions_and_restore_order(cx: &mut TestAppCon
     restored.snapshot = snapshot;
     assert_eq!(
         restored.project_order,
-        ["/p/folder", "/p/a", "/p/b", "/p/c"].map(PathBuf::from)
+        ["/p/folder", "/p/a", "/p/b", "/p/c"].map(|p| (HostId::Local, PathBuf::from(p)))
     );
     assert_eq!(
         view.read_with(cx, |s, _| projects(s)),
-        restored.project_order
+        restored
+            .project_order
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect::<Vec<_>>()
     );
     let rows = restored.local_rows();
     assert!(matches!(&rows[0], Row::Folder(p) if p == Path::new("/p/folder")));
@@ -192,4 +196,110 @@ fn remote_projects_reorder_as_complete_host_separated_blocks(cx: &mut TestAppCon
         view.read_with(cx, |s, _| projects(s)),
         ["/p/a", "/p/b", "/remote/c", "/remote/a"].map(PathBuf::from)
     );
+}
+
+#[gpui::test]
+fn shared_local_and_remote_path_drag_reorders_only_target_host(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!(
+        "krill-shared-host-project-drag-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sidebar.bin");
+    let studio = HostId::Remote("studio".into());
+    let (view, cx) = cx.add_window_view({
+        let file = file.clone();
+        move |_, _| Sidebar::new_loaded(Some(file))
+    });
+    view.update(cx, |s, cx| {
+        s.snapshot.trees = BTreeMap::from([
+            ("/repo".into(), vec!["/repo".into()]),
+            ("/other".into(), vec!["/other".into()]),
+        ]);
+        s.collapsed.extend(["/repo", "/other"].map(PathBuf::from));
+        s.remote_collapsed
+            .insert((studio.clone(), PathBuf::from("/repo")), true);
+        s.set_remote_snapshot_for_test(
+            "studio",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![],
+                trees: BTreeMap::from([("/repo".into(), vec!["/repo".into()])]),
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let project_hosts = |s: &Sidebar| -> Vec<(HostId, PathBuf)> {
+        s.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                project_key(row).map(|(_, p)| (s.row_host(i).clone(), p.clone()))
+            })
+            .collect()
+    };
+    let before = view.read_with(cx, |s, _| project_hosts(s));
+    assert_eq!(
+        before,
+        vec![
+            (HostId::Local, PathBuf::from("/other")),
+            (HostId::Local, PathBuf::from("/repo")),
+            (studio.clone(), PathBuf::from("/repo")),
+        ]
+    );
+
+    // Drag remote `/repo` above local `/other`: only remote `/repo` moves, local `/repo` stays put.
+    let bounds_for = |host: &HostId, path: &str, cx: &mut VisualTestContext| {
+        let index = view.read_with(cx, |s, _| {
+            s.rows
+                .iter()
+                .enumerate()
+                .find_map(|(i, row)| {
+                    (s.row_host(i) == host
+                        && matches!(row, Row::Repository(p) if p == Path::new(path)))
+                    .then_some(i)
+                })
+                .unwrap()
+        });
+        let selector: &'static str = Box::leak(format!("repo-header-{index}").into_boxed_str());
+        cx.debug_bounds(selector).unwrap()
+    };
+    let from = bounds_for(&studio, "/repo", cx).center();
+    let to = bounds_for(&HostId::Local, "/other", cx).center();
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    let expected = vec![
+        (studio.clone(), PathBuf::from("/repo")),
+        (HostId::Local, PathBuf::from("/other")),
+        (HostId::Local, PathBuf::from("/repo")),
+    ];
+    assert_eq!(view.read_with(cx, |s, _| project_hosts(s)), expected);
+
+    // Drag local `/repo` onto remote `/repo` (same path, different host): moves local `/repo` first.
+    let from = bounds_for(&HostId::Local, "/repo", cx).center();
+    let to = bounds_for(&studio, "/repo", cx).center();
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let expected2 = vec![
+        (HostId::Local, PathBuf::from("/repo")),
+        (studio.clone(), PathBuf::from("/repo")),
+        (HostId::Local, PathBuf::from("/other")),
+    ];
+    assert_eq!(view.read_with(cx, |s, _| project_hosts(s)), expected2);
+
+    // Persisted host-qualified order round-trips cleanly.
+    let restored = Sidebar::new_loaded(Some(file));
+    assert_eq!(restored.project_order, expected2);
+    fs::remove_dir_all(&dir).ok();
 }

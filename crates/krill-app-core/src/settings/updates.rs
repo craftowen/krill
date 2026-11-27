@@ -418,7 +418,7 @@ impl SettingsView {
         let page = if cfg!(target_os = "macos") {
             page.child(self.render_app_row(&state, cx)).child(
                 flat_row(p)
-                    .child(layout::label(
+                    .child(self.search_focus.label(
                         p,
                         text::UPDATES_AUTO_RESTART.get(),
                         Some(text::UPDATES_AUTO_RESTART_DESC.get()),

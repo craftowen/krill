@@ -183,13 +183,20 @@ impl Sidebar {
                 .selected_worktree
                 .as_deref()
                 .map(|p| preferred(p, &aliases));
-            for order in [&mut self.project_order, &mut self.worktree_order] {
-                for path in order.iter_mut() {
+            for (host, path) in &mut self.project_order {
+                if host.is_local() {
                     *path = preferred(path, &aliases);
                 }
-                let mut seen = BTreeSet::new();
-                order.retain(|p| seen.insert(p.clone()));
             }
+            let mut seen_projects = BTreeSet::new();
+            self.project_order
+                .retain(|k| seen_projects.insert(k.clone()));
+            for path in &mut self.worktree_order {
+                *path = preferred(path, &aliases);
+            }
+            let mut seen_worktrees = BTreeSet::new();
+            self.worktree_order
+                .retain(|p| seen_worktrees.insert(p.clone()));
         }
         for remote in &mut self.remote_hosts {
             if !remote

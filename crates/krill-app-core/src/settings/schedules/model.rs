@@ -2,31 +2,44 @@
 use super::{ScheduleRun, text};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::settings) enum RunOutcome {
+pub enum RunOutcome {
     Succeeded,
     Failed,
     Active,
     Skipped,
     Unknown,
 }
-pub(in crate::settings) fn run_outcome(run: &ScheduleRun) -> RunOutcome {
-    match run.phase.as_str() {
-        "finished" if run.status.is_none_or(|s| s == 0) => RunOutcome::Succeeded,
+#[must_use]
+pub fn run_outcome_for(phase: &str, status: Option<i32>) -> RunOutcome {
+    match phase {
+        "finished" if status.is_none_or(|s| s == 0) => RunOutcome::Succeeded,
         "finished" | "failed" => RunOutcome::Failed,
         "spawned" | "started" => RunOutcome::Active,
         "skipped" => RunOutcome::Skipped,
         _ => RunOutcome::Unknown,
     }
 }
-pub fn run_outcome_badge_spec(run: &ScheduleRun) -> (crate::ui::BadgeTone, &'static str) {
+#[must_use]
+pub fn run_outcome(run: &ScheduleRun) -> RunOutcome {
+    run_outcome_for(&run.phase, run.status)
+}
+#[must_use]
+pub fn run_outcome_badge_spec_for(
+    phase: &str,
+    status: Option<i32>,
+) -> (crate::ui::BadgeTone, &'static str) {
     use crate::ui::BadgeTone;
-    match run_outcome(run) {
+    match run_outcome_for(phase, status) {
         RunOutcome::Succeeded => (BadgeTone::Success, text::AUTOMATIONS_SUCCEEDED.get()),
         RunOutcome::Failed => (BadgeTone::Destructive, text::AUTOMATIONS_FAILED.get()),
         RunOutcome::Active => (BadgeTone::Warning, text::AUTOMATIONS_ACTIVE.get()),
         RunOutcome::Skipped => (BadgeTone::Muted, text::AUTOMATIONS_SKIPPED.get()),
         RunOutcome::Unknown => (BadgeTone::Neutral, text::AUTOMATIONS_NONE.get()),
     }
+}
+#[must_use]
+pub fn run_outcome_badge_spec(run: &ScheduleRun) -> (crate::ui::BadgeTone, &'static str) {
+    run_outcome_badge_spec_for(&run.phase, run.status)
 }
 
 #[derive(Clone, Copy)]

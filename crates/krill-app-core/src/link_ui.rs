@@ -1998,6 +1998,15 @@ impl PairingView {
             .update(cx, |server, cx| server.set_visible(visible, cx));
     }
 
+    pub fn client_input_handles(&self, cx: &App) -> [Entity<InputState>; 3] {
+        let client = self.client.read(cx);
+        [
+            client.link_input.clone(),
+            client.host_name_input.clone(),
+            client.device_name_input.clone(),
+        ]
+    }
+
     pub fn new(backend: Arc<dyn LinkBackend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let server_backend = backend.clone();
         let server = cx.new(|cx| ServerPanel::new(server_backend, cx));

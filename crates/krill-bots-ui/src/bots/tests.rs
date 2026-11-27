@@ -4421,3 +4421,158 @@ fn perf_bench_bot_panel_open_and_switch(cx: &mut TestAppContext) {
         "switching to SoulMemory tab must lazily fetch GetSoul"
     );
 }
+
+#[gpui::test]
+fn modified_enter_does_not_submit_inline_rename_or_bot_dialogs(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let bot = sample_bot("alpha", "Alpha");
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot.clone()],
+        ..MockState::default()
+    }));
+    let rpc = make_mock_rpc(state.clone());
+
+    // 1. Inline bot rename in settings_root.rs & Import dialog in import_dialog.rs
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc.clone(), None, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.start_inline_name_edit(&bot, window, cx);
+            v.open_import(cx);
+            v.ensure_import_dialog_inputs(window, cx);
+            if let Some(inp) = v.import_dialog.name_input.clone() {
+                inp.update(cx, |s, cx| s.set_value("Imported Bot", window, cx));
+            }
+        });
+    });
+    vcx.run_until_parked();
+    state.lock().unwrap().requests.clear();
+    vcx.update(|_, cx| {
+        let (inline_inp, import_inp) = view.read_with(cx, |v, _| {
+            (
+                v.settings.inline_name_input.clone().unwrap(),
+                v.import_dialog.name_input.clone().unwrap(),
+            )
+        });
+        for inp in [&inline_inp, &import_inp] {
+            for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+                inp.update(cx, |_, cx| {
+                    cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+                });
+            }
+        }
+    });
+    vcx.run_until_parked();
+    assert!(
+        state.lock().unwrap().requests.is_empty(),
+        "modified PressEnter must not submit inline rename or import dialog: {:?}",
+        state.lock().unwrap().requests
+    );
+    vcx.read_entity(&view, |v, _| {
+        assert!(v.settings.inline_name_editing);
+        assert_eq!(v.screen, Screen::Import);
+    });
+
+    // 2. NewBot name input (new_bot.rs)
+    let submitted_new = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submitted_new_c = submitted_new.clone();
+    let rpc_new = rpc.clone();
+    let (nb, nb_vcx) = cx.add_window_view(|window, cx| {
+        super::new_bot::NewBot::new(
+            vec![super::new_bot::HostChoice {
+                id: crate::hosts::HostId::Local,
+                label: "My Mac".into(),
+                rpc: rpc_new,
+            }],
+            vec![],
+            None,
+            window,
+            cx,
+        )
+    });
+    nb_vcx.update(|window, cx| {
+        cx.subscribe(&nb, move |_, ev: &super::new_bot::Event, _| {
+            if matches!(ev, super::new_bot::Event::Created { .. }) {
+                submitted_new_c.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
+        .detach();
+        nb.update(cx, |d, cx| {
+            d.name
+                .update(cx, |s, cx| s.set_value("Partial Bot", window, cx));
+        });
+    });
+    state.lock().unwrap().requests.clear();
+    nb_vcx.update(|_, cx| {
+        let inp = nb.read(cx).name.clone();
+        for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+            inp.update(cx, |_, cx| {
+                cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+            });
+        }
+    });
+    nb_vcx.run_until_parked();
+    assert!(state.lock().unwrap().requests.is_empty());
+    assert!(!submitted_new.load(std::sync::atomic::Ordering::Acquire));
+
+    // 3. GroupDialog name input (group_dialog.rs)
+    let submitted_grp = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let submitted_grp_c = submitted_grp.clone();
+    let sidebar_bots = sidebar_snapshot(std::slice::from_ref(&bot), &[], &[], &[]).bots;
+    let (gd, gd_vcx) = cx.add_window_view(|window, cx| {
+        super::group_dialog::BotGroupMembersDialog::new_group(
+            sidebar_bots,
+            std::collections::HashMap::new(),
+            window,
+            cx,
+        )
+    });
+    gd_vcx.update(|window, cx| {
+        cx.subscribe(&gd, move |_, ev: &super::group_dialog::Event, _| {
+            if !matches!(ev, super::group_dialog::Event::Close) {
+                submitted_grp_c.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
+        .detach();
+        gd.update(cx, |d, cx| {
+            d.name_input
+                .update(cx, |s, cx| s.set_value("My Group", window, cx));
+        });
+    });
+    gd_vcx.update(|_, cx| {
+        let inp = gd.read(cx).name_input.clone();
+        for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+            inp.update(cx, |_, cx| {
+                cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+            });
+        }
+    });
+    gd_vcx.run_until_parked();
+    assert!(!submitted_grp.load(std::sync::atomic::Ordering::Acquire));
+
+    // 4. Templates search input (templates.rs)
+    let picked_tpl = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let picked_tpl_c = picked_tpl.clone();
+    let (tpl, tpl_vcx) = cx.add_window_view(super::templates::Templates::new);
+    tpl_vcx.update(|_, cx| {
+        cx.subscribe(&tpl, move |_, ev: &super::templates::Event, _| {
+            if matches!(ev, super::templates::Event::Use(_)) {
+                picked_tpl_c.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
+        .detach();
+    });
+    tpl_vcx.update(|_, cx| {
+        let inp = tpl.read(cx).search.clone();
+        for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+            inp.update(cx, |_, cx| {
+                cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+            });
+        }
+    });
+    tpl_vcx.run_until_parked();
+    assert!(!picked_tpl.load(std::sync::atomic::Ordering::Acquire));
+}

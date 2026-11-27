@@ -2041,7 +2041,8 @@ impl Panel {
             } else {
                 px(26.)
             })
-            .when(!center, |d| d.flex_wrap().py_0p5())
+            .flex_wrap()
+            .py_0p5()
             .px_2p5()
             .flex_none()
             .flex()

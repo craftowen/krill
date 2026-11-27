@@ -87,7 +87,7 @@ pub struct NewBot {
     setup: BotAgentSetup,
     taken_names: Vec<String>,
     pub picture: PictureState,
-    name: Entity<InputState>,
+    pub(super) name: Entity<InputState>,
     purpose: Entity<TextareaState>,
     watches: Option<Entity<TextareaState>>,
     does: Option<Entity<TextareaState>>,
@@ -415,9 +415,10 @@ impl NewBot {
         cx: &mut Context<Self>,
     ) {
         match ev {
-            InputEvent::PressEnter { .. }
-                if !crate::jump::entity_input_is_composing(input, window, cx) =>
-            {
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } if !crate::jump::entity_input_is_composing(input, window, cx) => {
                 self.try_submit(Some(window), cx);
             }
             InputEvent::Change if !crate::jump::entity_input_is_composing(input, window, cx) => {

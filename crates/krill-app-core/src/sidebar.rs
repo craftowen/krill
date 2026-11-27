@@ -636,14 +636,14 @@ impl UiExpansionState {
     }
 }
 
-/// 두 `Vec<PathBuf>`는 수동 프로젝트 순서(5번째)와 워크트리 순서(6번째 구간)다. postcard는 구조체 끝 필드 추가를
-/// 옛 파일에서 못 읽으므로 구간을 따로 덧붙인다. 옛 앱은 남는 바이트를 무시한다.
+/// 5번째 구간은 하위 호환용 로컬 `Vec<PathBuf>` 프로젝트 순서, 6번째 구간은 워크트리 순서,
+/// 7번째 구간(선택)은 호스트별 프로젝트 순서 `Vec<(HostId, PathBuf)>`다.
 type PersistedSidebarState = (
     Preferences,
     WorkspaceOptions,
     lineage::LineageState,
     UiExpansionState,
-    Vec<PathBuf>,
+    Vec<(HostId, PathBuf)>,
     Vec<PathBuf>,
 );
 
@@ -718,15 +718,23 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
     }
     let (ui, rest) =
         postcard::take_from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?;
-    let (order, rest) = if rest.is_empty() {
+    let (legacy_order, rest) = if rest.is_empty() {
         (Vec::new(), rest)
     } else {
         postcard::take_from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
-    let worktree_order = if rest.is_empty() {
-        Vec::new()
+    let (worktree_order, rest) = if rest.is_empty() {
+        (Vec::new(), rest)
     } else {
-        postcard::from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
+        postcard::take_from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
+    };
+    let order = if rest.is_empty() {
+        legacy_order
+            .into_iter()
+            .map(|p| (HostId::Local, p))
+            .collect()
+    } else {
+        postcard::from_bytes::<Vec<(HostId, PathBuf)>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
     Ok(sanitize_persisted_sidebar_state((
         prefs,
@@ -802,10 +810,15 @@ fn sanitize_persisted_sidebar_state(
         .map(clean_persisted_path)
         .collect();
     let mut clean_order = Vec::with_capacity(order.len());
-    for p in order {
-        let cp = clean_persisted_path(p);
-        if !clean_order.contains(&cp) {
-            clean_order.push(cp);
+    for (host, p) in order {
+        let cp = if host.is_local() {
+            clean_persisted_path(p)
+        } else {
+            p
+        };
+        let key = (host, cp);
+        if !clean_order.contains(&key) {
+            clean_order.push(key);
         }
     }
     (
@@ -841,7 +854,7 @@ fn save_state(
     opts: &WorkspaceOptions,
     lin: &lineage::LineageState,
     ui: &UiExpansionState,
-    order: &[PathBuf],
+    order: &[(HostId, PathBuf)],
     worktree_order: &[PathBuf],
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
@@ -854,10 +867,20 @@ fn save_state(
             if need_ui {
                 bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
                 if !order.is_empty() || !worktree_order.is_empty() {
-                    bytes.extend(postcard::to_stdvec(order).map_err(io::Error::other)?);
-                    if !worktree_order.is_empty() {
+                    let mut legacy_order = Vec::with_capacity(order.len());
+                    for (_, p) in order {
+                        if !legacy_order.contains(p) {
+                            legacy_order.push(p.clone());
+                        }
+                    }
+                    bytes.extend(postcard::to_stdvec(&legacy_order).map_err(io::Error::other)?);
+                    let has_remote_order = order.iter().any(|(h, _)| !h.is_local());
+                    if !worktree_order.is_empty() || has_remote_order {
                         bytes
                             .extend(postcard::to_stdvec(worktree_order).map_err(io::Error::other)?);
+                        if has_remote_order {
+                            bytes.extend(postcard::to_stdvec(order).map_err(io::Error::other)?);
+                        }
                     }
                 }
             }
@@ -983,8 +1006,8 @@ pub struct Sidebar {
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
     collapsed_hosts: BTreeSet<HostId>,
-    /// 사용자가 끌어다 놓아 정한 프로젝트(저장소·폴더) 순서(`sidebar.bin` 5번째 구간).
-    project_order: Vec<PathBuf>,
+    /// 사용자가 끌어다 놓아 정한 호스트별 프로젝트(저장소·폴더) 순서(`sidebar.bin` 5·7번째 구간).
+    project_order: Vec<(HostId, PathBuf)>,
     worktree_order: Vec<PathBuf>,
     /// Runtime projection of Layout order; Layout remains the persisted source.
     session_order: BTreeMap<HostId, BTreeMap<SessionId, usize>>,
@@ -1179,6 +1202,15 @@ fn project_key(row: &Row) -> Option<((bool, String), &PathBuf)> {
     }
 }
 
+fn project_rank_on(host: &HostId, row: &Row, order: &[(HostId, PathBuf)]) -> usize {
+    project_key(row).map_or(0, |(_, path)| {
+        order
+            .iter()
+            .position(|(h, p)| h == host && p == path)
+            .map_or(usize::MAX, |i| i + 1)
+    })
+}
+
 /// Non-project groups retain their leading position; unordered projects follow
 /// saved ones in their existing order.
 fn project_rank(row: &Row, order: &[PathBuf]) -> usize {
@@ -1236,7 +1268,7 @@ impl ProjectMerge {
     }
 
     /// 프로젝트 → 작업 폴더 모르는 세션 순으로 편다.
-    fn finish(mut self, order: &[PathBuf]) -> (Vec<Row>, Vec<HostId>) {
+    fn finish(mut self, order: &[(HostId, PathBuf)]) -> (Vec<Row>, Vec<HostId>) {
         // Sort whole projects so remote projects and folders can move between
         // local repositories without separating their children.
         if !order.is_empty() {
@@ -1244,7 +1276,7 @@ impl ProjectMerge {
                 chunk
                     .rows
                     .first()
-                    .map_or(0, |(_, row)| project_rank(row, order))
+                    .map_or(0, |(host, row)| project_rank_on(host, row, order))
             });
         }
         let mut rows = Vec::new();
@@ -3019,12 +3051,32 @@ impl Sidebar {
             })
     }
 
+    fn uncollapse_on(&mut self, host: &HostId, path: &Path) -> bool {
+        if host.is_local() {
+            return self.collapsed.remove(path);
+        }
+        let was_collapsed = self.is_collapsed_on(host, path);
+        if was_collapsed {
+            self.remote_collapsed
+                .insert((host.clone(), path.to_path_buf()), false);
+        }
+        was_collapsed
+    }
+
+    fn project_order_for(&self, host: &HostId) -> Vec<PathBuf> {
+        self.project_order
+            .iter()
+            .filter(|(h, _)| h == host)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
     fn reveal_worktree_on(&mut self, host: &HostId, target_wt: Option<&Path>) -> bool {
         let mut uncollapsed = self.collapsed_hosts.remove(host);
         let Some(wt) = target_wt else {
             return uncollapsed;
         };
-        if self.collapsed.remove(wt) {
+        if self.uncollapse_on(host, wt) {
             uncollapsed = true;
         }
         if host.is_local() {
@@ -3060,7 +3112,7 @@ impl Sidebar {
             .map(|(repo, _)| repo.clone())
             .collect();
         for repo in &parent_repos {
-            if self.collapsed.remove(repo) {
+            if self.uncollapse_on(host, repo) {
                 uncollapsed = true;
             }
             if is_claude_wt && self.shown_external.insert(repo.clone()) {
@@ -3074,7 +3126,23 @@ impl Sidebar {
                 parent_repos.iter().map(PathBuf::as_path).collect()
             };
             for project_path in candidate_projects {
+                if self.uncollapse_on(host, project_path) {
+                    uncollapsed = true;
+                }
                 let key = basename(project_path).to_ascii_lowercase();
+                let matching_remote: Vec<PathBuf> = self
+                    .remote_collapsed
+                    .iter()
+                    .filter(|((h, p), closed)| {
+                        **closed && h == host && basename(p).to_ascii_lowercase() == key
+                    })
+                    .map(|((_, p), _)| p.clone())
+                    .collect();
+                for path in matching_remote {
+                    if self.uncollapse_on(host, &path) {
+                        uncollapsed = true;
+                    }
+                }
                 let matching_collapsed: Vec<PathBuf> = self
                     .collapsed
                     .iter()
@@ -3182,29 +3250,35 @@ impl Sidebar {
     /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
     /// 펼침 집합은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.toggle_card_sessions_on(&HostId::Local, path, cx);
+    }
+
+    pub fn toggle_card_sessions_on(&mut self, host: &HostId, path: &Path, cx: &mut Context<Self>) {
         if self.expanded_cards.remove(path) {
             self.manually_folded_cards.insert(path.to_path_buf());
             if let Some(c) = self.cursor
+                && self.same_machine_host(self.row_host(c), host)
                 && matches!(
                     self.rows.get(c),
                     Some(Row::Session(s, true)) if s.worktree.as_deref() == Some(path)
                 )
             {
-                self.cursor = self
-                    .rows
-                    .iter()
-                    .position(|r| matches!(r, Row::Worktree(p) if p == path));
+                self.cursor = self.rows.iter().enumerate().position(|(i, r)| {
+                    self.same_machine_host(self.row_host(i), host)
+                        && matches!(r, Row::Worktree(p) if p == path)
+                });
             }
             self.write_state(cx);
             cx.notify();
         } else {
             self.manually_folded_cards.remove(path);
             self.expanded_cards.insert(path.to_path_buf());
-            self.collapsed.remove(path);
+            self.uncollapse_on(host, path);
             if let Some(focused_id) = self.focused
-                && self.folder_on(&HostId::Local, focused_id) == Some(path)
+                && self.same_machine_host(&self.focused_host, host)
+                && self.folder_on(host, focused_id) == Some(path)
                 && let Some(idx) = self.rows.iter().enumerate().position(|(i, r)| {
-                    self.row_host(i).is_local()
+                    self.same_machine_host(self.row_host(i), host)
                         && matches!(r, Row::Session(s, true) if s.id == focused_id)
                 })
             {
@@ -3576,13 +3650,32 @@ impl Sidebar {
                 continue;
             };
             self.pending_added_projects
-                .remove(&(host, added_path.clone()));
+                .remove(&(host.clone(), added_path.clone()));
             self.removed_projects.retain(|p| {
                 !path_identity::same(p, &actual_repo) && !path_identity::same(p, &actual_wt)
             });
-            self.collapsed.retain(|p| {
-                !path_identity::same(p, &actual_repo) && !path_identity::same(p, &actual_wt)
-            });
+            if host.is_local() {
+                self.collapsed.retain(|p| {
+                    !path_identity::same(p, &actual_repo) && !path_identity::same(p, &actual_wt)
+                });
+            } else {
+                self.uncollapse_on(&host, &actual_repo);
+                self.uncollapse_on(&host, &actual_wt);
+                let matching_remote: Vec<PathBuf> = self
+                    .remote_collapsed
+                    .iter()
+                    .filter(|((h, p), closed)| {
+                        **closed
+                            && h == &host
+                            && (path_identity::same(p, &actual_repo)
+                                || path_identity::same(p, &actual_wt))
+                    })
+                    .map(|((_, p), _)| p.clone())
+                    .collect();
+                for p in matching_remote {
+                    self.uncollapse_on(&host, &p);
+                }
+            }
             self.sleeping_worktrees
                 .retain(|p| !path_identity::same(p, &actual_wt));
             self.recently_created_worktrees.insert(actual_wt.clone());
@@ -4574,14 +4667,28 @@ impl Sidebar {
 
     /// 프로젝트(저장소·폴더) `from`을 `to` 자리로 옮기고 보이는 순서를 저장한다.
     pub fn move_project(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
-        let mut order: Vec<PathBuf> = self
+        self.move_project_on(&HostId::Local, from, &HostId::Local, to, cx);
+    }
+
+    pub fn move_project_on(
+        &mut self,
+        from_host: &HostId,
+        from: &Path,
+        to_host: &HostId,
+        to: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let mut order: Vec<(HostId, PathBuf)> = self
             .rows
             .iter()
-            .filter_map(|row| project_key(row).map(|(_, path)| path.clone()))
+            .enumerate()
+            .filter_map(|(i, row)| {
+                project_key(row).map(|(_, path)| (self.row_host(i).clone(), path.clone()))
+            })
             .collect();
         let (Some(i), Some(j)) = (
-            order.iter().position(|p| p == from),
-            order.iter().position(|p| p == to),
+            order.iter().position(|(h, p)| h == from_host && p == from),
+            order.iter().position(|(h, p)| h == to_host && p == to),
         ) else {
             return;
         };
@@ -4591,9 +4698,9 @@ impl Sidebar {
         let moved = order.remove(i);
         order.insert(j, moved);
         // 지금 안 보이는(필터·접힌 호스트) 프로젝트의 예전 자리도 뒤에 남겨 둔다.
-        for p in &self.project_order {
-            if !order.contains(p) {
-                order.push(p.clone());
+        for entry in &self.project_order {
+            if !order.contains(entry) {
+                order.push(entry.clone());
             }
         }
         self.project_order = order;
@@ -4638,6 +4745,12 @@ impl Sidebar {
         let next_open = open.unwrap_or(closed);
         self.remote_collapsed
             .insert((host.clone(), path.to_path_buf()), !next_open);
+        if next_open {
+            self.manually_folded_cards.remove(path);
+            self.expanded_cards.insert(path.to_path_buf());
+        } else {
+            self.expanded_cards.remove(path);
+        }
         self.rebuild(cx);
     }
 

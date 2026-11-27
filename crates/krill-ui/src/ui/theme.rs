@@ -486,7 +486,7 @@ pub const LIGHT: Palette = Palette {
     worktree_sidebar_border: hex(0x00e5_e5e5),
     success: hex(0x0014_7638),
     warning: hex(0x00ca_8a04),
-    warning_foreground: hex(0x00fa_fafa),
+    warning_foreground: hex(0x0017_1717),
     agent_question: hex(0x00ea_580c),
     unread: hex(0x003b_82f6),
     // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
@@ -514,7 +514,7 @@ pub const DARK: Palette = Palette {
     accent: hex(0x002a_3040),
     accent_foreground: hex(0x00fa_fafa),
     destructive: hex(0x00ff_6568),
-    destructive_foreground: hex(0x00fa_fafa),
+    destructive_foreground: hex(0x0017_1717),
     border: hexa(0x00ff_ffff, 0.08),
     input: hexa(0x00ff_ffff, 0.15),
     ring: hex(0x007c_869c),
@@ -560,7 +560,7 @@ pub const ABYSS: Palette = Palette {
     accent: hex(0x001f_1f1f),
     accent_foreground: hex(0x00ed_eded),
     destructive: hex(0x00ff_6568),
-    destructive_foreground: hex(0x00fa_fafa),
+    destructive_foreground: hex(0x0017_1717),
     border: hexa(0x00ff_ffff, 0.09),
     input: hexa(0x00ff_ffff, 0.15),
     ring: hex(0x007a_7a7a),
@@ -604,7 +604,7 @@ pub const TIDEPOOL: Palette = Palette {
     accent: hex(0x0038_4052),
     accent_foreground: hex(0x00e5_e9f0),
     destructive: hex(0x00d0_707a),
-    destructive_foreground: hex(0x00fa_fafa),
+    destructive_foreground: hex(0x0017_1717),
     border: hexa(0x00ff_ffff, 0.07),
     input: hexa(0x00ff_ffff, 0.14),
     ring: hex(0x005e_81ac),
@@ -648,7 +648,7 @@ pub const GLOW: Palette = Palette {
     accent: hex(0x0016_263f),
     accent_foreground: hex(0x00e6_f4ff),
     destructive: hex(0x00ff_6b8b),
-    destructive_foreground: hex(0x00fa_fafa),
+    destructive_foreground: hex(0x0004_070e),
     border: hexa(0x0050_c8ff, 0.10),
     input: hexa(0x0050_c8ff, 0.18),
     ring: hex(0x001f_a8b0),
@@ -1147,6 +1147,22 @@ pub const fn tab_tag_color(color: crate::tab_color::TabColor) -> Hsla {
     }
 }
 
+fn danger_button_states(p: &Palette, dark: bool) -> (Hsla, Hsla) {
+    if dark {
+        let hover = Hsla {
+            l: (p.destructive.l + 0.06).min(0.84),
+            ..p.destructive
+        };
+        let active = Hsla {
+            l: (p.destructive.l - 0.035).max(0.56),
+            ..p.destructive
+        };
+        (hover, active)
+    } else {
+        (hex(0x00c8_0010), hex(0x00a8_000d))
+    }
+}
+
 /// `gpui-component`의 전역 [`Theme`]에 `mode`와 Orca 색·글꼴·반경 토큰을 적용한다.
 pub fn apply(mode: ThemeMode, cx: &mut App) {
     Theme::change(mode, None, cx);
@@ -1209,6 +1225,7 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         theme.colors.success = p.success;
         theme.colors.success_foreground = p.primary_foreground;
 
+        let (danger_hover, danger_active) = danger_button_states(p, mode.is_dark());
         let (
             button_bg,
             button_hover,
@@ -1217,8 +1234,6 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
             primary_active,
             secondary_hover,
             secondary_active,
-            danger_hover,
-            danger_active,
         ) = if mode.is_dark() {
             (
                 hexa(0x00ff_ffff, 0.05),
@@ -1228,8 +1243,6 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
                 hex(0x00c8_c8c8),
                 hex(0x0036_3636),
                 hex(0x0044_4444),
-                hex(0x00ff_8285),
-                hex(0x00e0_484b),
             )
         } else {
             (
@@ -1240,8 +1253,6 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
                 hex(0x0000_0000),
                 hex(0x00e5_e5e5),
                 hex(0x00d4_d4d4),
-                hex(0x00c8_0010),
-                hex(0x00a8_000d),
             )
         };
         theme.colors.button = button_bg;
@@ -1497,13 +1508,13 @@ mod tests {
     fn text_tokens_meet_wcag_aa_on_every_surface() {
         let palettes = DarkUiTheme::ALL
             .into_iter()
-            .map(|t| (t.label(), t.palette()))
+            .map(|t| (t.label(), t.palette(), true))
             .chain(
                 LightUiTheme::ALL
                     .into_iter()
-                    .map(|t| (t.label(), t.palette())),
+                    .map(|t| (t.label(), t.palette(), false)),
             );
-        for (name, p) in palettes {
+        for (name, p, is_dark) in palettes {
             let surfaces = [
                 ("background", p.background),
                 ("sidebar", p.sidebar),
@@ -1530,6 +1541,23 @@ mod tests {
             assert!(
                 ratio >= 4.5,
                 "{name}: preserve on background = {ratio:.2}:1"
+            );
+            let (danger_hover, danger_active) = danger_button_states(p, is_dark);
+            for (state_name, bg) in [
+                ("destructive", p.destructive),
+                ("danger_hover", danger_hover),
+                ("danger_active", danger_active),
+            ] {
+                let ratio = contrast(p.destructive_foreground, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: destructive_foreground on {state_name} = {ratio:.2}:1 < 4.5:1"
+                );
+            }
+            let warning_ratio = contrast(p.warning_foreground, p.warning);
+            assert!(
+                warning_ratio >= 4.5,
+                "{name}: warning_foreground on warning = {warning_ratio:.2}:1 < 4.5:1"
             );
         }
     }

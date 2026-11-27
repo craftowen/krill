@@ -18,7 +18,9 @@ use super::{SettingsView, layout, open_file, state_dir, text};
 
 mod editor;
 pub(super) mod model;
-pub use model::run_outcome_badge_spec;
+pub use model::{
+    RunOutcome, run_outcome, run_outcome_badge_spec, run_outcome_badge_spec_for, run_outcome_for,
+};
 use model::{TEMPLATES, Template};
 
 /// 스케줄 추가/편집 모달 입력 상태.
@@ -50,6 +52,7 @@ pub struct ScheduleLogView {
     pub id: String,
     pub minute: u64,
     pub phase: String,
+    pub status: Option<i32>,
     pub cwd: Option<String>,
     pub output: String,
 }
@@ -806,6 +809,7 @@ impl SettingsView {
             id: run.id.clone(),
             minute: run.minute,
             phase: run.phase.clone(),
+            status: run.status,
             cwd: run.cwd.clone(),
             output: run.output.clone().unwrap_or_default(),
         });
@@ -1224,7 +1228,7 @@ impl SettingsView {
 
         // 실행 상세 로그 뷰어
         if let Some(log) = &self.schedule_log {
-            let (tone, badge_label) = run_phase_badge_spec(&log.phase);
+            let (tone, badge_label) = run_outcome_badge_spec_for(&log.phase, log.status);
             let title = text::SCHEDULE_LOG_TITLE.format(&[
                 ("id", &log.id),
                 ("datetime", &format_run_minute(log.minute)),

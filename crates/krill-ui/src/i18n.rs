@@ -1250,7 +1250,7 @@ catalog! {
         GRP_SEND_FAILED => ("메시지를 보내지 못했습니다: {err}", "Could not send message: {err}"),
         GRP_NO_MENTIONED_HINT => ("멘션된 봇이 없어 응답이 실행되지 않았습니다.", "No bots matched that mention."),
         // Domain A — Bots sidebar 1:1 parity
-        SB_SECTION_TITLE => ("Bots", "Bots"),
+        SB_SECTION_TITLE => ("봇", "Bots"),
         SB_HOME_CHAT_EXACT => ("Home Chat", "Home Chat"),
         SB_RUNS_ON => ("{host}에서 실행 중", "Runs on {host}"),
         SB_UP_NEXT_NEW_ONE => ("새 제안 1개 · 클릭해 보기", "1 new suggestion · click to see"),
@@ -4880,13 +4880,17 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
     ),
     (
         crate::admin_tab::AdminTab::Agents,
-        catalog::settings::SKILLS_TITLE,
-        &["스킬", "훅", "skill", "hook"],
-    ),
-    (
-        crate::admin_tab::AdminTab::Agents,
         catalog::settings::AUTO_SETUP_ALL_TITLE,
-        &["자동 설정", "원클릭", "auto setup", "one click"],
+        &[
+            "자동 설정",
+            "원클릭",
+            "스킬",
+            "훅",
+            "auto setup",
+            "one click",
+            "skill",
+            "hook",
+        ],
     ),
     (
         crate::admin_tab::AdminTab::Agents,
@@ -5026,6 +5030,18 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
         ],
     ),
     (
+        crate::admin_tab::AdminTab::QuickCommands,
+        catalog::settings::TAB_QUICK_COMMANDS,
+        &[
+            "빠른 명령",
+            "단축 명령",
+            "스니펫",
+            "quick command",
+            "quick commands",
+            "snippet",
+        ],
+    ),
+    (
         crate::admin_tab::AdminTab::Shortcuts,
         catalog::settings::TAB_SHORTCUTS,
         &["단축키", "키 바인딩", "shortcut", "keybinding", "keys.toml"],
@@ -5066,6 +5082,20 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
             "worktree cleanup",
             "target",
             "node_modules",
+        ],
+    ),
+    (
+        crate::admin_tab::AdminTab::Feedback,
+        catalog::settings::TAB_FEEDBACK,
+        &[
+            "피드백",
+            "의견",
+            "버그",
+            "제보",
+            "문의",
+            "feedback",
+            "bug",
+            "report",
         ],
     ),
     (
@@ -5998,6 +6028,18 @@ mod platform_shortcut_tests {
             ko_spawn
                 .contains(catalog::settings::REMOTE_HOST_DISCONNECTED.in_language(Language::Ko)),
             "{ko_spawn}"
+        );
+    }
+
+    #[test]
+    fn bots_sidebar_section_title_is_translated_in_korean() {
+        assert_eq!(
+            catalog::bots::SB_SECTION_TITLE.in_language(Language::Ko),
+            "봇"
+        );
+        assert_eq!(
+            catalog::bots::SB_SECTION_TITLE.in_language(Language::En),
+            "Bots"
         );
     }
 }

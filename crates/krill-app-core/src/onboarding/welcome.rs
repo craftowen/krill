@@ -1237,7 +1237,6 @@ impl Render for Wizard {
             .id("onboarding-wizard")
             .debug_selector(|| "onboarding-wizard".into())
             .key_context(KEY_CONTEXT)
-            .track_focus(&self.focus)
             .role(gpui::Role::Dialog)
             .aria_label(text::TITLE.get())
             .occlude()
@@ -1266,7 +1265,10 @@ impl Render for Wizard {
             .child(self.render_header(cx))
             .child(body)
             .child(Self::render_footer(cx));
-        ui::modal_backdrop(window.viewport_size(), card)
+        ui::modal_backdrop(
+            window.viewport_size(),
+            ui::modal_focus_scope(card, &self.focus),
+        )
     }
 }
 

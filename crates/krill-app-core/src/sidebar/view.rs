@@ -1202,19 +1202,7 @@ impl Sidebar {
                     // Orca `ProjectHeaderActions` 패리티: 호버 액션(+, 접기 화살표)은 우측 오버레이로 띄워
                     // 유휴 폭을 확보하고, 호버 시 행 배경색으로 덮어 기기명과 겹치지 않게 한다.
                     .child(
-                        div()
-                            .debug_selector(move || format!("repo-actions-{index}"))
-                            .absolute()
-                            .top_0()
-                            .right_1()
-                            .h_full()
-                            .pl_1()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .rounded(ui::RADIUS_SM)
-                            .when(selected, |d| d.bg(p.sidebar_accent))
-                            .group_hover(ROW_GROUP, |d| d.bg(p.sidebar_accent))
+                        project_actions_overlay(format!("repo-actions-{index}"), p)
                             .when(!dimmed, |d| {
                                 let new_wt_host = row_host.clone();
                                 d.child(
@@ -1335,19 +1323,7 @@ impl Sidebar {
                             .when_some(host_inline, gpui::ParentElement::child),
                     )
                     .child(
-                        div()
-                            .debug_selector(move || format!("folder-actions-{index}"))
-                            .absolute()
-                            .top_0()
-                            .right_1()
-                            .h_full()
-                            .pl_1()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .rounded(ui::RADIUS_SM)
-                            .when(selected, |d| d.bg(p.sidebar_accent))
-                            .group_hover(ROW_GROUP, |d| d.bg(p.sidebar_accent))
+                        project_actions_overlay(format!("folder-actions-{index}"), p)
                             .child(
                                 div()
                                     .flex_none()
@@ -1711,10 +1687,12 @@ impl Sidebar {
         let project =
             super::project_key(row).filter(|_| self.options.group_by == super::GroupBy::Repo);
         let element = element.when_some(project, |d, (_, path)| {
+            let drop_host = row_host.clone();
             let drop_to = path.clone();
             let ring = p.ring;
             d.on_drag(
                 ProjectDrag {
+                    host: row_host.clone(),
                     path: path.clone(),
                     name: self.project_header_name_on(&row_host, path).into(),
                     index,
@@ -1728,7 +1706,7 @@ impl Sidebar {
             })
             .on_drop(cx.listener(move |s, drag: &ProjectDrag, _, cx| {
                 cx.stop_propagation();
-                s.move_project(&drag.path, &drop_to, cx);
+                s.move_project_on(&drag.host, &drag.path, &drop_host, &drop_to, cx);
             }))
         });
         self.card_segment(index, row, element, cx)
@@ -2087,6 +2065,7 @@ impl Sidebar {
                 let ring = p.ring;
                 d.on_drag(
                     WorktreeDrag(ProjectDrag {
+                        host: HostId::Local,
                         path: path.to_path_buf(),
                         name: self.name(path).into(),
                         index,
@@ -2544,6 +2523,7 @@ impl Sidebar {
                                         .children(ports_badge)
                                         .children(pr_badge)
                                         .when(has_agent_pill, |d| {
+                                            let fold_host = row_host.clone();
                                             d.child(
                                                 div()
                                                     .id(("fold", index))
@@ -2559,7 +2539,11 @@ impl Sidebar {
                                                     )
                                                     .on_click(cx.listener(move |s, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        s.toggle_card_sessions(&compact_fold, cx);
+                                                        s.toggle_card_sessions_on(
+                                                            &fold_host,
+                                                            &compact_fold,
+                                                            cx,
+                                                        );
                                                     })),
                                             )
                                         }),
@@ -2926,9 +2910,12 @@ impl Sidebar {
                                             .with_size(ui::ICON_XS)
                                             .text_color(p.muted_foreground),
                                         )
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            cx.stop_propagation();
-                                            s.toggle_card_sessions(&fold, cx);
+                                        .on_click(cx.listener({
+                                            let fold_host = row_host.clone();
+                                            move |s, _, _, cx| {
+                                                cx.stop_propagation();
+                                                s.toggle_card_sessions_on(&fold_host, &fold, cx);
+                                            }
                                         })),
                                 )
                             }
@@ -3800,9 +3787,25 @@ pub(super) fn disconnect_reason(error: &str) -> &'static str {
     }
 }
 
+pub(super) fn project_actions_overlay(selector: String, p: &ui::Palette) -> gpui::Div {
+    div()
+        .debug_selector(move || selector.clone())
+        .absolute()
+        .top_0()
+        .right_1()
+        .h_full()
+        .pl_1()
+        .flex()
+        .items_center()
+        .gap_0p5()
+        .rounded(ui::RADIUS_SM)
+        .group_hover(ROW_GROUP, |d| d.bg(p.sidebar_accent))
+}
+
 /// 끌고 있는 프로젝트 머리줄(놓을 자리 표시와 드래그 미리보기).
 #[derive(Clone)]
 struct ProjectDrag {
+    host: HostId,
     path: PathBuf,
     index: usize,
     name: gpui::SharedString,

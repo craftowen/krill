@@ -1911,17 +1911,6 @@ impl View {
                     .child(Input::new(&i).appearance(false))
             }));
         }
-        let mic_btn = Button::new("bot-item-comment-dictate")
-            .debug_selector(|| "bot-item-comment-dictate".into())
-            .ghost()
-            .xsmall()
-            .icon(
-                Icon::new(IconName::Mic)
-                    .size(px(15.))
-                    .text_color(p.muted_foreground),
-            )
-            .tooltip(hm::COMMENT_DICTATE.get())
-            .accessibility_label(hm::COMMENT_DICTATE.get());
         let send_btn = div()
             .id("bot-item-comment-send")
             .debug_selector(|| "bot-item-comment-send".into())
@@ -1960,7 +1949,6 @@ impl View {
             }));
         tools = tools
             .child(self.render_stepper(replying, p, cx))
-            .child(mic_btn)
             .child(send_btn);
         boxed.child(tools)
     }

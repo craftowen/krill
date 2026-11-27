@@ -1689,6 +1689,8 @@ impl Shell {
         Self::register_overlay_hosts(cx);
         Self::register_account_switch_host(cx);
         shell.refresh_local_state(cx);
+        #[cfg(not(test))]
+        shell.ensure_voice_shortcut_synced(cx);
         shell.orch_poll = Some(Self::poll_orchestration(cx));
         #[cfg(not(test))]
         {
@@ -2452,6 +2454,7 @@ impl Shell {
         self.sync_focused_session(cx);
         self.refresh_local_state(cx);
         self.voice.shortcut_loaded = false;
+        self.voice.shortcut_loading = false;
         self.ensure_voice_shortcut_synced(cx);
         self.files.refocus = true;
         self.focus_modal_or_workspace(window, cx);
@@ -3806,6 +3809,7 @@ impl Shell {
             );
             self.refresh_ssh_hosts(cx);
             self.refresh_bots_badge(cx);
+            self.ensure_voice_shortcut_synced(cx);
             return;
         }
         let home = krill_app_core::accounts::default_home();
@@ -4891,6 +4895,9 @@ impl Shell {
     /// OWE-872: 칸을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
     /// 아니면 바로 닫는다.
     pub(super) fn maybe_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.is_bot_home_pane(pane) {
+            return;
+        }
         if self.has_pane(pane)
             && self.pane_is_running(pane, cx)
             && krill_app_core::settings::confirm_running_close(cx)
@@ -4904,6 +4911,9 @@ impl Shell {
 
     /// OWE-872: 칸을 실제로 닫는다(줌 해제·닫은 기록 포함).
     pub(super) fn do_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.is_bot_home_pane(pane) {
+            return;
+        }
         if !self.has_pane(pane) {
             cx.notify();
             return;
@@ -7562,8 +7572,10 @@ impl Shell {
         let can_forward = self.can_navigate_forward(cx);
         div()
             .id("sidebar-titlebar")
+            .debug_selector(|| "sidebar-titlebar".into())
             .h(krill_app_core::ui::TITLEBAR_HEIGHT)
             .w_full()
+            .overflow_hidden()
             .flex_none()
             .pl(traffic_light_pad(window))
             .pr_2()
@@ -9537,8 +9549,7 @@ impl Render for Shell {
                     this.close_center_diff(cx);
                     return;
                 }
-                if this.layout.visible().len() == 1
-                    && this.layout.is_tab_pinned(this.layout.active())
+                if this.layout.visible().len() == 1 && this.is_tab_unclosable(this.layout.active())
                 {
                     this.request_close_tab(this.layout.active(), cx);
                     return;
@@ -10125,6 +10136,7 @@ impl Render for Shell {
                                 .flex_none()
                                 .w(px(sidebar_width))
                                 .h_full()
+                                .overflow_hidden()
                                 .bg(p.worktree_sidebar)
                                 .text_color(p.worktree_sidebar_foreground)
                                 .flex()
@@ -10332,6 +10344,7 @@ impl Shell {
             || self.confirm_close_tab.is_some()
             || self.pending_running_close.is_some()
             || self.session_switch.is_some()
+            || self.onboarding.is_some()
     }
 
     pub(super) fn has_blocking_overlay(&self) -> bool {
@@ -10384,6 +10397,12 @@ impl Shell {
             if std::mem::take(&mut self.bot_ui.back_to_templates) {
                 self.request_bot_templates(cx);
             }
+            cx.notify();
+            return true;
+        }
+        if self.onboarding.is_some() {
+            self.onboarding = None;
+            window.focus(&self.focus, cx);
             cx.notify();
             return true;
         }

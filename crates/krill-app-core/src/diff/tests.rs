@@ -3252,3 +3252,65 @@ fn explorer_link_row_drop_is_rejected_without_bubbling_to_root(cx: &mut gpui::Te
     assert!(!repo.0.join("never-import.txt").exists());
     assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
 }
+
+#[gpui::test]
+fn center_diff_header_wraps_keeping_open_editor_and_close_inside_560px_width(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct CenterHost(Entity<Panel>);
+    impl gpui::Render for CenterHost {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let panel = self.0.clone();
+            let body = panel.update(cx, |p, cx| p.render_center_diff(window, cx));
+            div().w(px(560.)).h(px(600.)).children(body)
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let mut panel_handle: Option<Entity<Panel>> = None;
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        let p = cx.new(|cx| {
+            let mut panel = Panel::unconnected(PathBuf::from("/repo"), cx);
+            panel.set_split_center(true);
+            panel.changes.files = vec![Repo::file(
+                b"crates/krill-app-core/src/very/long/path/to/modified_file.rs",
+                *b".M",
+            )];
+            panel.loaded = true;
+            panel.selected = Some(0);
+            panel.finish_patch_load(
+                0,
+                Ok(loading_patch(
+                    "crates/krill-app-core/src/very/long/path/to/modified_file.rs",
+                )),
+                cx,
+            );
+            panel
+        });
+        panel_handle = Some(p.clone());
+        CenterHost(p)
+    });
+    let panel = panel_handle.unwrap();
+    cx.simulate_resize(gpui::size(px(560.), px(600.)));
+    cx.run_until_parked();
+    let open_editor = cx.debug_bounds("diff-open-editor").unwrap();
+    let close = cx.debug_bounds("diff-close").unwrap();
+    assert!(
+        f32::from(open_editor.right()) <= 560.0,
+        "UI-21: diff-open-editor right {} clipped past 560px",
+        f32::from(open_editor.right())
+    );
+    assert!(
+        f32::from(close.right()) <= 560.0,
+        "UI-21: diff-close right {} clipped past 560px",
+        f32::from(close.right())
+    );
+    let _ = panel;
+}

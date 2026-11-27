@@ -2244,12 +2244,12 @@ mod tests {
         vcx.run_until_parked();
 
         // Superseded older ask (#47869), Wait card (#47308/#47309), failed comment (#47485),
-        // full-width link chips, and bottom dictate/send buttons all render cleanly.
+        // full-width link chips, and send button render cleanly; unwired dictate control is omitted (UI-15).
         assert!(vcx.debug_bounds("bot-item-ask-replaced-1").is_some());
         assert!(vcx.debug_bounds("bot-item-wait-card").is_some());
         assert!(vcx.debug_bounds("bot-item-failed-comment-1").is_some());
         assert!(vcx.debug_bounds("bot-item-link-chips").is_some());
-        assert!(vcx.debug_bounds("bot-item-comment-dictate").is_some());
+        assert!(vcx.debug_bounds("bot-item-comment-dictate").is_none());
         assert!(vcx.debug_bounds("bot-item-comment-send").is_some());
 
         // Connectors tab shows Webhooks card with Copy URL (#47479).

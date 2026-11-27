@@ -394,7 +394,11 @@ impl View {
         }
     }
 
-    fn ensure_import_dialog_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_import_dialog_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.import_dialog.name_input.is_none() {
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder(text::NAME_PLACEHOLDER.get()));
@@ -407,9 +411,10 @@ impl View {
                             this.import_dialog.typed = Some(inp.read(cx).value().to_string());
                             cx.notify();
                         }
-                        InputEvent::PressEnter { .. }
-                            if !crate::jump::entity_input_is_composing(inp, window, cx) =>
-                        {
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false,
+                        } if !crate::jump::entity_input_is_composing(inp, window, cx) => {
                             this.submit_import_or_update(cx);
                         }
                         _ => {}

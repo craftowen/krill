@@ -2491,3 +2491,80 @@ fn open_floating_registers_remote_target_and_distinguishes_hosts(cx: &mut TestAp
             .unwrap();
     });
 }
+
+#[gpui::test]
+fn provider_remote_tab_uses_inert_local_ghost_without_interactive_ids(cx: &mut TestAppContext) {
+    use krill_app_core::hosts::HostId;
+    use krill_proto::usage::{AccountInfo, AccountsSnapshot, Snapshot, Window};
+    let (shell, handle) = open(cx);
+    let make_acc = |id: &str, active: bool| AccountInfo {
+        id: id.into(),
+        provider: ProviderKind::Claude,
+        label: id.into(),
+        email: None,
+        profile_dir: format!("/tmp/{id}"),
+        active,
+        host_default: false,
+        stale: false,
+        usage: Snapshot {
+            five_hour: Some(Window {
+                percent: 25,
+                resets_at: None,
+            }),
+            seven_day: Some(Window {
+                percent: 40,
+                resets_at: None,
+            }),
+        },
+    };
+    shell.update(cx, |s, cx| {
+        s.link = Link::Up;
+        cx.set_global(krill_app_core::accounts::installed::Installed(Some(vec![
+            ProviderKind::Claude,
+        ])));
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
+            vec![make_acc("local-a", true), make_acc("local-b", false)];
+        let remote_snap = AccountsSnapshot {
+            accounts: vec![make_acc("remote-a", true)],
+            ..AccountsSnapshot::default()
+        };
+        s.remote_accounts.insert(
+            HostId::Remote("studio".into()),
+            std::sync::Arc::new(remote_snap),
+        );
+        s.host_statuses.push((
+            krill_app_core::hosts::RemoteHostSpec {
+                id: "studio".into(),
+                label: "Mac Studio".into(),
+                address: "owen@studio.local".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            },
+            krill_app_core::hosts::HostStatus::Connected,
+        ));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    let pill = vcx.debug_bounds("status-provider-pill-claude").unwrap();
+    vcx.simulate_click(pill.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("status-provider-account-claude-local-a")
+            .is_some(),
+        "local account card must be present on Local tab"
+    );
+    let remote_tab_btn = vcx.debug_bounds("status-provider-tab-remote").unwrap();
+    vcx.simulate_click(remote_tab_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("status-provider-account-claude-local-a")
+            .is_none(),
+        "UI-25: live local interactive account cards must not be prepainted when Remote tab is active"
+    );
+    assert!(
+        vcx.debug_bounds("status-provider-local-scroll").is_none(),
+        "UI-25: live local scroll viewport must not be prepainted when Remote tab is active"
+    );
+}

@@ -5,7 +5,8 @@
 //! - 자동 학습 단어장(빈도 표시, 직접 추가, 삭제/무시)
 
 use gpui::{
-    Context, Entity, FontWeight, KeyDownEvent, SharedString, Task, Window, div, prelude::*,
+    Context, Entity, FontWeight, KeyDownEvent, Keystroke, SharedString, Subscription, Task, Window,
+    div, prelude::*,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
@@ -27,6 +28,7 @@ pub(super) struct VoicePanel {
     pub(super) saving: bool,
     pub(super) error: Option<SharedString>,
     pub(super) capturing_shortcut: bool,
+    pub(super) capture_intercept: Option<Subscription>,
     pub(super) word_input: Option<Entity<InputState>>,
     pub(super) load_task: Option<Task<()>>,
     pub(super) save_task: Option<Task<()>>,
@@ -82,6 +84,15 @@ impl SettingsView {
     }
 
     pub(super) fn apply_voice_patch(&mut self, patch: VoiceConfigPatch, cx: &mut Context<Self>) {
+        self.apply_voice_patch_with_rollback(patch, None, cx);
+    }
+
+    pub(super) fn apply_voice_patch_with_rollback(
+        &mut self,
+        patch: VoiceConfigPatch,
+        rollback: Option<VoiceConfig>,
+        cx: &mut Context<Self>,
+    ) {
         let call = self.voice.caller();
         self.voice.saving = true;
         self.voice.error = None;
@@ -105,6 +116,9 @@ impl SettingsView {
                         this.voice.config = cfg;
                     }
                     Err(err) => {
+                        if let Some(prev) = rollback {
+                            this.voice.config = prev;
+                        }
                         this.voice.error = Some(SharedString::from(err.to_string()));
                     }
                 }
@@ -114,34 +128,81 @@ impl SettingsView {
         }));
     }
 
-    /// 설정 창에서 음성 단축키 캡처 모드일 때 키 입력을 가로챈다. 처리했으면 `true`.
-    pub(super) fn handle_voice_shortcut_key(
+    pub(super) fn stop_voice_shortcut_capture(&mut self) {
+        self.voice.capturing_shortcut = false;
+        self.voice.capture_intercept = None;
+    }
+
+    pub(super) fn start_voice_shortcut_capture(
         &mut self,
-        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        let view = cx.weak_entity();
+        let window_id = window.window_handle().window_id();
+        let intercept = cx.intercept_keystrokes(move |ev, window, cx| {
+            if window.window_handle().window_id() != window_id {
+                return;
+            }
+            let keystroke = ev.keystroke.clone();
+            let handled = view
+                .update(cx, |this, cx| {
+                    this.on_voice_shortcut_keystroke(&keystroke, cx)
+                })
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+            }
+        });
+        self.voice.capturing_shortcut = true;
+        self.voice.capture_intercept = Some(intercept);
+        cx.notify();
+    }
+
+    fn on_voice_shortcut_keystroke(
+        &mut self,
+        keystroke: &Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.voice.capturing_shortcut {
             return false;
         }
-        if ev.keystroke.key == "escape" {
-            self.voice.capturing_shortcut = false;
+        if self.tab != super::AdminTab::Voice {
+            self.stop_voice_shortcut_capture();
+            cx.notify();
+            return false;
+        }
+        if keystroke.key == "escape" {
+            self.stop_voice_shortcut_capture();
             cx.notify();
             return true;
         }
-        if let Some(formatted) = voice::format_keystroke(&ev.keystroke) {
-            self.voice.capturing_shortcut = false;
+        if let Some(formatted) = voice::format_keystroke(keystroke) {
+            self.stop_voice_shortcut_capture();
+            let prev = self.voice.config.clone();
             self.voice.config.desktop_shortcut.clone_from(&formatted);
-            self.apply_voice_patch(
+            self.apply_voice_patch_with_rollback(
                 VoiceConfigPatch {
                     desktop_shortcut: Some(formatted),
                     ..VoiceConfigPatch::default()
                 },
+                Some(prev),
                 cx,
             );
             return true;
         }
         // 단독 수식키 등은 계속 캡처 대기한다.
         true
+    }
+
+    /// 설정 창에서 음성 단축키 캡처 모드일 때 키 입력을 가로챈다. 처리했으면 `true`.
+    pub(super) fn handle_voice_shortcut_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.on_voice_shortcut_keystroke(&ev.keystroke, cx)
     }
 
     pub(super) fn render_voice_tab(
@@ -246,12 +307,14 @@ impl SettingsView {
                 saving,
                 move |next, _, cx| {
                     refine_entity.update(cx, |this, cx| {
+                        let prev = this.voice.config.clone();
                         this.voice.config.refine_enabled = next;
-                        this.apply_voice_patch(
+                        this.apply_voice_patch_with_rollback(
                             VoiceConfigPatch {
                                 refine_enabled: Some(next),
                                 ..VoiceConfigPatch::default()
                             },
+                            Some(prev),
                             cx,
                         );
                     });
@@ -277,9 +340,12 @@ impl SettingsView {
                             .debug_selector(|| "voice-shortcut-capture".into())
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.voice.capturing_shortcut = !this.voice.capturing_shortcut;
-                                window.focus(&this.focus, cx);
-                                cx.notify();
+                                if this.voice.capturing_shortcut {
+                                    this.stop_voice_shortcut_capture();
+                                    cx.notify();
+                                } else {
+                                    this.start_voice_shortcut_capture(window, cx);
+                                }
                             }))
                             .child(if capturing {
                                 ui::badge(
@@ -297,14 +363,18 @@ impl SettingsView {
                                 .debug_selector(|| "voice-shortcut-reset".into())
                                 .disabled(saving)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.voice.capturing_shortcut = false;
-                                    this.apply_voice_patch(
+                                    this.stop_voice_shortcut_capture();
+                                    let prev = this.voice.config.clone();
+                                    DEFAULT_DESKTOP_SHORTCUT
+                                        .clone_into(&mut this.voice.config.desktop_shortcut);
+                                    this.apply_voice_patch_with_rollback(
                                         VoiceConfigPatch {
                                             desktop_shortcut: Some(
                                                 DEFAULT_DESKTOP_SHORTCUT.to_owned(),
                                             ),
                                             ..VoiceConfigPatch::default()
                                         },
+                                        Some(prev),
                                         cx,
                                     );
                                 })),
