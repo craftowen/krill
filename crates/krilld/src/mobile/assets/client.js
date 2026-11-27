@@ -1619,16 +1619,30 @@
       }
       // A read that loses its socket waits for the next connection and is asked once more there.
       // Mutations are never resent: their delivery is unknown.
+      const reconnectWaiters = new Set();
+      function failReconnectWaiters() {
+        for (const cancel of [...reconnectWaiters]) cancel();
+        reconnectWaiters.clear();
+      }
       function reconnected() {
         return new Promise((resolve, reject) => {
           if (connected) return resolve();
+          if (stopped || authBlocked) return reject();
           const done = () => {
-            (clearTimeout(timeout), routeListeners.delete(done), resolve());
+            (clearTimeout(timeout),
+              routeListeners.delete(done),
+              reconnectWaiters.delete(fail),
+              resolve());
           };
-          const timeout = setTimeout(() => {
-            (routeListeners.delete(done), reject());
-          }, 20e3);
+          const fail = () => {
+            (clearTimeout(timeout),
+              routeListeners.delete(done),
+              reconnectWaiters.delete(fail),
+              reject());
+          };
+          const timeout = setTimeout(fail, 20e3);
           routeListeners.add(done);
+          reconnectWaiters.add(fail);
         });
       }
       function rpc(request, latest, probe = !1, retried = !1) {
@@ -1686,6 +1700,7 @@
                 !error.definitive &&
                 error.diagnosticReason !== "protocol_error" &&
                 !stopped &&
+                !authBlocked &&
                 (!connected || current !== generation)
               )
                 return reconnected().then(
@@ -2031,6 +2046,7 @@
                   if (denied && !routeAlternative) {
                     authBlocked = true;
                     clearTimeout(retryTimer);
+                    failReconnectWaiters();
                     if (!pair && !capacity)
                       options.endpoint?.setAuthBlocked?.(true);
                   }
@@ -2702,6 +2718,7 @@
           clearTimeout(retryTimer);
           clearTimeout(resumeTimer);
           clearWarm(true);
+          failReconnectWaiters();
           disconnect(transportClosed("Disconnected"));
           generation++;
           connecting = false;

@@ -174,7 +174,7 @@ pub(super) struct State {
     pub(super) connections: HashMap<u64, Connection>,
     pub(super) next: u64,
     pub(super) stopped: bool,
-    relay: Option<super::relay::RelayClient>,
+    pub(super) relay: Option<super::relay::RelayClient>,
     relay_ctx: Option<RelayContext>,
     saved_port: Option<u16>,
     pub(super) publication: super::relay::Publication,
@@ -454,7 +454,19 @@ impl Gateway {
             .stack_size(STACK)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
-                accept(&worker, &registry, &hello);
+                loop {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        accept(&worker, &registry, &hello);
+                    }));
+                    if result.is_ok() {
+                        break;
+                    }
+                    tracing::error!("mobile-listen thread panicked; retrying accept loop");
+                    if lock(&worker.state).stopped {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
             })?;
         Ok(Arc::new(Self { shared, backend }))
     }
@@ -518,6 +530,16 @@ impl Gateway {
         let fragment = (|| -> io::Result<String> {
             let mut state = lock(&self.shared.state);
             let now = now_ms();
+            // Validate transport and URL preconditions before minting or rotating any live ticket.
+            let probe = krill_proto::mobile::PairingTicket {
+                token: [0; 32],
+                secret: [0; 32],
+                expires_at_ms: now,
+            };
+            let MobileReply::PairingOffer { .. } = pairing_offer_with_ticket(&state, &probe)?
+            else {
+                return Err(invalid());
+            };
             let reusable = state
                 .devices
                 .ticket(now)
@@ -527,10 +549,11 @@ impl Gateway {
                         && current.expires_at_ms.saturating_sub(now) >= 30_000
                 });
             let ticket = state.devices.mint(now, !reusable)?;
-            state.install_offer = Some(ticket);
-            let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now)? else {
+            let MobileReply::PairingOffer { url, .. } = pairing_offer_with_ticket(&state, &ticket)?
+            else {
                 return Err(invalid());
             };
+            state.install_offer = Some(ticket);
             let (_, fragment) = url.split_once('#').ok_or_else(invalid)?;
             Ok(fragment.to_owned())
         })();
@@ -789,6 +812,13 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
 }
 fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let ticket = state.devices.ticket(now).ok_or_else(invalid)?;
+    pairing_offer_with_ticket(state, ticket)
+}
+
+fn pairing_offer_with_ticket(
+    state: &State,
+    ticket: &krill_proto::mobile::PairingTicket,
+) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = if state.mode == ConnectMode::Tunnel {
         state
@@ -1194,8 +1224,16 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                     shared: Arc::clone(&s),
                     id,
                 };
-                if let Err(error) = serve(socket, &s, id, &r, &h) {
-                    tracing::debug!(kind=?error.kind(), "mobile connection ended");
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    serve(socket, &s, id, &r, &h)
+                })) {
+                    Ok(Err(error)) => {
+                        tracing::debug!(kind=?error.kind(), "mobile connection ended");
+                    }
+                    Ok(Ok(())) => {}
+                    Err(_) => {
+                        tracing::error!("mobile-ws thread panicked");
+                    }
                 }
                 drop(guard);
                 crate::alloc::purge();
@@ -1416,6 +1454,24 @@ fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Re
     result
 }
 
+struct TcpShutdownGuard(Arc<Mutex<TcpStream>>);
+impl Drop for TcpShutdownGuard {
+    fn drop(&mut self) {
+        crate::alloc::purge();
+        lock(&self.0).shutdown(Shutdown::Both).ok();
+    }
+}
+
+struct UnixShutdownGuard(Option<UnixStream>);
+impl Drop for UnixShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done.shutdown(Shutdown::Both).ok();
+        }
+        crate::alloc::purge();
+    }
+}
+
 /// 암호화 페이로드 하나는 IPC 프레임 하나다. 연결이 끊기면 이 pair만 닫는다.
 fn bridge(
     mut socket: TcpStream,
@@ -1451,22 +1507,27 @@ fn bridge(
         .stack_size(STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
-            let result = (|| -> io::Result<()> {
-                while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
-                    let large = body.len() > 8 * 1024;
-                    let frame = ipc::encode_frame(kind, &body)?;
-                    drop(body);
-                    send(&frame)?;
-                    drop(frame);
-                    if large {
-                        crate::alloc::purge();
+            let _guard = TcpShutdownGuard(w);
+            if let Ok(result) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                    while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
+                        let large = body.len() > 8 * 1024;
+                        let frame = ipc::encode_frame(kind, &body)?;
+                        drop(body);
+                        send(&frame)?;
+                        drop(frame);
+                        if large {
+                            crate::alloc::purge();
+                        }
                     }
-                }
-                Ok(())
-            })();
-            crate::alloc::purge();
-            lock(&w).shutdown(Shutdown::Both).ok();
-            result
+                    Ok(())
+                }))
+            {
+                result
+            } else {
+                tracing::error!("mobile-out thread panicked");
+                Err(io::Error::other("mobile-out panicked"))
+            }
         })?;
     let installed = Arc::clone(&feed);
     let worker = thread::Builder::new()
@@ -1475,15 +1536,17 @@ fn bridge(
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
             // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
-            // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료) 여기서 닫아 WS도 닫히게 한다.
-            let done = server.try_clone();
+            // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료·패닉) 여기서 닫아 WS도 닫히게 한다.
+            let _done = UnixShutdownGuard(server.try_clone().ok());
             installed.install();
-            let result = registry.serve_mobile(server, &hello);
-            if let Ok(done) = done {
-                done.shutdown(Shutdown::Both).ok();
+            if let Ok(result) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.serve_mobile(server, &hello)
+            })) {
+                result
+            } else {
+                tracing::error!("mobile-ipc thread panicked");
+                Err(io::Error::other("mobile-ipc panicked"))
             }
-            crate::alloc::purge();
-            result
         });
     let result = if worker.is_ok() {
         (|| -> io::Result<()> {
@@ -1547,8 +1610,9 @@ mod tests;
 #[cfg(all(test, unix))]
 mod handoff_regression_tests {
     use super::*;
-    #[test]
-    fn repeated_install_handoff_preserves_a_valid_offer_then_renews_near_expiry() {
+
+    #[expect(clippy::unwrap_used, reason = "test helper")]
+    fn gateway_with_loopback_route() -> (Arc<Registry>, Arc<Gateway>) {
         let registry = Arc::new(Registry::new(None, None));
         registry
             .start_mobile(ServerHello {
@@ -1559,14 +1623,29 @@ mod handoff_regression_tests {
                 instance_id: 1,
             })
             .unwrap();
-        let gateway = registry.mobile_gateway().unwrap();
-        gateway.install_handoff();
+        let gateway = Arc::clone(registry.mobile_gateway().unwrap());
+        let reply = gateway.request(MobileRequest::MintPairingTicket {
+            mode: ConnectMode::Lan,
+            custom_address: Some("127.0.0.1:0".into()),
+            rotate: true,
+        });
+        assert!(
+            matches!(reply, MobileReply::PairingOffer { .. }),
+            "{reply:?}"
+        );
+        (registry, gateway)
+    }
+
+    #[test]
+    fn repeated_install_handoff_preserves_a_valid_offer_then_renews_near_expiry() {
+        let (_registry, gateway) = gateway_with_loopback_route();
+        assert_eq!(gateway.install_handoff()["ok"], true);
         let first = lock(&gateway.shared.state)
             .devices
             .ticket(now_ms())
             .unwrap()
             .clone();
-        gateway.install_handoff();
+        assert_eq!(gateway.install_handoff()["ok"], true);
         assert_eq!(
             lock(&gateway.shared.state)
                 .devices
@@ -1581,7 +1660,7 @@ mod handoff_regression_tests {
             state.install_offer = Some(ticket.clone());
             ticket
         };
-        gateway.install_handoff();
+        assert_eq!(gateway.install_handoff()["ok"], true);
         let state = lock(&gateway.shared.state);
         let renewed = state.devices.ticket(now_ms()).unwrap();
         assert_ne!(renewed.token, nearly_expired.token);
@@ -1590,24 +1669,12 @@ mod handoff_regression_tests {
 
     #[test]
     fn install_handoff_rotates_a_nearly_expired_ticket() {
-        let registry = Arc::new(Registry::new(None, None));
-        registry
-            .start_mobile(ServerHello {
-                proto_min: 1,
-                proto_max: 1,
-                features: ipc::FEATURES,
-                build: "test".into(),
-                instance_id: 1,
-            })
-            .unwrap();
-        let gateway = registry.mobile_gateway().unwrap();
+        let (_registry, gateway) = gateway_with_loopback_route();
         let old = lock(&gateway.shared.state)
             .devices
             .mint(now_ms() - 299_000, true)
             .unwrap();
-        // Even when no route is configured and an offer cannot yet be delivered,
-        // the installation request must replace the nearly expired credential.
-        gateway.install_handoff();
+        assert_eq!(gateway.install_handoff()["ok"], true);
         let state = lock(&gateway.shared.state);
         let ticket = state.devices.ticket(now_ms()).unwrap();
         assert_ne!(ticket.token, old.token);

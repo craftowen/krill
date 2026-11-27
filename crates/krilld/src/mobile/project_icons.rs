@@ -179,6 +179,7 @@ impl RepoIconCache {
         let failed_urls = Arc::clone(&self.failed_urls);
         let revision = Arc::clone(&self.revision);
         let scheduled_paths: Vec<PathBuf> = queued.iter().map(|t| t.repo.clone()).collect();
+        let rollback_paths = scheduled_paths.clone();
         let spawned = thread::Builder::new()
             .name("mobile-icon-swr".into())
             .stack_size(128 * 1024)
@@ -245,12 +246,16 @@ impl RepoIconCache {
                 crate::alloc::purge();
             });
         if spawned.is_err() {
-            let mut inflight = crate::session::lock(&self.inflight);
-            for target in targets {
-                inflight.remove(&target.repo);
-            }
+            self.rollback_inflight(&rollback_paths);
         }
         found
+    }
+
+    fn rollback_inflight(&self, paths: &[PathBuf]) {
+        let mut inflight = crate::session::lock(&self.inflight);
+        for path in paths {
+            inflight.remove(path);
+        }
     }
 
     /// 등록된 저장소 키 배치를 읽어 최대 256 KiB 한도 안에서 아이콘 payload를 돌려준다.
@@ -757,5 +762,27 @@ mod tests {
         let cache = RepoIconCache::default();
         let too_many: Vec<String> = (0..=MAX_BATCH_KEYS).map(|i| format!("{i:04x}")).collect();
         assert!(cache.read_batch(&catalog, &too_many, None).is_err());
+    }
+
+    #[test]
+    fn rollback_inflight_preserves_other_active_threads_paths() {
+        let cache = RepoIconCache::default();
+        let repo1 = PathBuf::from("/tmp/repo-already-inflight");
+        let repo2 = PathBuf::from("/tmp/repo-newly-scheduled");
+        {
+            let mut inflight = crate::session::lock(&cache.inflight);
+            inflight.insert(repo1.clone());
+            inflight.insert(repo2.clone());
+        }
+        cache.rollback_inflight(std::slice::from_ref(&repo2));
+        let inflight = crate::session::lock(&cache.inflight);
+        assert!(
+            inflight.contains(&repo1),
+            "pre-existing inflight path must not be removed on sibling spawn failure"
+        );
+        assert!(
+            !inflight.contains(&repo2),
+            "newly scheduled path must be removed on spawn failure"
+        );
     }
 }

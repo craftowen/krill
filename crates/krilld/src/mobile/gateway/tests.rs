@@ -2504,3 +2504,98 @@ fn relay_handshake_answered_after_five_seconds_still_authenticates() {
     assert_eq!(kind, MUX_BINARY, "authenticated instead of closed");
     let _: Authenticated = serde_json::from_slice(&channel.open(&sealed).unwrap()).unwrap();
 }
+
+#[test]
+fn paired_mobile_ws_denies_desktop_admin_mobile_requests() {
+    let (_registry, gateway) = start();
+    let (port, ticket) = offer(&gateway);
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let original_mode = lock(&gateway.shared.state).mode;
+    let original_devices = lock(&gateway.shared.state).devices.active_count();
+    let admin_requests = [
+        MobileRequest::MintPairingTicket {
+            mode: ConnectMode::Lan,
+            custom_address: Some("127.0.0.1:0".into()),
+            rotate: true,
+        },
+        MobileRequest::CurrentPairingOffer,
+        MobileRequest::SetConnectMode {
+            mode: ConnectMode::Tunnel,
+            custom_address: None,
+        },
+        MobileRequest::CancelPairingTicket,
+        MobileRequest::RevokeDevice {
+            device_id: None,
+            all: true,
+        },
+        MobileRequest::ListDevices,
+        MobileRequest::ConnectedDevices,
+    ];
+    for req in admin_requests {
+        phone.write(&req.encode().unwrap());
+        let (kind, body) = phone.read().unwrap();
+        assert_eq!(
+            MobileReply::decode(kind, &body).unwrap(),
+            MobileReply::Failed("permission denied".into()),
+            "admin request must be denied over mobile WS"
+        );
+    }
+    assert_eq!(lock(&gateway.shared.state).mode, original_mode);
+    assert_eq!(
+        lock(&gateway.shared.state).devices.active_count(),
+        original_devices
+    );
+    // Read-only Status and Workflow remain permitted over paired mobile WS.
+    phone.write(&MobileRequest::Status.encode().unwrap());
+    let (kind, body) = phone.read().unwrap();
+    assert!(matches!(
+        MobileReply::decode(kind, &body).unwrap(),
+        MobileReply::GatewayStatus { .. }
+    ));
+    phone.write(
+        &MobileRequest::Workflow("{\"action\":\"snapshot\"}".into())
+            .encode()
+            .unwrap(),
+    );
+    let (kind, body) = phone.read().unwrap();
+    assert!(matches!(
+        MobileReply::decode(kind, &body).unwrap(),
+        MobileReply::Workflow(_)
+    ));
+}
+
+#[test]
+fn install_handoff_validates_preconditions_before_minting_or_rotating_ticket() {
+    let (_registry, gateway) = start();
+    // Case 1: unready Tunnel mode (relay = None) with no prior ticket must not mint or store install_offer.
+    {
+        let mut s = lock(&gateway.shared.state);
+        s.mode = ConnectMode::Tunnel;
+        s.relay = None;
+        s.devices.clear_ticket();
+        s.install_offer = None;
+    }
+    let reply = gateway.install_handoff();
+    assert_eq!(reply["ok"], false, "expected error: {reply}");
+    {
+        let s = lock(&gateway.shared.state);
+        assert!(s.devices.ticket(now_ms()).is_none());
+        assert!(s.install_offer.is_none());
+    }
+    // Case 2: an existing desktop QR ticket must not be rotated/invalidated when handoff fails.
+    let existing_token = {
+        let mut s = lock(&gateway.shared.state);
+        s.devices.mint(now_ms(), true).unwrap().token
+    };
+    let reply = gateway.install_handoff();
+    assert_eq!(reply["ok"], false, "expected error: {reply}");
+    {
+        let s = lock(&gateway.shared.state);
+        assert_eq!(
+            s.devices.ticket(now_ms()).map(|t| t.token),
+            Some(existing_token)
+        );
+        assert!(s.install_offer.is_none());
+    }
+}

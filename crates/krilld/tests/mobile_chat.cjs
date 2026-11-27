@@ -199,6 +199,7 @@ function fixture(options = {}) {
       sheets.push({ title, body });
     },
   };
+  if (options.voice) sandbox.KrillMobile.voice = options.voice;
   let view = sandbox.KrillMobile.chat.mount(root, {
     ctx,
     sessionId: 7,
@@ -6789,6 +6790,80 @@ async function unboundEmptyAndVisibilityTransitions() {
         process.off("unhandledRejection", onOrphanUnhandled);
       }
       console.log("PASS regression: orphaned foldable note across non-foldable assistant and loadEarlier");
+    }
+    // MOB-02, MOB-04, MOB-07, MOB-16 regressions in chat.js
+    {
+      let voiceOpts = null;
+      let voiceCleaned = 0;
+      const fMob = fixture({
+        capabilities: { composer_models: true, chat_composer: true },
+        voice: {
+          attach(_ta, _host, opts) {
+            voiceOpts = opts;
+            return {
+              el: null,
+              onSend() {},
+              setDisabled() {},
+              cleanup() {
+                voiceCleaned++;
+              },
+            };
+          },
+        },
+        handler: async (req) => {
+          if (req.action === "chat_poll") {
+            return {
+              generation: "g-mob",
+              agent: "claude",
+              bound: true,
+              next_offset: 10,
+              items: [
+                { id: "m1", kind: "assistant", text: "alpha hit one" },
+                { id: "m2", kind: "assistant", text: "alpha hit two" },
+              ],
+            };
+          }
+          if (req.action === "chat_composer_status") {
+            return { supported: true, models: [{ id: "m1", label: "M1" }], effort_supported: false };
+          }
+          if (req.action === "composer_models") {
+            return { supported: true, items: [{ id: "m1", label: "M1" }] };
+          }
+          return {};
+        },
+      });
+      await flush();
+      // MOB-02: invoking voice onInsert calls sizeInput(true) without throwing ReferenceError.
+      assert(voiceOpts && typeof voiceOpts.onInsert === "function", "MOB-02: voice.attach receives onInsert");
+      assert.doesNotThrow(() => voiceOpts.onInsert("dictated phrase"), "MOB-02: onInsert must not throw ReferenceError");
+      // MOB-07: chooseModel() blurs document.activeElement before opening model sheet.
+      let blurred = 0;
+      const inputEl = fMob.find("chat-input");
+      inputEl.blur = () => { blurred++; };
+      fMob.doc.activeElement = inputEl;
+      const modelBtn = fMob.find("composer-model-name")?.parentElement;
+      assert(modelBtn && typeof modelBtn.action === "function", "model button exists");
+      modelBtn.action();
+      await flush();
+      assert(blurred >= 1, "MOB-07: chooseModel() blurs activeElement before opening model sheet");
+      // MOB-16: Chat Search Enter ignored during IME composition (isComposing / keyCode 229).
+      const searchToggle = fMob.root.descendants().find((n) => n.attrs?.["aria-label"] === "Search messages");
+      searchToggle?.action?.();
+      await flush();
+      const searchIn = fMob.find("chat-search-input");
+      assert(searchIn, "chat search input exists");
+      searchIn.value = "alpha";
+      searchIn.dispatchEvent(new Event("input"));
+      const countEl = fMob.find("chat-search-count");
+      const beforeCount = countEl?.textContent;
+      searchIn.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { key: "Enter", isComposing: true }));
+      assert.equal(countEl?.textContent, beforeCount, "MOB-16: Enter with isComposing must not step search");
+      searchIn.dispatchEvent(Object.assign(new Event("keydown", { cancelable: true }), { key: "Enter", keyCode: 229 }));
+      assert.equal(countEl?.textContent, beforeCount, "MOB-16: Enter with keyCode 229 must not step search");
+      // MOB-04: chat unmount calls voiceCtl.cleanup().
+      fMob.dispose();
+      assert.equal(voiceCleaned, 1, "MOB-04: chat unmount cleans up voiceCtl");
+      console.log("PASS MOB-02/MOB-04/MOB-07/MOB-16 chat voice insert, unmount cleanup, model blur & search IME guard");
     }
   }
 }

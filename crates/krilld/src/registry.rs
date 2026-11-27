@@ -824,13 +824,19 @@ impl Registry {
             while let Some((kind, body)) = frame {
                 let request = MobileRequest::decode(kind, &body)?;
                 let allowed = peer.scope.full()
-                    && (role != Role::Observer
-                        || matches!(
-                            request,
-                            MobileRequest::Status
-                                | MobileRequest::ListDevices
-                                | MobileRequest::ConnectedDevices
-                        ));
+                    && if mobile {
+                        matches!(request, MobileRequest::Status)
+                            || (role != Role::Observer
+                                && matches!(request, MobileRequest::Workflow(_)))
+                    } else {
+                        role != Role::Observer
+                            || matches!(
+                                request,
+                                MobileRequest::Status
+                                    | MobileRequest::ListDevices
+                                    | MobileRequest::ConnectedDevices
+                            )
+                    };
                 let reply = if !allowed {
                     MobileReply::Failed("permission denied".into())
                 } else if let Some(gateway) = self.mobile.get() {

@@ -889,6 +889,21 @@ el("p", cur.subtitle, cur.kind === "schedule_error" ? "account-error bot-decisio
 );
 }
 const actions = el("div", undefined, "bot-decision-card-actions");
+let cardBusy = false;
+const cardActionButtons = [];
+const setCardBusy = (v) => {
+cardBusy = v;
+for (const b of cardActionButtons) b.disabled = v || !ready();
+};
+const runCardAction = async (fn) => {
+if (cardBusy || !ready()) return;
+setCardBusy(true);
+try {
+await fn();
+} finally {
+setCardBusy(false);
+}
+};
 const finishMutation = async (hostId, toastMsg) => {
 if (toastMsg) ctx.toast?.(toastMsg);
 await refreshHost(ctx, hostId).catch(() => {});
@@ -909,8 +924,8 @@ optsList.forEach((opt, optIdx) => {
 const isRec = firstDec.recommended === optIdx;
 const btn = button(
 "",
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 const multiQ = latest.decisions.length > 1;
 await rpcHost(ctx, cur.hostId, {
 action: "bots.item.answer",
@@ -920,13 +935,14 @@ decision_id: `${latest.event.id}:${dIdx}`,
 answer_text: multiQ ? `${questionLine(firstDec.question)} → ${opt}` : opt,
 });
 await finishMutation(cur.hostId, t("Answer sent"));
-},
+}),
 `${isRec ? "primary" : "secondary"} small bot-opt-btn`,
 );
 btn.setAttribute("aria-label", opt);
 btn.append(el("span", opt));
 if (isRec) btn.append(el("span", t("Recommended"), "bot-rec-badge"));
 btn.disabled = !ready();
+cardActionButtons.push(btn);
 actions.append(btn);
 });
 } else {
@@ -950,6 +966,7 @@ draftKey: `bot-item:${cur.hostId ? `${cur.hostId}:${cur.item.uid}` : cur.item.ui
 "primary small",
 );
 answerBtn.disabled = !ready();
+cardActionButtons.push(answerBtn);
 actions.append(answerBtn);
 }
 } else {
@@ -959,73 +976,76 @@ card.append(el("p", ctxNote.text, "muted bot-decision-card-sub"));
 }
 const doneBtn = button(
 t("Done"),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 await rpcHost(ctx, cur.hostId, {
 action: "bots.item.update",
 item_id: cur.item.uid,
 status: "done",
 });
 await finishMutation(cur.hostId, t("Done"));
-},
+}),
 "primary small",
 );
 const snoozeBtn = button(
 t("Snooze 4h"),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 await rpcHost(ctx, cur.hostId, {
 action: "bots.item.update",
 item_id: cur.item.uid,
 snoozed_until_ms: { set: Date.now() + 4 * 3600 * 1000 },
 });
 await finishMutation(cur.hostId, t("Snooze 4h"));
-},
+}),
 "secondary small",
 );
 doneBtn.disabled = snoozeBtn.disabled = !ready();
+cardActionButtons.push(doneBtn, snoozeBtn);
 actions.append(doneBtn, snoozeBtn);
 }
 } else if (cur.kind === "access") {
 const approveBtn = button(
 t("Approve"),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 await rpcHost(ctx, cur.hostId, { action: "bots.access.decide", token: cur.request.token, approve: true });
 await finishMutation(cur.hostId, t("Access approved"));
-},
+}),
 "primary small",
 );
 const denyBtn = button(
 t("Deny"),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 await rpcHost(ctx, cur.hostId, { action: "bots.access.decide", token: cur.request.token, approve: false });
 await finishMutation(cur.hostId, t("Access declined"));
-},
+}),
 "secondary small",
 );
 approveBtn.disabled = denyBtn.disabled = !ready();
+cardActionButtons.push(approveBtn, denyBtn);
 actions.append(approveBtn, denyBtn);
 } else if (cur.kind === "gate") {
 (cur.gate.options || []).forEach((opt, optIdx) => {
 const b = button(
 t(opt),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 await rpcHost(ctx, cur.hostId, { action: "gate_reply", id: cur.gate.id, decision: opt });
 await finishMutation(cur.hostId, t("Decision sent."));
-},
+}),
 optIdx === 0 ? "primary small" : "secondary small",
 );
 b.disabled = !ready();
+cardActionButtons.push(b);
 actions.append(b);
 });
 } else if (cur.kind === "schedule_error") {
 const retryBtn = button(
 t("Run now"),
-async () => {
-if (!ready()) return;
+() =>
+runCardAction(async () => {
 try {
 await rpcHost(ctx, cur.hostId, {
 action: "bots.schedule.run",
@@ -1036,10 +1056,11 @@ await finishMutation(cur.hostId, t("Schedule started"));
 } catch (err) {
 ctx.toast?.(safeMsg(err, t));
 }
-},
+}),
 "primary small",
 );
 retryBtn.disabled = !ready();
+cardActionButtons.push(retryBtn);
 actions.append(retryBtn);
 }
 if (cards.length > 1 && onNext) {
@@ -1111,16 +1132,24 @@ el("strong", req.sender_name || req.sender_id || t("Sender")),
 el("small", meta, "muted"),
 );
 const actions = el("div", undefined, "bots-row-actions");
+let rowBusy = false;
+const allow = button(t("Approve"), () => decide(true), "primary small");
+const deny = button(t("Deny"), () => decide(false), "ghost small");
 const decide = async (approve) => {
-if (!ready()) return;
+if (rowBusy || !ready()) return;
+rowBusy = true;
+allow.disabled = deny.disabled = true;
+try {
 await rpcHost(ctx, req._hostId, { action: "bots.access.decide", token: req.token, approve });
 ctx.toast?.(approve ? t("Access approved") : t("Access declined"));
 await refreshHost(ctx, req._hostId).catch(() => {});
 ctx.syncTabBar?.();
 await reload();
+} finally {
+rowBusy = false;
+allow.disabled = deny.disabled = !ready();
+}
 };
-const allow = button(t("Approve"), () => decide(true), "primary small");
-const deny = button(t("Deny"), () => decide(false), "ghost small");
 allow.disabled = deny.disabled = !ready();
 actions.append(allow, deny);
 row.append(copy, actions);
@@ -1810,6 +1839,7 @@ await entry.onReload?.();
 };
 urlInput.addEventListener("keydown", (ev) => {
 if (ev.key === "Enter") {
+if (ev.isComposing || ev.keyCode === 229) return;
 ev.preventDefault();
 ctx.act(add);
 }
@@ -1938,9 +1968,17 @@ el("small", [showBot ? botDisplayName(bots, s.bot_id) : null, multiHost && s._ho
 );
 if (s.ask) main.append(el("small", s.ask, "muted"));
 const actions = el("div", undefined, "bots-row-actions");
+let sugBusy = false;
+const setSugBusy = (v) => {
+sugBusy = v;
+startBtn.disabled = dismissBtn.disabled = v || !ready();
+};
 const startBtn = button(
 t("Start"),
 async () => {
+if (sugBusy || !ready()) return;
+setSugBusy(true);
+try {
 const res = await rpcHost(ctx, s._hostId, {
 action: "bots.suggestions.start",
 bot_id: s.bot_id,
@@ -1955,18 +1993,27 @@ return;
 }
 ctx.toast?.(t("Suggestion started"));
 await reload();
+} finally {
+setSugBusy(false);
+}
 },
 "primary small",
 );
 const dismissBtn = button(
 t("Dismiss"),
 async () => {
+if (sugBusy || !ready()) return;
+setSugBusy(true);
+try {
 await rpcHost(ctx, s._hostId, {
 action: "bots.suggestions.dismiss",
 bot_id: s.bot_id,
 suggestion_id: s.id,
 });
 await reload();
+} finally {
+setSugBusy(false);
+}
 },
 "ghost small",
 );
@@ -3449,7 +3496,15 @@ requests.filter((r) => r.status === "pending").length
 function currentAutoErrCount() {
 return (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error).length;
 }
+let firstChatVoice = null;
+function cleanupFirstChatVoice() {
+if (firstChatVoice) {
+firstChatVoice.cleanup?.();
+firstChatVoice = null;
+}
+}
 function unmountChat() {
+cleanupFirstChatVoice();
 if (chatHandle) {
 chatHandle.unmount?.();
 chatHandle = null;
@@ -3594,10 +3649,20 @@ if (!ctx.signal.aborted) draw();
 }
 let lastEmptyKey = null;
 function renderChatEmptyState() {
-const emptyKey = JSON.stringify([Boolean(bot?.paused), chatRefusal || "", Boolean(chatStarting), Boolean(ready())]);
+const notFound = loaded && !bot;
+const emptyKey = JSON.stringify([notFound, Boolean(bot?.paused), chatRefusal || "", Boolean(chatStarting), Boolean(ready())]);
 if (lastEmptyKey === emptyKey && chatStage.querySelector(".bot-chat-empty")) return;
 lastEmptyKey = emptyKey;
+cleanupFirstChatVoice();
 const box = el("div", undefined, "bot-chat-empty");
+if (notFound) {
+box.append(
+el("p", t("Bot not found"), "account-error"),
+button(t("Back to Bots"), () => ctx.go("/bots"), "primary small"),
+);
+chatStage.replaceChildren(box);
+return;
+}
 if (chatRefusal) {
 box.append(el("p", chatRefusal, "account-error"));
 }
@@ -3647,7 +3712,7 @@ sendPrompt,
 startBtn.disabled = !ready() || chatStarting;
 input.disabled = !ready() || chatStarting;
 row.append(startBtn);
-const firstChatVoice = M.voice?.attach?.(input, row, {
+firstChatVoice = M.voice?.attach?.(input, row, {
 ctx,
 targetKind: "bot_chat",
 targetId: () => botId,
@@ -3741,6 +3806,21 @@ bucket.hub.bots = allBots.length ? allBots : bucket.hub.bots;
 bucket.hub.sessions = allBotSessions;
 }
 }
+if (!bot) {
+let slugMatch = allBots.find((b) => b.slug === botId);
+if (!slugMatch && !Array.isArray(res?.bots)) {
+const listRes = await ctx.rpc({ action: "bots.list", limit: 100 }).catch(() => null);
+if (ctx.signal.aborted || seq !== loadSeq) return;
+if (Array.isArray(listRes?.bots)) {
+allBots = listRes.bots;
+slugMatch = allBots.find((b) => b.slug === botId);
+}
+}
+if (slugMatch && slugMatch.id && slugMatch.id !== botId) {
+ctx.go(`/bots/${encodeURIComponent(slugMatch.id)}`, true);
+return;
+}
+}
 const liveForBot = botSessions.filter((s) => s.live);
 if (activeSessionId && !liveForBot.some((s) => Number(s.session_id) === Number(activeSessionId))) {
 activeSessionId = liveForBot[0]?.session_id ?? null;
@@ -3791,6 +3871,13 @@ rpcHost(ctx, null, { action: "bots.groups.list", limit: 50 }).catch(() => ({ gro
 if (ctx.signal.aborted || seq !== loadSeq) return;
 allBots = botsRes?.bots || [];
 bot = allBots.find((b) => b.id === botId) || null;
+if (!bot) {
+const slugMatch = allBots.find((b) => b.slug === botId);
+if (slugMatch && slugMatch.id && slugMatch.id !== botId) {
+ctx.go(`/bots/${encodeURIComponent(slugMatch.id)}`, true);
+return;
+}
+}
 if (h1 && bot?.name) h1.textContent = bot.name;
 items = itemsRes?.items || [];
 itemsCursor = itemsRes?.next_cursor || null;
@@ -4631,7 +4718,9 @@ if (h1) h1.textContent = bot?.name || botId;
 headerTitleBtn.setAttribute("aria-label", `${bot?.name || botId} · ${t("Switch bot")}`);
 const metaTone = !ready()
 ? "unknown"
-: bot?.paused
+: !bot
+? "unknown"
+: bot.paused
 ? "unknown"
 : needsCount > 0
 ? "waiting"
@@ -4648,7 +4737,11 @@ t(bot.paused ? "Paused" : working ? "Working" : "Active"),
 ]
 .filter(Boolean)
 .join(" · ")
+: loaded
+? t("Bot not found")
 : "";
+panelBtn.disabled = loaded && !bot;
+moreBtn.disabled = loaded && !bot;
 panelBtnBadge.hidden = !(needsCount > 0);
 if (needsCount > 0) panelBtnBadge.textContent = needsCount > 99 ? "99+" : String(needsCount);
 panelBtn.setAttribute(
@@ -4770,11 +4863,9 @@ const orchEntries = new Map();
 // Persistent containers so background draw() preserves focus inside items, access, and orchestration forms.
 const accessCtrl = createAccessSection(ctx, t);
 const orchSec = el("section", undefined, "bots-section todo-orch-section");
-const orchHead = el("div", undefined, "home-section-heading");
 const orchCountEl = el("small", "", "muted");
-orchHead.append(el("h2", t("Confirmation requests"), "section-title"), orchCountEl);
 const orchWrap = el("div", undefined, "bots-items-list");
-orchSec.append(orchHead, orchWrap);
+orchSec.append(orchWrap);
 const makeGroupHead = (label, dotCls, countEl) => {
 const head = el("div", undefined, "todo-group-head");
 const title = el("h2", undefined, "todo-group-title");
@@ -4879,6 +4970,8 @@ const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
 const reqFilter = filter;
 const filterChanged = reqFilter !== lastLoadedFilter;
 if (!targets.length) {
+++loadSeq;
+loading = false;
 if (!hydrateTodoFromCache(reqFilter)) {
 bots = [];
 items = [];
@@ -5293,16 +5386,22 @@ head.append(left, button(botDisplayName(bots, f.botId), () => openBotDetail(ctx,
 card.append(head, el("strong", f.title, "bot-decision-card-title"));
 if (f.detail) card.append(el("p", f.detail, "account-error bot-decision-card-sub"));
 const actions = el("div", undefined, "bot-decision-card-actions");
+let retryBusy = false;
 const retry = button(
 t("Run now"),
 async () => {
-if (!ready()) return;
+if (retryBusy || !ready()) return;
+retryBusy = true;
+retry.disabled = true;
 try {
 await rpcHost(ctx, f.hostId, { action: "bots.schedule.run", bot_id: f.botId, schedule_id: f.scheduleId });
 ctx.toast?.(t("Schedule started"));
 await load(true);
 } catch (err) {
 ctx.toast?.(safeMsg(err, t));
+} finally {
+retryBusy = false;
+retry.disabled = !ready();
 }
 },
 "primary small",

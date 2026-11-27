@@ -1046,6 +1046,15 @@ async function testFailurePaths(){
  const B=await mount(901,{stateKey:'host-B\n901'});assert.equal(find(B.root,'command-input').value,'');assert.equal(B.handle.getInputMode(),'direct');B.handle.unmount();
  const restoredA=await mount(901,{stateKey:'host-A\n901'});assert.equal(find(restoredA.root,'command-input').value,'HOST_A_PRIVATE_DRAFT');assert.equal(restoredA.handle.getInputMode(),'buffered');assert(context.KrillMobile.terminal.snapshotDrafts().some(([key,text])=>key==='host-A\n901'&&text==='HOST_A_PRIVATE_DRAFT'));assert.equal(inputs(restoredA.socket).length,0);restoredA.handle.unmount();
  console.log('PASS host-scoped terminal drafts/modes restore without input replay for identical session IDs');}
+ {let errCount=0;({root,handle,socket}=await mount(712,{preferences:{inputMode:'direct'},onError:()=>errCount++}));
+ const bs=find(root,'keybar').children.find(b=>b.dataset.keyId==='backspace');assert(bs,'backspace key exists');
+ socket.readyState=3;
+ event(bs,'pointerdown',{button:0,pointerId:1});
+ await flush();
+ assert.equal(root.dataset.phase,'disconnected','MOB-21: repeatable key disconnect transitions to recoverable disconnected phase');
+ assert.equal(errCount,0,'MOB-21: repeatable key disconnect does not raise error toast');
+ handle.unmount();
+ console.log('PASS MOB-21: repeatable accessory keys treat transport disconnect as recoverable disconnected phase');}
 }
 // These layout rules complement the real-browser port geometry probe.
 function stableStatusLayout(){const css=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.css'),'utf8');
