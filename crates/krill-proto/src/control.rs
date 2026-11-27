@@ -1393,10 +1393,19 @@ impl Cold {
     }
 }
 
+/// Postcard variant discriminant for [`Request::Bot`] (0-indexed variant 29).
+const REQUEST_BOT_TAG: u8 = 29;
+
 impl Msg for Request {
     const KIND: u8 = kind::REQUEST;
 
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        if let Self::Bot(req) = self {
+            let mut body =
+                postcard::to_stdvec(&REQUEST_BOT_TAG).map_err(crate::ipc::Error::Codec)?;
+            body.extend(req.encode_wire_body()?);
+            return crate::ipc::encode_frame(Self::KIND, &body);
+        }
         let (tag, session, create) = match self {
             Self::Create(c) => (0_u8, None, c),
             Self::Resume { session, create } => (16, Some(session), create),
@@ -1418,6 +1427,13 @@ impl Msg for Request {
     }
 
     fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind == Self::KIND && body.first() == Some(&REQUEST_BOT_TAG) {
+            let (_, rest) =
+                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
+            return Ok(Self::Bot(crate::bots::BotRpcRequest::decode_wire_body(
+                rest,
+            )?));
+        }
         if kind != Self::KIND || !matches!(body.first(), Some(0 | 16 | 18)) {
             return crate::ipc::decode(Self::KIND, kind, body);
         }

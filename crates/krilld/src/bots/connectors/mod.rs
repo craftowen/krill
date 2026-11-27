@@ -916,6 +916,11 @@ impl ConnectorManager {
         self.router.on_session_removed(session_id);
     }
 
+    /// Re-keys active external turns when a bot session is rebound (`old -> new`) during account switch.
+    pub fn rebind_session(&self, old: SessionId, new: SessionId) {
+        self.router.rebind_session(old, new);
+    }
+
     /// Receives turn-completion notifications with explicit `turn_seq` and `workers_running`
     /// context so written answers deliver immediately while helper workers keep running without
     /// duplicate delivery or silent overwrite (Orca #47532).

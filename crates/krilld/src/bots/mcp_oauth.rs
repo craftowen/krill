@@ -495,6 +495,7 @@ pub fn resolve_or_refresh_token(
                 ) {
                     Ok(refreshed) => {
                         creds.access_token.clone_from(&refreshed.access_token);
+                        let rotated_refresh = refreshed.refresh_token.is_some();
                         if let Some(next_rt) = refreshed.refresh_token {
                             creds.refresh_token = Some(next_rt);
                         }
@@ -504,8 +505,25 @@ pub fn resolve_or_refresh_token(
                         if let Some(sc) = refreshed.scope {
                             creds.scope = Some(sc);
                         }
-                        persist_oauth_credentials(secrets, bot_id, tool_id, secret_ref, &creds)
-                            .ok();
+                        if let Err(err) =
+                            persist_oauth_credentials(secrets, bot_id, tool_id, secret_ref, &creds)
+                        {
+                            tracing::warn!(
+                                bot_id = %bot_id.as_str(),
+                                tool_id,
+                                rotated_refresh,
+                                kind = ?err.kind(),
+                                "failed to persist refreshed MCP OAuth credentials"
+                            );
+                            if rotated_refresh {
+                                return Err(io::Error::new(
+                                    err.kind(),
+                                    format!(
+                                        "failed to persist rotated MCP OAuth refresh token: {err}"
+                                    ),
+                                ));
+                            }
+                        }
                         return Ok(Some(Zeroizing::new(creds.access_token)));
                     }
                     Err(err) => {
@@ -1016,6 +1034,9 @@ fn run_pkce_callback_listener(
             scope: tok.scope,
             resource: resource.map(ToOwned::to_owned),
         };
+        // Serialize callback token persistence with concurrent background token refreshes (CORE-18).
+        let refresh_lock = refresh_mutex_for(bot_id, &tool.id);
+        let _refresh_guard = lock(&refresh_lock);
         if cancel.load(Ordering::Acquire) {
             return Err("OAuth sign-in cancelled".to_owned());
         }
@@ -1792,6 +1813,65 @@ mod tests {
         assert_eq!(mgr.status(&bot, "slow").status, "cancelled");
 
         stop_srv.store(true, Ordering::Release);
+        srv.join().ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_rotated_refresh_token_persistence_failure_returns_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("krill-mcp-rot-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _n = stream.read(&mut buf).unwrap_or(0);
+                let body = r#"{"access_token":"new-mcp","refresh_token":"rotated-mcp-rt","expires_in":3600}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).ok();
+            }
+        });
+
+        let secrets = SecretVault::with_static_key(dir.clone(), [0x88; 32]);
+        let bot_id = BotId::new("bot-mcp-rot").unwrap();
+        let creds = StoredMcpOAuthCredentials {
+            access_token: "expired-tok".to_owned(),
+            refresh_token: Some("old-rt".to_owned()),
+            token_endpoint: Some(format!("http://{addr}/token")),
+            client_id: Some("cid".to_owned()),
+            client_secret: None,
+            expires_at_ms: Some(1),
+            scope: None,
+            resource: None,
+        };
+        persist_oauth_credentials(&secrets, &bot_id, "sentry", None, &creds).unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = resolve_or_refresh_token(
+            &secrets,
+            &bot_id,
+            "sentry",
+            None,
+            "mcp:sentry",
+            SsrfPolicy::AllowLoopback,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rotated MCP OAuth refresh token"),
+            "unexpected error: {err}"
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok();
         srv.join().ok();
         fs::remove_dir_all(&dir).ok();
     }

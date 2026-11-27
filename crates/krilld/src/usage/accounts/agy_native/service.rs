@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use krill_proto::usage::{
@@ -226,14 +226,26 @@ impl AntigravityAccountService {
         }
     }
 
-    pub(crate) fn for_host(home: &Path, state_dir: Option<&Path>) -> Self {
+    pub(crate) fn for_host(home: &Path, state_dir: Option<&Path>) -> Arc<Self> {
+        type HostServiceMap = BTreeMap<(PathBuf, Option<PathBuf>), Arc<AntigravityAccountService>>;
+        static HOST_SERVICES: Mutex<HostServiceMap> = Mutex::new(BTreeMap::new());
+        let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+        let canon_state =
+            state_dir.map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        let key = (canon_home, canon_state);
+        let mut cache = lock(&HOST_SERVICES);
+        if let Some(existing) = cache.get(&key) {
+            return Arc::clone(existing);
+        }
         let path = vault_path(home, state_dir);
-        Self::new(
+        let service = Arc::new(Self::new(
             Box::new(EncryptedAntigravityAccountStore::new(path)),
             Box::new(HostCredentialBackend::new(home)),
             Box::new(default_now_ms),
             Box::new(fetch_google_identity),
-        )
+        ));
+        cache.insert(key, Arc::clone(&service));
+        service
     }
 
     pub(crate) fn list_accounts(&self) -> Result<AntigravityAccountState, String> {
@@ -434,7 +446,7 @@ impl AntigravityAccountService {
         Ok(Self::build_state(&vault, current.as_ref(), false))
     }
 
-    #[cfg(any(not(target_os = "windows"), test))]
+    #[cfg(test)]
     pub(crate) fn prepare_for_launch(&self) -> Result<(), String> {
         let _guard = lock(&self.op_lock);
         let (vault, current) = match self.reconcile(None) {
@@ -591,11 +603,25 @@ impl AntigravityAccountService {
         selected_id: Option<&str>,
     ) -> Result<(AntigravityAccountVault, Option<AntigravityNativeCredential>), ReconcileError>
     {
-        let initial_accounts = self.store.read()?.accounts;
+        let initial_vault = self.store.read()?;
+        self.reconcile_with_vault(selected_id, initial_vault)
+    }
+
+    fn reconcile_with_vault(
+        &self,
+        selected_id: Option<&str>,
+        initial_vault: AntigravityAccountVault,
+    ) -> Result<(AntigravityAccountVault, Option<AntigravityNativeCredential>), ReconcileError>
+    {
         let raw_current = self.backend.read()?;
-        let current = self.identify_rewritten_login(raw_current, &initial_accounts);
-        // Re-read after native I/O so a delayed read never restores an older vault.
-        let mut vault = self.store.read()?;
+        let current = self.identify_rewritten_login(raw_current, &initial_vault.accounts);
+        // Because `op_lock` serializes in-process vault writers (CORE-02), reuse the loaded vault
+        // unless native I/O observed a rewritten login or another writer could have touched disk.
+        let mut vault = if current.is_some() {
+            self.store.read()?
+        } else {
+            initial_vault
+        };
         if let Some(sel_id) = selected_id {
             let selected = vault
                 .accounts
@@ -610,6 +636,69 @@ impl AntigravityAccountService {
             self.store.write(&vault)?;
         }
         Ok((vault, current))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn prepare_for_launch_in_env(
+        &self,
+        home: &Path,
+        launch_env: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let _guard = lock(&self.op_lock);
+        let initial_vault = match self.store.read() {
+            Ok(v) => v,
+            Err(VaultError::LegacyAclLocked { status }) => {
+                warn_vault_locked_once(
+                    "prepare_antigravity_account_for_launch",
+                    status,
+                    "skipping Antigravity launch preflight because legacy vault is ACL-locked",
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into_message()),
+        };
+        if initial_vault.selected_account_id.is_none() {
+            return Ok(());
+        }
+        let env_home = launch_env
+            .get("HOME")
+            .or_else(|| launch_env.get("USERPROFILE"))
+            .map(PathBuf::from);
+        let host_env = current_process_env();
+        let home_mismatch = env_home.is_some_and(|eh| {
+            let ca = std::fs::canonicalize(&eh).unwrap_or(eh);
+            let cb = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+            ca != cb
+        });
+        if home_mismatch
+            || is_antigravity_file_storage_host(launch_env)
+                != is_antigravity_file_storage_host(&host_env)
+        {
+            return Err("This agy launch uses a different credential authority from the selected Antigravity account.".to_owned());
+        }
+        let (vault, current) = match self.reconcile_with_vault(None, initial_vault) {
+            Ok(pair) => pair,
+            Err(ReconcileError::LegacyVaultLocked { status }) => {
+                warn_vault_locked_once(
+                    "prepare_antigravity_account_for_launch",
+                    status,
+                    "skipping Antigravity launch preflight because legacy vault is ACL-locked",
+                );
+                return Ok(());
+            }
+            Err(ReconcileError::Other(msg)) => return Err(msg),
+        };
+        let Some(selected_id) = vault.selected_account_id.as_deref() else {
+            return Ok(());
+        };
+        let selected = vault.accounts.iter().find(|a| a.id == selected_id);
+        let matches = selected
+            .zip(current.as_ref())
+            .is_some_and(|(sel, curr)| account_matches(sel, curr));
+        if !matches {
+            return Err("The native Antigravity account changed. Select the account again in Accounts before launching agy.".to_owned());
+        }
+        Ok(())
     }
 
     fn update_snapshot(
@@ -705,38 +794,8 @@ pub(crate) fn prepare_antigravity_account_for_launch(
         if !path.is_file() {
             return Ok(());
         }
-        let store = EncryptedAntigravityAccountStore::new(path);
-        let vault = match store.read() {
-            Ok(v) => v,
-            Err(VaultError::LegacyAclLocked { status }) => {
-                tracing::warn!(
-                    status,
-                    "skipping Antigravity launch preflight because legacy vault is ACL-locked"
-                );
-                return Ok(());
-            }
-            Err(err) => return Err(err.into_message()),
-        };
-        if vault.selected_account_id.is_none() {
-            return Ok(());
-        }
-        let env_home = launch_env
-            .get("HOME")
-            .or_else(|| launch_env.get("USERPROFILE"))
-            .map(PathBuf::from);
-        let host_env = current_process_env();
-        let home_mismatch = env_home.is_some_and(|eh| {
-            let ca = std::fs::canonicalize(&eh).unwrap_or(eh);
-            let cb = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-            ca != cb
-        });
-        if home_mismatch
-            || is_antigravity_file_storage_host(launch_env)
-                != is_antigravity_file_storage_host(&host_env)
-        {
-            return Err("This agy launch uses a different credential authority from the selected Antigravity account.".to_owned());
-        }
-        AntigravityAccountService::for_host(home, state_dir).prepare_for_launch()
+        AntigravityAccountService::for_host(home, state_dir)
+            .prepare_for_launch_in_env(home, launch_env)
     }
 }
 

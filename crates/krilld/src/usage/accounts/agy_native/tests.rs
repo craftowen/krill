@@ -1230,3 +1230,187 @@ fn encrypted_store_reset_locked_vault_backs_up_unreadable_file_and_preserves_oth
 
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn for_host_interns_service_instance_sharing_op_lock_and_rewritten_cache() {
+    let root = std::env::temp_dir().join(format!("krill-agy-intern-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let svc1 = AntigravityAccountService::for_host(&home, Some(&state));
+    let svc2 = AntigravityAccountService::for_host(&home, Some(&state));
+    assert!(
+        std::sync::Arc::ptr_eq(&svc1, &svc2),
+        "for_host must intern Arc<AntigravityAccountService> per canonical (home, state_dir)"
+    );
+
+    // Concurrent read-modify-write via two `for_host()` handles must serialize cleanly under op_lock.
+    let home_a = home.clone();
+    let state_a = state.clone();
+    let home_b = home.clone();
+    let state_b = state.clone();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b1 = std::sync::Arc::clone(&barrier);
+    let b2 = std::sync::Arc::clone(&barrier);
+
+    let cred_a = serde_json::json!({
+        "auth_method": "consumer",
+        "id_token_email": "alice@example.test",
+        "token": {
+            "access_token": "tok-a",
+            "refresh_token": "ref-a",
+            "id_token": codex_jwt(&serde_json::json!({
+                "sub": "sub-a",
+                "email": "alice@example.test",
+                "iss": "https://accounts.google.com"
+            })),
+            "token_type": "Bearer"
+        }
+    })
+    .to_string();
+    let cred_b = serde_json::json!({
+        "auth_method": "consumer",
+        "id_token_email": "bob@example.test",
+        "token": {
+            "access_token": "tok-b",
+            "refresh_token": "ref-b",
+            "id_token": codex_jwt(&serde_json::json!({
+                "sub": "sub-b",
+                "email": "bob@example.test",
+                "iss": "https://accounts.google.com"
+            })),
+            "token_type": "Bearer"
+        }
+    })
+    .to_string();
+
+    let t1 = std::thread::spawn(move || {
+        b1.wait();
+        AntigravityAccountService::for_host(&home_a, Some(&state_a))
+            .import_snapshots(
+                vec![StoredAntigravityAccount {
+                    id: "acc-a".into(),
+                    email: Some("alice@example.test".into()),
+                    subject: Some("sub-a".into()),
+                    auth_method: "consumer".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    credentials: Zeroizing::new(cred_a),
+                    usage: None,
+                }],
+                None,
+            )
+            .unwrap();
+    });
+    let t2 = std::thread::spawn(move || {
+        b2.wait();
+        AntigravityAccountService::for_host(&home_b, Some(&state_b))
+            .import_snapshots(
+                vec![StoredAntigravityAccount {
+                    id: "acc-b".into(),
+                    email: Some("bob@example.test".into()),
+                    subject: Some("sub-b".into()),
+                    auth_method: "consumer".into(),
+                    created_at: 2,
+                    updated_at: 2,
+                    credentials: Zeroizing::new(cred_b),
+                    usage: None,
+                }],
+                None,
+            )
+            .unwrap();
+    });
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    let listed = AntigravityAccountService::for_host(&home, Some(&state))
+        .list_accounts()
+        .unwrap();
+    assert_eq!(
+        listed.accounts.len(),
+        2,
+        "concurrent for_host() vault writes must both survive under shared op_lock"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn rewritten_login_identity_lookup_hits_cache_on_shared_service() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = MemoryStore {
+        vault: Arc::new(Mutex::new(AntigravityAccountVault::default())),
+    };
+    let raw_slot = Arc::new(Mutex::new(Some(agy_credential_json(
+        "sub-initial",
+        "initial@example.test",
+        "tok-initial",
+        "ref-initial",
+        true,
+    ))));
+    let backend = MemoryBackend {
+        raw: Arc::clone(&raw_slot),
+    };
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let calls_bg = std::sync::Arc::clone(&calls);
+    let svc = std::sync::Arc::new(AntigravityAccountService::new(
+        Box::new(store),
+        Box::new(backend),
+        Box::new(|| 100),
+        Box::new(move |_| {
+            calls_bg.fetch_add(1, Ordering::AcqRel);
+            Ok(AntigravityCredentialIdentity {
+                subject: "sub-rewritten".into(),
+                email: Some("rewritten@example.test".into()),
+                issuer: "https://accounts.google.com",
+            })
+        }),
+    ));
+    // Register initial account with a subject into the vault.
+    let _ = svc.add_current_account().unwrap();
+    // Simulate a rewritten login without an embedded id_token JWT.
+    *raw_slot.lock().unwrap() = Some(agy_credential_json(
+        "sub-initial",
+        "initial@example.test",
+        "tok-rewritten-1",
+        "ref-rewritten",
+        false,
+    ));
+    let _ = svc.list_accounts().unwrap();
+    let _ = svc.list_accounts().unwrap();
+    assert_eq!(
+        calls.load(Ordering::Acquire),
+        1,
+        "shared service must cache rewritten login identity across polls"
+    );
+}
+
+#[test]
+fn prepare_for_launch_handles_legacy_acl_locked_silently_after_first_warn() {
+    struct LockedStore;
+    impl AntigravityAccountStore for LockedStore {
+        fn read(&self) -> Result<AntigravityAccountVault, VaultError> {
+            Err(VaultError::LegacyAclLocked { status: -25293 })
+        }
+        fn write(&self, _vault: &AntigravityAccountVault) -> Result<(), String> {
+            Err("locked".into())
+        }
+        fn reset_locked_vault(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let svc = AntigravityAccountService::new(
+        Box::new(LockedStore),
+        Box::new(MemoryBackend {
+            raw: Arc::new(Mutex::new(None)),
+        }),
+        Box::new(|| 1),
+        Box::new(|_| Err("offline".into())),
+    );
+    // Repeated launch preflights must succeed (skip preflight gracefully) on locked legacy vault.
+    assert!(svc.prepare_for_launch().is_ok());
+    assert!(svc.prepare_for_launch().is_ok());
+}

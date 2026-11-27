@@ -777,6 +777,19 @@ impl BotRuntime {
         }
     }
 
+    fn peek_matching_restart_cut(
+        &self,
+        bot_id: &BotId,
+        link_id: &str,
+        turn_seq: u64,
+    ) -> Option<RestartCutTurn> {
+        let _io = lock(&self.inner.bindings_io_lock);
+        let cuts = self.load_restart_cuts_locked();
+        cuts.into_iter().find(|c| {
+            &c.bot_id == bot_id && c.link_id == link_id && (turn_seq == 0 || c.turn_seq == turn_seq)
+        })
+    }
+
     fn take_matching_restart_cut(
         &self,
         bot_id: &BotId,
@@ -2199,33 +2212,44 @@ impl BotRuntime {
             };
             let failed_seq = completed_seq.unwrap_or_else(|| ts.max(1));
             let limited_account_id = registry.session_account_id(session_id);
-            {
+            let now_secs = ts / 1_000;
+            let reset_at_secs = extract_rate_limit_reset_secs(&event.payload, now_secs);
+            let same_turn = {
                 // Canonical lock order: sessions -> turn_meta (MB-01).
                 let mut sessions = lock(&self.inner.sessions);
                 let mut meta_map = lock(&self.inner.turn_meta);
-                if let Some(entry) = sessions.get_mut(&session_id) {
-                    entry.explicit_reply_posted = false;
-                    entry.owner_turn_pending = false;
-                    if failure_kind == TurnFailureKind::UsageLimit {
-                        entry.rate_limit_pause = Some(PersistedRateLimitPause {
-                            cut_id: failed_seq,
-                            limited_account_id,
-                            reset_at_secs: None,
-                            recorded_at_secs: ts / 1_000,
-                            continued: false,
-                            cancelled: false,
+                let current_seq = meta_map.get(&session_id).and_then(|m| m.active_turn_seq);
+                if completed_seq.is_some() && current_seq != completed_seq {
+                    false
+                } else {
+                    if let Some(entry) = sessions.get_mut(&session_id) {
+                        entry.explicit_reply_posted = false;
+                        entry.owner_turn_pending = false;
+                        if failure_kind == TurnFailureKind::UsageLimit {
+                            entry.rate_limit_pause = Some(PersistedRateLimitPause {
+                                cut_id: failed_seq,
+                                limited_account_id,
+                                reset_at_secs,
+                                recorded_at_secs: now_secs,
+                                continued: false,
+                                cancelled: false,
+                            });
+                        }
+                    }
+                    if let Some(meta) = meta_map.get_mut(&session_id) {
+                        meta.active_turn_seq = None;
+                        meta.failed_turn = Some(FailedTurnState {
+                            turn_seq: failed_seq,
+                            kind: failure_kind,
+                            link_id: binding.link_id.clone(),
+                            error_text: Some(err_text.clone()),
                         });
                     }
+                    true
                 }
-                if let Some(meta) = meta_map.get_mut(&session_id) {
-                    meta.active_turn_seq = None;
-                    meta.failed_turn = Some(FailedTurnState {
-                        turn_seq: failed_seq,
-                        kind: failure_kind,
-                        link_id: binding.link_id.clone(),
-                        error_text: Some(err_text.clone()),
-                    });
-                }
+            };
+            if !same_turn {
+                return None;
             }
             self.inner.persist_bindings();
             if let Some(g) = groups {
@@ -2316,27 +2340,45 @@ impl BotRuntime {
             .map(|text| strip_echoed_prompt(&text, binding.last_prompt.as_deref()))
             .filter(|text| !text.trim().is_empty() && !is_quiet_reply(text));
 
-        let final_reply = {
+        let (turn_still_current, final_reply) = {
             let mut sessions = lock(&self.inner.sessions);
             let mut meta_map = lock(&self.inner.turn_meta);
-            let explicit_posted = if let Some(entry) = sessions.get_mut(&session_id) {
-                let posted = entry.explicit_reply_posted;
-                entry.explicit_reply_posted = false;
-                entry.owner_turn_pending = false;
-                entry.chat_offset = next_offset;
-                entry.status_message_id = None;
-                entry.rate_limit_pause = None;
-                posted
+            let current_seq = meta_map.get(&session_id).and_then(|m| m.active_turn_seq);
+            let same_turn = current_seq == completed_seq;
+            if same_turn {
+                let explicit_posted = if let Some(entry) = sessions.get_mut(&session_id) {
+                    let posted = entry.explicit_reply_posted;
+                    entry.explicit_reply_posted = false;
+                    entry.owner_turn_pending = false;
+                    if next_offset >= entry.chat_offset || next_offset < binding.chat_offset {
+                        entry.chat_offset = next_offset;
+                    }
+                    entry.status_message_id = None;
+                    entry.rate_limit_pause = None;
+                    posted
+                } else {
+                    binding.explicit_reply_posted
+                };
+                if let Some(meta) = meta_map.get_mut(&session_id) {
+                    meta.active_turn_seq = None;
+                    meta.failed_turn = None;
+                }
+                (true, if explicit_posted { None } else { cleaned_reply })
             } else {
-                binding.explicit_reply_posted
-            };
-            if let Some(meta) = meta_map.get_mut(&session_id) {
-                meta.active_turn_seq = None;
-                meta.failed_turn = None;
+                // Fence completion state mutation against newer turns started during the
+                // `extract_final_reply` settle sleep, while keeping `chat_offset` monotonic (CORE-09).
+                if let Some(entry) = sessions.get_mut(&session_id)
+                    && next_offset > entry.chat_offset
+                {
+                    entry.chat_offset = next_offset;
+                }
+                (false, None)
             }
-            if explicit_posted { None } else { cleaned_reply }
         };
         self.inner.persist_bindings();
+        if !turn_still_current {
+            return None;
+        }
 
         if let Some(g) = groups {
             // Always notify GroupCoordinator so empty/quiet/explicit-reply turns clear their
@@ -2747,7 +2789,8 @@ impl BotRuntime {
         }
 
         // Case 2: persisted restart-cut turn whose old session died across daemon restart.
-        if let Some(cut) = self.take_matching_restart_cut(bot_id, link_id, turn_seq) {
+        // Peek first and delete from disk ONLY after `start_bot_session` succeeds (CORE-25).
+        if let Some(cut) = self.peek_matching_restart_cut(bot_id, link_id, turn_seq) {
             let prompt = match cut.last_prompt.as_deref().map(str::trim) {
                 Some(prev) if !prev.is_empty() => {
                     format!("{CONNECTOR_RESUME_TEXT}\n\n[Interrupted request context]\n{prev}")
@@ -2767,6 +2810,7 @@ impl BotRuntime {
                     Some(link.id.clone()),
                 )
                 .map_err(|err| io::Error::other(err.message()))?;
+            let _ = self.take_matching_restart_cut(bot_id, link_id, cut.turn_seq);
             let ts = now_ms();
             if let Some(updated) = store.bind_link_session(&link.id, new_sid, ts)? {
                 link = updated;
@@ -2817,6 +2861,27 @@ impl BotRuntime {
         &self,
         registry: &Registry,
         store: &BotStore,
+        auto_continue_enabled: bool,
+        accounts: &AccountsSnapshot,
+        now_secs: u64,
+    ) -> Vec<SessionId> {
+        self.poll_rate_limit_auto_continues_with_connectors(
+            registry,
+            store,
+            None,
+            auto_continue_enabled,
+            accounts,
+            now_secs,
+        )
+    }
+
+    /// Evaluates durable usage-limit pauses across live bot sessions and re-registers external
+    /// connector turn routing on resume so Slack/Telegram/Discord receive the continued reply.
+    pub fn poll_rate_limit_auto_continues_with_connectors(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        connectors: Option<&ConnectorManager>,
         auto_continue_enabled: bool,
         accounts: &AccountsSnapshot,
         now_secs: u64,
@@ -2875,16 +2940,23 @@ impl BotRuntime {
                     let meta = meta_map.entry(sid).or_default();
                     meta.failed_turn = None;
                     meta.turn_seq = meta.turn_seq.saturating_add(1);
-                    meta.active_turn_seq = Some(meta.turn_seq);
-                    true
+                    let next_seq = meta.turn_seq;
+                    meta.active_turn_seq = Some(next_seq);
+                    Some((next_seq, b.link_id.clone()))
                 } else {
-                    false
+                    None
                 }
             };
-            if !claimed {
+            let Some((claimed_seq, link_id)) = claimed else {
                 continue;
-            }
+            };
             self.inner.persist_bindings();
+            if let (Some(mgr), Some(lid)) = (connectors, link_id.as_deref())
+                && let Ok(Some(link)) = store.get_link(lid)
+            {
+                mgr.router()
+                    .ensure_active_turn_seq(bot_id.clone(), sid, Some(claimed_seq), &link);
+            }
             if self
                 .inner
                 .deliver_serialized_input(
@@ -2897,8 +2969,17 @@ impl BotRuntime {
             {
                 continued.push(sid);
             } else {
-                if let Some(b) = lock(&self.inner.sessions).get_mut(&sid) {
-                    b.owner_turn_pending = false;
+                {
+                    let mut sessions = lock(&self.inner.sessions);
+                    let mut meta_map = lock(&self.inner.turn_meta);
+                    if let Some(b) = sessions.get_mut(&sid) {
+                        b.owner_turn_pending = false;
+                    }
+                    if let Some(meta) = meta_map.get_mut(&sid)
+                        && meta.active_turn_seq == Some(claimed_seq)
+                    {
+                        meta.active_turn_seq = None;
+                    }
                 }
                 self.inner.persist_bindings();
             }
@@ -3768,7 +3849,80 @@ pub fn bot_rate_limit_ready_to_continue(
         return current_account.is_none_or(has_headroom);
     }
 
+    // Fallback when hook payload omitted reset metadata: after a minimum cooldown, allow
+    // same-account continuation once refreshed account usage confirms explicit headroom.
+    if pause.reset_at_secs.is_none()
+        && now_secs
+            >= pause
+                .recorded_at_secs
+                .saturating_add(UNKNOWN_RESET_COOLDOWN_SECS)
+        && let Some(cur) = current_account
+        && accounts
+            .accounts
+            .iter()
+            .any(|a| a.id == cur && (a.usage.five_hour.is_some() || a.usage.seven_day.is_some()))
+        && has_headroom(cur)
+    {
+        return true;
+    }
+
     false
+}
+
+const UNKNOWN_RESET_COOLDOWN_SECS: u64 = 60;
+
+/// Extracts a rate-limit reset Unix timestamp (seconds) from a provider Stop hook JSON payload
+/// when present (supporting `reset_at_secs`, `resets_at_ms`, `resets_at`, and `retry_after*`).
+fn extract_rate_limit_reset_secs(payload: &[u8], now_secs: u64) -> Option<u64> {
+    fn from_value(v: &serde_json::Value, now_secs: u64) -> Option<u64> {
+        let obj = v.as_object()?;
+        for key in ["reset_at_secs", "resets_at_secs"] {
+            if let Some(s) = obj.get(key).and_then(serde_json::Value::as_u64)
+                && s > 0
+            {
+                return Some(s);
+            }
+        }
+        for key in ["resets_at_ms", "reset_at_ms"] {
+            if let Some(ms) = obj.get(key).and_then(serde_json::Value::as_u64)
+                && ms > 0
+            {
+                return Some(ms / 1_000);
+            }
+        }
+        for key in ["resets_at", "reset_at"] {
+            if let Some(val) = obj.get(key) {
+                if let Some(s) = val.as_u64()
+                    && s > 0
+                {
+                    return Some(if s > 10_000_000_000 { s / 1_000 } else { s });
+                }
+                if let Some(raw) = val.as_str()
+                    && let Some(epoch) = krill_proto::time::parse_reset_epoch(raw)
+                    && let Ok(u) = u64::try_from(epoch)
+                {
+                    return Some(u);
+                }
+            }
+        }
+        for key in ["retry_after_secs", "retry_after"] {
+            if let Some(delta) = obj.get(key).and_then(serde_json::Value::as_u64)
+                && delta > 0
+            {
+                return Some(now_secs.saturating_add(delta));
+            }
+        }
+        for nested in ["error", "rate_limit", "usage_limit"] {
+            if let Some(sub) = obj.get(nested)
+                && let Some(found) = from_value(sub, now_secs)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let val: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    from_value(&val, now_secs)
 }
 
 /// Returns `true` if `session_id` currently coordinates at least one active helper worker dispatch.
@@ -5883,6 +6037,259 @@ mod tests {
             rt3.take_matching_restart_cut(&bot.id, &slack_link.id, 4)
                 .is_none()
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rate_limit_reset_parser_and_unknown_reset_headroom_fallback_work() {
+        assert_eq!(
+            extract_rate_limit_reset_secs(br#"{"reset_at_secs":1700001234}"#, 1_700_000_000),
+            Some(1_700_001_234)
+        );
+        assert_eq!(
+            extract_rate_limit_reset_secs(br#"{"resets_at_ms":1700002000000}"#, 1_700_000_000),
+            Some(1_700_002_000)
+        );
+        assert_eq!(
+            extract_rate_limit_reset_secs(br#"{"error":{"retry_after":120}}"#, 1_700_000_000),
+            Some(1_700_000_120)
+        );
+
+        // When reset_at_secs is None, same-account continuation stays false before cooldown
+        // and fires after cooldown once refreshed account usage confirms headroom.
+        let pause = PersistedRateLimitPause {
+            cut_id: 7,
+            limited_account_id: Some("acct-1".to_owned()),
+            reset_at_secs: None,
+            recorded_at_secs: 1_000,
+            continued: false,
+            cancelled: false,
+        };
+        let empty_snap = AccountsSnapshot::default();
+        assert!(!bot_rate_limit_ready_to_continue(
+            &pause,
+            Some("acct-1"),
+            &empty_snap,
+            1_200
+        ));
+
+        let mut headroom_snap = AccountsSnapshot::default();
+        headroom_snap
+            .accounts
+            .push(krill_proto::usage::AccountInfo {
+                id: "acct-1".to_owned(),
+                provider: krill_proto::usage::ProviderKind::Claude,
+                label: "Primary".to_owned(),
+                email: None,
+                profile_dir: "/tmp/p1".to_owned(),
+                active: true,
+                host_default: true,
+                stale: false,
+                usage: krill_proto::usage::Snapshot {
+                    five_hour: Some(krill_proto::usage::Window {
+                        percent: 20,
+                        resets_at: None,
+                    }),
+                    seven_day: None,
+                },
+            });
+        assert!(
+            !bot_rate_limit_ready_to_continue(&pause, Some("acct-1"), &headroom_snap, 1_030),
+            "must wait out minimum cooldown before unknown-reset fallback"
+        );
+        assert!(
+            bot_rate_limit_ready_to_continue(&pause, Some("acct-1"), &headroom_snap, 1_060),
+            "same-account rate limit with reset_at_secs=None must continue once usage confirms headroom"
+        );
+    }
+
+    #[test]
+    fn resume_failed_external_turn_preserves_restart_cut_when_start_fails() {
+        let dir = std::env::temp_dir().join(format!("krill-core25-cut-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = BotStore::new(dir.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "CutBot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let link = store
+            .lookup_or_create_link(
+                &bot.id,
+                krill_proto::bots::ExternalSource::Slack,
+                Some("T1"),
+                "C1",
+                Some("100.1"),
+                krill_proto::bots::ActsFor::Owner,
+                1_000,
+            )
+            .unwrap();
+        let rt = BotRuntime::with_root(dir.clone());
+        {
+            let _io = lock(&rt.inner.bindings_io_lock);
+            rt.save_restart_cuts_locked(&[RestartCutTurn {
+                bot_id: bot.id.clone(),
+                link_id: link.id.clone(),
+                old_session_id: SessionId(99),
+                turn_seq: 9,
+                status_message_id: None,
+                last_prompt: Some("Keep this prompt".to_owned()),
+                pending_turns: vec!["Queued follow-up".to_owned()],
+                cut_at_ms: 2_000,
+                notified: true,
+            }]);
+        }
+
+        let reg = Registry::new(None, None);
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x55; 32]));
+        let relay = BotToolRelay::new(Arc::clone(&secrets));
+        let res = rt.resume_failed_external_turn(
+            &reg,
+            &store,
+            &secrets,
+            &relay,
+            "http://127.0.0.1:1",
+            &bot.id,
+            &link.id,
+            9,
+        );
+        assert!(
+            res.is_err(),
+            "expected start_bot_session to fail for unknown agent"
+        );
+
+        // RestartCutTurn must still be intact on disk after the failed resume attempt.
+        let preserved = rt
+            .peek_matching_restart_cut(&bot.id, &link.id, 9)
+            .expect("RestartCutTurn must NOT be deleted when start_bot_session fails");
+        assert_eq!(preserved.last_prompt.as_deref(), Some("Keep this prompt"));
+        assert_eq!(preserved.pending_turns, vec!["Queued follow-up".to_owned()]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_stop_hook_fenced_against_newer_turn_and_monotonic_chat_offset() {
+        let dir = std::env::temp_dir().join(format!("krill-core09-fence-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let store = BotStore::new(dir.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "FenceBot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let rt = Arc::new(BotRuntime::with_root(dir.clone()));
+        let sid = SessionId(77);
+        {
+            let mut sessions = lock(&rt.inner.sessions);
+            sessions.insert(
+                sid,
+                BotSessionBinding {
+                    bot_id: bot.id.clone(),
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(""),
+                    chat_offset: 500,
+                    explicit_reply_posted: false,
+                    launch_token: None,
+                    pid: 1234,
+                    label: "Fence".to_owned(),
+                    created_at_ms: 1_000,
+                    owner_turn_pending: true,
+                    last_prompt: Some("Turn 1".to_owned()),
+                    status_message_id: Some("msg-1".to_owned()),
+                    rate_limit_pause: None,
+                },
+            );
+        }
+        {
+            let mut meta = lock(&rt.inner.turn_meta);
+            meta.insert(
+                sid,
+                SessionTurnMeta {
+                    turn_seq: 1,
+                    active_turn_seq: Some(1),
+                    ..SessionTurnMeta::default()
+                },
+            );
+        }
+
+        // Race a slow Stop hook (extract_final_reply takes ~225ms when transcript is absent)
+        // against a newer turn starting on the same session mid-flight.
+        let reg = Arc::new(Registry::new(None, None));
+        let rt_bg = Arc::clone(&rt);
+        let reg_bg = Arc::clone(&reg);
+        let dir_bg = dir.clone();
+        let hook_thread = std::thread::spawn(move || {
+            let store_bg = BotStore::new(dir_bg);
+            let ev = HookEvent {
+                id: krill_proto::hook::EventId {
+                    pid: 1,
+                    unix_ns: 2_000,
+                },
+                ppid: 0,
+                agent: "claude".to_owned(),
+                payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+                input: krill_proto::hook::Input::Complete,
+            };
+            rt_bg.on_hook_event_with_groups(&reg_bg, &store_bg, None, None, sid, &ev);
+        });
+
+        // Shortly after Stop snapshots turn_seq=1 and enters extract_final_reply's sleep,
+        // advance the session to turn_seq=2 with a higher chat_offset.
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let mut sessions = lock(&rt.inner.sessions);
+            let mut meta = lock(&rt.inner.turn_meta);
+            let b = sessions.get_mut(&sid).unwrap();
+            b.owner_turn_pending = true;
+            b.chat_offset = 900;
+            b.status_message_id = Some("msg-2".to_owned());
+            let m = meta.get_mut(&sid).unwrap();
+            m.turn_seq = 2;
+            m.active_turn_seq = Some(2);
+        }
+
+        hook_thread.join().unwrap();
+
+        // Turn 2's active state and chat_offset MUST NOT have been clobbered by Turn 1's late Stop.
+        let sessions = lock(&rt.inner.sessions);
+        let meta = lock(&rt.inner.turn_meta);
+        let b = sessions.get(&sid).unwrap();
+        let m = meta.get(&sid).unwrap();
+        assert_eq!(m.active_turn_seq, Some(2));
+        assert!(b.owner_turn_pending);
+        assert_eq!(b.chat_offset, 900);
+        assert_eq!(b.status_message_id.as_deref(), Some("msg-2"));
 
         fs::remove_dir_all(&dir).ok();
     }

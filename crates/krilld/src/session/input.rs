@@ -439,8 +439,10 @@ pub(super) fn write_input_if_untouched(
     if state.orphaned(owner) {
         state.finish(tap)?;
         state.matched = 0;
+        state.matched_at = None;
         state.peer = None;
     }
+    state.expire_stale_start_prefix();
     if state.paste || state.matched != 0 {
         return Ok(None);
     }
@@ -615,6 +617,66 @@ mod prefix_recovery_tests {
         assert_eq!(received, command);
         user.write_all(b"\x1b[2J\x1b[H/model actual").unwrap();
         worker.join().unwrap().unwrap();
+        drop(user);
+        session.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lone_escape_does_not_permanently_block_write_input_if_untouched() {
+        use std::io::Read as _;
+
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut termios = rustix::termios::tcgetattr(&pty.user).unwrap();
+        termios.make_raw();
+        rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &termios)
+            .unwrap();
+        rustix::fs::fcntl_setfl(
+            &pty.user,
+            rustix::fs::fcntl_getfl(&pty.user).unwrap() | rustix::fs::OFlags::NONBLOCK,
+        )
+        .unwrap();
+        let session = Session::start(
+            SessionId(93),
+            pty.controller,
+            WinSize { cols: 80, rows: 24 },
+            Arc::new(Appearance::load(PathBuf::new())),
+            None,
+        )
+        .unwrap();
+        let mut user = std::fs::File::from(pty.user);
+        let tap = session.tap();
+
+        // Simulate a connected UI client sending a lone Escape (matches byte 0 of `\x1b[200~`).
+        write_input(&tap, b"\x1b", None).unwrap();
+        let stamp_after_esc = tap.0.live().last_input_ns;
+        {
+            let state = lock(&tap.0.input);
+            assert_eq!(state.matched, 1);
+        }
+
+        // Wait past PARTIAL_START_GRACE (50ms); untouched automated write must now succeed.
+        thread::sleep(PARTIAL_START_GRACE + Duration::from_millis(20));
+        let delivered = write_input_if_untouched(&tap, b"ok", stamp_after_esc).unwrap();
+        assert!(
+            delivered.is_some(),
+            "stale lone Escape prefix must expire and allow write_input_if_untouched"
+        );
+
+        let mut buf = [0u8; 16];
+        let mut read_all = Vec::new();
+        let start = Instant::now();
+        while !read_all.windows(2).any(|w| w == b"ok") && start.elapsed() < Duration::from_secs(1) {
+            match user.read(&mut buf) {
+                Ok(n) if n > 0 => read_all.extend_from_slice(&buf[..n]),
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(
+            read_all.windows(2).any(|w| w == b"ok"),
+            "expected 'ok' delivered to PTY, got {read_all:?}"
+        );
+
         drop(user);
         session.wait().unwrap();
     }

@@ -148,22 +148,28 @@ impl ClosedLedger {
     }
 
     pub(crate) fn record_closed(&self, id: SessionId) {
-        let mut guard = lock(&self.ranges);
-        if !guard.insert(id) || self.corrupt.load(Ordering::Relaxed) {
-            return;
-        }
-        let encoded = encode_disk(&guard);
-        drop(guard);
-        if let Some(writer) = &self.writer {
-            match encoded {
+        let saved = {
+            let mut guard = lock(&self.ranges);
+            if !guard.insert(id) || self.corrupt.load(Ordering::Relaxed) {
+                return;
+            }
+            match encode_disk(&guard) {
                 Ok(raw) => {
-                    writer.save(raw);
-                    writer.flush_observed(Duration::from_millis(200)).ok();
+                    if let Some(writer) = &self.writer {
+                        writer.save(raw);
+                        true
+                    } else {
+                        false
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(kind = ?error.kind(), "closed session ledger encode failed");
+                    false
                 }
             }
+        };
+        if saved && let Some(writer) = &self.writer {
+            writer.flush_observed(Duration::from_millis(200)).ok();
         }
     }
 
@@ -217,6 +223,40 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_record_closed_preserves_union_of_all_session_ids() {
+        let dir = std::env::temp_dir().join(format!("closed-ledger-conc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let ledger = std::sync::Arc::new(ClosedLedger::open(Some(&dir), &[]));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+        for t in 0_u64..4 {
+            let ledger = std::sync::Arc::clone(&ledger);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0_u64..25 {
+                    ledger.record_closed(SessionId(1 + t * 25 + i));
+                }
+            }));
+        }
+        for handle in threads {
+            handle.join().unwrap();
+        }
+        ledger.flush(Duration::from_secs(2));
+
+        let reloaded = ClosedLedger::open(Some(&dir), &[]);
+        for id in 1_u64..=100 {
+            assert!(
+                reloaded.contains(SessionId(id)),
+                "closed session {id} lost under concurrent record_closed"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 }

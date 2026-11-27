@@ -735,6 +735,10 @@ fn has_macos_credential() -> Result<bool, ()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn read_macos_credential() -> Result<Option<AntigravityNativeCredential>, String> {
+    #[cfg(not(test))]
+    if !crate::keychain_key::is_default_keychain_unlocked() {
+        return Err("The Antigravity macOS credential store is locked.".to_owned());
+    }
     let mut cmd = Command::new("/usr/bin/security");
     cmd.args([
         "find-generic-password",
@@ -773,6 +777,10 @@ pub(crate) fn read_macos_credential() -> Result<Option<AntigravityNativeCredenti
 #[cfg(target_os = "macos")]
 pub(crate) fn write_macos_credential(contents: &str) -> Result<(), String> {
     parse_antigravity_native_credential(contents)?;
+    #[cfg(not(test))]
+    if !crate::keychain_key::is_default_keychain_unlocked() {
+        return Err("The Antigravity macOS credential store is locked.".to_owned());
+    }
     let encoded = encode_antigravity_keychain_value(contents)?;
     let input = Zeroizing::new(format!(
         "add-generic-password -U -s \"gemini\" -a \"antigravity\" -w {}\n",

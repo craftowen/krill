@@ -827,10 +827,12 @@ fn run_discord_loop_with_timeouts(
             }
         }
 
-        ws.close();
         if stop.is_stopped() || fatal_close {
+            ws.close_with_code(1000, "shutdown");
             break;
         }
+        // Discord Gateway v10 invalidates sessions on close codes 1000/1001; use 4000 so OP_RESUME works.
+        ws.close_with_code(4000, "reconnect");
         if attempting_resume && !resumed_or_ready {
             consecutive_resume_failures = consecutive_resume_failures.saturating_add(1);
             if consecutive_resume_failures >= 2 {
@@ -992,6 +994,29 @@ fn handle_message_create(
         .and_then(|t| t.get("parent_id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let raw_content = data
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mentions_array_hit = bot_user_id.is_some_and(|uid| {
+        data.get("mentions")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(uid))
+            })
+    });
+    let mentions_text_hit = bot_user_id.is_some_and(|uid| {
+        raw_content.contains(&format!("<@{uid}>")) || raw_content.contains(&format!("<@!{uid}>"))
+    });
+    let mentions_bot = mentions_array_hit || mentions_text_hit;
+
+    // Short-circuit unmentioned guild messages outside participated threads BEFORE calling
+    // `GET /channels/{id}` so busy servers never trigger spurious REST calls or 429 sleeps (CORE-15).
+    if guild_id.is_some() && !mentions_bot && !participated_threads.contains(channel_id) {
+        return;
+    }
+
     let mut parent_id = thread_obj_parent_id.clone().or_else(|| {
         data.get("parent_id")
             .and_then(Value::as_str)
@@ -1028,23 +1053,6 @@ fn handle_message_create(
     {
         return;
     }
-
-    let raw_content = data
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mentions_array_hit = bot_user_id.is_some_and(|uid| {
-        data.get("mentions")
-            .and_then(Value::as_array)
-            .is_some_and(|arr| {
-                arr.iter()
-                    .any(|m| m.get("id").and_then(Value::as_str) == Some(uid))
-            })
-    });
-    let mentions_text_hit = bot_user_id.is_some_and(|uid| {
-        raw_content.contains(&format!("<@{uid}>")) || raw_content.contains(&format!("<@!{uid}>"))
-    });
-    let mentions_bot = mentions_array_hit || mentions_text_hit;
 
     if guild_id.is_some() {
         let in_participated_thread = is_thread && participated_threads.contains(channel_id);
@@ -1650,6 +1658,17 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
             write_server_frame(&mut sock1, true, 1, br#"{"op":7,"d":null}"#).unwrap();
+            let (close_op, close_body) = read_client_frame(&mut sock1).unwrap();
+            assert_eq!(
+                close_op, 8,
+                "expected WebSocket close frame on OP_RECONNECT"
+            );
+            assert!(close_body.len() >= 2);
+            let close_code = u16::from_be_bytes([close_body[0], close_body[1]]);
+            assert!(
+                close_code != 1000 && close_code != 1001,
+                "OP_RECONNECT must not close with 1000/1001 (got {close_code}), which invalidates OP_RESUME"
+            );
             drop(sock1);
 
             // Connection #2: Client reconnects to resume_gateway_url and sends op 6 Resume with seq=4!
@@ -2441,6 +2460,139 @@ mod tests {
         assert!(
             (2..=3).contains(&count),
             "2nd consecutive OP_RECONNECT must apply backoff (expected 2..=3 connections in 450ms, got {count})"
+        );
+    }
+
+    #[test]
+    fn unmentioned_guild_message_triggers_zero_channel_meta_rest_calls() {
+        struct QuietBridge {
+            bot: BotConfig,
+        }
+        impl ConnectorBridge for QuietBridge {
+            fn dispatch_external_message(
+                &self,
+                _: InboundExternalMessage,
+            ) -> io::Result<crate::bots::connectors::DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> io::Result<crate::bots::connectors::AccessDecision> {
+                Ok(crate::bots::connectors::AccessDecision::Allowed)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+                _: krill_proto::bots::ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.bot.id == bot_id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+            fn resolve_secret(
+                &self,
+                _: &BotId,
+                _: Option<&str>,
+                _: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+        }
+
+        let rest_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rest_hits_srv = Arc::clone(&rest_hits);
+        let rest_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let rest_addr = rest_listener.local_addr().unwrap();
+        rest_listener.set_nonblocking(true).ok();
+        let stop_srv = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let rest_thread = thread::spawn(move || {
+            while !stop_srv_bg.load(std::sync::atomic::Ordering::Acquire) {
+                match rest_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        rest_hits_srv.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        let mut buf = [0u8; 1024];
+                        if stream.read(&mut buf).unwrap_or(0) > 0 {
+                            stream
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                                )
+                                .ok();
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let bot =
+            BotConfig::new(BotId::new("dc-quiet").unwrap(), "DcQuiet", "claude", 1_000).unwrap();
+        let bridge: Arc<dyn ConnectorBridge> = Arc::new(QuietBridge { bot: bot.clone() });
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge)));
+        let sender = Arc::new(DiscordSender::new(
+            &format!("http://{rest_addr}"),
+            Zeroizing::new("tok".to_owned()),
+        ));
+        let mut session = GatewaySession {
+            session_id: Some("s1".to_owned()),
+            resume_gateway_url: None,
+            seq: Some(1),
+            bot_user_id: Some("bot-uid-999".to_owned()),
+            account_label: Some("DcQuiet".to_owned()),
+        };
+        let mut participated_threads = BTreeSet::new();
+        let unmentioned_msg = json!({
+            "id": "m-1",
+            "guild_id": "g-1",
+            "channel_id": "ch-busy-1",
+            "content": "just regular guild chatter without mentioning the bot",
+            "mentions": [],
+            "author": { "id": "user-1", "username": "alice", "bot": false }
+        });
+
+        handle_dispatch(
+            &bot.id,
+            "MESSAGE_CREATE",
+            &unmentioned_msg,
+            &mut session,
+            &sender,
+            &bridge,
+            &router,
+            &mut participated_threads,
+        );
+
+        stop_srv.store(true, std::sync::atomic::Ordering::Release);
+        rest_thread.join().ok();
+        assert_eq!(
+            rest_hits.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "unmentioned guild MESSAGE_CREATE must NOT trigger GET /channels/{{id}} REST calls"
         );
     }
 }

@@ -8,10 +8,55 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+#[cfg(windows)]
+use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use wire::{CHUNK, HEADER_LEN, Header, Hello, Kind};
+
+#[cfg(unix)]
+type LocalRead = tokio::net::unix::OwnedReadHalf;
+#[cfg(unix)]
+type LocalWrite = tokio::net::unix::OwnedWriteHalf;
+#[cfg(windows)]
+type LocalRead = ReadHalf<Stream>;
+#[cfg(windows)]
+type LocalWrite = WriteHalf<Stream>;
+
+fn split_local(unix: Stream) -> (LocalRead, LocalWrite) {
+    #[cfg(unix)]
+    {
+        unix.into_split()
+    }
+    #[cfg(windows)]
+    {
+        tokio::io::split(unix)
+    }
+}
+
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::unused_async,
+        reason = "Unix awaits socket readiness; Windows uses sync tx_empty fallback"
+    )
+)]
+async fn local_peer_fully_closed(read: &LocalRead, tx_empty: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = tx_empty;
+        read.as_ref()
+            .ready(tokio::io::Interest::WRITABLE)
+            .await
+            .is_ok_and(tokio::io::Ready::is_write_closed)
+    }
+    #[cfg(windows)]
+    {
+        let _ = read;
+        tx_empty
+    }
+}
 
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
 struct StreamSlot;
@@ -152,7 +197,7 @@ impl Logical {
         mut grace: Duration,
         buffer_limit: usize,
     ) {
-        let (read, write) = tokio::io::split(unix);
+        let (read, write) = split_local(unix);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let mut local_tasks = JoinSet::new();
         let me = Arc::clone(&self);
@@ -307,18 +352,21 @@ impl Logical {
         .ok();
     }
 
-    async fn read_local(&self, mut unix: ReadHalf<Stream>, limit: usize) -> Result<(), Error> {
+    async fn read_local(&self, mut unix: LocalRead, limit: usize) -> Result<(), Error> {
         let mut stop = self.stop.subscribe();
         let mut scratch = [0; CHUNK];
         loop {
             // `read` is cancel safe: losing the race to `stop` consumes no bytes.
             let n = tokio::select! { _=stop.changed()=>return Ok(()), n=unix.read(&mut scratch)=>n.map_err(Error::Io)? };
             if n == 0 {
-                self.with(|l| {
+                let (never_attached, tx_empty) = self.with(|l| {
                     l.tx_fin = true;
-                    Ok(())
+                    Ok((l.generation == 0, l.tx_next == 0))
                 })?;
                 self.changed.notify_waiters();
+                if never_attached && local_peer_fully_closed(&unix, tx_empty).await {
+                    self.close("local closed before peer attach");
+                }
                 return Ok(());
             }
             let mut bytes = Bytes::zeroed(n)?;
@@ -330,7 +378,7 @@ impl Logical {
 
     async fn write_local(
         &self,
-        mut unix: WriteHalf<Stream>,
+        mut unix: LocalWrite,
         mut incoming: mpsc::Receiver<Incoming>,
     ) -> Result<(), Error> {
         let mut stop = self.stop.subscribe();
@@ -651,5 +699,30 @@ mod tests {
                 "transport stream close/reset must allow generation takeover"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unattached_logical_closes_immediately_on_local_eof_and_releases_slot() {
+        let before_slots = STREAMS.load(Ordering::Acquire);
+        let (local_a, local_b) = tokio::net::UnixStream::pair().unwrap();
+        let id = StreamId::random().unwrap();
+        let (logical, actor) =
+            Logical::spawn(local_a, id, Duration::from_secs(120), 64 * 1024).unwrap();
+        assert_eq!(STREAMS.load(Ordering::Acquire), before_slots + 1);
+
+        drop(local_b);
+        tokio::time::timeout(Duration::from_millis(100), logical.closed())
+            .await
+            .expect("unattached Logical must close in <100ms when local peer drops");
+        tokio::time::timeout(Duration::from_millis(100), actor)
+            .await
+            .expect("Logical actor task must exit promptly")
+            .unwrap();
+        assert_eq!(
+            STREAMS.load(Ordering::Acquire),
+            before_slots,
+            "StreamSlot must be released immediately on unattached local close"
+        );
     }
 }

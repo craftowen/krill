@@ -478,7 +478,13 @@ impl Shared {
             daemon: conn.daemon_identity,
             machine: conn.machine_identity,
         };
-        let res = f(&mut conn.stream);
+        let res = f(&mut conn.stream).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                io::Error::from(io::ErrorKind::TimedOut)
+            } else {
+                e
+            }
+        });
         if !self.target.is_current() {
             *guard = None;
             return Err(io::ErrorKind::Interrupted.into());

@@ -221,18 +221,35 @@ impl LinkConfig {
         {
             return name.trim().to_owned();
         }
-        if let Ok(out) = std::process::Command::new("/bin/hostname")
-            .arg("-s")
-            .output()
-            && out.status.success()
-            && let Ok(name) = String::from_utf8(out.stdout)
+        #[cfg(unix)]
         {
-            let trimmed = name.trim().trim_end_matches(".local");
-            if !trimmed.is_empty() {
-                return trimmed.to_owned();
+            if let Ok(out) = std::process::Command::new("/bin/hostname")
+                .arg("-s")
+                .output()
+                && out.status.success()
+                && let Ok(name) = String::from_utf8(out.stdout)
+            {
+                let trimmed = name.trim().trim_end_matches(".local");
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
             }
+            "krill-mac".to_owned()
         }
-        "krill-mac".to_owned()
+        #[cfg(windows)]
+        {
+            if let Ok(name) = std::env::var("COMPUTERNAME") {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+            "krill-pc".to_owned()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            "krill-host".to_owned()
+        }
     }
 }
 
@@ -318,5 +335,22 @@ mod tests {
 
         assert!(LinkConfig::parse_toml("relay = \"invalid-mode\"\n").is_err());
         assert!(LinkConfig::parse_toml("relay_mode = \"custom\"\n").is_err());
+    }
+
+    #[test]
+    fn effective_server_name_uses_platform_hostname_or_fallback() {
+        let cfg = LinkConfig {
+            server_name: None,
+            ..LinkConfig::default()
+        };
+        let name = cfg.effective_server_name();
+        assert!(!name.trim().is_empty());
+        assert!(
+            !std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("local"))
+        );
+        #[cfg(windows)]
+        assert_ne!(name, "krill-mac");
     }
 }

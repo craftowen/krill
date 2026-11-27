@@ -3081,3 +3081,221 @@ fn bot_item_waiting_serde_wire_and_legacy_downgrade() {
     assert!(preamble.contains("running worker counts as `working`"));
     assert_eq!(strip_launch_preamble(&preamble), Some(""));
 }
+
+#[test]
+fn with_capabilities_rejects_nested_dos_on_small_stack_and_bounds_caps() {
+    let mut payload = Vec::with_capacity(5_000 * 2 + 1);
+    for _ in 0..5_000 {
+        payload.push(0x5F); // BotRpcRequest::WithCapabilities discriminant (95)
+        payload.push(0x00); // empty capabilities vec
+    }
+    payload.push(0x00); // ListBots
+
+    let payload_for_thread = payload.clone();
+    let handle = std::thread::Builder::new()
+        .name("core05-small-stack".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let err = BotRpcRequest::decode(BOT_REQ, &payload_for_thread).unwrap_err();
+            assert_eq!(
+                std::io::Error::from(err).kind(),
+                std::io::ErrorKind::InvalidData
+            );
+
+            let mut ctrl_body = vec![29_u8]; // control::Request::Bot
+            ctrl_body.extend_from_slice(&payload_for_thread);
+            let ctrl_err =
+                crate::control::Request::decode(crate::control::kind::REQUEST, &ctrl_body)
+                    .unwrap_err();
+            assert_eq!(
+                std::io::Error::from(ctrl_err).kind(),
+                std::io::ErrorKind::InvalidData
+            );
+
+            assert!(postcard::from_bytes::<BotRpcRequest>(&payload_for_thread).is_err());
+        })
+        .unwrap();
+    handle.join().unwrap();
+
+    // Depth 1 with valid capabilities decodes cleanly.
+    let valid = BotRpcRequest::WithCapabilities {
+        capabilities: vec![DESKTOP_BOT_CAPABILITIES[0].to_owned()],
+        request: Box::new(BotRpcRequest::ListBots),
+    };
+    let frame = valid.encode().unwrap();
+    let (kind, body) = crate::ipc::read_frame(&mut frame.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(BotRpcRequest::decode(kind, &body).unwrap(), valid);
+    assert!(valid.is_read_only());
+
+    // Excess capability count and overlong capability string are rejected.
+    let too_many = vec!["cap".to_owned(); crate::bots::rpc::MAX_BOT_CAPABILITIES + 1];
+    let mut raw_many = vec![0x5F];
+    raw_many.extend(postcard::to_stdvec(&too_many).unwrap());
+    raw_many.push(0x00);
+    assert!(BotRpcRequest::decode(BOT_REQ, &raw_many).is_err());
+
+    let too_long = vec!["x".repeat(crate::bots::rpc::MAX_BOT_CAPABILITY_LEN + 1)];
+    let mut raw_long = vec![0x5F];
+    raw_long.extend(postcard::to_stdvec(&too_long).unwrap());
+    raw_long.push(0x00);
+    assert!(BotRpcRequest::decode(BOT_REQ, &raw_long).is_err());
+}
+
+#[test]
+fn create_and_update_item_preserve_n_minus_1_wire_layout_and_roundtrip_waiting_reason() {
+    #[derive(serde::Serialize)]
+    struct LegacyCreateBotItemParams<'a> {
+        bot_id: &'a BotId,
+        title: &'a str,
+        description: &'a Option<String>,
+        done_means: &'a Option<String>,
+        status: Option<BotItemStatus>,
+        links: &'a [BotItemLink],
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyUpdateBotItemParams<'a> {
+        item_id: &'a str,
+        title: &'a Option<String>,
+        description: &'a Option<String>,
+        done_means: &'a Option<String>,
+        status: Option<BotItemStatus>,
+        comment: &'a Option<String>,
+        decisions: &'a [BotItemDecision],
+        close_note: &'a Option<String>,
+        snoozed_until_ms: &'a FieldPatch<u64>,
+    }
+
+    let bot_id = BotId::new("bot-wire").unwrap();
+    let create_no_wait = BotRpcRequest::CreateItem(Box::new(CreateBotItemParams {
+        bot_id: bot_id.clone(),
+        title: "Ship v0.3.34".to_owned(),
+        description: Some("Fix wire compat".to_owned()),
+        done_means: None,
+        status: Some(BotItemStatus::Working),
+        links: vec![BotItemLink::Pr("craftowen/krill#99".to_owned())],
+        waiting_reason: None,
+    }));
+    let mut legacy_create_body = vec![14_u8]; // BotRpcRequest::CreateItem
+    legacy_create_body.extend(
+        postcard::to_stdvec(&LegacyCreateBotItemParams {
+            bot_id: &bot_id,
+            title: "Ship v0.3.34",
+            description: &Some("Fix wire compat".to_owned()),
+            done_means: &None,
+            status: Some(BotItemStatus::Working),
+            links: &[BotItemLink::Pr("craftowen/krill#99".to_owned())],
+        })
+        .unwrap(),
+    );
+    // N-1 bytes decode cleanly on current server, and current encode with waiting_reason=None is bit-identical.
+    assert_eq!(
+        BotRpcRequest::decode(BOT_REQ, &legacy_create_body).unwrap(),
+        create_no_wait
+    );
+    let encoded_create = create_no_wait.encode().unwrap();
+    let (k, b) = crate::ipc::read_frame(&mut encoded_create.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(k, BOT_REQ);
+    assert_eq!(b, legacy_create_body);
+
+    let update_no_wait = BotRpcRequest::UpdateItem(Box::new(UpdateBotItemParams {
+        item_id: "item-1".to_owned(),
+        title: None,
+        description: None,
+        done_means: None,
+        status: Some(BotItemStatus::Working),
+        comment: Some("Progress".to_owned()),
+        decisions: Vec::new(),
+        close_note: None,
+        snoozed_until_ms: FieldPatch::Unchanged,
+        waiting_reason: None,
+    }));
+    let mut legacy_update_body = vec![15_u8]; // BotRpcRequest::UpdateItem
+    legacy_update_body.extend(
+        postcard::to_stdvec(&LegacyUpdateBotItemParams {
+            item_id: "item-1",
+            title: &None,
+            description: &None,
+            done_means: &None,
+            status: Some(BotItemStatus::Working),
+            comment: &Some("Progress".to_owned()),
+            decisions: &[],
+            close_note: &None,
+            snoozed_until_ms: &FieldPatch::Unchanged,
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        BotRpcRequest::decode(BOT_REQ, &legacy_update_body).unwrap(),
+        update_no_wait
+    );
+    let encoded_update = update_no_wait.encode().unwrap();
+    let (k, b) = crate::ipc::read_frame(&mut encoded_update.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(k, BOT_REQ);
+    assert_eq!(b, legacy_update_body);
+
+    // Also decode legacy N-1 Control::Request::Bot frames cleanly.
+    let mut legacy_ctrl_body = vec![29_u8];
+    legacy_ctrl_body.extend_from_slice(&legacy_create_body);
+    assert_eq!(
+        crate::control::Request::decode(crate::control::kind::REQUEST, &legacy_ctrl_body).unwrap(),
+        crate::control::Request::Bot(create_no_wait)
+    );
+
+    // New requests with waiting_reason round-trip cleanly both bare and wrapped in WithCapabilities,
+    // over both BOT_REQ and control::Request::Bot.
+    let create_wait = BotRpcRequest::CreateItem(Box::new(CreateBotItemParams {
+        bot_id,
+        title: "Wait for CI".to_owned(),
+        description: None,
+        done_means: None,
+        status: Some(BotItemStatus::Waiting),
+        links: Vec::new(),
+        waiting_reason: Some("CI on PR #99".to_owned()),
+    }));
+    let update_wait = BotRpcRequest::UpdateItem(Box::new(UpdateBotItemParams {
+        item_id: "item-1".to_owned(),
+        title: None,
+        description: None,
+        done_means: None,
+        status: Some(BotItemStatus::Waiting),
+        comment: None,
+        decisions: Vec::new(),
+        close_note: None,
+        snoozed_until_ms: FieldPatch::Unchanged,
+        waiting_reason: Some("Waiting for review".to_owned()),
+    }));
+    for req in [
+        create_wait.clone(),
+        update_wait.clone(),
+        BotRpcRequest::WithCapabilities {
+            capabilities: vec![DESKTOP_BOT_CAPABILITIES[0].to_owned()],
+            request: Box::new(create_wait),
+        },
+        BotRpcRequest::WithCapabilities {
+            capabilities: vec![DESKTOP_BOT_CAPABILITIES[0].to_owned()],
+            request: Box::new(update_wait),
+        },
+    ] {
+        let frame = req.encode().unwrap();
+        let (kind, body) = crate::ipc::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(BotRpcRequest::decode(kind, &body).unwrap(), req);
+
+        let ctrl = crate::control::Request::Bot(req);
+        let cframe = ctrl.encode().unwrap();
+        let (ckind, cbody) = crate::ipc::read_frame(&mut cframe.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::control::Request::decode(ckind, &cbody).unwrap(),
+            ctrl
+        );
+    }
+}

@@ -174,7 +174,7 @@ impl RemoteConnector {
     }
 
     #[must_use]
-    pub(crate) fn with_ensure_socket_epoch(
+    pub fn with_ensure_socket_epoch(
         mut self,
         ensure_socket_epoch: impl Fn() -> io::Result<(PathBuf, u64)> + Send + Sync + 'static,
     ) -> Self {
@@ -462,7 +462,7 @@ impl HostTarget {
 fn normalize_remote_io_error(err: io::Error) -> io::Error {
     if matches!(
         err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::WouldBlock | io::ErrorKind::NetworkDown
+        io::ErrorKind::NotFound | io::ErrorKind::NetworkDown
     ) {
         io::Error::new(io::ErrorKind::ConnectionRefused, err.to_string())
     } else {

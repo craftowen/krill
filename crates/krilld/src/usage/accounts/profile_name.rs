@@ -217,12 +217,40 @@ fn build_security_interactive_write_line(
     if !safe_arg(service) || !safe_arg(account) {
         return None;
     }
-    let prefix = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X ");
+    let max_len = crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE;
+    // Prefer `-w "<escaped>"` with `-T "/usr/bin/security"` for printable ASCII JSON (~4 KB capacity,
+    // ~2x larger than hex `-X`) while keeping the item's ACL bound to Apple-signed `/usr/bin/security`.
+    if secret.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+        let prefix = format!(
+            "add-generic-password -U -a \"{account}\" -s \"{service}\" -T \"/usr/bin/security\" -w \""
+        );
+        let mut escaped_len = 0usize;
+        for &b in secret {
+            escaped_len = escaped_len.checked_add(if matches!(b, b'\\' | b'"') { 2 } else { 1 })?;
+        }
+        let line_len = prefix.len().checked_add(escaped_len)?.checked_add(2)?; // `"\n`
+        if line_len <= max_len {
+            let mut script = Zeroizing::new(String::with_capacity(line_len));
+            script.push_str(&prefix);
+            for &b in secret {
+                if matches!(b, b'\\' | b'"') {
+                    script.push('\\');
+                }
+                script.push(char::from(b));
+            }
+            script.push_str("\"\n");
+            return Some(script);
+        }
+        return None;
+    }
+    let prefix = format!(
+        "add-generic-password -U -a \"{account}\" -s \"{service}\" -T \"/usr/bin/security\" -X "
+    );
     let line_len = prefix
         .len()
         .checked_add(secret.len().checked_mul(2)?)?
         .checked_add(1)?;
-    if line_len > crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE {
+    if line_len > max_len {
         return None;
     }
     let mut script = Zeroizing::new(String::with_capacity(line_len));
@@ -268,10 +296,21 @@ mod macos {
                 "invalid keychain credential payload",
             ));
         }
+        if !crate::keychain_key::is_default_keychain_unlocked() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "macOS Keychain is locked",
+            ));
+        }
         let Some(script) = super::build_security_interactive_write_line(service, account, secret)
         else {
-            return security_framework::passwords::set_generic_password(service, account, secret)
-                .map_err(|_| io::Error::other("keychain write failed"));
+            // Never fall back to `security_framework::passwords::set_generic_password`:
+            // ad-hoc builds would create a `krilld`-CDHash-only ACL item that breaks both
+            // `/usr/bin/security` readback and Claude Code CLI.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "keychain credential exceeds interactive security command limit",
+            ));
         };
         let mut cmd = Command::new(SECURITY);
         cmd.arg("-i");
@@ -295,6 +334,12 @@ mod macos {
     }
 
     fn read(service: &str, user: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+        if !crate::keychain_key::is_default_keychain_unlocked() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "macOS Keychain is locked",
+            ));
+        }
         let mut cmd = Command::new(SECURITY);
         cmd.args(["find-generic-password", "-s", service, "-a", user, "-w"]);
         let (status, secret) = crate::usage::accounts::agy_native::run_command_with_timeout(
@@ -604,22 +649,41 @@ mod tests {
     fn security_interactive_write_line_enforces_4095_byte_limit_and_safe_quoting() {
         let small = r#"{"claudeAiOauth":{"accessToken":"small","name":"한글"}}"#.as_bytes();
         let line = build_security_interactive_write_line("Claude Code-credentials", "owen", small)
-            .expect("small JSON fits security -i");
+            .expect("small UTF-8 JSON fits security -i");
         assert!(line.len() <= crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE);
+        assert!(line.contains("-T \"/usr/bin/security\""));
+        assert!(line.contains(" -X "));
 
-        // 2100 raw bytes -> 4200 hex chars + command prefix > 4095 fgets buffer limit
-        let large = format!(
+        // 2500-byte printable ASCII Claude OAuth JSON fits via `-w` with `-T "/usr/bin/security"`.
+        let medium_ascii = format!(
             r#"{{"claudeAiOauth":{{"accessToken":"{}"}}}}"#,
-            "x".repeat(2100)
+            "x".repeat(2500)
+        );
+        let medium_line = build_security_interactive_write_line(
+            "Claude Code-credentials",
+            "owen",
+            medium_ascii.as_bytes(),
+        )
+        .expect("2500-byte printable ASCII JSON must fit security -i via -w");
+        assert!(
+            medium_line.len() <= crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE
+        );
+        assert!(medium_line.contains("-T \"/usr/bin/security\""));
+        assert!(medium_line.contains(" -w \""));
+
+        // >4095-byte payload must fail cleanly instead of creating a krilld-CDHash-only ACL item.
+        let oversized = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{}"}}}}"#,
+            "x".repeat(4100)
         );
         assert!(
             build_security_interactive_write_line(
                 "Claude Code-credentials",
                 "owen",
-                large.as_bytes()
+                oversized.as_bytes()
             )
             .is_none(),
-            "lines exceeding 4095 bytes must bypass security -i fgets limit"
+            "lines exceeding 4095 bytes must return None without falling back to SecKeychain"
         );
         assert!(
             build_security_interactive_write_line("svc\"bad", "owen", small).is_none(),

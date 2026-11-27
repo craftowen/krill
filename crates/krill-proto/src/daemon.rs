@@ -1367,6 +1367,14 @@ pub fn handshake(socket: &Path, hello: &ClientHello, timeout: Duration) -> io::R
     handshake_stream(UnixStream::connect(socket)?, hello, timeout)
 }
 
+fn map_blocking_timeout(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::ErrorKind::TimedOut.into()
+    } else {
+        error
+    }
+}
+
 fn handshake_stream(
     mut stream: UnixStream,
     hello: &ClientHello,
@@ -1392,14 +1400,20 @@ fn handshake_stream(
         error
     });
     configured?;
-    let (kind, body) = ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+    let (kind, body) = ipc::read_frame(&mut stream)
+        .map_err(map_blocking_timeout)?
+        .ok_or(io::ErrorKind::UnexpectedEof)?;
     let (server, daemon_identity, machine_identity) =
         ServerHello::decode_with_identities(kind, &body)?;
-    stream.write_all(&hello.encode()?)?;
+    stream
+        .write_all(&hello.encode()?)
+        .map_err(map_blocking_timeout)?;
     let negotiated = ipc::negotiate(&server, hello).ok_or(ipc::Error::Incompatible)?;
     let holder_status = if is_watch(hello.features) && negotiated.features & FEAT_HOLDER_WATCH != 0
     {
-        let (kind, body) = ipc::read_frame(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        let (kind, body) = ipc::read_frame(&mut stream)
+            .map_err(map_blocking_timeout)?
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
         Some(HolderStatus::decode(kind, &body)?)
     } else {
         None

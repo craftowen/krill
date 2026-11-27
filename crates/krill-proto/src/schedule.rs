@@ -56,7 +56,6 @@ impl WorkspaceMode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Schedules {
     #[serde(default)]
     pub schedule: Vec<Schedule>,
@@ -75,7 +74,6 @@ const fn is_enabled(enabled: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Schedule {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -667,20 +665,48 @@ pub struct ClassifiedSchedule {
     pub cron: String,
 }
 
-fn normalize_weekdays(text: &str) -> String {
-    let mut text = text.to_ascii_uppercase();
-    for (day, n) in [
-        ("SUN", "0"),
-        ("MON", "1"),
-        ("TUE", "2"),
-        ("WED", "3"),
-        ("THU", "4"),
-        ("FRI", "5"),
-        ("SAT", "6"),
-    ] {
-        text = text.replace(day, n);
+fn normalize_weekday_atom(atom: &str, as_range_end: bool, range_start: Option<&str>) -> String {
+    match atom {
+        "SUN" => {
+            if as_range_end && !matches!(range_start, Some("SUN" | "0")) {
+                "7".to_owned()
+            } else {
+                "0".to_owned()
+            }
+        }
+        "MON" => "1".to_owned(),
+        "TUE" => "2".to_owned(),
+        "WED" => "3".to_owned(),
+        "THU" => "4".to_owned(),
+        "FRI" => "5".to_owned(),
+        "SAT" => "6".to_owned(),
+        other => other.to_owned(),
     }
-    text
+}
+
+fn normalize_weekdays(text: &str) -> String {
+    let upper = text.to_ascii_uppercase();
+    upper
+        .split(',')
+        .map(|part| {
+            let (range, step) = match part.split_once('/') {
+                Some((r, s)) => (r, Some(s)),
+                None => (part, None),
+            };
+            let normalized_range = if let Some((start, end)) = range.split_once('-') {
+                let s = normalize_weekday_atom(start, false, None);
+                let e = normalize_weekday_atom(end, true, Some(start));
+                format!("{s}-{e}")
+            } else {
+                normalize_weekday_atom(range, false, None)
+            };
+            match step {
+                Some(s) => format!("{normalized_range}/{s}"),
+                None => normalized_range,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn rrule_to_cron(expr: &str) -> io::Result<String> {

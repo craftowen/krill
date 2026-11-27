@@ -9,8 +9,8 @@ pub use tunnel::*;
 
 /// 재연결 지수 백오프 초기 지연 (50ms).
 pub const BACKOFF_INITIAL: Duration = Duration::from_millis(50);
-/// 재연결 지수 백오프 최대 상한 (2,000ms).
-pub const BACKOFF_MAX: Duration = Duration::from_millis(2_000);
+/// 재연결 지수 백오프 최대 상한 (30,000ms).
+pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// 지수 백오프 지연 계산 (`50ms * 2^attempt`, 상한 `BACKOFF_MAX`).
 pub fn reconnect_backoff_delay(attempt: u32) -> Duration {

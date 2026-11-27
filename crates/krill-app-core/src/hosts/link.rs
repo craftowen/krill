@@ -867,6 +867,25 @@ fn is_pid_alive(pid: u32) -> bool {
     sys.process(spid).is_some()
 }
 
+fn stale_cleanup_lock(state_dir: &Path, host_id: &str) -> Arc<Mutex<()>> {
+    type StaleLockMap = BTreeMap<(PathBuf, String), Arc<Mutex<()>>>;
+    static LOCKS: OnceLock<Mutex<StaleLockMap>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let key = (state_dir.to_path_buf(), host_id.to_owned());
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(guard.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
+fn clear_status_file_if_pid(state_dir: &Path, host_id: &str, expected_pid: u32) {
+    if let Some(current) = read_raw_host_status(state_dir, host_id)
+        && current.pid == Some(expected_pid)
+    {
+        clear_status_file(state_dir, host_id);
+    }
+}
+
 /// 구버전(또는 `build` 필드가 없는) `krill-link connect <host_id>` 프로세스를
 /// 실행 파일·인자 일치 검증 후 안전하게 종료해 새 바이너리로 교체할 수 있게 한다.
 fn stop_stale_connect_process(
@@ -881,6 +900,18 @@ fn stop_stale_connect_process(
     if pid == std::process::id() || !krill_link_core::service::is_stale_build(&status.build) {
         return false;
     }
+    let host_lock = stale_cleanup_lock(state_dir, host_id);
+    let _guard = host_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check the on-disk status after acquiring the per-host lock so concurrent callers
+    // never double-signal a stale PID or delete a freshly spawned replacement's status file.
+    let Some(current) = read_raw_host_status(state_dir, host_id) else {
+        return false;
+    };
+    if current.pid != Some(pid) || !krill_link_core::service::is_stale_build(&current.build) {
+        return false;
+    }
     let spid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes_specifics(
@@ -890,7 +921,7 @@ fn stop_stale_connect_process(
             .with_cmd(sysinfo::UpdateKind::Always),
     );
     let Some(process) = sys.process(spid) else {
-        clear_status_file(state_dir, host_id);
+        clear_status_file_if_pid(state_dir, host_id, pid);
         return false;
     };
     if !process_matches_krill_link_connect(process, host_id, executable) {
@@ -904,7 +935,7 @@ fn stop_stale_connect_process(
     tracing::info!(
         host_id,
         pid,
-        running_build = %status.build,
+        running_build = %current.build,
         current_build = krill_proto::build_id(),
         "stopping stale krill-link connect process for upgrade replacement"
     );
@@ -943,7 +974,7 @@ fn stop_stale_connect_process(
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    clear_status_file(state_dir, host_id);
+    clear_status_file_if_pid(state_dir, host_id, pid);
     true
 }
 
@@ -1567,6 +1598,46 @@ mod tests {
         current_child.wait().ok();
         unrelated_child.kill().ok();
         unrelated_child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_status_file_if_pid_preserves_replacement_child_status() {
+        let dir = std::env::temp_dir().join(format!("rem04-pid-guard-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_id = "mac-mini";
+        let status_path = krill_link_core::host_status_path(&dir, host_id).unwrap();
+        std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        let replacement = krill_link_core::HostTunnelStatus {
+            host_id: host_id.into(),
+            host_name: "Mac Mini".into(),
+            node_id: "node-1".into(),
+            socket_path: krill_link_core::host_socket_path(&dir, host_id).unwrap(),
+            state: krill_link_core::TunnelState::Connected,
+            route: krill_link_core::RouteKind::Direct,
+            remote_addr: None,
+            rtt_ms: None,
+            reconnect_attempt: 0,
+            updated_at_ms: now_unix_ms(),
+            pid: Some(999_002),
+            build: krill_proto::build_id().to_owned(),
+            last_error: None,
+            last_error_kind: None,
+            streams: Vec::new(),
+        };
+        std::fs::write(&status_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+
+        // Stale cleanup for an old PID must NOT delete the replacement child's status file.
+        clear_status_file_if_pid(&dir, host_id, 999_001);
+        assert!(
+            status_path.exists(),
+            "replacement child status file must survive stale PID cleanup"
+        );
+
+        // Matching PID removes the file.
+        clear_status_file_if_pid(&dir, host_id, 999_002);
+        assert!(!status_path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1670,6 +1670,10 @@ pub(crate) fn is_json_object_credential(raw: &[u8]) -> bool {
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
 #[cfg(all(not(test), not(windows)))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
+    #[cfg(target_os = "macos")]
+    if !crate::keychain_key::is_default_keychain_unlocked() {
+        return None;
+    }
     let mut cmd = krill_proto::os::background_command("/usr/bin/security");
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
     let (status, stdout) = accounts::agy_native::run_command_with_timeout(
