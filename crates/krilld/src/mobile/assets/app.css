@@ -1195,15 +1195,15 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .voice-dot{width:8px;height:8px;border-radius:50%;background:var(--status-blocked);animation:voice-pulse 1s infinite}
 @keyframes voice-pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .voice-timer,.voice-busy{font-size:var(--font-meta);font-variant-numeric:tabular-nums}
-#mobile-app .voice-stop{min-width:auto;min-height:26px;padding:0 8px}
+#mobile-app .voice-stop{min-width:var(--touch-target);min-height:var(--touch-target);padding:0 12px}
 .voice-settings-card>.voice-vocab-block{position:relative;display:flex;flex-direction:column;gap:8px;padding:12px}
 .voice-add-row{display:flex;flex-direction:row;gap:6px;align-items:center}
 .voice-add-row input{flex:1;min-width:0}
 .voice-add-row button{flex:none}
-.voice-chips{display:flex;flex-wrap:wrap;gap:6px}
-.voice-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;background:var(--surface-raised);border:1px solid var(--border);font-size:var(--font-meta)}
+.voice-chips{display:flex;flex-wrap:wrap;gap:8px}
+.voice-chip{display:inline-flex;align-items:center;gap:0;min-height:var(--touch-target);min-width:0;max-width:100%;padding:0 0 0 12px;border-radius:999px;background:var(--surface-raised);border:1px solid var(--border);font-size:var(--font-meta);overflow-wrap:anywhere}
 .voice-chip.pinned{border-color:var(--accent)}
-#mobile-app .voice-chip-x{min-width:20px;min-height:20px;border:0;background:none;color:var(--text-muted);cursor:pointer;padding:0 2px;font-size:13px;line-height:1}
+#mobile-app .voice-chip-x{display:inline-grid;place-items:center;min-width:var(--touch-target);min-height:var(--touch-target);border:0;background:none;color:var(--text-muted);cursor:pointer;padding:0;font-size:15px;line-height:1;flex:none}
 .voice-status-pill[data-status=ready]{color:var(--status-done)}
 .voice-status-pill[data-status=loading]{color:var(--status-working)}
 .voice-status-pill[data-status=not_running],.voice-status-pill[data-status=not_installed]{color:var(--status-blocked)}
