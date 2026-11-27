@@ -425,7 +425,7 @@ fn main() -> ExitCode {
                 let (hello, r) = (hello.clone(), Arc::clone(&accept_registry));
                 match thread::Builder::new()
                     .name("conn".to_owned())
-                    .stack_size(256 * 1024)
+                    .stack_size(512 * 1024)
                     .spawn(move || {
                         krilld::alloc::mobile_thread().ok();
                         r.serve_admitted(s, &hello, permit).ok()

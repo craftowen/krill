@@ -11,14 +11,16 @@
 //! 96-bit random nonce. Raw secret values are always returned inside [`Zeroizing<String>`] and
 //! are never logged or serialized into `bot.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
 #[cfg(all(target_os = "macos", not(test)))]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::bots::BotId;
 use krill_proto::os::fs::DirBuilderExt as _;
@@ -47,6 +49,44 @@ const LEGACY_KEYCHAIN_SERVICE: &str = "com.krill.bots-secret-key.v1";
 
 const KEY_FILE: &str = "secrets.key";
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
+static LOCKED_WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+#[cfg(any(target_os = "macos", test))]
+fn mark_locked_warned(path: &Path) -> bool {
+    lock(&LOCKED_WARNED).insert(path.to_path_buf())
+}
+
+fn clear_locked_warned(path: &Path) {
+    lock(&LOCKED_WARNED).remove(path);
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn invalidate_macos_keychain_cache(root: &Path) {
+    if !crate::usage::accounts::agy_native::backend::is_real_home_for_state_path(root) {
+        return;
+    }
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let account = crate::mobile::devices::hex(&Sha256::digest(canonical.as_os_str().as_bytes()));
+    crate::keychain_key::invalidate_key_cache(KEYCHAIN_SERVICE, &account, None);
+}
+
+fn unique_locked_backup_path(root: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u64, |d| d.as_secs());
+    for attempt in 0_u32..1000 {
+        let name = if attempt == 0 {
+            format!("{VAULT_FILE}.locked-{ts}.bak")
+        } else {
+            format!("{VAULT_FILE}.locked-{ts}-{attempt}.bak")
+        };
+        let candidate = root.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    root.join(format!("{VAULT_FILE}.locked-{ts}.bak"))
+}
 
 struct MasterKey(Zeroizing<[u8; 32]>);
 
@@ -98,13 +138,36 @@ impl MasterKey {
             allow_create,
             check_legacy,
         }) {
-            Ok(bytes) => Ok(Arc::new(Self(bytes))),
+            Ok(bytes) => {
+                clear_locked_warned(root);
+                Ok(Arc::new(Self(bytes)))
+            }
             Err(err) => {
-                tracing::warn!(
-                    reason = err.log_kind(),
-                    status = ?err.os_status(),
-                    "failed to load bot secret vault master key from macOS Keychain"
+                let is_legacy_locked = matches!(
+                    err.kind,
+                    crate::keychain_key::KeyLoadErrorKind::LegacyAclLocked(_)
                 );
+                if is_legacy_locked {
+                    if mark_locked_warned(root) {
+                        tracing::warn!(
+                            reason = err.log_kind(),
+                            status = ?err.os_status(),
+                            "failed to load bot secret vault master key from macOS Keychain"
+                        );
+                    } else {
+                        tracing::debug!(
+                            reason = err.log_kind(),
+                            status = ?err.os_status(),
+                            "bot secret vault master key remains ACL-locked"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        reason = err.log_kind(),
+                        status = ?err.os_status(),
+                        "failed to load bot secret vault master key from macOS Keychain"
+                    );
+                }
                 Err(err.into_io_error("bot vault key unavailable"))
             }
         }
@@ -245,13 +308,18 @@ pub struct SecretVault {
     root: PathBuf,
     vault_path: PathBuf,
     io_lock: Mutex<()>,
-    key: OnceLock<Arc<MasterKey>>,
+    key: Mutex<Option<Arc<MasterKey>>>,
+    legacy_acl_locked: AtomicBool,
 }
 
 impl fmt::Debug for SecretVault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretVault")
-            .field("initialized", &self.key.get().is_some())
+            .field("initialized", &lock(&self.key).is_some())
+            .field(
+                "legacy_acl_locked",
+                &self.legacy_acl_locked.load(Ordering::Acquire),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -265,7 +333,8 @@ impl SecretVault {
             root: bots_root,
             vault_path,
             io_lock: Mutex::new(()),
-            key: OnceLock::new(),
+            key: Mutex::new(None),
+            legacy_acl_locked: AtomicBool::new(false),
         }
     }
 
@@ -274,14 +343,61 @@ impl SecretVault {
     #[must_use]
     pub(crate) fn with_static_key(bots_root: PathBuf, raw_key: [u8; 32]) -> Self {
         let vault_path = bots_root.join(VAULT_FILE);
-        let key = OnceLock::new();
-        key.set(Arc::new(MasterKey(Zeroizing::new(raw_key)))).ok();
         Self {
             root: bots_root,
             vault_path,
             io_lock: Mutex::new(()),
-            key,
+            key: Mutex::new(Some(Arc::new(MasterKey(Zeroizing::new(raw_key))))),
+            legacy_acl_locked: AtomicBool::new(false),
         }
+    }
+
+    /// Returns `true` if this vault recently failed to unlock due to a legacy macOS Keychain ACL.
+    #[must_use]
+    pub fn is_legacy_acl_locked(&self) -> bool {
+        self.legacy_acl_locked.load(Ordering::Acquire)
+    }
+
+    /// Recovers a locked bot secret vault by backing up any existing `secrets.enc` to
+    /// `secrets.enc.locked-<ts>.bak`, creating a fresh upgrade-resilient `.v2` master key
+    /// (`check_legacy = false`), and writing an empty encrypted vault.
+    pub fn reset_locked_vault(&self) -> io::Result<Option<PathBuf>> {
+        let _guard = lock(&self.io_lock);
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.root)?;
+
+        let key_path = self.root.join(KEY_FILE);
+        if key_path.is_file() && MasterKey::load_or_create_file(&self.root, false).is_err() {
+            let key_backup = self.root.join(format!("{KEY_FILE}.locked.bak"));
+            fs::rename(&key_path, &key_backup).ok();
+        }
+
+        #[cfg(all(target_os = "macos", not(test)))]
+        invalidate_macos_keychain_cache(&self.root);
+
+        // Obtain/create a fresh upgrade-resilient `.v2` key FIRST (bypassing locked legacy key)
+        // before moving the existing encrypted vault aside.
+        let fresh_key = MasterKey::load_or_create(&self.root, true, false)?;
+
+        let backup = if self.vault_path.exists() {
+            let dst = unique_locked_backup_path(&self.root);
+            fs::rename(&self.vault_path, &dst)?;
+            Some(dst)
+        } else {
+            None
+        };
+
+        *lock(&self.key) = Some(fresh_key);
+        self.legacy_acl_locked.store(false, Ordering::Release);
+        clear_locked_warned(&self.root);
+
+        let empty = BTreeMap::new();
+        self.save_map_locked(&empty)?;
+        Ok(backup)
     }
 
     /// Canonical scoped reference key for `(bot_id, key)`.
@@ -403,13 +519,25 @@ impl SecretVault {
     }
 
     fn key(&self, allow_create: bool) -> io::Result<Arc<MasterKey>> {
-        if let Some(existing) = self.key.get() {
+        if let Some(existing) = lock(&self.key).as_ref() {
             return Ok(Arc::clone(existing));
         }
         let vault_exists = self.vault_path.exists();
-        let loaded = MasterKey::load_or_create(&self.root, allow_create, vault_exists)?;
-        self.key.set(Arc::clone(&loaded)).ok();
-        Ok(loaded)
+        match MasterKey::load_or_create(&self.root, allow_create, vault_exists) {
+            Ok(loaded) => {
+                self.legacy_acl_locked.store(false, Ordering::Release);
+                *lock(&self.key) = Some(Arc::clone(&loaded));
+                Ok(loaded)
+            }
+            Err(err) => {
+                if err.kind() == io::ErrorKind::PermissionDenied
+                    && err.to_string().contains("legacy macOS keychain ACL")
+                {
+                    self.legacy_acl_locked.store(true, Ordering::Release);
+                }
+                Err(err)
+            }
+        }
     }
 
     fn load_map_locked(&self) -> io::Result<BTreeMap<String, Zeroizing<String>>> {
@@ -742,6 +870,70 @@ mod tests {
                 .map(String::as_str),
             Some("keep-me")
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn locked_warn_once_deduplicates_and_reset_locked_vault_backs_up_and_restores_writes() {
+        let dir = temp_dir("locked-reset");
+        clear_locked_warned(&dir);
+        assert!(mark_locked_warned(&dir), "first locked warning must fire");
+        assert!(
+            !mark_locked_warned(&dir),
+            "subsequent locked warnings for the same path must be deduplicated"
+        );
+
+        // Seed an encrypted vault with a different (unreadable) key to simulate a locked vault.
+        let old_vault = SecretVault::with_static_key(dir.clone(), [0xAA; 32]);
+        old_vault
+            .set_ref("legacy-token", Zeroizing::new("secret-old".to_owned()))
+            .unwrap();
+        let vault_file = dir.join(VAULT_FILE);
+        assert!(vault_file.is_file());
+
+        // Write a corrupted/mismatched local key file so reads fail before reset.
+        fs::write(dir.join(KEY_FILE), b"corrupt-key").unwrap();
+        let locked = SecretVault::new(dir.clone());
+        assert!(locked.get_ref("legacy-token").is_err());
+
+        let backup = locked
+            .reset_locked_vault()
+            .expect("reset_locked_vault must succeed")
+            .expect("existing secrets.enc must be backed up");
+        assert!(backup.is_file(), "backup file must exist on disk");
+        assert!(
+            backup
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| {
+                    n.starts_with("secrets.enc.locked-")
+                        && Path::new(n)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                }),
+            "unexpected backup filename: {backup:?}"
+        );
+        assert!(!locked.is_legacy_acl_locked());
+        assert!(
+            mark_locked_warned(&dir),
+            "reset_locked_vault must clear warn-once state"
+        );
+        clear_locked_warned(&dir);
+
+        // Fresh writes and reads succeed cleanly after reset.
+        locked
+            .set_ref("fresh-token", Zeroizing::new("secret-new".to_owned()))
+            .unwrap();
+        assert_eq!(
+            locked
+                .get_ref("fresh-token")
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("secret-new")
+        );
+        assert!(locked.get_ref("legacy-token").unwrap().is_none());
 
         fs::remove_dir_all(&dir).ok();
     }

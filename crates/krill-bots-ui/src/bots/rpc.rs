@@ -238,8 +238,13 @@ fn is_transient_stream_error(err: &io::Error) -> bool {
 
 fn connect_bot_stream(target: &HostTarget) -> io::Result<(UnixStream, u64)> {
     let hello = daemon::client_hello(ClientRole::App, "krill-app-bots");
-    let epoch = target.transport_epoch();
-    let conn = target.connect(&hello).map_err(io::Error::other)?;
+    let (conn, epoch) = target.connect_with_epoch(&hello).map_err(|err| match err {
+        daemon::Error::Io(io_err) => {
+            let kind = io_err.kind();
+            io::Error::new(kind, format!("cannot talk to krilld: {io_err}"))
+        }
+        other => io::Error::other(other),
+    })?;
     let need = FEAT_CONTROL | FEAT_BOTS;
     if conn.negotiated.features & need != need {
         return Err(io::Error::new(
@@ -337,12 +342,19 @@ fn wrap_with_desktop_capabilities(req: &BotRpcRequest) -> BotRpcRequest {
     }
 }
 
+fn is_capability_fallback_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
+    )
+}
+
 /// Executes a batch of `BotRpcRequest`s against `target` using a pooled persistent control
 /// connection and pipelining when possible.
 ///
 /// Advertises [`DESKTOP_BOT_CAPABILITIES`] on item-read requests so `Waiting` items are never
 /// downgraded on modern daemons, transparently falling back to raw requests if an older daemon
-/// does not understand `WithCapabilities`.
+/// rejects `WithCapabilities` at the protocol level (never on transport errors).
 ///
 /// If a reused pooled connection fails with a transient stream error and all requests are
 /// read-only, transparently reconnects once on a fresh stream.
@@ -366,7 +378,9 @@ pub fn call_daemon_bot_batch(
                 return Ok(replies);
             }
             Ok(replies) if !target.is_current() => return Ok(replies),
-            Err(err) if !target.is_current() => return Err(err),
+            Err(err) if !target.is_current() || !is_capability_fallback_error(&err) => {
+                return Err(err);
+            }
             Ok(_) | Err(_) => {}
         }
     }
@@ -418,7 +432,7 @@ fn call_daemon_bot_batch_raw(
     }
     match result {
         Ok(replies) => {
-            target.record_outcome(true, None);
+            target.record_outcome_for_epoch(epoch, true, None);
             return_pooled_conn(target, stream, epoch);
             Ok(replies)
         }
@@ -427,7 +441,7 @@ fn call_daemon_bot_batch_raw(
                 && err.kind() != io::ErrorKind::Unsupported
                 && err.kind() != io::ErrorKind::Interrupted
             {
-                target.record_outcome(false, Some(&err));
+                target.record_outcome_for_epoch(epoch, false, Some(&err));
             }
             Err(err)
         }
@@ -1584,5 +1598,62 @@ mod tests {
         );
         assert_eq!(row.sessions[0].session_id, SessionId(41_800));
         assert_eq!(row.sessions[1].session_id, SessionId(41_900));
+    }
+
+    #[test]
+    fn call_daemon_bot_batch_does_not_retry_transport_eof_and_fences_epoch_outcomes() {
+        use std::sync::atomic::AtomicU64;
+
+        let host = HostId::Remote("rem02-eof-host".into());
+        invalidate_host_connections(&host);
+
+        // Daemon accepts, completes handshake, and immediately closes with EOF on the first RPC.
+        let daemon =
+            MockBotDaemon::start(FEAT_CONTROL | FEAT_BOTS, "0.3.33", Arc::new(|_, _| None));
+        let outcome_epochs = Arc::new(Mutex::new(Vec::<(u64, bool)>::new()));
+        let epoch_counter = Arc::new(AtomicU64::new(7));
+        let sock = daemon.socket.clone();
+        let epochs_for_cb = Arc::clone(&outcome_epochs);
+        let epoch_for_ensure = Arc::clone(&epoch_counter);
+        let connector = crate::hosts::RemoteConnector::new(
+            {
+                let sock = sock.clone();
+                move || Ok(sock.clone())
+            },
+            |_, _| {},
+        )
+        .with_ensure_socket_epoch(move || {
+            Ok((sock.clone(), epoch_for_ensure.load(Ordering::Acquire)))
+        })
+        .with_epoch_outcome(move |ep, ok, _| {
+            epochs_for_cb.lock().unwrap().push((ep, ok));
+        })
+        .with_transport_epoch({
+            let epoch_counter = Arc::clone(&epoch_counter);
+            move || epoch_counter.load(Ordering::Acquire)
+        });
+        let target =
+            HostTarget::remote_with_connector("rem02-eof-host", daemon.socket.clone(), connector);
+
+        let err = call_daemon_bot_batch(
+            &target,
+            &[BotRpcRequest::ListItems {
+                bot_id: None,
+                include_closed: false,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            daemon.accepted.load(Ordering::Acquire),
+            1,
+            "UnexpectedEof must NOT trigger a duplicate WithCapabilities fallback connection"
+        );
+        assert_eq!(
+            *outcome_epochs.lock().unwrap(),
+            vec![(7, false)],
+            "post-handshake failure must report epoch-fenced outcome for epoch 7"
+        );
+        invalidate_host_connections(&host);
     }
 }

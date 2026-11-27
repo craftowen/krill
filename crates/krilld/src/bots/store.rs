@@ -734,17 +734,22 @@ impl BotStore {
 
     /// Deletes a bot from the registry, cleans up links/access requests/groups, and optionally removes its home.
     pub fn delete_bot(&self, bot_id: &BotId, delete_home: bool) -> io::Result<BotConfig> {
-        let (removed, _) = self.delete_bot_with_cleanup(bot_id, delete_home)?;
+        let (removed, _, home_err) = self.delete_bot_with_cleanup(bot_id, delete_home)?;
+        if let Some(err) = home_err {
+            return Err(err);
+        }
         Ok(removed)
     }
 
     /// Deletes a bot from the registry, cleans up links, access requests/meta, offers, settings
     /// extras, and groups (pruning 0-member groups and returning their IDs).
+    /// Any `delete_home` error is returned alongside `(removed, removed_group_ids)` so callers
+    /// still execute downstream cleanup (groups, items, secrets, tool relay, workers).
     pub(crate) fn delete_bot_with_cleanup(
         &self,
         bot_id: &BotId,
         delete_home: bool,
-    ) -> io::Result<(BotConfig, Vec<String>)> {
+    ) -> io::Result<(BotConfig, Vec<String>, Option<io::Error>)> {
         let _guard = lock(&self.io_lock);
         let mut bots: Vec<BotConfig> = self.read_bots()?;
         let Some(pos) = bots.iter().position(|b| &b.id == bot_id) else {
@@ -838,30 +843,41 @@ impl BotStore {
             self.write_json(DEFAULT_TRACKERS_FILE, &defaults)?;
         }
 
+        let mut home_err = None;
         if delete_home {
             let home = self.bot_home(&removed);
             if home.exists() {
-                if fs::symlink_metadata(&home)?.file_type().is_symlink() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "refusing to delete symlinked bot home",
-                    ));
+                let remove_res = (|| -> io::Result<()> {
+                    if fs::symlink_metadata(&home)?.file_type().is_symlink() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "refusing to delete symlinked bot home",
+                        ));
+                    }
+                    assert_bot_owns_home(&home, removed.id.as_str())?;
+                    fs::remove_dir_all(&home)?;
+                    Ok(())
+                })();
+                if let Err(err) = remove_res {
+                    home_err = Some(err);
                 }
-                assert_bot_owns_home(&home, removed.id.as_str())?;
-                fs::remove_dir_all(&home)?;
             }
         }
 
-        Ok((removed, removed_group_ids))
+        Ok((removed, removed_group_ids, home_err))
     }
 
     // ---------- Soul & Memory ----------
 
-    /// Reads `<home>/SOUL.md` for `bot_id`.
+    /// Reads `<home>/SOUL.md` for `bot_id` without rewriting `<home>` metadata on disk.
     pub fn get_soul(&self, bot_id: &BotId) -> io::Result<String> {
         let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = init_bot_home(&self.root, &bot, None)?;
-        read_text_bounded(&home.join("SOUL.md"))
+        let home = self.bot_home(&bot);
+        let path = home.join("SOUL.md");
+        if !path.exists() {
+            return Ok(krill_proto::bots::starter_soul(&bot.name));
+        }
+        read_text_bounded(&path)
     }
 
     /// Writes `<home>/SOUL.md` atomically (`0o600`) and updates `description` when empty.
@@ -892,10 +908,10 @@ impl BotStore {
         Ok(())
     }
 
-    /// Reads `<home>/MEMORY.md` for `bot_id`.
+    /// Reads `<home>/MEMORY.md` for `bot_id` without rewriting `<home>` metadata on disk.
     pub fn get_memory(&self, bot_id: &BotId) -> io::Result<String> {
         let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = init_bot_home(&self.root, &bot, None)?;
+        let home = self.bot_home(&bot);
         let path = home.join("MEMORY.md");
         if !path.exists() {
             return Ok(BOT_MEMORY_SEED.to_owned());
@@ -1184,8 +1200,13 @@ impl BotStore {
         topic: &str,
         content: &str,
     ) -> io::Result<BotMemoryTopicInfo> {
-        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = init_bot_home(&self.root, &bot, None)?;
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_bots()?;
+        let bot = bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+        let home = init_bot_home(&self.root, bot, None)?;
         ensure_bot_subdirs_safe(&home)?;
         memory_history::set_topic(&home, topic, content)
     }
@@ -1831,7 +1852,7 @@ impl BotStore {
         options: BotPackageExportOptions,
     ) -> io::Result<(String, Vec<u8>)> {
         let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = init_bot_home(&self.root, &bot, None)?;
+        let home = self.bot_home(&bot);
         let bytes = export_bot_home_zip(&home, &bot, options)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         if bytes.len() > MAX_RPC_ZIP_BYTES {
@@ -3953,6 +3974,47 @@ mod tests {
 
         // load_all_suggestions returns the single-read map cleanly.
         assert!(store.load_all_suggestions().unwrap().is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_only_bot_store_methods_do_not_recreate_deleted_home_or_rewrite_metadata() {
+        let root = std::env::temp_dir().join(format!("krill-core23-ro-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "ReadOnlyBot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: "v1".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let home = store.bot_home(&bot);
+        assert!(home.is_dir());
+
+        // Remove the bot home directory to simulate a concurrent DeleteBot / missing home.
+        fs::remove_dir_all(&home).unwrap();
+        assert!(!home.exists());
+
+        // get_memory and get_soul must NOT recreate the deleted home directory on disk.
+        let _ = store.get_memory(&bot.id).unwrap();
+        let _ = store.get_soul(&bot.id).unwrap();
+        assert!(
+            !home.exists(),
+            "read-only get_memory/get_soul must NOT recreate bot home via init_bot_home"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

@@ -11,11 +11,15 @@
 //!
 //! Payloads are authenticated with AES-256-GCM + per-write random 256-bit HKDF salt + 96-bit nonce.
 
+#[cfg(all(target_os = "macos", not(test)))]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 #[cfg(all(target_os = "macos", not(test)))]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(all(target_os = "macos", not(test)))]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +61,19 @@ const KEY_FILE: &str = "vault.key";
 static KEY_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 static VAULT_IO_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(all(target_os = "macos", not(test)))]
+static VAULT_FILE_FINGERPRINTS: Mutex<BTreeMap<PathBuf, (i64, u64, u64)>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn invalidate_macos_keychain_cache(root: &Path) {
+    if !super::backend::is_real_home_for_state_path(root) {
+        return;
+    }
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let account = crate::mobile::devices::hex(&Sha256::digest(canonical.as_os_str().as_bytes()));
+    crate::keychain_key::invalidate_key_cache(KEYCHAIN_SERVICE, &account, None);
+}
 
 /// Structured failure from reading the encrypted Antigravity vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +233,20 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
             .path
             .parent()
             .ok_or_else(|| VaultError::Other(READ_ERR.to_owned()))?;
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let fp = (meta.mtime(), meta.len(), meta.ino());
+            let changed = {
+                let mut map = lock(&VAULT_FILE_FINGERPRINTS);
+                match map.insert(self.path.clone(), fp) {
+                    Some(prev) => prev != fp,
+                    None => false,
+                }
+            };
+            if changed {
+                invalidate_macos_keychain_cache(dir);
+            }
+        }
         let key = MasterKey::load_or_create(dir, false, true).map_err(|err| {
             if err.is_legacy_acl_locked() {
                 if mark_locked_warned(&self.path) {
@@ -272,6 +303,8 @@ impl AntigravityAccountStore for EncryptedAntigravityAccountStore {
             let key_backup = unique_backup_path(dir, KEY_FILE);
             fs::rename(&key_path, &key_backup).ok();
         }
+        #[cfg(all(target_os = "macos", not(test)))]
+        invalidate_macos_keychain_cache(dir);
         // Obtain/create the upgrade-resilient key FIRST (bypassing locked legacy key) so we
         // never move the existing vault aside if protected storage itself is currently unavailable.
         let key = MasterKey::load_or_create(dir, true, false).map_err(|err| {

@@ -359,7 +359,7 @@ fn read_oauth_head_target(stream: &mut std::net::TcpStream) -> io::Result<String
 fn run_oauth_callback_listener(
     listener: &TcpListener,
     cancel: &GoogleOAuthCancel,
-    _bot_id: &BotId,
+    bot_id: &BotId,
     creds: &OAuthClientCredentials,
     redirect_uri: &str,
     verifier: &Zeroizing<String>,
@@ -449,6 +449,9 @@ fn run_oauth_callback_listener(
                     }
                     let encoded = serde_json::to_string(&bundle)
                         .map_err(|_| "failed to serialize Google OAuth token bundle".to_owned())?;
+                    // Serialize callback token write with concurrent background refreshes (CORE-18).
+                    let refresh_lock = bot_refresh_mutex(bot_id);
+                    let _refresh_guard = lock(&refresh_lock);
                     if cancel.is_cancelled() {
                         return Err("Google OAuth sign-in cancelled".to_owned());
                     }
@@ -633,6 +636,7 @@ pub fn ensure_valid_access_token(
     })?;
     let ttl_ms = refreshed.expires_in.unwrap_or(3600).saturating_mul(1_000);
     bundle.access_token = refreshed.access_token;
+    let rotated_refresh = refreshed.refresh_token.is_some();
     if refreshed.refresh_token.is_some() {
         bundle.refresh_token = refreshed.refresh_token;
     }
@@ -643,7 +647,39 @@ pub fn ensure_valid_access_token(
         ToOwned::to_owned,
     );
     if let Ok(encoded) = serde_json::to_string(&bundle) {
-        secrets.set_ref(&save_ref, Zeroizing::new(encoded)).ok();
+        if let Err(err) = secrets.set_ref(&save_ref, Zeroizing::new(encoded)) {
+            tracing::warn!(
+                bot_id = %bot.id.as_str(),
+                rotated_refresh,
+                kind = ?err.kind(),
+                "failed to persist refreshed Google OAuth tokens"
+            );
+            if rotated_refresh {
+                return Err(BotErrorDetail {
+                    category: BotErrorCategory::AgentError,
+                    agent_name: None,
+                    message: format!(
+                        "failed to persist rotated Google OAuth refresh token: {}",
+                        err.kind()
+                    ),
+                    resets_at_ms: None,
+                });
+            }
+        }
+    } else {
+        tracing::warn!(
+            bot_id = %bot.id.as_str(),
+            rotated_refresh,
+            "failed to serialize refreshed Google OAuth tokens"
+        );
+        if rotated_refresh {
+            return Err(BotErrorDetail {
+                category: BotErrorCategory::AgentError,
+                agent_name: None,
+                message: "failed to serialize rotated Google OAuth refresh token".to_owned(),
+                resets_at_ms: None,
+            });
+        }
     }
 
     Ok(Zeroizing::new(bundle.access_token))
@@ -2265,6 +2301,95 @@ mod tests {
         );
 
         srv2.join().ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_refresh_token_persistence_failure_returns_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("krill-google-rot-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _n = stream.read(&mut buf).unwrap_or(0);
+                let body =
+                    r#"{"access_token":"new-acc","refresh_token":"rotated-rt","expires_in":3600}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).ok();
+            }
+        });
+
+        let bots_root = dir.join("bots");
+        let store = BotStore::new(bots_root.clone());
+        let secrets = SecretVault::with_static_key(bots_root.clone(), [0x77; 32]);
+        let bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "GoogleRot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let mut conn = bot.connectors.clone();
+        conn.google.enabled = true;
+        store.set_connector_config(&bot.id, conn, 1_100).unwrap();
+        let bot = store.get_bot(&bot.id).unwrap().unwrap();
+        secrets
+            .set_secret(
+                &bot.id,
+                "google_oauth_client",
+                Zeroizing::new(r#"{"client_id":"cid","client_secret":"csec"}"#.to_owned()),
+            )
+            .unwrap();
+        secrets
+            .set_secret(
+                &bot.id,
+                "google_oauth_tokens",
+                Zeroizing::new(
+                    r#"{"access_token":"old","refresh_token":"old-rt","expires_at_ms":1}"#
+                        .to_owned(),
+                ),
+            )
+            .unwrap();
+
+        // Make bots_root read-only so writing the rotated refresh token fails.
+        fs::set_permissions(&bots_root, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let ep = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{addr}/token"),
+            gmail_base_url: format!("http://{addr}"),
+            calendar_base_url: format!("http://{addr}"),
+            drive_base_url: format!("http://{addr}"),
+        };
+        let err = ensure_valid_access_token(&bot, &secrets, &ep, 100_000).unwrap_err();
+        assert!(
+            err.message.contains("rotated Google OAuth refresh token"),
+            "unexpected error: {err:?}"
+        );
+
+        fs::set_permissions(&bots_root, fs::Permissions::from_mode(0o700)).ok();
+        srv.join().ok();
         fs::remove_dir_all(&dir).ok();
     }
 }

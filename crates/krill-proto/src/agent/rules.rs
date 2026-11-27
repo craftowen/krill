@@ -279,6 +279,8 @@ impl ScreenRules {
             let trimmed = line.trim();
             self.prompt_lines.iter().any(|prompt| trimmed == prompt)
                 || trimmed.starts_with("> Accept-edits mode:")
+                || trimmed.starts_with("> Auto mode:")
+                || trimmed.starts_with("> Plan mode:")
         })
     }
 }

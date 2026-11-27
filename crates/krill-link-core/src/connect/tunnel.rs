@@ -697,12 +697,19 @@ async fn drive_client_stream(
                 previous = None;
             }
         }
+        let retry_same_conn = previous.is_none()
+            && connections
+                .borrow()
+                .connection
+                .as_ref()
+                .is_some_and(|c| c.close_reason().is_none());
         tokio::select! {
+            () = logical.closed() => return,
             result = connections.changed() => if result.is_err() {
                 logical.close("tunnel closed");
                 return;
             },
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            () = tokio::time::sleep(Duration::from_millis(20)), if retry_same_conn => {}
         }
     }
 }

@@ -666,6 +666,20 @@ impl Tap {
         ))
     }
 
+    /// Cell-aware idle composer check (dimmed placeholder prompts on Claude/Codex/Agy).
+    /// Only invoked by the status monitor while a session is currently `Waiting` or `Blocked`.
+    pub(crate) fn is_idle_composer(&self, agent: &str) -> bool {
+        let canonical = match agent {
+            "claude" | "codex" | "agy" => agent,
+            _ => return false,
+        };
+        let screen = self.0.live().engine.screen();
+        matches!(
+            crate::registry::prompt_delivery::composer_state(canonical, &screen),
+            crate::registry::prompt_delivery::ComposerState::Empty
+        )
+    }
+
     /// 세션 셸의 현재 디렉터리: 프로세스 `pid`의 cwd, 읽지 못하면(Windows) 셸이 OSC 7·9;9로 알린 값.
     pub(crate) fn cwd(&self, pid: u32) -> Option<std::path::PathBuf> {
         crate::sys::current_directory(pid)

@@ -626,3 +626,93 @@ fn agy_signed_in_boot_welcome_and_leftover_banner_do_not_classify_as_blocked() {
         .unwrap();
     assert_ne!(settled.state, AgentState::Blocked);
 }
+
+#[test]
+fn dismissed_permission_dialog_with_placeholder_prompts_clears_waiting_for_claude_codex_agy() {
+    let now = Instant::now();
+    let dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+
+    // 1. Claude hook Waiting dismissed to dimmed placeholder prompt (`idle_composer = true`).
+    let st = Statuses::open(None);
+    let mut detector = Detector::default();
+    let perm = crate::status::tests::event(
+        1,
+        10,
+        "claude",
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+    );
+    st.hook(&[(ID, &perm)]).unwrap();
+    assert_eq!(st.get(ID).state, AgentState::Waiting);
+    let _ = detector.observe_with_composer("", dialog, 1, &st.get(ID), now, false);
+    let _ = detector.observe_with_composer("", dialog, 1, &st.get(ID), now + QUIET, false);
+    let claude_placeholder = "❯\u{a0}Try \"fix the build\"";
+    let _ = detector.observe_with_composer(
+        "✳ Claude Code",
+        claude_placeholder,
+        2,
+        &st.get(ID),
+        now + QUIET,
+        true,
+    );
+    let dismissed = detector
+        .observe_with_composer(
+            "✳ Claude Code",
+            claude_placeholder,
+            2,
+            &st.get(ID),
+            now + QUIET * 2,
+            true,
+        )
+        .expect("Claude placeholder prompt must dismiss Waiting");
+    assert_eq!(dismissed.state, AgentState::Done);
+    assert_eq!(dismissed.dismissed_since, Some(st.get(ID).since_unix_ns));
+    st.inferred(ID, dismissed, 20);
+    assert_eq!(st.get(ID).state, AgentState::Done);
+
+    // 2. Agy screen Waiting dismissed to `> Auto mode:` or `> Plan mode:` prompt (even via is_prompt).
+    let st_agy = Statuses::open(None);
+    let mut det_agy = Detector::default();
+    det_agy.observe("", dialog, 1, &st_agy.get(ID), now);
+    let e = det_agy
+        .observe("", dialog, 1, &st_agy.get(ID), now + QUIET)
+        .unwrap();
+    st_agy.inferred(ID, e, 10);
+    assert_eq!(st_agy.get(ID).state, AgentState::Waiting);
+    let agy_auto = "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
+    det_agy.observe("", agy_auto, 2, &st_agy.get(ID), now + QUIET);
+    let cleared = det_agy
+        .observe("", agy_auto, 2, &st_agy.get(ID), now + QUIET * 2)
+        .expect("Agy Auto mode prompt must clear screen Waiting");
+    assert_eq!(cleared.state, AgentState::Done);
+
+    // 3. Codex mid-turn spinner title guard: while title shows Working, idle_composer must NOT flip to Done.
+    let st_codex = Statuses::open(None);
+    let mut det_codex = Detector::default();
+    let codex_q = "• Queued follow-up inputs\n? 1 question\nTab to answer";
+    det_codex.observe("⠋ Codex", codex_q, 1, &st_codex.get(ID), now);
+    let e = det_codex
+        .observe("⠋ Codex", codex_q, 1, &st_codex.get(ID), now + QUIET)
+        .unwrap();
+    st_codex.inferred(ID, e, 10);
+    assert_eq!(st_codex.get(ID).state, AgentState::Waiting);
+    let codex_placeholder = "› Ask Codex to do anything";
+    det_codex.observe_with_composer(
+        "⠙ Codex",
+        codex_placeholder,
+        2,
+        &st_codex.get(ID),
+        now + QUIET,
+        true,
+    );
+    let mid_turn = det_codex
+        .observe_with_composer(
+            "⠙ Codex",
+            codex_placeholder,
+            2,
+            &st_codex.get(ID),
+            now + QUIET * 2,
+            true,
+        )
+        .expect("Codex mid-turn with spinner must report Working, not Done");
+    assert_eq!(mid_turn.state, AgentState::Working);
+}

@@ -124,9 +124,18 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         let Some((rev, title, screen)) = t.evidence.as_ref() else {
             continue;
         };
-        let evidence = t
-            .detector
-            .observe(title, screen, *rev, &status, Instant::now());
+        let idle_composer = matches!(
+            status.state,
+            krill_proto::control::AgentState::Waiting | krill_proto::control::AgentState::Blocked
+        ) && tap.is_idle_composer(&status.agent);
+        let evidence = t.detector.observe_with_composer(
+            title,
+            screen,
+            *rev,
+            &status,
+            Instant::now(),
+            idle_composer,
+        );
         let raw = tap.foreground();
         let foreground = super::effective_foreground(root, raw);
         #[cfg(windows)]

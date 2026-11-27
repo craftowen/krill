@@ -907,6 +907,30 @@ impl ConversationRouter {
         lock(&self.active_turns).retain(|(_, sid), _| *sid != session_id);
     }
 
+    /// Re-keys active turn tracking from `old` to `new` when a bot session switches accounts (CORE-08).
+    pub fn rebind_session(&self, old: SessionId, new: SessionId) {
+        if old == new {
+            return;
+        }
+        let mut turns = lock(&self.active_turns);
+        let moving_keys: Vec<(BotId, SessionId)> = turns
+            .keys()
+            .filter(|(_, sid)| *sid == old)
+            .cloned()
+            .collect();
+        for key in moving_keys {
+            if let Some(mut queue) = turns.remove(&key) {
+                let dst = turns.entry((key.0, new)).or_default();
+                while let Some(item) = queue.pop_front() {
+                    if dst.len() >= 64 {
+                        dst.pop_front();
+                    }
+                    dst.push_back(item);
+                }
+            }
+        }
+    }
+
     /// Registers or refreshes active external delivery tracking for `(bot_id, session_id)`
     /// (used when resuming failed turns, draining queued external turns, or rehydrating links).
     pub fn register_active_turn(
@@ -3668,5 +3692,56 @@ mod tests {
             6,
             None,
         ));
+    }
+
+    #[test]
+    fn rebind_session_preserves_active_turn_delivery_after_old_session_removal() {
+        let bot = BotConfig::new(
+            BotId::new("bot-rebind").unwrap(),
+            "RebindBot",
+            "claude",
+            1_000,
+        )
+        .unwrap();
+        let bridge = Arc::new(MockBridge {
+            bot: Mutex::new(bot.clone()),
+            decision: Mutex::new(AccessDecision::Allowed),
+            dispatched: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+        });
+        let bridge_dyn: Arc<dyn ConnectorBridge> = bridge;
+        let router = ConversationRouter::new(bridge_dyn);
+        let sender = Arc::new(MockSender::default());
+        router.register_sender(bot.id.clone(), ExternalSource::Slack, sender.clone());
+
+        let link = ExternalConversationLink {
+            id: "lnk-rebind".to_owned(),
+            bot_id: bot.id.clone(),
+            source: ExternalSource::Slack,
+            channel_id: "C-REBIND".to_owned(),
+            thread_id: Some("100.1".to_owned()),
+            workspace_id: None,
+            acts_for: krill_proto::bots::ActsFor::Owner,
+            session_id: Some(SessionId(1)),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        router.register_active_turn_seq(bot.id.clone(), SessionId(1), Some(3), &link, None);
+
+        // Mid-turn account switch rebinds 1 -> 2, then old session 1 closes.
+        router.rebind_session(SessionId(1), SessionId(2));
+        router.on_session_removed(SessionId(1));
+
+        // Completing turn 3 on session 2 must deliver the reply to Slack instead of dropping it.
+        router.on_turn_complete_with_context(
+            &bot.id,
+            SessionId(2),
+            Some(3),
+            Some("Rebound reply delivered"),
+            false,
+        );
+        let sent = lock(&sender.sent);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "Rebound reply delivered");
     }
 }

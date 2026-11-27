@@ -902,8 +902,8 @@ impl Shell {
                 let mut fetch_orch = false;
                 let mut refresh_up_next = false;
                 let mut retry_delay = None;
-                let host_online =
-                    host_owned.is_local() || this.can_query_remote_bot_host(&host_owned);
+                let host_online = host_owned.is_local()
+                    || this.is_remote_host_live_or_connecting(&host_owned, cx);
                 {
                     let Some(state) = this.bot_ui.hosts.get_mut(&host_owned) else {
                         return;

@@ -6,6 +6,7 @@
 //! and control-channel multiplexing (`control::Request::Bot` / `control::Reply::Bot`).
 //! Append new enum variants only at the end to preserve postcard wire compatibility.
 
+use std::cell::Cell;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,10 @@ pub const MAX_RPC_ZIP_BYTES: usize = 768 * 1024;
 /// Maximum PNG avatar payload transferred inside a single IPC frame (512 KiB, leaving headroom
 /// for Store-mode ZIP export within `MAX_RPC_ZIP_BYTES` and Mobile base64 within `ipc::MAX_FRAME`).
 pub const MAX_RPC_AVATAR_PNG_BYTES: usize = super::MAX_AVATAR_PNG_BYTES;
+/// Maximum number of client capability tokens allowed on [`BotRpcRequest::WithCapabilities`].
+pub const MAX_BOT_CAPABILITIES: usize = 64;
+/// Maximum UTF-8 byte length of a single client capability token.
+pub const MAX_BOT_CAPABILITY_LEN: usize = 128;
 
 /// Parameters for creating a new bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,44 +171,288 @@ pub struct UpdateBotParams {
 }
 
 /// Parameters for creating a tracked bot item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// On binary postcard wire formats, `waiting_reason` is omitted from the frozen 6-field
+/// layout and carried as an optional trailing wire field by [`BotRpcRequest::encode_wire_body`]
+/// / [`BotRpcRequest::decode_wire_body`] to preserve N-1 compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateBotItemParams {
     pub bot_id: BotId,
     pub title: String,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub done_means: Option<String>,
-    #[serde(default)]
     pub status: Option<BotItemStatus>,
-    #[serde(default)]
     pub links: Vec<BotItemLink>,
-    #[serde(default)]
     pub waiting_reason: Option<String>,
 }
 
+impl Serialize for CreateBotItemParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct WireV0317<'a> {
+            bot_id: &'a BotId,
+            title: &'a str,
+            description: &'a Option<String>,
+            done_means: &'a Option<String>,
+            status: Option<BotItemStatus>,
+            links: &'a [BotItemLink],
+        }
+        #[derive(Serialize)]
+        struct Human<'a> {
+            bot_id: &'a BotId,
+            title: &'a str,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            description: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            done_means: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            status: Option<BotItemStatus>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            links: &'a Vec<BotItemLink>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            waiting_reason: &'a Option<String>,
+        }
+        if serializer.is_human_readable() {
+            Human {
+                bot_id: &self.bot_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                links: &self.links,
+                waiting_reason: &self.waiting_reason,
+            }
+            .serialize(serializer)
+        } else {
+            WireV0317 {
+                bot_id: &self.bot_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                links: &self.links,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CreateBotItemParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireV0317 {
+            bot_id: BotId,
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            #[serde(default)]
+            status: Option<BotItemStatus>,
+            #[serde(default)]
+            links: Vec<BotItemLink>,
+        }
+        #[derive(Deserialize)]
+        struct Human {
+            bot_id: BotId,
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            #[serde(default)]
+            status: Option<BotItemStatus>,
+            #[serde(default)]
+            links: Vec<BotItemLink>,
+            #[serde(default)]
+            waiting_reason: Option<String>,
+        }
+        if deserializer.is_human_readable() {
+            let h = Human::deserialize(deserializer)?;
+            Ok(Self {
+                bot_id: h.bot_id,
+                title: h.title,
+                description: h.description,
+                done_means: h.done_means,
+                status: h.status,
+                links: h.links,
+                waiting_reason: h.waiting_reason,
+            })
+        } else {
+            let w = WireV0317::deserialize(deserializer)?;
+            Ok(Self {
+                bot_id: w.bot_id,
+                title: w.title,
+                description: w.description,
+                done_means: w.done_means,
+                status: w.status,
+                links: w.links,
+                waiting_reason: None,
+            })
+        }
+    }
+}
+
 /// Parameters for updating a tracked bot item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// On binary postcard wire formats, `waiting_reason` is omitted from the frozen 9-field
+/// layout and carried as an optional trailing wire field by [`BotRpcRequest::encode_wire_body`]
+/// / [`BotRpcRequest::decode_wire_body`] to preserve N-1 compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateBotItemParams {
     pub item_id: String,
-    #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub done_means: Option<String>,
-    #[serde(default)]
     pub status: Option<BotItemStatus>,
-    #[serde(default)]
     pub comment: Option<String>,
-    #[serde(default)]
     pub decisions: Vec<BotItemDecision>,
-    #[serde(default)]
     pub close_note: Option<String>,
-    #[serde(default)]
     pub snoozed_until_ms: FieldPatch<u64>,
-    #[serde(default)]
     pub waiting_reason: Option<String>,
+}
+
+impl Serialize for UpdateBotItemParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct WireV0317<'a> {
+            item_id: &'a str,
+            title: &'a Option<String>,
+            description: &'a Option<String>,
+            done_means: &'a Option<String>,
+            status: Option<BotItemStatus>,
+            comment: &'a Option<String>,
+            decisions: &'a [BotItemDecision],
+            close_note: &'a Option<String>,
+            snoozed_until_ms: &'a FieldPatch<u64>,
+        }
+        #[derive(Serialize)]
+        struct Human<'a> {
+            item_id: &'a str,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            title: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            description: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            done_means: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            status: Option<BotItemStatus>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            comment: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            decisions: &'a Vec<BotItemDecision>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            close_note: &'a Option<String>,
+            #[serde(default)]
+            snoozed_until_ms: &'a FieldPatch<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            waiting_reason: &'a Option<String>,
+        }
+        if serializer.is_human_readable() {
+            Human {
+                item_id: &self.item_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                comment: &self.comment,
+                decisions: &self.decisions,
+                close_note: &self.close_note,
+                snoozed_until_ms: &self.snoozed_until_ms,
+                waiting_reason: &self.waiting_reason,
+            }
+            .serialize(serializer)
+        } else {
+            WireV0317 {
+                item_id: &self.item_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                comment: &self.comment,
+                decisions: &self.decisions,
+                close_note: &self.close_note,
+                snoozed_until_ms: &self.snoozed_until_ms,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateBotItemParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireV0317 {
+            item_id: String,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            #[serde(default)]
+            status: Option<BotItemStatus>,
+            #[serde(default)]
+            comment: Option<String>,
+            #[serde(default)]
+            decisions: Vec<BotItemDecision>,
+            #[serde(default)]
+            close_note: Option<String>,
+            #[serde(default)]
+            snoozed_until_ms: FieldPatch<u64>,
+        }
+        #[derive(Deserialize)]
+        struct Human {
+            item_id: String,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            #[serde(default)]
+            status: Option<BotItemStatus>,
+            #[serde(default)]
+            comment: Option<String>,
+            #[serde(default)]
+            decisions: Vec<BotItemDecision>,
+            #[serde(default)]
+            close_note: Option<String>,
+            #[serde(default)]
+            snoozed_until_ms: FieldPatch<u64>,
+            #[serde(default)]
+            waiting_reason: Option<String>,
+        }
+        if deserializer.is_human_readable() {
+            let h = Human::deserialize(deserializer)?;
+            Ok(Self {
+                item_id: h.item_id,
+                title: h.title,
+                description: h.description,
+                done_means: h.done_means,
+                status: h.status,
+                comment: h.comment,
+                decisions: h.decisions,
+                close_note: h.close_note,
+                snoozed_until_ms: h.snoozed_until_ms,
+                waiting_reason: h.waiting_reason,
+            })
+        } else {
+            let w = WireV0317::deserialize(deserializer)?;
+            Ok(Self {
+                item_id: w.item_id,
+                title: w.title,
+                description: w.description,
+                done_means: w.done_means,
+                status: w.status,
+                comment: w.comment,
+                decisions: w.decisions,
+                close_note: w.close_note,
+                snoozed_until_ms: w.snoozed_until_ms,
+                waiting_reason: None,
+            })
+        }
+    }
 }
 
 /// Versioned extensible RPC request enum covering all Phase 1-3 Krill Bot operations.
@@ -645,9 +894,11 @@ pub enum BotRpcRequest {
     },
     /// Wraps a bot RPC request with client capability strings (e.g. `bots.item-waiting.v1`)
     /// so the daemon can preserve or downgrade newer item states cleanly.
+    /// Maximum nesting depth is 1; nested `WithCapabilities` wrappers are rejected on decode.
     WithCapabilities {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "rpc_capabilities")]
         capabilities: Vec<String>,
+        #[serde(deserialize_with = "rpc_inner_request")]
         request: Box<BotRpcRequest>,
     },
 }
@@ -656,39 +907,42 @@ impl BotRpcRequest {
     /// Returns `true` for read-only requests safe for `Role::Observer` clients.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
-        match self {
-            Self::WithCapabilities { request, .. } => request.is_read_only(),
-            Self::ListBots
-            | Self::GetBot { .. }
-            | Self::GetSoul { .. }
-            | Self::GetMemory { .. }
-            | Self::ListItems { .. }
-            | Self::ListGroups
-            | Self::ConnectorStatus { .. }
-            | Self::ToolRelayStatus
-            | Self::ImportExternalBots { dry_run: true, .. }
-            | Self::GetBotAvatar { .. }
-            | Self::ListItemsPage { .. }
-            | Self::GetBotItem { .. }
-            | Self::GetMemoryHistory { .. }
-            | Self::GetMemoryTidyStatus { .. }
-            | Self::ListMemoryTopics { .. }
-            | Self::GetMemoryTopic { .. }
-            | Self::ListSuggestions { .. }
-            | Self::ListBotSessions { .. }
-            | Self::ReadGroup { .. }
-            | Self::McpOAuthStatus { .. }
-            | Self::ListComposioConnections { .. }
-            | Self::GetDefaultTrackerBots
-            | Self::ListAgentModels { .. }
-            | Self::GetBotUpcoming { .. }
-            | Self::GetBotSettingsExtras { .. }
-            | Self::ListBotOffers { .. }
-            | Self::ListImportedSources
-            | Self::ListGroupSummaries
-            | Self::ReadGroupRoom { .. } => true,
-            _ => false,
+        let mut current = self;
+        while let Self::WithCapabilities { request, .. } = current {
+            current = request;
         }
+        matches!(
+            current,
+            Self::ListBots
+                | Self::GetBot { .. }
+                | Self::GetSoul { .. }
+                | Self::GetMemory { .. }
+                | Self::ListItems { .. }
+                | Self::ListGroups
+                | Self::ConnectorStatus { .. }
+                | Self::ToolRelayStatus
+                | Self::ImportExternalBots { dry_run: true, .. }
+                | Self::GetBotAvatar { .. }
+                | Self::ListItemsPage { .. }
+                | Self::GetBotItem { .. }
+                | Self::GetMemoryHistory { .. }
+                | Self::GetMemoryTidyStatus { .. }
+                | Self::ListMemoryTopics { .. }
+                | Self::GetMemoryTopic { .. }
+                | Self::ListSuggestions { .. }
+                | Self::ListBotSessions { .. }
+                | Self::ReadGroup { .. }
+                | Self::McpOAuthStatus { .. }
+                | Self::ListComposioConnections { .. }
+                | Self::GetDefaultTrackerBots
+                | Self::ListAgentModels { .. }
+                | Self::GetBotUpcoming { .. }
+                | Self::GetBotSettingsExtras { .. }
+                | Self::ListBotOffers { .. }
+                | Self::ListImportedSources
+                | Self::ListGroupSummaries
+                | Self::ReadGroupRoom { .. }
+        )
     }
 }
 
@@ -1677,8 +1931,131 @@ impl BotRpcResponse {
     }
 }
 
+/// Postcard variant discriminant for [`BotRpcRequest::CreateItem`] (0-indexed variant 14).
+pub(crate) const CREATE_ITEM_REQUEST_TAG: u8 = 14;
+/// Postcard variant discriminant for [`BotRpcRequest::UpdateItem`] (0-indexed variant 15).
+pub(crate) const UPDATE_ITEM_REQUEST_TAG: u8 = 15;
+/// Postcard variant discriminant for [`BotRpcRequest::WithCapabilities`] (0-indexed variant 95).
+pub(crate) const WITH_CAPABILITIES_REQUEST_TAG: u8 = 95;
+
+#[derive(Deserialize)]
+struct BoundedCapabilities(#[serde(deserialize_with = "rpc_capabilities")] Vec<String>);
+
+impl BotRpcRequest {
+    /// Encodes this request into postcard body bytes, preserving frozen N-1 layouts for
+    /// `CreateItem` / `UpdateItem` and appending `waiting_reason` as an optional trailing field
+    /// only when set.
+    pub(crate) fn encode_wire_body(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        let inner = match self {
+            Self::WithCapabilities {
+                capabilities,
+                request,
+            } => {
+                if matches!(request.as_ref(), Self::WithCapabilities { .. })
+                    || capabilities.len() > MAX_BOT_CAPABILITIES
+                    || capabilities
+                        .iter()
+                        .any(|c| c.len() > MAX_BOT_CAPABILITY_LEN)
+                {
+                    return Err(crate::ipc::Error::Codec(
+                        postcard::Error::DeserializeBadEncoding,
+                    ));
+                }
+                request.as_ref()
+            }
+            other => other,
+        };
+        let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
+        match inner {
+            Self::CreateItem(params) if params.waiting_reason.is_some() => {
+                body.extend(
+                    postcard::to_stdvec(&params.waiting_reason)
+                        .map_err(crate::ipc::Error::Codec)?,
+                );
+            }
+            Self::UpdateItem(params) if params.waiting_reason.is_some() => {
+                body.extend(
+                    postcard::to_stdvec(&params.waiting_reason)
+                        .map_err(crate::ipc::Error::Codec)?,
+                );
+            }
+            _ => {}
+        }
+        Ok(body)
+    }
+
+    /// Decodes postcard body bytes produced by either this build or N-1 releases,
+    /// enforcing a maximum `WithCapabilities` nesting depth of 1 without recursion.
+    pub(crate) fn decode_wire_body(body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if body.first() == Some(&WITH_CAPABILITIES_REQUEST_TAG) {
+            let (_, rest) =
+                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
+            let (BoundedCapabilities(capabilities), inner_bytes) =
+                postcard::take_from_bytes::<BoundedCapabilities>(rest)
+                    .map_err(crate::ipc::Error::Codec)?;
+            if inner_bytes.first() == Some(&WITH_CAPABILITIES_REQUEST_TAG) {
+                return Err(crate::ipc::Error::Codec(
+                    postcard::Error::DeserializeBadEncoding,
+                ));
+            }
+            let inner = Self::decode_unwrapped_wire_body(inner_bytes)?;
+            return Ok(Self::WithCapabilities {
+                capabilities,
+                request: Box::new(inner),
+            });
+        }
+        Self::decode_unwrapped_wire_body(body)
+    }
+
+    fn decode_unwrapped_wire_body(body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if body.first() == Some(&WITH_CAPABILITIES_REQUEST_TAG) {
+            return Err(crate::ipc::Error::Codec(
+                postcard::Error::DeserializeBadEncoding,
+            ));
+        }
+        if matches!(
+            body.first().copied(),
+            Some(CREATE_ITEM_REQUEST_TAG | UPDATE_ITEM_REQUEST_TAG)
+        ) {
+            let (mut req, tail) =
+                postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;
+            if !tail.is_empty() {
+                let (waiting_reason, rest) = postcard::take_from_bytes::<Option<String>>(tail)
+                    .map_err(crate::ipc::Error::Codec)?;
+                if !rest.is_empty() {
+                    return Err(crate::ipc::Error::Codec(
+                        postcard::Error::DeserializeBadEncoding,
+                    ));
+                }
+                match &mut req {
+                    Self::CreateItem(params) => params.waiting_reason = waiting_reason,
+                    Self::UpdateItem(params) => params.waiting_reason = waiting_reason,
+                    _ => {}
+                }
+            }
+            return Ok(req);
+        }
+        postcard::from_bytes(body).map_err(crate::ipc::Error::Codec)
+    }
+}
+
 impl Msg for BotRpcRequest {
     const KIND: u8 = BOT_REQ;
+
+    fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        let body = self.encode_wire_body()?;
+        crate::ipc::encode_frame(Self::KIND, &body)
+    }
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind != Self::KIND {
+            return Err(crate::ipc::Error::UnexpectedKind {
+                want: Self::KIND,
+                got: kind,
+            });
+        }
+        Self::decode_wire_body(body)
+    }
 }
 
 impl Msg for BotRpcResponse {
@@ -1698,6 +2075,67 @@ impl Msg for BotRpcResponse {
         }
         Self::decode_wire_body(body)
     }
+}
+
+thread_local! {
+    static IN_WITH_CAPABILITIES: Cell<bool> = const { Cell::new(false) };
+}
+
+fn rpc_capabilities<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    struct CapsVisitor;
+    impl<'de> serde::de::Visitor<'de> for CapsVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("bounded list of bot capability strings")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            use serde::de::Error as _;
+            if seq.size_hint().is_some_and(|n| n > MAX_BOT_CAPABILITIES) {
+                return Err(A::Error::custom("bot capabilities list exceeds limit"));
+            }
+            let mut out = Vec::new();
+            while let Some(cap) = seq.next_element::<String>()? {
+                if out.len() >= MAX_BOT_CAPABILITIES {
+                    return Err(A::Error::custom("bot capabilities list exceeds limit"));
+                }
+                if cap.len() > MAX_BOT_CAPABILITY_LEN {
+                    return Err(A::Error::custom("bot capability string exceeds byte limit"));
+                }
+                out.push(cap);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(CapsVisitor)
+}
+
+fn rpc_inner_request<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Box<BotRpcRequest>, D::Error> {
+    use serde::de::Error as _;
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_WITH_CAPABILITIES.with(|flag| flag.set(false));
+        }
+    }
+    let already_inside = IN_WITH_CAPABILITIES.with(|flag| flag.replace(true));
+    if already_inside {
+        return Err(D::Error::custom(
+            "nested WithCapabilities request is not allowed",
+        ));
+    }
+    let _guard = Guard;
+    let inner = Box::<BotRpcRequest>::deserialize(d)?;
+    if matches!(inner.as_ref(), BotRpcRequest::WithCapabilities { .. }) {
+        return Err(D::Error::custom(
+            "nested WithCapabilities request is not allowed",
+        ));
+    }
+    Ok(inner)
 }
 
 fn rpc_zip_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {

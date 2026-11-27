@@ -501,16 +501,45 @@ fn forward(
         .args(relay_args(opts, control))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
-    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(mut stdin), Some(mut stdout), stderr) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
         child.kill().ok();
         child.wait().ok();
         return Err(io::Error::other("ssh stdio pipes are missing"));
     };
     let finished = AtomicBool::new(false);
+    let remote_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let mut stderr_tail = String::new();
+    let mut exit_status = None;
     thread::scope(|scope| {
         let finished_ref = &finished;
+        let remote_bytes_ref = &remote_bytes;
+        let stderr_drain = scope.spawn(move || -> String {
+            const MAX_STDERR_TAIL: usize = 2048;
+            let Some(mut stderr) = stderr else {
+                return String::new();
+            };
+            let mut ring = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        ring.extend_from_slice(&chunk[..n]);
+                        if ring.len() > MAX_STDERR_TAIL {
+                            let drop_n = ring.len() - MAX_STDERR_TAIL;
+                            ring.drain(..drop_n);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&ring).trim().to_owned()
+        });
         let from_local = scope.spawn(move || {
             let mut socket = socket;
             let mut buffer = vec![0; 64 * 1024];
@@ -535,7 +564,7 @@ fn forward(
             // stdin을 닫으면 원격 `krill __bridge`가 EOF를 보고 끝난다.
             drop(stdin);
         });
-        let from_remote = scope.spawn(|| {
+        let from_remote = scope.spawn(move || {
             let mut buffer = vec![0; 64 * 1024];
             'pump: while !stopped.load(Ordering::Acquire) {
                 let n = match stdout.read(&mut buffer) {
@@ -544,6 +573,7 @@ fn forward(
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
+                remote_bytes_ref.fetch_add(n, Ordering::Relaxed);
                 let mut offset = 0;
                 while offset < n {
                     if stopped.load(Ordering::Acquire) {
@@ -564,7 +594,7 @@ fn forward(
                 }
             }
             back.shutdown(std::net::Shutdown::Write).ok();
-            finished.store(true, Ordering::Release);
+            finished_ref.store(true, Ordering::Release);
         });
         while !stopped.load(Ordering::Acquire) && !finished.load(Ordering::Acquire) {
             if !matches!(child.try_wait(), Ok(None)) {
@@ -573,7 +603,7 @@ fn forward(
             thread::sleep(POLL);
         }
         child.kill().ok();
-        child.wait().ok();
+        exit_status = child.wait().ok();
         if stopped.load(Ordering::Acquire) {
             cancel.shutdown(std::net::Shutdown::Both).ok();
         }
@@ -587,7 +617,18 @@ fn forward(
         finished.store(true, Ordering::Release);
         from_local.join().ok();
         from_remote.join().ok();
+        if let Ok(tail) = stderr_drain.join() {
+            stderr_tail = tail;
+        }
     });
+    if remote_bytes.load(Ordering::Relaxed) == 0 && !stopped.load(Ordering::Acquire) {
+        let exit_code = exit_status.and_then(|s| s.code());
+        if !stderr_tail.is_empty() || exit_code.is_some_and(|c| c != 0) {
+            return Err(io::Error::other(format!(
+                "ssh bridge exited with 0 remote bytes (exit={exit_code:?}): {stderr_tail}"
+            )));
+        }
+    }
     Ok(())
 }
 

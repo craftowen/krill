@@ -193,6 +193,8 @@ impl BotsManager {
             return;
         }
         self.ensure_runtime_rehydrated(registry);
+        self.groups
+            .reconcile_live_sessions(|sid| registry.is_session_live(sid));
         self.reconcile_enabled_workers();
         let cut_turns = self.runtime.pending_unnotified_restart_cuts();
         if !cut_turns.is_empty() {
@@ -404,14 +406,40 @@ impl BotsManager {
         is_observer: bool,
         req: BotRpcRequest,
     ) -> BotRpcResponse {
-        if let Ok(resp) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.dispatch_rpc(registry, peer_session, is_observer, req)
-        })) {
+        // Unwrap `WithCapabilities` iteratively BEFORE entering the large `dispatch_rpc`
+        // stack frame so dev builds never double-stack `dispatch_rpc` (LIVE-01 / CORE-05).
+        let mut caps: Option<Vec<String>> = None;
+        let mut depth = 0usize;
+        let mut current = req;
+        while let BotRpcRequest::WithCapabilities {
+            capabilities,
+            request,
+        } = current
+        {
+            depth += 1;
+            if depth > 1 {
+                return BotRpcResponse::Error(
+                    "nested WithCapabilities request is not allowed".to_owned(),
+                );
+            }
+            caps = Some(capabilities);
+            current = *request;
+        }
+        let mut resp = if let Ok(resp) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.dispatch_rpc(registry, peer_session, is_observer, current)
+            })) {
             resp
         } else {
             tracing::warn!("bot RPC handler panicked; isolated");
             BotRpcResponse::Error("internal bot RPC panic".to_owned())
+        };
+        if let Some(capabilities) = caps
+            && !client_supports_item_waiting(&capabilities)
+        {
+            downgrade_response_for_legacy_client(&mut resp);
         }
+        resp
     }
 
     /// Dispatches a [`BotRpcRequest`] while enforcing backward-compatible item downgrades for
@@ -528,6 +556,9 @@ impl BotsManager {
             self.store.bind_link_session(link_id, new, now_ms()).ok();
         }
         self.groups.rebind_session(old, new);
+        if let Some(connectors) = self.connectors.get() {
+            connectors.rebind_session(old, new);
+        }
         for sid in lock(&self.active_cron_sessions).values_mut() {
             if *sid == old {
                 *sid = new;
@@ -606,9 +637,10 @@ impl BotsManager {
                     let home = crate::usage::accounts::default_home();
                     let accounts_snap =
                         crate::usage::accounts::refresh_accounts(&home, Some(&self.state_dir));
-                    self.runtime.poll_rate_limit_auto_continues(
+                    self.runtime.poll_rate_limit_auto_continues_with_connectors(
                         registry,
                         &self.store,
+                        self.connectors.get().map(Arc::as_ref),
                         auto_continue_enabled,
                         &accounts_snap,
                         secs,
@@ -1006,15 +1038,8 @@ impl BotsManager {
 
         let ts = now_ms();
         match req {
-            BotRpcRequest::WithCapabilities {
-                capabilities,
-                request,
-            } => {
-                let mut resp = self.dispatch_rpc(registry, peer_session, is_observer, *request);
-                if !client_supports_item_waiting(&capabilities) {
-                    downgrade_response_for_legacy_client(&mut resp);
-                }
-                resp
+            BotRpcRequest::WithCapabilities { .. } => {
+                BotRpcResponse::Error("nested WithCapabilities request is not allowed".to_owned())
             }
             BotRpcRequest::ListBots => match self.store.list_bots() {
                 Ok(bots) => BotRpcResponse::Bots(bots),
@@ -1181,7 +1206,7 @@ impl BotsManager {
                 }
                 lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot_id);
                 match self.store.delete_bot_with_cleanup(&bot_id, delete_home) {
-                    Ok((removed, removed_group_ids)) => {
+                    Ok((removed, removed_group_ids, home_err)) => {
                         self.groups.on_bot_deleted(&bot_id, &removed_group_ids);
                         self.items.delete_bot_items(&bot_id).ok();
                         let mut extra_refs = collect_bot_secret_refs(&removed);
@@ -1203,7 +1228,11 @@ impl BotsManager {
                         lock(&self.composio_statuses).remove(&bot_id);
                         lock(&self.composio_last_poll_ms).remove(&bot_id);
                         self.reconcile_all_lazy_workers();
-                        BotRpcResponse::Deleted { bot_id }
+                        if let Some(err) = home_err {
+                            BotRpcResponse::Error(err.to_string())
+                        } else {
+                            BotRpcResponse::Deleted { bot_id }
+                        }
                     }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
@@ -6442,6 +6471,111 @@ mod tests {
             Some("CI on PR #42")
         );
         assert!(modern_items[0].waiting_since_ms.is_some());
+
+        // Nested WithCapabilities is rejected cleanly without recursing into dispatch_rpc (CORE-05).
+        let nested = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::WithCapabilities {
+                capabilities: Vec::new(),
+                request: Box::new(BotRpcRequest::WithCapabilities {
+                    capabilities: Vec::new(),
+                    request: Box::new(BotRpcRequest::ListBots),
+                }),
+            },
+        );
+        assert!(
+            matches!(nested, BotRpcResponse::Error(_)),
+            "nested WithCapabilities must be rejected"
+        );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_bot_runs_downstream_cleanup_even_when_delete_home_fails() {
+        let state = std::env::temp_dir().join(format!("krill-core10-del-{}", std::process::id()));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+        let reg = Arc::new(Registry::new(None, None));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        let bot = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "SymlinkHomeBot".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) {
+            BotRpcResponse::Bot(b) => *b,
+            other => panic!("expected Bot, got {other:?}"),
+        };
+
+        // Seed a secret, an item, and a tool-relay registration for this bot.
+        mgr.secrets
+            .set_secret(
+                &bot.id,
+                "api_key",
+                zeroize::Zeroizing::new("secret-val".to_owned()),
+            )
+            .unwrap();
+        assert!(matches!(
+            mgr.handle_rpc(
+                &reg,
+                BotRpcRequest::CreateItem(Box::new(CreateBotItemParams {
+                    bot_id: bot.id.clone(),
+                    title: "Clean me up".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: None,
+                    links: Vec::new(),
+                    waiting_reason: None,
+                })),
+            ),
+            BotRpcResponse::Item(_)
+        ));
+
+        // Replace bot home directory with a symlink so `delete_home` fails cleanly.
+        let home = mgr.store.bot_home(&bot);
+        let outside = state.join("outside-target");
+        fs::create_dir_all(&outside).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&outside, &home).unwrap();
+
+        let resp = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::DeleteBot {
+                bot_id: bot.id.clone(),
+                delete_home: true,
+            },
+        );
+        assert!(
+            matches!(resp, BotRpcResponse::Error(ref msg) if msg.contains("symlink")),
+            "expected symlink delete_home error, got {resp:?}"
+        );
+
+        // Downstream cleanup MUST have still removed the bot's secrets and items!
+        assert!(
+            !mgr.secrets.has_secret(&bot.id, "api_key").unwrap(),
+            "bot secrets must be cleaned up even if delete_home fails"
+        );
+        assert!(
+            mgr.items
+                .list_items(Some(&bot.id), None, true, true, 10_000)
+                .unwrap()
+                .is_empty(),
+            "bot items must be cleaned up even if delete_home fails"
+        );
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();

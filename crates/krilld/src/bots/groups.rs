@@ -514,7 +514,9 @@ impl GroupCoordinator {
 
         let target_bots: Vec<BotConfig> = member_bots
             .into_iter()
-            .filter(|b| target_ids.contains(&b.id) && !b.paused)
+            .filter(|b| {
+                target_ids.contains(&b.id) && !b.paused && sender_bot_id.as_ref() != Some(&b.id)
+            })
             .collect();
 
         let thread = if let Some(explicit) = thread_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -914,6 +916,57 @@ impl GroupCoordinator {
                 self.persist_locked(data).ok();
             }
         }
+    }
+
+    /// Reconciles persisted active group turns and `in_progress` placeholders against live
+    /// daemon sessions on boot so dead sessions never leave `active_run: true` stuck (CORE-19).
+    pub(crate) fn reconcile_live_sessions(&self, is_live: impl Fn(SessionId) -> bool) -> usize {
+        let _io = lock(&self.io_lock);
+        if self.ensure_loaded_locked().is_err() {
+            return 0;
+        }
+        let mut guard = lock(&self.state);
+        let Some(data) = guard.as_mut() else {
+            return 0;
+        };
+        let mut removed_placeholders = Vec::new();
+        let before_turns = data.turns.len();
+        data.turns.retain(|t| {
+            if is_live(t.session_id) {
+                true
+            } else {
+                removed_placeholders.push(t.placeholder_message_id.clone());
+                false
+            }
+        });
+        let pruned_turns = before_turns.saturating_sub(data.turns.len());
+        let active_placeholders: std::collections::HashSet<&str> = data
+            .turns
+            .iter()
+            .map(|t| t.placeholder_message_id.as_str())
+            .collect();
+        let mut changed = pruned_turns > 0;
+        let before_msgs = data.messages.len();
+        data.messages.retain(|m| {
+            let orphaned = removed_placeholders.contains(&m.message_id)
+                || (m.in_progress && !active_placeholders.contains(m.message_id.as_str()));
+            !(orphaned && m.in_progress && m.body.trim().is_empty())
+        });
+        if data.messages.len() != before_msgs {
+            changed = true;
+        }
+        for msg in &mut data.messages {
+            let orphaned = removed_placeholders.contains(&msg.message_id)
+                || (msg.in_progress && !active_placeholders.contains(msg.message_id.as_str()));
+            if orphaned && msg.in_progress {
+                msg.in_progress = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_locked(data).ok();
+        }
+        pruned_turns
     }
 
     pub(crate) fn on_session_removed(&self, session_id: SessionId) {
@@ -1699,6 +1752,163 @@ mod tests {
             .unwrap();
         assert_eq!(legacy_some.body, "Legacy with seq reply");
         assert!(!legacy_some.in_progress);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_live_sessions_prunes_dead_turns_and_placeholders_on_boot() {
+        let root = std::env::temp_dir().join(format!("krill-core19-boot-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+        let alice = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Alice".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let grp = store
+            .create_group("Ops", vec![alice.id.clone()], String::new(), 1_000)
+            .unwrap();
+
+        let g1 = GroupCoordinator::new(root.clone());
+        let plan = g1
+            .prepare_message_dispatch(&store, &grp.id, None, "owner", "Check status", None, 1_000)
+            .unwrap();
+        g1.record_turn_started_seq(
+            &grp.id,
+            &plan.thread.thread_id,
+            &alice,
+            SessionId(901),
+            Some(1),
+            1_010,
+        )
+        .unwrap();
+
+        // Simulate daemon reboot: fresh GroupCoordinator loads persisted turns from disk.
+        let g2 = GroupCoordinator::new(root.clone());
+        let before = g2.read_group(&store, &grp.id, None, None).unwrap();
+        assert!(before.active_run);
+
+        let pruned = g2.reconcile_live_sessions(|sid| sid == SessionId(999));
+        assert_eq!(pruned, 1);
+
+        let after = g2.read_group(&store, &grp.id, None, None).unwrap();
+        assert!(
+            !after.active_run,
+            "boot reconciliation must clear active_run for dead sessions"
+        );
+        assert!(
+            after.messages.iter().all(|m| !m.in_progress),
+            "boot reconciliation must remove empty in_progress placeholders"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sender_bot_is_excluded_in_mentions_and_bot_modes() {
+        let root = std::env::temp_dir().join(format!("krill-core20-self-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+        let alice = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Alice".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let bob = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Bob".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_001,
+            )
+            .unwrap();
+        let grp = store
+            .create_group(
+                "Team",
+                vec![alice.id.clone(), bob.id.clone()],
+                String::new(),
+                1_000,
+            )
+            .unwrap();
+
+        let groups = GroupCoordinator::new(root.clone());
+        // Mentions mode with @everyone sent by Alice must NOT dispatch back to Alice.
+        let plan_mentions = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp.id,
+                None,
+                alice.id.as_str(),
+                "@everyone hi",
+                BotGroupReplyAudience::Mentions,
+                1_010,
+            )
+            .unwrap();
+        assert_eq!(
+            plan_mentions
+                .target_bots
+                .iter()
+                .map(|b| b.id.clone())
+                .collect::<Vec<_>>(),
+            vec![bob.id.clone()],
+            "Mentions mode must exclude sender_bot_id"
+        );
+
+        // Bot mode targeting Alice sent by Alice must NOT dispatch back to Alice.
+        let plan_bot = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp.id,
+                None,
+                alice.id.as_str(),
+                "ping",
+                BotGroupReplyAudience::Bot {
+                    bot_id: alice.id.clone(),
+                },
+                1_020,
+            )
+            .unwrap();
+        assert!(
+            plan_bot.target_bots.is_empty(),
+            "Bot mode must exclude sender_bot_id"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

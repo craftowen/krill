@@ -189,12 +189,19 @@ impl RemoteSession {
                 target.record_outcome_for_epoch(epoch, false, Some(e));
             }
         };
-        if let Err(e) = sock.write_all(encoded) {
+        let map_timeout = |e: io::Error| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                io::Error::from(io::ErrorKind::TimedOut)
+            } else {
+                e
+            }
+        };
+        if let Err(e) = sock.write_all(encoded).map_err(map_timeout) {
             self.stream = None;
             record_err(&e);
             return Err(e);
         }
-        let frame = match ipc::read_frame(sock) {
+        let frame = match ipc::read_frame(sock).map_err(map_timeout) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 self.stream = None;

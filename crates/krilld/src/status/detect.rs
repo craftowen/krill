@@ -85,6 +85,18 @@ impl Detector {
         status: &AgentStatus,
         now: Instant,
     ) -> Option<Evidence> {
+        self.observe_with_composer(title, screen, revision, status, now, false)
+    }
+
+    pub fn observe_with_composer(
+        &mut self,
+        title: &str,
+        screen: &str,
+        revision: u64,
+        status: &AgentStatus,
+        now: Instant,
+        idle_composer: bool,
+    ) -> Option<Evidence> {
         if self.revision != Some(revision) {
             self.revision = Some(revision);
             self.changed = Some(now);
@@ -112,6 +124,7 @@ impl Detector {
                 .or(pending_question.then_some(AgentState::Waiting))
         };
         let title_state = self.title_state(title);
+        let at_prompt = idle_composer || self.rules.is_prompt(screen);
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && matches!(status.source, Some(Source::Hook | Source::Screen))
         {
@@ -134,7 +147,7 @@ impl Detector {
                 };
                 if quiet
                     && menu.is_none()
-                    && self.rules.is_prompt(screen)
+                    && at_prompt
                     && now.saturating_duration_since(first) >= STRAY_WAITING
                 {
                     self.stray_waiting = None;
@@ -153,7 +166,8 @@ impl Detector {
             }
             if quiet
                 && menu.is_none()
-                && self.rules.is_prompt(screen)
+                && title_state != Some(AgentState::Working)
+                && at_prompt
                 && (self.dialog_waiting_since == Some(status.since_unix_ns)
                     || status.source == Some(Source::Screen))
             {

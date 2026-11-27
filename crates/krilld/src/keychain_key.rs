@@ -22,8 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use ring::rand::{SecureRandom as _, SystemRandom};
 use security_framework::os::macos::keychain::SecKeychain;
@@ -53,11 +52,6 @@ const ERR_SEC_AUTH_FAILED: i32 = -25293;
 /// (64 hex chars + trailing newline, with generous headroom for unexpected padding).
 const MAX_KEY_STDOUT_BYTES: u64 = 256;
 
-/// How long a `LegacyAclLocked` denial is cached in-process before re-probing Keychain.
-/// An ad-hoc binary's `CDHash` cannot change within the same process, and explicit vault reset
-/// invalidates the cache immediately.
-const LEGACY_ACL_CACHE_TTL: Duration = Duration::from_secs(60);
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LegacyAclCacheKey {
     service: String,
@@ -66,10 +60,22 @@ struct LegacyAclCacheKey {
     keychain_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PositiveKeyCacheKey {
+    service: String,
+    account: String,
+    keychain_path: Option<PathBuf>,
+}
+
 /// Process-global serialization for `SecKeychain::disable_user_interaction()` and Keychain ops.
 static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
-/// Negative cache preventing repeated `/usr/bin/security` spawns on locked legacy Keychain ACLs.
-static LEGACY_ACL_CACHE: Mutex<BTreeMap<LegacyAclCacheKey, (i32, Instant)>> =
+/// Process-lifetime negative cache preventing repeated `/usr/bin/security` spawns on locked legacy
+/// Keychain ACLs. An ad-hoc binary's `CDHash` cannot change within the same process; explicit
+/// vault reset/write or disk vault replacement invalidates the cache immediately.
+static LEGACY_ACL_CACHE: Mutex<BTreeMap<LegacyAclCacheKey, i32>> = Mutex::new(BTreeMap::new());
+/// Process-global positive cache for loaded/created `.v2` master keys so repeated vault reads
+/// do not spawn `/usr/bin/security` on every poll/launch.
+static POSITIVE_KEY_CACHE: Mutex<BTreeMap<PositiveKeyCacheKey, Arc<Zeroizing<[u8; 32]>>>> =
     Mutex::new(BTreeMap::new());
 /// Tracks `(legacy_service, account)` pairs already logged at WARN for ACL denial.
 static LEGACY_ACL_WARNED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
@@ -222,30 +228,61 @@ fn disable_ui_guard() -> Result<
     }
 }
 
+/// Non-interactive check whether the user's default macOS login Keychain is currently unlocked.
+/// Returns `false` if locked or unavailable without ever triggering a macOS GUI prompt.
+pub(crate) fn is_default_keychain_unlocked() -> bool {
+    let _gate = lock(&KEYCHAIN_GATE);
+    let Ok(_ui) = disable_ui_guard() else {
+        return false;
+    };
+    let Ok(mut keychain) = SecKeychain::default() else {
+        return false;
+    };
+    keychain.unlock(None).is_ok()
+}
+
+/// Non-interactive unlock check against an explicit [`SecKeychain`] (used by isolated tests).
+#[cfg(test)]
+pub(crate) fn is_keychain_unlocked(keychain: &SecKeychain) -> bool {
+    let _gate = lock(&KEYCHAIN_GATE);
+    let Ok(_ui) = disable_ui_guard() else {
+        return false;
+    };
+    let mut kc = keychain.clone();
+    kc.unlock(None).is_ok()
+}
+
+/// Invalidates both negative (`LegacyAclLocked`) and positive (`.v2`) in-process caches
+/// for `(service, account, keychain_path)`.
+pub(crate) fn invalidate_key_cache(service: &str, account: &str, keychain_path: Option<&Path>) {
+    invalidate_legacy_acl_cache(service, account, keychain_path);
+    let pos_key = PositiveKeyCacheKey {
+        service: service.to_owned(),
+        account: account.to_owned(),
+        keychain_path: keychain_path.map(Path::to_path_buf),
+    };
+    lock(&POSITIVE_KEY_CACHE).remove(&pos_key);
+}
+
 /// Runs with `KEYCHAIN_GATE` held and `SecKeychain::disable_user_interaction()` active.
 fn load_or_create_locked(
     spec: KeychainSpec<'_>,
     keychain: &SecKeychain,
     keychain_path: Option<&Path>,
 ) -> Result<Zeroizing<[u8; 32]>, KeyLoadError> {
-    // Fast path: if this process recently observed a legacy ACL denial for this exact
+    // Fast path: if this process observed a legacy ACL denial for this exact
     // `(service, legacy_service, account, keychain_path)` and the caller is performing a
     // read/legacy check, avoid spawning `/usr/bin/security` and spamming WARN on every poll.
     if spec.check_legacy
         && let Some(legacy_service) = spec.legacy_service
-        && let Some(status) = check_legacy_acl_cache(
-            spec.service,
-            legacy_service,
-            spec.account,
-            keychain_path,
-            Instant::now(),
-        )
+        && let Some(status) =
+            check_legacy_acl_cache(spec.service, legacy_service, spec.account, keychain_path)
     {
         return Err(KeyLoadError::legacy_acl_locked(status));
     }
 
-    // Step 0: Verify the target keychain is unlocked BEFORE spawning `/usr/bin/security`,
-    // so `/usr/bin/security` can never trigger a macOS unlock dialog on a locked keychain.
+    // Step 0: Verify the target keychain is unlocked BEFORE consulting positive cache or
+    // spawning `/usr/bin/security`, so locked keychains fail closed without prompting.
     let mut kc_check = keychain.clone();
     if let Err(err) = kc_check.unlock(None) {
         tracing::warn!(
@@ -256,10 +293,16 @@ fn load_or_create_locked(
         return Err(KeyLoadError::keychain_locked(err.code()));
     }
 
+    // Step 0.5: Positive in-process `.v2` master-key cache hit avoids spawning `/usr/bin/security`.
+    if let Some(cached) = get_positive_key_cache(spec.service, spec.account, keychain_path) {
+        return Ok(Zeroizing::new(**cached));
+    }
+
     // Step 1: Try the upgrade-resilient `/usr/bin/security`-owned service first.
     match read_via_security_cli(spec.service, spec.account, keychain_path) {
         Ok(Some(key)) => {
             invalidate_legacy_acl_cache(spec.service, spec.account, keychain_path);
+            put_positive_key_cache(spec.service, spec.account, keychain_path, &key);
             return Ok(key);
         }
         Ok(None) => {}
@@ -282,6 +325,7 @@ fn load_or_create_locked(
                 // ad-hoc binary upgrade does not lose access.
                 match write_via_security_cli(spec.service, spec.account, &key, keychain_path) {
                     Ok(()) => {
+                        put_positive_key_cache(spec.service, spec.account, keychain_path, &key);
                         tracing::info!(
                             service = spec.service,
                             legacy_service,
@@ -289,6 +333,7 @@ fn load_or_create_locked(
                         );
                     }
                     Err(WriteCliError::Duplicate) => {
+                        put_positive_key_cache(spec.service, spec.account, keychain_path, &key);
                         tracing::debug!(
                             service = spec.service,
                             legacy_service,
@@ -314,7 +359,6 @@ fn load_or_create_locked(
                     spec.account,
                     keychain_path,
                     err.code(),
-                    Instant::now(),
                 );
                 if first_warn {
                     tracing::warn!(
@@ -360,17 +404,48 @@ fn load_or_create_locked(
     match write_via_security_cli(spec.service, spec.account, &fresh, keychain_path) {
         Ok(()) => {
             invalidate_legacy_acl_cache(spec.service, spec.account, keychain_path);
+            put_positive_key_cache(spec.service, spec.account, keychain_path, &fresh);
             Ok(fresh)
         }
         Err(WriteCliError::Duplicate) => {
             invalidate_legacy_acl_cache(spec.service, spec.account, keychain_path);
             // Another process created the key concurrently; read back the winner.
-            read_via_security_cli(spec.service, spec.account, keychain_path)?.ok_or_else(|| {
-                KeyLoadError::unavailable("keychain item disappeared after duplicate race")
-            })
+            let winner = read_via_security_cli(spec.service, spec.account, keychain_path)?
+                .ok_or_else(|| {
+                    KeyLoadError::unavailable("keychain item disappeared after duplicate race")
+                })?;
+            put_positive_key_cache(spec.service, spec.account, keychain_path, &winner);
+            Ok(winner)
         }
         Err(WriteCliError::Failed(err)) => Err(err),
     }
+}
+
+fn get_positive_key_cache(
+    service: &str,
+    account: &str,
+    keychain_path: Option<&Path>,
+) -> Option<Arc<Zeroizing<[u8; 32]>>> {
+    let key = PositiveKeyCacheKey {
+        service: service.to_owned(),
+        account: account.to_owned(),
+        keychain_path: keychain_path.map(Path::to_path_buf),
+    };
+    lock(&POSITIVE_KEY_CACHE).get(&key).cloned()
+}
+
+fn put_positive_key_cache(
+    service: &str,
+    account: &str,
+    keychain_path: Option<&Path>,
+    bytes: &Zeroizing<[u8; 32]>,
+) {
+    let key = PositiveKeyCacheKey {
+        service: service.to_owned(),
+        account: account.to_owned(),
+        keychain_path: keychain_path.map(Path::to_path_buf),
+    };
+    lock(&POSITIVE_KEY_CACHE).insert(key, Arc::new(Zeroizing::new(**bytes)));
 }
 
 fn check_legacy_acl_cache(
@@ -378,7 +453,6 @@ fn check_legacy_acl_cache(
     legacy_service: &str,
     account: &str,
     keychain_path: Option<&Path>,
-    now: Instant,
 ) -> Option<i32> {
     let key = LegacyAclCacheKey {
         service: service.to_owned(),
@@ -386,14 +460,7 @@ fn check_legacy_acl_cache(
         account: account.to_owned(),
         keychain_path: keychain_path.map(Path::to_path_buf),
     };
-    let mut cache = lock(&LEGACY_ACL_CACHE);
-    let &(status, cached_at) = cache.get(&key)?;
-    if now.saturating_duration_since(cached_at) < LEGACY_ACL_CACHE_TTL {
-        Some(status)
-    } else {
-        cache.remove(&key);
-        None
-    }
+    lock(&LEGACY_ACL_CACHE).get(&key).copied()
 }
 
 fn record_legacy_acl_locked(
@@ -402,7 +469,6 @@ fn record_legacy_acl_locked(
     account: &str,
     keychain_path: Option<&Path>,
     status: i32,
-    now: Instant,
 ) -> bool {
     let key = LegacyAclCacheKey {
         service: service.to_owned(),
@@ -410,7 +476,7 @@ fn record_legacy_acl_locked(
         account: account.to_owned(),
         keychain_path: keychain_path.map(Path::to_path_buf),
     };
-    lock(&LEGACY_ACL_CACHE).insert(key, (status, now));
+    lock(&LEGACY_ACL_CACHE).insert(key, status);
     lock(&LEGACY_ACL_WARNED).insert((legacy_service.to_owned(), account.to_owned()))
 }
 
@@ -733,6 +799,16 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        let t_lock = std::time::Instant::now();
+        assert!(
+            !is_keychain_unlocked(&kc),
+            "locked keychain must report unlocked=false"
+        );
+        assert!(
+            t_lock.elapsed() < std::time::Duration::from_secs(5),
+            "locked keychain check must return without prompting (took {:?})",
+            t_lock.elapsed()
+        );
         let locked_err = load_or_create_in_keychain(
             KeychainSpec {
                 service: svc_new,
@@ -756,6 +832,54 @@ mod tests {
             locked_err.kind
         );
 
+        // 4. Unlock and verify positive in-process `.v2` cache hits without re-spawning security.
+        assert!(
+            Command::new(SECURITY_BIN)
+                .args(["unlock-keychain", "-p", &ephemeral_pass])
+                .arg(&kc_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(is_keychain_unlocked(&kc));
+        assert!(
+            Command::new(SECURITY_BIN)
+                .args(["delete-generic-password", "-s", svc_new, "-a", "acct-fresh"])
+                .arg(&kc_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Item was deleted on disk, so a cache hit proves `/usr/bin/security` was not re-spawned.
+        let cached = load_or_create_in_keychain(
+            KeychainSpec {
+                service: svc_new,
+                legacy_service: None,
+                account: "acct-fresh",
+                allow_create: false,
+                check_legacy: false,
+            },
+            &kc,
+            Some(&kc_path),
+        )
+        .unwrap();
+        assert_eq!(*cached, *k1);
+        // After explicit cache invalidation, the missing item returns NotFound.
+        invalidate_key_cache(svc_new, "acct-fresh", Some(&kc_path));
+        let missing = load_or_create_in_keychain(
+            KeychainSpec {
+                service: svc_new,
+                legacy_service: None,
+                account: "acct-fresh",
+                allow_create: false,
+                check_legacy: false,
+            },
+            &kc,
+            Some(&kc_path),
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind, KeyLoadErrorKind::NotFound);
+
         drop(kc);
         Command::new(SECURITY_BIN)
             .args(["delete-keychain"])
@@ -766,26 +890,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_acl_negative_cache_deduplicates_warns_expires_and_invalidates() {
+    fn legacy_acl_negative_cache_is_process_lifetime_and_invalidates_cleanly() {
         let svc = "com.krill.unit-cache-test.v2";
         let legacy = "com.krill.unit-cache-test.v1";
         let acct = format!("acct-cache-{}", std::process::id());
-        let now = Instant::now();
 
-        invalidate_legacy_acl_cache(svc, &acct, None);
-        assert_eq!(check_legacy_acl_cache(svc, legacy, &acct, None, now), None);
+        invalidate_key_cache(svc, &acct, None);
+        assert_eq!(check_legacy_acl_cache(svc, legacy, &acct, None), None);
 
-        // First ACL denial returns true (emit WARN once) and caches the status.
+        // First ACL denial returns true (emit WARN once) and caches the status for process lifetime.
         assert!(record_legacy_acl_locked(
             svc,
             legacy,
             &acct,
             None,
             ERR_SEC_INTERACTION_NOT_ALLOWED,
-            now,
         ));
         assert_eq!(
-            check_legacy_acl_cache(svc, legacy, &acct, None, now + Duration::from_secs(10)),
+            check_legacy_acl_cache(svc, legacy, &acct, None),
             Some(ERR_SEC_INTERACTION_NOT_ALLOWED)
         );
         // Subsequent denial for the same pair returns false (downgraded to DEBUG).
@@ -795,39 +917,22 @@ mod tests {
             &acct,
             None,
             ERR_SEC_INTERACTION_NOT_ALLOWED,
-            now + Duration::from_secs(10),
         ));
-        // After TTL, negative cache expires so Keychain can be re-probed.
         assert_eq!(
-            check_legacy_acl_cache(
-                svc,
-                legacy,
-                &acct,
-                None,
-                now + Duration::from_secs(10) + LEGACY_ACL_CACHE_TTL,
-            ),
-            None
+            check_legacy_acl_cache(svc, legacy, &acct, None),
+            Some(ERR_SEC_INTERACTION_NOT_ALLOWED)
         );
 
-        // Re-record and confirm invalidation clears both negative cache and warn-once state.
-        record_legacy_acl_locked(
-            svc,
-            legacy,
-            &acct,
-            None,
-            ERR_SEC_INTERACTION_NOT_ALLOWED,
-            now,
-        );
-        invalidate_legacy_acl_cache(svc, &acct, None);
-        assert_eq!(check_legacy_acl_cache(svc, legacy, &acct, None, now), None);
+        // Explicit invalidation clears both negative cache and warn-once state.
+        invalidate_key_cache(svc, &acct, None);
+        assert_eq!(check_legacy_acl_cache(svc, legacy, &acct, None), None);
         assert!(record_legacy_acl_locked(
             svc,
             legacy,
             &acct,
             None,
             ERR_SEC_INTERACTION_NOT_ALLOWED,
-            now,
         ));
-        invalidate_legacy_acl_cache(svc, &acct, None);
+        invalidate_key_cache(svc, &acct, None);
     }
 }

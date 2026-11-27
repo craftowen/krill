@@ -386,12 +386,17 @@ impl WsClient {
         self.send_frame(OP_CLOSE, &payload)
     }
 
-    /// Closes the connection gracefully (best-effort close frame + TCP shutdown).
-    pub fn close(mut self) {
+    /// Closes the connection with an explicit RFC 6455 close status code and reason.
+    pub fn close_with_code(mut self, code: u16, reason: &str) {
         if !self.closed {
-            self.send_close(1000, "shutdown").ok();
+            self.send_close(code, reason).ok();
         }
         self.transport.tcp().shutdown(Shutdown::Both).ok();
+    }
+
+    /// Closes the connection gracefully (best-effort close frame `1000` + TCP shutdown).
+    pub fn close(self) {
+        self.close_with_code(1000, "shutdown");
     }
 
     /// Polls for the next complete WebSocket message, returning [`WsEvent::Timeout`] if `timeout`

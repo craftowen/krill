@@ -43,6 +43,29 @@ enum OutcomeFence {
     Epoch(u64),
 }
 
+/// Marker payload attached to `WouldBlock` errors returned by `ensure_tunnel_socket`
+/// when a host is already in backoff, so `record_ipc_outcome_in_slot` can distinguish
+/// active backoff from OS `EAGAIN`/`WouldBlock` (`SO_RCVTIMEO` expiry).
+#[derive(Debug)]
+struct BackoffActiveError(String);
+
+impl std::fmt::Display for BackoffActiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BackoffActiveError {}
+
+fn backoff_active_io_error(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, BackoffActiveError(message))
+}
+
+fn is_backoff_active_error(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BackoffActiveError>)
+}
+
 /// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OfflineKey {
@@ -781,8 +804,7 @@ impl HostManager {
                     false
                 };
                 if !agent_unlocked {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
+                    return Err(backoff_active_io_error(
                         s.last_error
                             .clone()
                             .unwrap_or_else(|| "remote host backoff active".to_owned()),
@@ -836,7 +858,7 @@ impl HostManager {
                 s.agent_fingerprint = shared_fp;
                 s.last_agent_probe = Some(Instant::now());
                 s.status = HostStatus::AuthFailed;
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
+                return Err(backoff_active_io_error(error));
             }
         }
 
@@ -853,7 +875,7 @@ impl HostManager {
             s.next_retry_at = Some(until);
             s.last_error = Some(error.clone());
             s.status = HostStatus::Disconnected;
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
+            return Err(backoff_active_io_error(error));
         }
 
         s.status = HostStatus::Connecting;
@@ -993,7 +1015,7 @@ impl HostManager {
         if !Arc::ptr_eq(&slot, &expected) {
             return;
         }
-        Self::record_ipc_outcome_in_slot(&slot, Some(expected_reg), fence, ok, err);
+        self.record_ipc_outcome_in_slot(&slot, Some(expected_reg), fence, ok, err);
     }
 
     #[cfg(all(test, unix))]
@@ -1008,10 +1030,11 @@ impl HostManager {
             return;
         };
         let fence = attempt.map_or(OutcomeFence::None, OutcomeFence::Attempt);
-        Self::record_ipc_outcome_in_slot(&slot, None, fence, ok, err);
+        self.record_ipc_outcome_in_slot(&slot, None, fence, ok, err);
     }
 
     fn record_ipc_outcome_in_slot(
+        &self,
         slot: &Mutex<RemoteSlot>,
         expected_reg: Option<&Arc<()>>,
         fence: OutcomeFence,
@@ -1053,9 +1076,11 @@ impl HostManager {
             s.status = HostStatus::Connected;
             return;
         }
-        // 이미 ensure_tunnel_socket에서 백오프가 걸린 상태(WouldBlock)라면 실패 횟수를 중복 증가시키지 않는다.
+        // 이미 ensure_tunnel_socket에서 백오프가 걸린 상태라면 실패 횟수를 중복 증가시키지 않는다.
+        // OS `SO_RCVTIMEO` 만료의 raw `WouldBlock`(`os error 35`)은 백오프 센티넬이 아니므로
+        // 일반 시간 초과 오류로 처리해 터널을 내리고 백오프에 진입한다.
         // 인증 실패 백오프(`AuthFailed`) 상태도 그대로 보존한다.
-        if err.is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
+        if err.is_some_and(is_backoff_active_error) {
             if s.status != HostStatus::AuthFailed {
                 s.status = HostStatus::Disconnected;
             }
@@ -1082,6 +1107,7 @@ impl HostManager {
                     | io::ErrorKind::ConnectionReset
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
             )
         }) || s.failures >= OFFLINE_AFTER_FAILURES
         {
@@ -1091,9 +1117,21 @@ impl HostManager {
             s.generation = s.generation.wrapping_add(1);
         }
         let delay = Self::backoff_delay(s.failures);
-        s.next_retry_at = Some(Instant::now() + delay);
+        let until = Instant::now() + delay;
+        s.next_retry_at = Some(until);
         if let Some(e) = err {
             s.last_error = Some(e.to_string());
+        }
+        if s.failures >= OFFLINE_AFTER_FAILURES
+            && let Ok(mut offline) = OFFLINE.lock()
+        {
+            let key = self.offline_key(&s.spec);
+            let offline_until = Instant::now() + delay.max(OFFLINE_BACKOFF);
+            let message = s
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "remote host unreachable".to_owned());
+            offline.insert(key, (offline_until, message));
         }
         s.status = HostStatus::Disconnected;
     }
@@ -1233,6 +1271,110 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
         assert_eq!(manager2.tunnel_pid("studio"), Some(pid2));
 
         drop(manager2);
+        drop(manager);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn silent_peer_timeout_maps_would_block_to_timed_out_drops_tunnel_and_engages_backoff() {
+        let dir = std::env::temp_dir().join(format!("rem01-silent-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        // Bind a local listener that accepts and holds the socket open without writing.
+        let silent_sock = dir.join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&silent_sock).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(400));
+                drop(stream);
+            }
+        });
+        let hello = krill_proto::ipc::ClientHello {
+            proto_min: 1,
+            proto_max: 1,
+            features: 0,
+            role: krill_proto::ipc::ClientRole::Cli,
+            name: "rem01-test".into(),
+        };
+        let err = krill_proto::daemon::handshake(&silent_sock, &hello, Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "SO_RCVTIMEO expiry must normalize EAGAIN/WouldBlock to TimedOut, got {err:?}"
+        );
+        accept_thread.join().ok();
+
+        // Raw OS WouldBlock (os error 35) reaching record_ipc_outcome must NOT be ignored as backoff:
+        // it must drop s.tunnel, bump transport_epoch, increment failures, and set next_retry_at.
+        let script = dir.join("ssh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; sleep 60' "${fwd%%:*}"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+        manager.sync_specs(&[RemoteHostSpec {
+            id: "rem01-host".into(),
+            label: "REM01".into(),
+            address: "owen@rem01.local".into(),
+            port: None,
+            identity_file: None,
+            remote_socket: Some("/tmp/remote.sock".into()),
+        }]);
+        let target = manager
+            .target_for(&HostId::Remote("rem01-host".into()), None)
+            .unwrap();
+        manager.ensure_tunnel_socket("rem01-host").unwrap();
+        assert!(manager.tunnel_pid("rem01-host").is_some());
+        let epoch_before = target.transport_epoch();
+
+        let raw_would_block = io::Error::from(io::ErrorKind::WouldBlock);
+        manager.record_ipc_outcome("rem01-host", false, Some(&raw_would_block));
+        assert_eq!(
+            manager.tunnel_pid("rem01-host"),
+            None,
+            "raw OS WouldBlock must immediately drop the wedged tunnel"
+        );
+        assert!(
+            target.transport_epoch() > epoch_before,
+            "raw OS WouldBlock must bump transport_epoch"
+        );
+        let slot = manager.slot("rem01-host").unwrap();
+        let (failures, has_retry) = {
+            let s = slot.lock().unwrap();
+            (s.failures, s.next_retry_at.is_some())
+        };
+        assert_eq!(failures, 1);
+        assert!(has_retry, "next_retry_at must be set on timeout");
+
+        // By contrast, the active backoff error returned by ensure_tunnel_socket must not double-count.
+        let backoff_err = manager.ensure_tunnel_socket("rem01-host").unwrap_err();
+        assert_eq!(backoff_err.kind(), io::ErrorKind::WouldBlock);
+        manager.record_ipc_outcome("rem01-host", false, Some(&backoff_err));
+        assert_eq!(slot.lock().unwrap().failures, 1);
+
+        // Reaching OFFLINE_AFTER_FAILURES via IPC outcomes must populate cross-window OFFLINE.
+        for _ in 0..OFFLINE_AFTER_FAILURES {
+            manager.record_ipc_outcome("rem01-host", false, Some(&err));
+        }
+        let offline_key = manager.offline_key(&slot.lock().unwrap().spec);
+        assert!(
+            OFFLINE.lock().unwrap().contains_key(&offline_key),
+            "IPC failures reaching OFFLINE_AFTER_FAILURES must mark host in cross-window OFFLINE"
+        );
+        OFFLINE.lock().unwrap().remove(&offline_key);
+
         drop(manager);
         fs::remove_dir_all(&dir).ok();
     }

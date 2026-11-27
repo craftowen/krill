@@ -3418,7 +3418,11 @@ impl WorktreeStore {
             issue: self.issues.get(&key).cloned(),
             references: self.references.get(&key).cloned().unwrap_or_default(),
             parent: self.parents.get(&key).cloned(),
-            updated_at_ms: self.updated_at.get(&key).copied(),
+            updated_at_ms: self
+                .updated_at
+                .get(&key)
+                .copied()
+                .map(|secs| secs.saturating_mul(1_000)),
             worktree: key,
         }
     }
@@ -7150,5 +7154,15 @@ mod frame_bound_tests {
             Some(TaskStatus::Ready)
         );
         Ok(())
+    }
+
+    #[test]
+    fn worktree_checkpoint_converts_updated_at_seconds_to_milliseconds() {
+        let mut store = WorktreeStore::default();
+        store
+            .updated_at
+            .insert("/tmp/wt-ms".to_owned(), 1_700_000_123);
+        let cp = store.checkpoint("/tmp/wt-ms");
+        assert_eq!(cp.updated_at_ms, Some(1_700_000_123_000));
     }
 }

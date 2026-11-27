@@ -216,6 +216,27 @@ impl GitQueue {
 
     /// 링크된 워크트리는 실행 디렉터리와 직렬화할 주 저장소 키가 다르다.
     fn enqueue_key(&self, repo: PathBuf, key: PathBuf, retained: usize, execute: Execute) {
+        self.enqueue_key_with_spawner(repo, key, retained, execute, |index, shared| {
+            thread::Builder::new()
+                .name(format!("git-{index}"))
+                .stack_size(128 * 1024)
+                .spawn(move || {
+                    crate::alloc::mobile_thread().ok();
+                    work(&shared);
+                })
+        });
+    }
+
+    fn enqueue_key_with_spawner<S>(
+        &self,
+        repo: PathBuf,
+        key: PathBuf,
+        retained: usize,
+        execute: Execute,
+        spawn: S,
+    ) where
+        S: FnOnce(usize, Arc<Shared>) -> io::Result<JoinHandle<()>>,
+    {
         let retained = retained
             .saturating_add(repo.as_os_str().as_bytes().len())
             .saturating_add(key.as_os_str().as_bytes().len());
@@ -249,16 +270,20 @@ impl GitQueue {
         {
             let index = state.active_workers;
             let shared = Arc::clone(&self.shared);
-            if let Ok(handle) = thread::Builder::new()
-                .name(format!("git-{index}"))
-                .stack_size(128 * 1024)
-                .spawn(move || {
-                    crate::alloc::mobile_thread().ok();
-                    work(&shared);
-                })
-            {
-                state.active_workers += 1;
-                state.workers.push(handle);
+            match spawn(index, shared) {
+                Ok(handle) => {
+                    state.active_workers += 1;
+                    state.workers.push(handle);
+                }
+                Err(_) if state.active_workers == 0 => {
+                    // No live worker exists to drain the job we just pushed; remove it so
+                    // dropping `execute` immediately disconnects the caller's result channel.
+                    if let Some(stranded) = state.pending.pop_back() {
+                        state.pending_bytes = state.pending_bytes.saturating_sub(stranded.retained);
+                    }
+                    return;
+                }
+                Err(_) => {}
             }
         }
         self.shared.changed.notify_one();
@@ -531,5 +556,27 @@ mod resolve_tests {
             resolve_program(Path::new("/usr/bin/git"), OsStr::new("/bin")),
             Path::new("/usr/bin/git")
         );
+    }
+
+    #[test]
+    fn enqueue_key_disconnects_caller_when_first_worker_spawn_fails() {
+        let queue = GitQueue::with_program(PathBuf::from("/usr/bin/git"), 2).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        queue.enqueue_key_with_spawner(
+            PathBuf::from("/tmp/repo"),
+            PathBuf::from("/tmp/repo"),
+            0,
+            Box::new(move |_, _| {
+                tx.send(()).ok();
+            }),
+            |_, _| Err(io::Error::new(io::ErrorKind::WouldBlock, "spawn failed")),
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "caller channel must disconnect immediately when worker spawn fails with 0 active workers"
+        );
+        let state = lock(&queue.shared.state);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_bytes, 0);
     }
 }

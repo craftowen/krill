@@ -566,3 +566,67 @@ fn coalescing_keeps_metadata_and_separates_reused_session_runs() {
     assert_eq!(runs[0].timed_out, Some(false));
     assert_eq!(runs[1].run_number, Some(1));
 }
+
+#[test]
+fn cron_accepts_sunday_ending_weekday_ranges() {
+    let mon_sun = Cron::parse("0 9 * * MON-SUN").unwrap();
+    for dow in 0..=6 {
+        assert!(
+            mon_sun.matches([0, 9, 1, 1, dow]),
+            "MON-SUN must match {dow}"
+        );
+    }
+
+    let fri_sun = Cron::parse("0 9 * * FRI-SUN").unwrap();
+    for dow in [5, 6, 0] {
+        assert!(
+            fri_sun.matches([0, 9, 1, 1, dow]),
+            "FRI-SUN must match {dow}"
+        );
+    }
+    for dow in [1, 2, 3, 4] {
+        assert!(
+            !fri_sun.matches([0, 9, 1, 1, dow]),
+            "FRI-SUN must not match {dow}"
+        );
+    }
+
+    let sat_sun = Cron::parse("0 9 * * SAT-SUN").unwrap();
+    assert!(sat_sun.matches([0, 9, 1, 1, 6]));
+    assert!(sat_sun.matches([0, 9, 1, 1, 0]));
+    assert!(!sat_sun.matches([0, 9, 1, 1, 5]));
+
+    let sun_tue = Cron::parse("0 9 * * SUN-TUE").unwrap();
+    for dow in [0, 1, 2] {
+        assert!(
+            sun_tue.matches([0, 9, 1, 1, dow]),
+            "SUN-TUE must match {dow}"
+        );
+    }
+    assert!(!sun_tue.matches([0, 9, 1, 1, 3]));
+
+    let sun_only = Cron::parse("0 9 * * SUN-SUN").unwrap();
+    assert!(sun_only.matches([0, 9, 1, 1, 0]));
+    for dow in 1..=6 {
+        assert!(!sun_only.matches([0, 9, 1, 1, dow]));
+    }
+}
+
+#[test]
+fn schedules_toml_ignores_unknown_future_fields() {
+    let raw = r#"
+future_top_level_flag = true
+
+[[schedule]]
+id = "daily-check"
+cron = "0 9 * * MON-SUN"
+cwd = "/tmp"
+command = ["claude"]
+prompt = "check"
+future_schedule_field = "v0.4.0"
+"#;
+    let parsed: Schedules = toml::from_str(raw).unwrap();
+    assert_eq!(parsed.schedule.len(), 1);
+    assert_eq!(parsed.schedule[0].id, "daily-check");
+    assert_eq!(parsed.schedule[0].cron, "0 9 * * MON-SUN");
+}
