@@ -2374,15 +2374,16 @@ mod tests {
         let stop2_r = Arc::clone(&stop2_srv);
         let stop2_w = Arc::clone(&stop2_srv);
         let r2_thread = thread::spawn(move || {
-            rest2.set_nonblocking(true).ok();
             while !stop2_r.load(std::sync::atomic::Ordering::Acquire) {
                 let Ok((mut sock, _)) = rest2.accept() else {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
+                    break;
                 };
-                sock.set_nonblocking(false).ok();
-                let mut buf = [0u8; 2048];
-                if sock.read(&mut buf).unwrap_or(0) == 0 {
+                if stop2_r.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let (method, _, _, _) = read_http(&mut sock);
+                if method.is_empty() {
                     continue;
                 }
                 let body = format!(r#"{{"url":"ws://{ws2_addr}"}}"#);
@@ -2391,18 +2392,25 @@ mod tests {
                     body.len()
                 );
                 sock.write_all(wire.as_bytes()).ok();
+                sock.flush().ok();
             }
         });
         let reconnect_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
         let reconnect_times_bg = Arc::clone(&reconnect_times);
         let w2_thread = thread::spawn(move || {
-            ws2.set_nonblocking(true).ok();
+            // Keep accepted sockets open until shutdown so the client can finish reading
+            // OP_HELLO/OP_RECONNECT and send OP_IDENTIFY + close code 4000 without hitting
+            // a Windows loopback TCP RST (`WSAECONNRESET`) on a dropped server socket.
+            let mut held_sockets = Vec::new();
             while !stop2_w.load(std::sync::atomic::Ordering::Acquire) {
                 let Ok((mut sock, _)) = ws2.accept() else {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
+                    break;
                 };
-                sock.set_nonblocking(false).ok();
+                if stop2_w.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                sock.set_nodelay(true).ok();
+                sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 if accept_ws_test_handshake(&mut sock).is_ok() {
                     lock(&reconnect_times_bg).push(Instant::now());
                     write_server_frame(
@@ -2414,6 +2422,8 @@ mod tests {
                     .ok();
                     // Immediately send OP_RECONNECT without READY/RESUMED.
                     write_server_frame(&mut sock, true, 1, br#"{"op":7,"d":null}"#).ok();
+                    sock.flush().ok();
+                    held_sockets.push(sock);
                 }
             }
         });
@@ -2449,18 +2459,38 @@ mod tests {
                 Duration::from_secs(5),
             );
         });
+        let second_deadline = Instant::now() + Duration::from_secs(3);
+        while lock(&reconnect_times).len() < 2 && Instant::now() < second_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // After the 2nd consecutive OP_RECONNECT, backoff (1,000ms) must prevent a rapid 3rd connect.
         thread::sleep(Duration::from_millis(450));
         stop2.signal();
         stop2_srv.store(true, std::sync::atomic::Ordering::Release);
+        std::net::TcpStream::connect(rest2_addr).ok();
+        std::net::TcpStream::connect(ws2_addr).ok();
         worker2.join().unwrap();
         r2_thread.join().ok();
         w2_thread.join().ok();
 
-        let count = lock(&reconnect_times).len();
+        let times = lock(&reconnect_times);
+        let count = times.len();
         assert!(
-            (2..=3).contains(&count),
-            "2nd consecutive OP_RECONNECT must apply backoff (expected 2..=3 connections in 450ms, got {count})"
+            count >= 2,
+            "1st OP_RECONNECT must reconnect promptly (expected >=2 connections, got {count})"
         );
+        let first_gap = times[1].saturating_duration_since(times[0]);
+        assert!(
+            first_gap < Duration::from_millis(850),
+            "1st OP_RECONNECT must skip 1000ms backoff (gap was {first_gap:?})"
+        );
+        if count > 2 {
+            let second_gap = times[2].saturating_duration_since(times[1]);
+            assert!(
+                second_gap >= Duration::from_millis(850),
+                "2nd consecutive OP_RECONNECT must apply 1000ms backoff (gap was {second_gap:?}, total {count} connections)"
+            );
+        }
     }
 
     #[test]
