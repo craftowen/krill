@@ -483,6 +483,36 @@ fn normalize_agent_family(agent: &str) -> &'static str {
     }
 }
 
+/// Returns true when the payload is a bare `/clear` command (ignoring surrounding whitespace and case).
+pub(super) fn is_clear_slash_command(payload: &str) -> bool {
+    payload.trim().eq_ignore_ascii_case("/clear")
+}
+
+/// Returns the native CLI slash command that resets conversation context for `agent`.
+/// Claude Code and Antigravity (`agy`) use `/clear`; Codex, `OpenCode`, omp, and Pi use `/new`.
+pub(super) fn provider_clear_command(agent: &str) -> &'static str {
+    let trimmed = agent.trim();
+    if trimmed.eq_ignore_ascii_case("pi") {
+        return "/new";
+    }
+    match normalize_agent_family(trimmed) {
+        "codex" | "opencode" | "omp" => "/new",
+        _ => "/clear",
+    }
+}
+
+/// Normalizes bare local slash commands before PTY delivery (trims trailing whitespace added by
+/// autocomplete and translates `/clear` to the provider's native clear command).
+pub(super) fn normalize_local_slash_payload(agent: &str, payload: &str) -> String {
+    if is_clear_slash_command(payload) {
+        return provider_clear_command(agent).to_owned();
+    }
+    if slash_command_is_local_non_echoed(agent, payload) {
+        return payload.trim().to_owned();
+    }
+    payload.to_owned()
+}
+
 /// Returns true when a bare slash command executes locally inside the CLI
 /// without echoing a `ChatItemKind::User` turn in the saved transcript.
 pub(super) fn slash_command_is_local_non_echoed(_agent: &str, payload: &str) -> bool {
@@ -1265,5 +1295,32 @@ mod tests {
         ));
         assert!(slash_command_opens_in_terminal("opencode", "/models", true));
         assert!(slash_command_opens_in_terminal("omp", "/model", true));
+    }
+
+    #[test]
+    fn clear_slash_command_detection_and_provider_normalization() {
+        assert!(is_clear_slash_command("/clear"));
+        assert!(is_clear_slash_command(" /CLEAR "));
+        assert!(!is_clear_slash_command("/clear now"));
+        assert!(!is_clear_slash_command("clear"));
+
+        assert_eq!(provider_clear_command("agy"), "/clear");
+        assert_eq!(provider_clear_command("antigravity"), "/clear");
+        assert_eq!(provider_clear_command("claude"), "/clear");
+        assert_eq!(provider_clear_command("codex"), "/new");
+        assert_eq!(provider_clear_command("opencode"), "/new");
+        assert_eq!(provider_clear_command("pi"), "/new");
+        assert_eq!(provider_clear_command("omp"), "/new");
+
+        assert_eq!(normalize_local_slash_payload("agy", "/clear "), "/clear");
+        assert_eq!(normalize_local_slash_payload("codex", " /CLEAR "), "/new");
+        assert_eq!(
+            normalize_local_slash_payload("claude", "/compact "),
+            "/compact"
+        );
+        assert_eq!(
+            normalize_local_slash_payload("agy", "hello world "),
+            "hello world "
+        );
     }
 }

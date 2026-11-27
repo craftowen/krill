@@ -364,6 +364,8 @@ impl Shell {
                                         ));
                                         ac.close();
                                     }
+                                    let run_clear_now = cmd_str == "/clear"
+                                        && input_state.read(cx).value().trim().is_empty();
                                     input_state.update(cx, |state, cx| {
                                         let val = state.value();
                                         let new_val = if val.trim().is_empty() {
@@ -374,7 +376,11 @@ impl Shell {
                                         state.set_value(new_val, window, cx);
                                         state.focus(window, cx);
                                     });
-                                    cx.notify();
+                                    if run_clear_now {
+                                        this.submit_chat_prompt(&key, window, cx);
+                                    } else {
+                                        cx.notify();
+                                    }
                                 },
                             ))
                         }),
@@ -614,7 +620,7 @@ impl Shell {
                             .child(badge_text)
                     }))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.accept_chat_autocomplete(&accept_key, Some(idx), window, cx);
+                        this.accept_chat_autocomplete(&accept_key, Some(idx), true, window, cx);
                     }));
                 list_box = list_box.child(row);
             }
@@ -1659,7 +1665,7 @@ impl Shell {
             .capture_action(cx.listener({
                 let tab_key = key.clone();
                 move |this, _: &gpui_component::input::IndentInline, window, cx| {
-                    if this.accept_chat_autocomplete(&tab_key, None, window, cx) {
+                    if this.accept_chat_autocomplete(&tab_key, None, false, window, cx) {
                         window.prevent_default();
                         cx.stop_propagation();
                     }
@@ -1673,7 +1679,18 @@ impl Shell {
                         if super::Shell::chat_input_is_composing(&enter_input, window, cx) {
                             return;
                         }
-                        if this.accept_chat_autocomplete(&enter_key, None, window, cx)
+                        if this.chat_autocomplete_should_submit_directly(
+                            &enter_key,
+                            &enter_input,
+                            cx,
+                        ) {
+                            if let Some(ac) = this.chat.autocomplete.get_mut(&enter_key) {
+                                ac.close();
+                                ac.dismissed = None;
+                            }
+                            return;
+                        }
+                        if this.accept_chat_autocomplete(&enter_key, None, true, window, cx)
                             || this.accept_chat_model_picker(&enter_key, cx)
                         {
                             window.prevent_default();

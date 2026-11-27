@@ -2692,21 +2692,25 @@ impl Registry {
                 AgyLookup::Sync => {
                     let agy_fg =
                         account_switch::effective_foreground_pid(root, tap.foreground(), exited);
-                    let (title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
-                        session,
-                        root,
-                        agy_fg,
-                        exited,
-                        stored.as_ref(),
-                    );
+                    let cleared = self.agents.cleared_bindings(session);
+                    let (title, discovered) =
+                        crate::agent_history::vault::resolve_live_agy_title_excluding(
+                            session,
+                            root,
+                            agy_fg,
+                            exited,
+                            stored.as_ref(),
+                            &cleared.session_ids,
+                        );
                     if let Some((ref conv_id, ref tp)) = discovered {
                         if tp.is_some() {
                             self.agents
                                 .bind_discovered_session(session, conv_id, tp.as_deref());
-                        } else if let Ok(Some(found)) = account_switch::identity::discover(
+                        } else if let Ok(Some(found)) = account_switch::identity::discover_excluding(
                             krill_proto::usage::ProviderKind::Antigravity,
                             root,
                             agy_fg,
+                            &cleared.session_ids,
                         ) {
                             self.agents.bind_discovered_session(
                                 session,
@@ -2841,6 +2845,12 @@ impl Registry {
         let origin = root.map_or(hook_identity::Origin::Unverified, |root| {
             hook_identity::origin(root, tap.and_then(Tap::foreground), e)
         });
+        let prev_session_id = self
+            .agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.session_id);
         let is_subagent_or_foreign = match origin {
             hook_identity::Origin::Foreground => self
                 .agents
@@ -2856,16 +2866,19 @@ impl Registry {
                 cwd_hint,
             ),
         };
-        if !is_subagent_or_foreign
-            && let Ok(Some(stored)) = self.agents.stored(id)
-            && stored.permission == krill_proto::agent::Permission::Manual
-            && self.live_agent_has_yolo_args(id, &stored.profile)
-        {
-            let yolo = crate::agent::control::StoredLaunch {
-                permission: krill_proto::agent::Permission::Yolo,
-                ..stored
-            };
-            self.agents.bind_switch_identity(id, &yolo).ok();
+        if !is_subagent_or_foreign && let Ok(Some(stored)) = self.agents.stored(id) {
+            if prev_session_id.is_some() && stored.session_id != prev_session_id {
+                crate::agent_history::vault::clear_live_agy_cache(id);
+            }
+            if stored.permission == krill_proto::agent::Permission::Manual
+                && self.live_agent_has_yolo_args(id, &stored.profile)
+            {
+                let yolo = crate::agent::control::StoredLaunch {
+                    permission: krill_proto::agent::Permission::Yolo,
+                    ..stored
+                };
+                self.agents.bind_switch_identity(id, &yolo).ok();
+            }
         }
         self.status.subagent_hook(id, e, !is_subagent_or_foreign);
         let allow_status_hook = !is_subagent_or_foreign
@@ -2951,16 +2964,34 @@ impl Registry {
         let Some(provider) = provider else {
             return;
         };
+        let cleared = self.agents.cleared_bindings(id);
         let discovered = self
-            .discover_live_identity(provider, home, Some(&stored), root_pid, fg_pid)
+            .discover_live_identity_excluding(
+                provider,
+                home,
+                Some(&stored),
+                (root_pid, fg_pid),
+                false,
+                &cleared.session_ids,
+            )
             .ok()
             .flatten()
             .map(|found| (found.id, found.path))
             .or_else(|| {
                 (provider == krill_proto::usage::ProviderKind::Antigravity).then(|| {
-                    crate::agent_history::vault::discover_live_agy_identity(root_pid, fg_pid)
-                        .or_else(|| crate::agent_history::vault::cached_live_agy_identity(id))
-                        .map(|(_, conv_id, path)| (conv_id, path))
+                    crate::agent_history::vault::discover_live_agy_identity_excluding(
+                        root_pid,
+                        fg_pid,
+                        &cleared.session_ids,
+                    )
+                    .or_else(|| {
+                        crate::agent_history::vault::cached_live_agy_identity(id).filter(
+                            |(_, conv_id, path)| {
+                                !cleared.contains(Some(conv_id.as_str()), Some(path.as_path()))
+                            },
+                        )
+                    })
+                    .map(|(_, conv_id, path)| (conv_id, path))
                 })?
             });
         if let Some((conv_id, path)) = discovered {
@@ -3703,6 +3734,30 @@ impl Registry {
             })
     }
 
+    /// Returns the stored agent profile name for `id` (fallback when live status has no agent yet).
+    pub(crate) fn session_agent_profile(&self, id: SessionId) -> Option<String> {
+        self.agents.stored(id).ok().flatten().map(|s| s.profile)
+    }
+
+    /// Clears a session's bound conversation identity so `/clear` resets the chat view
+    /// immediately and subsequent polls/hooks never resurrect the cleared conversation.
+    pub(crate) fn clear_chat_session(&self, id: SessionId) -> io::Result<()> {
+        let resolved = self.resolve_chat_transcript(id);
+        let mut extra_sids: Vec<String> = Vec::new();
+        let mut extra_paths: Vec<String> = Vec::new();
+        if !resolved.session_id.trim().is_empty() {
+            extra_sids.push(resolved.session_id);
+        }
+        if !resolved.transcript_path.trim().is_empty() {
+            extra_paths.push(resolved.transcript_path);
+        }
+        let sid_refs: Vec<&str> = extra_sids.iter().map(String::as_str).collect();
+        let path_refs: Vec<&str> = extra_paths.iter().map(String::as_str).collect();
+        let res = self.agents.clear_chat_binding(id, &sid_refs, &path_refs);
+        crate::agent_history::vault::clear_live_agy_cache(id);
+        res
+    }
+
     /// Resolves a session's transcript identity (`bound`, `agent`, `session_id`, `transcript_path`)
     /// without reading or parsing transcript content from byte offset 0.
     pub(crate) fn resolve_chat_transcript(
@@ -3742,6 +3797,7 @@ impl Registry {
             .session_cwd(id)
             .map(|p| p.as_os_str().as_bytes().to_vec())
             .unwrap_or_default();
+        let cleared = self.agents.cleared_bindings(id);
         let mut stored = self.agents.stored(id).ok().flatten().or_else(|| {
             let mut status_agent = self.status.get(id).agent;
             if status_agent.is_empty()
@@ -3779,15 +3835,17 @@ impl Registry {
                 .as_ref()
                 .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
         {
-            let discovered = self.discover_live_identity_with_mode(
+            let discovered = self.discover_live_identity_excluding(
                 provider,
                 &crate::usage::accounts::default_home(),
                 stored.as_ref(),
-                root_pid,
-                fg_pid,
+                (root_pid, fg_pid),
                 true,
+                &cleared.session_ids,
             );
-            if let Ok(Some(found)) = discovered {
+            if let Ok(Some(found)) = discovered
+                && !cleared.contains(Some(&found.id), Some(&found.path))
+            {
                 // A process-owned file also covers external account homes that are
                 // absent from the daemon's configured transcript search roots.
                 // Never replace a launch/hook-bound conversation with another ID.
@@ -3851,13 +3909,23 @@ impl Registry {
             let start = crate::sys::start_us(fg_pid?).ok()?;
             (start / 1_000_000).checked_sub(11_644_473_600)
         });
-        let claimed = self.agents.claimed_transcripts(id);
+        let min_birth = match (launched_at, cleared.cleared_at) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let mut claimed = self.agents.claimed_transcripts(id);
+        for old_sid in &cleared.session_ids {
+            claimed.0.insert(old_sid.clone());
+        }
+        for old_path in &cleared.transcript_paths {
+            claimed.1.insert(PathBuf::from(old_path));
+        }
         let (snapshot, resolved) = if resolve_only {
             crate::agent_history::chat::resolve_session_bounded(
                 self.state_dir().as_deref(),
                 stored.as_ref(),
                 &cwd,
-                launched_at,
+                min_birth,
                 &claimed,
             )
         } else {
@@ -3866,7 +3934,7 @@ impl Registry {
                 stored.as_ref(),
                 &cwd,
                 offset,
-                launched_at,
+                min_birth,
                 &claimed,
             )
         };
@@ -5861,21 +5929,25 @@ fn spawn_agy_swr_refresh(weak_reg: std::sync::Weak<Registry>, jobs: Vec<AgyRefre
                 };
                 let agy_fg =
                     account_switch::effective_foreground_pid(job.root, job.tap_fg, job.exited);
-                let (_title, discovered) = crate::agent_history::vault::resolve_live_agy_title(
-                    job.session,
-                    job.root,
-                    agy_fg,
-                    job.exited,
-                    job.stored.as_ref(),
-                );
+                let cleared = reg.agents.cleared_bindings(job.session);
+                let (_title, discovered) =
+                    crate::agent_history::vault::resolve_live_agy_title_excluding(
+                        job.session,
+                        job.root,
+                        agy_fg,
+                        job.exited,
+                        job.stored.as_ref(),
+                        &cleared.session_ids,
+                    );
                 if let Some((ref conv_id, ref tp)) = discovered {
                     if tp.is_some() {
                         reg.agents
                             .bind_discovered_session(job.session, conv_id, tp.as_deref());
-                    } else if let Ok(Some(found)) = account_switch::identity::discover(
+                    } else if let Ok(Some(found)) = account_switch::identity::discover_excluding(
                         krill_proto::usage::ProviderKind::Antigravity,
                         job.root,
                         agy_fg,
+                        &cleared.session_ids,
                     ) {
                         reg.agents.bind_discovered_session(
                             job.session,

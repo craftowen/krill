@@ -710,6 +710,11 @@ enum Action {
         #[serde(default)]
         end_offset: Option<u64>,
     },
+    /// Retires the session's current conversation binding so `/clear` resets the chat view
+    /// cleanly across Desktop, remote hosts, and Mobile PWA without resurrecting old history.
+    ChatClear {
+        session: u64,
+    },
     #[expect(
         dead_code,
         reason = "Legacy question fields are decoded for compatibility but cannot authorize PTY input"
@@ -1692,7 +1697,39 @@ impl Backend {
                 } else {
                     None
                 };
-                let result = self.send_prompt(session, &combined);
+                let clear_cmd = if saved_paths.is_empty()
+                    && combined.trim().eq_ignore_ascii_case("/clear")
+                {
+                    let agent = self
+                        .registry
+                        .upgrade()
+                        .and_then(|reg| {
+                            let from_status = reg.mobile_session_status(SessionId(session))?.agent;
+                            if !from_status.is_empty() {
+                                return Some(from_status);
+                            }
+                            reg.session_agent_profile(SessionId(session))
+                        })
+                        .unwrap_or_default();
+                    let lower = agent.trim().to_ascii_lowercase();
+                    let cmd = if lower.contains("codex")
+                        || lower.contains("opencode")
+                        || lower.contains("omp")
+                        || lower == "pi"
+                    {
+                        "/new"
+                    } else {
+                        "/clear"
+                    };
+                    if let Some(reg) = self.registry.upgrade() {
+                        reg.clear_chat_session(SessionId(session)).ok();
+                    }
+                    Some(cmd.to_owned())
+                } else {
+                    None
+                };
+                let send_text = clear_cmd.as_deref().unwrap_or(&combined);
+                let result = self.send_prompt(session, send_text);
                 if result.is_err() {
                     for path in saved_paths {
                         fs::remove_file(path).ok();
@@ -1700,14 +1737,18 @@ impl Backend {
                 }
                 result?;
                 if let Some(baseline) = agy_steer_baseline {
-                    self.promote_agy_steer_if_queued(session, &combined, baseline);
+                    self.promote_agy_steer_if_queued(session, send_text, baseline);
                 }
                 if let Some(reg) = self.registry.upgrade()
                     && let Some(bots) = reg.bots_if_initialized()
                 {
-                    bots.on_owner_prompt_submitted(SessionId(session), &combined);
+                    bots.on_owner_prompt_submitted(SessionId(session), send_text);
                 }
-                Ok(json!({"sent":true}))
+                if clear_cmd.is_some() {
+                    Ok(json!({"sent":true,"cleared":true}))
+                } else {
+                    Ok(json!({"sent":true}))
+                }
             }
             Action::Interrupt { session } => {
                 let registry = self.registry.upgrade().ok_or_else(invalid)?;
@@ -1794,6 +1835,11 @@ impl Backend {
                     snapshot
                 };
                 chat_page_value(snapshot, offset)
+            }
+            Action::ChatClear { session } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                registry.clear_chat_session(SessionId(session))?;
+                Ok(json!({"cleared": true}))
             }
             Action::AnswerQuestion { .. } => Err(review_in_term()),
             Action::Accounts => to_value(self.accounts(&UsageRequest::ListAccounts)?),
@@ -9103,6 +9149,67 @@ value = "{}"
             .collect();
         assert!(leaked.is_empty(), "leaked temp photo files: {leaked:?}");
         drop(peer);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_chat_clear_and_prompt_clear_retire_binding() {
+        let dir = std::env::temp_dir().join(format!("mk-chat-clear-rpc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        reg.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&reg),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let id = SessionId(778);
+        let _peer = reg
+            .insert_mock_live_session_for_test(id, dir.clone())
+            .unwrap();
+        let old_tp = dir.join("old.jsonl");
+        fs::write(&old_tp, "{}\n").unwrap();
+        let launch_path = dir.join("agent-launches").join("778.json");
+        fs::create_dir_all(launch_path.parent().unwrap()).unwrap();
+        fs::write(
+            &launch_path,
+            serde_json::to_vec(&json!({
+                "profile": "agy",
+                "permission": "yolo",
+                "session_id": "conv-old-rpc",
+                "transcript_path": old_tp.to_string_lossy(),
+                "cwd": dir.to_string_lossy().as_bytes(),
+                "hibernation_blocked": false,
+                "launched_at": 1_700_000_000u64,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "chat_clear", "session": id.0}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(reply["ok"], true, "chat_clear should succeed: {reply}");
+        assert_eq!(reply["data"]["cleared"], true);
+
+        let poll: Value = serde_json::from_str(
+            &backend
+                .request(&json!({"action": "chat_poll", "session": id.0, "offset": 0}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(poll["ok"], true, "chat_poll should succeed: {poll}");
+        assert_eq!(poll["data"]["bound"], false);
+        assert_eq!(poll["data"]["items"].as_array().map(Vec::len), Some(0));
+
         fs::remove_dir_all(&dir).ok();
     }
 }

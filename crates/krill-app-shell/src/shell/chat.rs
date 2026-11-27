@@ -716,6 +716,10 @@ pub(crate) struct ChatState {
     pub(super) resolved_bot_cards: BTreeMap<(ChatKey, usize), BotCardResolution>,
     #[cfg(test)]
     pub now_override: Option<u64>,
+    #[cfg(test)]
+    pub opened_system_paths: Vec<std::path::PathBuf>,
+    #[cfg(test)]
+    pub revealed_paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,6 +830,14 @@ fn chat_incremental_poll_request(session: SessionId, offset: u64) -> String {
         "action": "chat_poll",
         "session": session.0,
         "offset": offset,
+    })
+    .to_string()
+}
+
+fn chat_clear_request(session: SessionId) -> String {
+    serde_json::json!({
+        "action": "chat_clear",
+        "session": session.0,
     })
     .to_string()
 }
@@ -4379,6 +4391,19 @@ impl Shell {
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
+        if attachments.is_empty()
+            && side_prefix.is_none()
+            && catalog::is_clear_slash_command(&submitted_payload)
+        {
+            self.execute_chat_clear(key, pane, Some(window), cx);
+            return;
+        }
+        let agent_for_norm = self.chat_agent_id(key).to_owned();
+        let submitted_payload = if attachments.is_empty() && side_prefix.is_none() {
+            catalog::normalize_local_slash_payload(&agent_for_norm, &submitted_payload)
+        } else {
+            submitted_payload
+        };
         let session = key.1;
         let modes = self
             .live
@@ -4647,13 +4672,25 @@ impl Shell {
         else {
             return;
         };
+        if queued.attachments.is_empty()
+            && catalog::is_clear_slash_command(&queued.submitted_payload)
+        {
+            self.execute_chat_clear(key, pane, None, cx);
+            return;
+        }
         let session = key.1;
+        let agent_for_norm = self.chat_agent_id(key).to_owned();
+        let normalized_payload = if queued.attachments.is_empty() {
+            catalog::normalize_local_slash_payload(&agent_for_norm, &queued.submitted_payload)
+        } else {
+            queued.submitted_payload.clone()
+        };
         let modes = self
             .live
             .get(&pane)
             .map_or_else(Default::default, |live| live.pane.modes());
         let krill_app_core::security::PastePlan::Immediate(bytes) =
-            self.plan_terminal_paste(pane, queued.submitted_payload.as_bytes(), modes, cx)
+            self.plan_terminal_paste(pane, normalized_payload.as_bytes(), modes, cx)
         else {
             if let Some(log) = self.chat.logs.get_mut(key) {
                 log.queued_prompts.push_front(queued);
@@ -4663,13 +4700,10 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(key);
-        let (origin_epoch, origin_item, opens_terminal, local_slash) = self.pending_prompt_meta(
-            key,
-            &queued.submitted_payload,
-            queued.attachments.is_empty(),
-        );
+        let (origin_epoch, origin_item, opens_terminal, local_slash) =
+            self.pending_prompt_meta(key, &normalized_payload, queued.attachments.is_empty());
         let pending_id = queued.id;
-        let submitted_payload = queued.submitted_payload;
+        let submitted_payload = normalized_payload;
         let submitted_at_ms = self.chat_now_epoch_ms();
         self.chat
             .pending_prompts
@@ -6144,6 +6178,10 @@ impl Shell {
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
+        if no_attachments && catalog::is_clear_slash_command(&submitted_payload) {
+            self.execute_chat_clear(key, pane, Some(window), cx);
+            return;
+        }
         let session = key.1;
         let modes = self
             .live
@@ -6753,10 +6791,211 @@ impl Shell {
         ac.task = Some(task);
     }
 
+    /// Executes `/clear` end-to-end: resets local chat UI immediately, retires the session's
+    /// bound conversation in `krilld` via `chat_clear` (preventing stale polls/hooks from
+    /// resurrecting pre-clear messages), and delivers the provider's native clear command to PTY.
+    fn execute_chat_clear(
+        &mut self,
+        key: &ChatKey,
+        pane: PaneId,
+        mut window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let session = key.1;
+        let agent = self.chat_agent_id(key).to_owned();
+        let clear_cmd = catalog::provider_clear_command(&agent).to_owned();
+        let modes = self
+            .live
+            .get(&pane)
+            .map_or_else(Default::default, |live| live.pane.modes());
+        let krill_app_core::security::PastePlan::Immediate(bytes) =
+            self.plan_terminal_paste(pane, clear_cmd.as_bytes(), modes, cx)
+        else {
+            self.chat.multiline_blocked.insert(key.clone());
+            cx.notify();
+            return;
+        };
+        self.chat.multiline_blocked.remove(key);
+        self.chat.side_chat_mode.remove(key);
+        self.chat.editing_queued.remove(key);
+        self.cancel_auto_continue(key, cx);
+        self.mark_auto_continue_resolved_by_user(key, cx);
+        self.record_chat_prompt_history(key, "/clear");
+
+        if let Some((input, _)) = self.chat.inputs.get(key) {
+            let input = input.clone();
+            if let Some(window) = window.as_deref_mut() {
+                input.update(cx, |state, cx| {
+                    state.set_placeholder(ctext::PROMPT_PLACEHOLDER.get(), window, cx);
+                    state.set_value(String::new(), window, cx);
+                });
+            }
+        }
+        self.chat.draft_attachments.remove(key);
+        self.chat.image_tokens.remove(key);
+        if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+            ac.close();
+            ac.dismissed = None;
+        }
+        self.chat.prompt_review.remove(key);
+        self.chat.prompt_failed.remove(key);
+        self.chat.pending_prompts.remove(key);
+        self.chat.pending_epochs.retain(|(k, _), _| k != key);
+        self.chat.turn_tasks.retain(|(k, _), _| k != key);
+        self.chat.request_tasks.remove(key);
+        if self
+            .chat
+            .selection_quote
+            .as_ref()
+            .is_some_and(|q| &q.key == key)
+        {
+            self.chat.selection_quote = None;
+            self.chat.selection_quote_dismissed = None;
+        }
+
+        // Reset local chat log immediately and invalidate any in-flight poll of the old transcript.
+        self.chat.poll_tasks.remove(key);
+        self.chat.next_poll_generation = self.chat.next_poll_generation.wrapping_add(1);
+        let clear_generation = self.chat.next_poll_generation;
+        self.chat
+            .poll_generations
+            .insert(key.clone(), clear_generation);
+        let log = self.chat.logs.entry(key.clone()).or_default();
+        log.reset_transcript();
+        log.bound = false;
+        log.offset = 0;
+        log.binding = (String::new(), String::new());
+        log.revision = log.revision.wrapping_add(1);
+        let origin_epoch = log.epoch;
+        self.recompute_chat_find(key);
+
+        self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
+        let pending_id = self.chat.next_pending_id;
+        let submitted_at_ms = self.chat_now_epoch_ms();
+        self.chat
+            .pending_prompts
+            .entry(key.clone())
+            .or_default()
+            .push(PendingChatPrompt {
+                id: pending_id,
+                origin_item: 0,
+                submitted_payload: clear_cmd.clone(),
+                display_text: "/clear".to_owned(),
+                attachments: Vec::new(),
+                status: PendingStatus::Sending,
+                submitted_at_ms,
+            });
+        self.chat
+            .pending_epochs
+            .insert((key.clone(), pending_id), origin_epoch);
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        if let Some(list) = self.chat.lists.get_mut(&(pane, session)) {
+            list.state.set_follow_mode(gpui::FollowMode::Tail);
+        }
+
+        let workflow = self.workflow_call_for_key(key);
+        #[cfg(test)]
+        let workflow = workflow.filter(|_| self.chat.workflow_call.is_some());
+        if let Some(workflow) = workflow {
+            let task_key = key.clone();
+            let win = window.as_deref().map(Window::window_handle).or(self.window);
+            let req = chat_clear_request(session);
+            // Hold the `poll_tasks` slot while `chat_clear` runs in `krilld` so no concurrent
+            // poll can race and re-populate the pre-clear transcript before retirement persists.
+            let task = cx.spawn(async move |this, cx| {
+                let clear_res = cx
+                    .background_executor()
+                    .spawn(async move { workflow(&req) })
+                    .await;
+                if let Err(err) = clear_res {
+                    tracing::warn!(
+                        host = %task_key.0,
+                        session = session.0,
+                        error = %err,
+                        "daemon chat_clear failed; proceeding with PTY clear"
+                    );
+                }
+                prompt::update_with_optional_window(&this, win, cx, |this, window, cx| {
+                    if this.chat.poll_generations.get(&task_key).copied() != Some(clear_generation)
+                    {
+                        return;
+                    }
+                    this.chat.poll_tasks.remove(&task_key);
+                    this.dispatch_pending_chat_prompt(
+                        PendingDispatch {
+                            key: task_key.clone(),
+                            pane,
+                            session,
+                            pending_id,
+                            submitted_payload: clear_cmd,
+                            bytes,
+                            modes,
+                            opens_terminal: false,
+                            local_slash: true,
+                            steer: false,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            });
+            self.chat.poll_tasks.insert(key.clone(), task);
+            cx.notify();
+            return;
+        }
+
+        self.dispatch_pending_chat_prompt(
+            PendingDispatch {
+                key: key.clone(),
+                pane,
+                session,
+                pending_id,
+                submitted_payload: clear_cmd,
+                bytes,
+                modes,
+                opens_terminal: false,
+                local_slash: true,
+                steer: false,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn chat_autocomplete_should_submit_directly(
+        &self,
+        key: &ChatKey,
+        input: &gpui::Entity<TextareaState>,
+        cx: &gpui::App,
+    ) -> bool {
+        let Some(ac) = self.chat.autocomplete.get(key) else {
+            return false;
+        };
+        if !ac.is_open() {
+            return false;
+        }
+        let Some(trigger) = ac.trigger.as_ref() else {
+            return false;
+        };
+        if trigger.kind != catalog::AutocompleteKind::Slash {
+            return false;
+        }
+        let Some(candidate) = ac.items.get(ac.selected) else {
+            return false;
+        };
+        let current = input.read(cx).value();
+        let trimmed = current.trim();
+        let agent = self.chat_agent_id(key);
+        trimmed.eq_ignore_ascii_case(&candidate.label)
+            && (catalog::is_clear_slash_command(trimmed)
+                || catalog::slash_command_is_local_non_echoed(agent, trimmed))
+    }
+
     pub(super) fn accept_chat_autocomplete(
         &mut self,
         key: &ChatKey,
         index: Option<usize>,
+        execute_zero_arg: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -6767,16 +7006,28 @@ impl Shell {
         if Self::chat_input_is_composing(&input, window, cx) {
             return false;
         }
-        let Some((replace_range, insert_text)) =
+        let Some((replace_range, insert_text, label)) =
             self.chat.autocomplete.get_mut(key).and_then(|ac| {
                 let trigger = ac.trigger.as_ref()?;
                 let idx = index.unwrap_or(ac.selected);
                 let candidate = ac.items.get(idx)?;
                 let range = trigger.replace_range.clone();
-                let insert = candidate.insert_text.clone();
+                let is_clear = catalog::is_clear_slash_command(&candidate.label);
+                let insert = if is_clear {
+                    candidate.label.clone()
+                } else {
+                    candidate.insert_text.clone()
+                };
+                let label = candidate.label.clone();
                 ac.close();
-                ac.dismissed = None;
-                Some((range, insert))
+                ac.dismissed = is_clear.then(|| {
+                    (
+                        catalog::AutocompleteKind::Slash,
+                        range.start,
+                        label.trim_start_matches('/').to_owned(),
+                    )
+                });
+                Some((range, insert, label))
             })
         else {
             return false;
@@ -6798,6 +7049,13 @@ impl Shell {
             ac.close();
         }
         self.sync_side_chat_pill(key, window, cx);
+        if execute_zero_arg
+            && catalog::is_clear_slash_command(&label)
+            && catalog::is_clear_slash_command(input.read(cx).value().as_ref())
+        {
+            self.submit_chat_prompt(key, window, cx);
+            return true;
+        }
         cx.notify();
         true
     }

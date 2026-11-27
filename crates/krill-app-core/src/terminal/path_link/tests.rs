@@ -507,3 +507,180 @@ fn input_policy_native_home_lookup_uses_userprofile_on_windows() {
     let output = child.output().unwrap();
     assert!(output.status.success(), "{output:?}");
 }
+
+#[test]
+fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() {
+    let dir = TempDir::new("md-link-resolve");
+    let gallery = dir
+        .0
+        .join("Application Support/outputs/yunjadong-profile-gallery.html");
+    let png = dir
+        .0
+        .join("Application Support/outputs/01c-balanced-lowkey-depth.png");
+    let korean_md = dir.0.join("한글 폴더/노트 파일.md");
+    let rust_src = dir.0.join("src/view.rs");
+    let shell_script = dir.0.join("run.sh");
+    let mac_command = dir.0.join("evil.command");
+    for f in [
+        &gallery,
+        &png,
+        &korean_md,
+        &rust_src,
+        &shell_script,
+        &mac_command,
+    ] {
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, b"ok").unwrap();
+    }
+
+    // 1. Percent-encoded file:// URL with `%20` spaces (.html & .png -> system open, safe)
+    let gallery_url = format!("file://{}", gallery.to_string_lossy().replace(' ', "%20"));
+    assert_eq!(
+        resolve_markdown_link(&gallery_url, None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: gallery.clone(),
+            line: None,
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+    assert!(prefers_system_open(&gallery));
+    assert!(prefers_system_open(&png));
+    assert!(prefers_system_open(&dir.0));
+    assert!(!prefers_system_open(&korean_md));
+    assert!(!prefers_system_open(&rust_src));
+
+    // 2. HTML anchor `#01c` is stripped without being misparsed as a line number
+    assert_eq!(
+        resolve_markdown_link(&format!("{gallery_url}#01c"), None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: gallery.clone(),
+            line: None,
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+
+    // 3. Unencoded spaces inside file:// URL also resolve cleanly
+    let raw_space_url = format!("file://{}", png.to_string_lossy());
+    assert_eq!(
+        resolve_markdown_link(&raw_space_url, None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: png.clone(),
+            line: None,
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+
+    // 4. Percent-encoded Korean UTF-8 + `file://localhost/...`
+    let encoded_korean = format!(
+        "file://localhost{}/%ED%95%9C%EA%B8%80%20%ED%8F%B4%EB%8D%94/%EB%85%B8%ED%8A%B8%20%ED%8C%8C%EC%9D%BC.md",
+        dir.0.to_string_lossy()
+    );
+    assert_eq!(
+        resolve_markdown_link(&encoded_korean, None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: korean_md.clone(),
+            line: None,
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+
+    // 5. `#L10-L20` and `#L12C4-L20C8` source line fragments
+    let rust_url = format!("file://{}#L10-L20", rust_src.to_string_lossy());
+    assert_eq!(
+        resolve_markdown_link(&rust_url, None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: rust_src.clone(),
+            line: Some(10),
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+    let rust_col_url = format!("file://{}#L12C4-L20C8", rust_src.to_string_lossy());
+    assert_eq!(
+        resolve_markdown_link(&rust_col_url, None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: rust_src.clone(),
+            line: Some(12),
+            column: Some(4),
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+
+    // 6. Relative path against base_dir and missing relative path rejection
+    assert_eq!(
+        resolve_markdown_link("src/view.rs#L5", Some(&dir.0)),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: rust_src.clone(),
+            line: Some(5),
+            column: None,
+            dangerous_executable: false,
+            text_script: false,
+        })
+    );
+    assert_eq!(
+        resolve_markdown_link("does/not/exist.md", Some(&dir.0)),
+        None
+    );
+
+    // 7. Executable / script classification
+    assert_eq!(
+        resolve_markdown_link(&format!("file://{}", shell_script.to_string_lossy()), None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: shell_script,
+            line: None,
+            column: None,
+            dangerous_executable: true,
+            text_script: true,
+        })
+    );
+    assert_eq!(
+        resolve_markdown_link(&format!("file://{}", mac_command.to_string_lossy()), None),
+        Some(MarkdownLinkTarget::LocalPath {
+            path: mac_command,
+            line: None,
+            column: None,
+            dangerous_executable: true,
+            text_script: false,
+        })
+    );
+
+    // 8. External URLs still work (http, https, mailto, Korean paths)
+    assert_eq!(
+        resolve_markdown_link("https://example.com/문서/한글", None),
+        Some(MarkdownLinkTarget::ExternalUrl(
+            "https://example.com/%EB%AC%B8%EC%84%9C/%ED%95%9C%EA%B8%80".into()
+        ))
+    );
+    assert_eq!(
+        resolve_markdown_link("mailto:owen@example.com", None),
+        Some(MarkdownLinkTarget::ExternalUrl(
+            "mailto:owen@example.com".into()
+        ))
+    );
+
+    // 9. Security rejections: remote file:// host, NUL, bidi override, javascript:, data:
+    assert_eq!(
+        resolve_markdown_link("file://evil.example/etc/passwd", None),
+        None
+    );
+    assert_eq!(resolve_markdown_link("file:///tmp/%00evil.txt", None), None);
+    assert_eq!(
+        resolve_markdown_link("file:///tmp/%E2%80%AEevil.txt", None),
+        None
+    );
+    assert_eq!(resolve_markdown_link("javascript:alert(1)", None), None);
+    assert_eq!(
+        resolve_markdown_link("data:text/html,<h1>x</h1>", None),
+        None
+    );
+}

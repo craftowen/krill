@@ -87,6 +87,100 @@ struct SegmentStyle<'a> {
 }
 
 impl Shell {
+    pub(crate) fn open_chat_markdown_link(
+        &mut self,
+        pane: Option<super::super::PaneId>,
+        host: krill_app_core::hosts::HostId,
+        base_dir: Option<&std::path::Path>,
+        url: &str,
+        event: &gpui::ClickEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use krill_app_core::terminal::path_link::{
+            MarkdownLinkTarget, prefers_system_open, resolve_markdown_link, should_open_link_click,
+        };
+        if !should_open_link_click(event) {
+            return false;
+        }
+        let Some(target) = resolve_markdown_link(url, base_dir) else {
+            tracing::warn!(url, "ignoring invalid or disallowed chat markdown link");
+            return false;
+        };
+        match target {
+            MarkdownLinkTarget::ExternalUrl(clean) => {
+                if let Some(pane) = pane {
+                    self.open_terminal_url(pane, &clean, cx);
+                } else {
+                    cx.open_url(&clean);
+                }
+                true
+            }
+            MarkdownLinkTarget::LocalPath {
+                path,
+                line,
+                column,
+                dangerous_executable,
+                text_script,
+            } => {
+                if host.is_remote() {
+                    self.open_file_on_at(host, path, line.unwrap_or(1), column.unwrap_or(1), cx);
+                    return true;
+                }
+                if !path.exists() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "chat markdown link target does not exist"
+                    );
+                    return false;
+                }
+                if path.is_dir() {
+                    if dangerous_executable {
+                        #[cfg(test)]
+                        self.chat.revealed_paths.push(path);
+                        #[cfg(not(test))]
+                        cx.reveal_path(&path);
+                    } else {
+                        #[cfg(test)]
+                        self.chat.opened_system_paths.push(path);
+                        #[cfg(not(test))]
+                        cx.open_with_system(&path);
+                    }
+                    return true;
+                }
+                if dangerous_executable {
+                    if text_script {
+                        self.open_file_on_at(
+                            host,
+                            path,
+                            line.unwrap_or(1),
+                            column.unwrap_or(1),
+                            cx,
+                        );
+                    } else {
+                        #[cfg(test)]
+                        self.chat.revealed_paths.push(path);
+                        #[cfg(not(test))]
+                        cx.reveal_path(&path);
+                    }
+                    return true;
+                }
+                if prefers_system_open(&path) {
+                    #[cfg(test)]
+                    self.chat.opened_system_paths.push(path);
+                    #[cfg(not(test))]
+                    cx.open_with_system(&path);
+                    return true;
+                }
+                if let Some(line) = line {
+                    self.open_file_on_at(host, path, line, column.unwrap_or(1), cx);
+                } else {
+                    self.open_file_on(host, path, cx);
+                }
+                true
+            }
+        }
+    }
+
     fn append_chat_segments<T: gpui::ParentElement>(
         &self,
         mut container: T,
@@ -102,6 +196,15 @@ impl Shell {
         let fg = style.palette.foreground;
         let muted_fg = style.palette.muted_foreground;
         let mut next_code_idx = 0usize;
+        let link_host = style.key.0.clone();
+        let link_base_dir = if link_host.is_local() {
+            self.pane_cwd(pane, cx).or_else(|| {
+                self.chat_bot(style.key)
+                    .and_then(|bot| self.bot_folder(bot))
+            })
+        } else {
+            None
+        };
         let segments = parse_chat_segments_cached(text);
         for (seg_idx, segment) in segments.iter().enumerate() {
             container = match segment {
@@ -117,6 +220,9 @@ impl Shell {
                             .text_size(style.text_size)
                             .text_color(style.text_color)
                             .child(if style.markdown {
+                                let shell = cx.weak_entity();
+                                let link_host = link_host.clone();
+                                let link_base_dir = link_base_dir.clone();
                                 gpui_component::text::TextView::markdown(
                                     SharedString::from(format!(
                                         "chat-markdown-{}-{epoch}-{abs_idx}-{seg_idx}",
@@ -127,10 +233,26 @@ impl Shell {
                                 .scrollable(false)
                                 .selectable(true)
                                 .stream_fade(style.stream_fade)
-                                .on_link_click(|url, _, _, cx| {
-                                    if let Some(clean) = krill_bots_ui::bots::sanitize_http_url(url)
+                                .on_link_click(move |url, event, _, cx| {
+                                    if shell
+                                        .update(cx, |this, cx| {
+                                            this.open_chat_markdown_link(
+                                                Some(pane),
+                                                link_host.clone(),
+                                                link_base_dir.as_deref(),
+                                                url,
+                                                event,
+                                                cx,
+                                            );
+                                        })
+                                        .is_err()
+                                        && krill_app_core::terminal::path_link::should_open_link_click(event)
                                     {
-                                        cx.open_url(&clean);
+                                        krill_app_core::terminal::path_link::open_markdown_link_with_app(
+                                            url,
+                                            link_base_dir.as_deref(),
+                                            cx,
+                                        );
                                     }
                                 })
                                 .into_any_element()

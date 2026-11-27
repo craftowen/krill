@@ -254,15 +254,16 @@ fn worker_title(s: Option<&BotSessionSummary>, id: &str) -> String {
         .unwrap_or_else(|| hm::WORKER_FALLBACK.format(&[("id", id.trim())]))
 }
 
-/// Markdown as Orca's `BotItemMarkdown` shows it: selectable, links open in the browser.
+/// Markdown as Orca's `BotItemMarkdown` shows it: selectable, links open external URLs or local files.
 pub(super) fn markdown(id: impl Into<SharedString>, src: &str) -> AnyElement {
     TextView::markdown(gpui::ElementId::Name(id.into()), src.to_owned())
         .scrollable(false)
         .selectable(true)
-        .on_link_click(|url, _, _, cx| {
-            if let Some(clean) = super::sanitize_http_url(url) {
-                cx.open_url(&clean);
+        .on_link_click(|url, event, _, cx| {
+            if !krill_app_core::terminal::path_link::should_open_link_click(event) {
+                return;
             }
+            krill_app_core::terminal::path_link::open_markdown_link_with_app(url, None, cx);
         })
         .into_any_element()
 }

@@ -4626,3 +4626,119 @@ fn strip_bracketed_paste_end_removes_nested_escape_sequences_to_fixed_point() {
     Registry::strip_bracketed_paste_end(b"\x1b[\x1b[201~201~\r/cmd", &mut nested);
     assert_eq!(nested, b"\r/cmd");
 }
+
+#[test]
+fn clear_chat_session_stops_chat_poll_resurrection_and_binds_new_agy_conversation() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-registry-chat-clear-agy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let state_dir = dir.join("state");
+    let agy_home = dir.join("agy-profile");
+    let work_cwd = dir.join("bot-7-work");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&work_cwd).unwrap();
+
+    let old_id = "conv-old-clear-1111";
+    let old_logs = agy_home
+        .join(".gemini/antigravity-cli/brain")
+        .join(old_id)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&old_logs).unwrap();
+    let old_transcript = old_logs.join("transcript_full.jsonl");
+    fs::write(
+        &old_transcript,
+        format!(
+            "{{\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"cwd\":{},\"content\":\"old question\"}}\n",
+            serde_json::to_string(&work_cwd.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let reg = Registry::new(None, Some(&state_dir));
+    let session = SessionId(77);
+    reg.agents
+        .remember_session(
+            session,
+            &krill_proto::control::AgentLaunch {
+                profile: "agy".into(),
+                permission: krill_proto::agent::Permission::Yolo,
+            },
+            Some(old_id.into()),
+            work_cwd.to_string_lossy().as_bytes().to_vec(),
+            Some(crate::agent::control::LaunchAccount {
+                id: "my-agy".into(),
+                env_key: "ANTIGRAVITY_CLI_HOME".into(),
+                dir: agy_home.to_string_lossy().into_owned(),
+            }),
+        )
+        .unwrap();
+    reg.agents
+        .bind_discovered_session(session, old_id, Some(&old_transcript));
+
+    // Before `/clear`, chat_poll returns the old transcript items.
+    let before = reg.chat_poll(session, 0);
+    assert!(before.bound, "pre-clear session must be bound: {before:?}");
+    assert_eq!(before.session_id, old_id);
+    assert!(!before.items.is_empty());
+
+    // Run `/clear`: daemon retires old conversation & clears session binding.
+    reg.clear_chat_session(session).expect("clear_chat_session");
+
+    // Repeated polls (including offset=0 reload) must stay unbound & empty — NEVER resurrect old_id.
+    let after_clear = reg.chat_poll(session, before.next_offset);
+    assert!(
+        !after_clear.bound && after_clear.items.is_empty(),
+        "post-clear poll must not resurrect old conversation: {after_clear:?}"
+    );
+    let after_reload = reg.chat_poll(session, 0);
+    assert!(
+        !after_reload.bound && after_reload.items.is_empty(),
+        "offset=0 reload after /clear must stay empty: {after_reload:?}"
+    );
+
+    // Next turn creates a brand-new agy conversation and fires PreInvocation hook.
+    let new_id = "conv-new-clear-2222";
+    let new_logs = agy_home
+        .join(".gemini/antigravity-cli/brain")
+        .join(new_id)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&new_logs).unwrap();
+    let new_transcript = new_logs.join("transcript_full.jsonl");
+    fs::write(
+        &new_transcript,
+        format!(
+            "{{\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"cwd\":{},\"content\":\"fresh question\"}}\n",
+            serde_json::to_string(&work_cwd.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+    let hook_payload = serde_json::json!({
+        "hook_event_name": "PreInvocation",
+        "conversation_id": new_id,
+        "transcript_path": new_transcript.to_string_lossy(),
+    })
+    .to_string();
+    assert!(!reg.agents.record_hook_session_with_context(
+        session,
+        hook_payload.as_bytes(),
+        Some("agy"),
+        None,
+    ));
+
+    let after_next_turn = reg.chat_poll(session, 0);
+    assert!(
+        after_next_turn.bound,
+        "new conversation must bind cleanly: {after_next_turn:?}"
+    );
+    assert_eq!(after_next_turn.session_id, new_id);
+    assert_eq!(after_next_turn.items.len(), 1);
+    assert_eq!(after_next_turn.items[0].text, "fresh question");
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
