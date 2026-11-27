@@ -225,6 +225,19 @@ impl Feed {
     }
 
     fn spawn(self: &Arc<Self>) -> bool {
+        struct FeedThreadGuard {
+            feed: Arc<Feed>,
+        }
+        impl Drop for FeedThreadGuard {
+            fn drop(&mut self) {
+                let old_sub = {
+                    let mut state = lock(&self.feed.state);
+                    state.chat_sub.take()
+                };
+                drop(old_sub);
+                *lock(&self.feed.thread) = None;
+            }
+        }
         let mut thread = lock(&self.thread);
         if thread.is_some() {
             return true;
@@ -235,7 +248,16 @@ impl Feed {
             .stack_size(super::super::gateway::RPC_STACK)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
-                feed.run();
+                let _guard = FeedThreadGuard {
+                    feed: Arc::clone(&feed),
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    feed.run();
+                }))
+                .is_err()
+                {
+                    tracing::error!("mobile-feed thread panicked");
+                }
             })
             .ok();
         thread.is_some()
@@ -618,5 +640,23 @@ mod tests {
         feed.stop();
         assert!(lock(&feed.thread).is_none());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mobile_feed_catches_panic_and_clears_thread_slot_for_recovery() {
+        let registry = registry();
+        let feed = Feed::new(Arc::downgrade(&registry), |_: &[u8]| {
+            panic!("simulated feed sink panic");
+        });
+        // Trigger a snapshot push immediately after observe; sink panic must be caught and thread slot cleared.
+        feed.observe(Some(1_000), "different-etag", 1);
+        {
+            let mut state = lock(&feed.state);
+            state.due = Some(Instant::now());
+        }
+        feed.changed.notify_all();
+        until(|| lock(&feed.thread).is_none());
+        feed.stop();
+        assert!(lock(&feed.thread).is_none());
     }
 }

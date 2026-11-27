@@ -1725,7 +1725,7 @@ ctx,
 targetKind: "session",
 targetId: () => String(sessionId),
 beforeNode: sendBtn,
-onInsert: () => resizeInput?.(),
+onInsert: () => sizeInput(true),
 });
 box.append(suggestions, queuedStrip, attachment, input, statusRow);
 composer.append(box, photoPicker);
@@ -2238,6 +2238,7 @@ return;
 }
 closeSuggestions();
 if (!capability("composer_models")) return;
+globalThis.document?.activeElement?.blur?.();
 const context = scope(),
 version = suggestVersion,
 warm =
@@ -3450,6 +3451,7 @@ if (e.key === "Escape") {
 e.preventDefault?.();
 closeSearch();
 } else if (e.key === "Enter") {
+if (e.isComposing || e.keyCode === 229) return;
 e.preventDefault?.();
 stepSearch(e.shiftKey ? -1 : 1);
 }
@@ -5752,6 +5754,7 @@ pollNow(); refreshStatus();
 },
 unmount() {
 if (disposed) return;
+voiceCtl?.cleanup?.();
 syncDraft();
 earlierEpoch++;
 earlierQueued = false;

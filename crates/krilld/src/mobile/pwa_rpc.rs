@@ -1725,13 +1725,22 @@ impl Backend {
                 data,
                 prompt,
             } => {
+                struct TempPhotoGuard(Option<PathBuf>);
+                impl Drop for TempPhotoGuard {
+                    fn drop(&mut self) {
+                        if let Some(path) = self.0.take() {
+                            fs::remove_file(path).ok();
+                        }
+                    }
+                }
+                self.ensure_not_agy_auth_screen(session)?;
                 let path = save_photo(&mime, &data)?;
+                let mut guard = TempPhotoGuard(Some(path.clone()));
                 let quoted = krill_proto::agent::hooks::shell_quote(&path.to_string_lossy());
                 let trimmed_prompt = prompt.as_deref().map(str::trim).filter(|s| !s.is_empty());
                 let combined = match trimmed_prompt {
                     Some(p) => {
                         if p.len() >= krill_proto::input::MAX_INPUT {
-                            fs::remove_file(&path).ok();
                             return Err(invalid());
                         }
                         format!("{quoted} {p}")
@@ -1746,23 +1755,19 @@ impl Backend {
                     sanitize_plain_input(&combined)
                 };
                 if payload.len() > krill_proto::input::MAX_INPUT {
-                    fs::remove_file(&path).ok();
                     return Err(invalid());
                 }
                 self.ensure_not_agy_auth_screen(session)?;
-                let send_result = if trimmed_prompt.is_some() {
+                if trimmed_prompt.is_some() {
                     self.input_paced(
                         session,
                         &[payload, b"\r".to_vec()],
                         Duration::from_millis(60),
-                    )
+                    )?;
                 } else {
-                    self.input(session, payload)
-                };
-                if let Err(error) = send_result {
-                    fs::remove_file(&path).ok();
-                    return Err(error);
+                    self.input(session, payload)?;
                 }
+                guard.0 = None;
                 Ok(json!({"attached":true,"path":path.to_string_lossy()}))
             }
             Action::ChatPoll {
@@ -3249,7 +3254,10 @@ impl Backend {
     }
 
     fn finish_bundle_with_etag(mut data: Value, since: Option<&str>) -> io::Result<Value> {
-        let max_wrapped = ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM);
+        // Reserve space for `,"etag":"<16hex>"` (+26 bytes) inserted after the shrink loop.
+        const BUNDLE_ETAG_OVERHEAD: usize = 26;
+        let max_wrapped =
+            ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM + BUNDLE_ETAG_OVERHEAD);
         // Shrink optional/large arrays first so composite bundles never overflow the 1 MiB frame limit.
         while wrapped_ok_len(&data) >= max_wrapped {
             let mut shrank = false;
@@ -3262,10 +3270,33 @@ impl Backend {
                     "groups",
                     "bots",
                 ] {
-                    if let Some(arr) = obj.get_mut(key).and_then(Value::as_array_mut)
+                    let popped_cursor = if let Some(arr) =
+                        obj.get_mut(key).and_then(Value::as_array_mut)
                         && arr.len() > 1
                     {
                         arr.pop();
+                        let updated_cursor = match key {
+                            "items" => Some((
+                                "items_next_cursor",
+                                arr.last()
+                                    .and_then(item_cursor_from_value)
+                                    .map_or(Value::Null, Value::String),
+                            )),
+                            "bots" => {
+                                Some(("bots_next_cursor", Value::String(arr.len().to_string())))
+                            }
+                            _ => None,
+                        };
+                        Some(updated_cursor)
+                    } else {
+                        None
+                    };
+                    if let Some(updated_cursor) = popped_cursor {
+                        if let Some((cursor_key, cursor_val)) = updated_cursor
+                            && obj.contains_key(cursor_key)
+                        {
+                            obj.insert(cursor_key.into(), cursor_val);
+                        }
                         obj.insert("truncated".into(), Value::Bool(true));
                         shrank = true;
                         break;
@@ -8906,6 +8937,172 @@ value = "{}"
         assert!(avs["data"]["avatars"][b2.id.as_str()].is_null());
         assert_eq!(avs["data"]["remaining"].as_array().unwrap().len(), 0);
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finish_bundle_with_etag_respects_frame_limit_across_26_byte_etag_boundary() {
+        let limit = ipc::MAX_FRAME - MOBILE_FRAME_HEADROOM;
+        for k in 1..=26 {
+            let target_pre_etag = limit - k;
+            let base = json!({
+                "items": [
+                    {"uid": "u1", "last_activity_at_ms": 1000, "title": "first"},
+                    {"uid": "u2", "last_activity_at_ms": 900, "title": ""}
+                ],
+                "items_next_cursor": null
+            });
+            let base_len = wrapped_ok_len(&base);
+            assert!(target_pre_etag > base_len);
+            let pad = "a".repeat(target_pre_etag - base_len);
+            let payload = json!({
+                "items": [
+                    {"uid": "u1", "last_activity_at_ms": 1000, "title": "first"},
+                    {"uid": "u2", "last_activity_at_ms": 900, "title": pad}
+                ],
+                "items_next_cursor": null
+            });
+            assert_eq!(wrapped_ok_len(&payload), target_pre_etag);
+            let finished = Backend::finish_bundle_with_etag(payload, None).unwrap();
+            assert!(
+                wrapped_ok_len(&finished) < limit,
+                "k={k}: wrapped len {} exceeded limit {limit}",
+                wrapped_ok_len(&finished)
+            );
+            assert!(finished["etag"].is_string());
+        }
+    }
+
+    #[test]
+    fn finish_bundle_with_etag_rewinds_items_and_bots_next_cursors_when_popping() {
+        let big = "x".repeat(ipc::MAX_FRAME / 2);
+        // Oversized items bundle with null initial cursor must rewind items_next_cursor to last retained item.
+        let items_null = json!({
+            "items": [
+                {"uid": "item-1", "last_activity_at_ms": 300, "title": big.clone()},
+                {"uid": "item-2", "last_activity_at_ms": 200, "title": big.clone()},
+                {"uid": "item-3", "last_activity_at_ms": 100, "title": big.clone()}
+            ],
+            "items_next_cursor": null
+        });
+        let res = Backend::finish_bundle_with_etag(items_null, None).unwrap();
+        assert_eq!(res["truncated"], true);
+        assert_eq!(res["items"].as_array().unwrap().len(), 1);
+        assert_eq!(res["items_next_cursor"], "300|item-1");
+
+        // Oversized items bundle with non-null initial cursor must also rewind to last retained item.
+        let items_nonnull = json!({
+            "items": [
+                {"uid": "item-a", "last_activity_at_ms": 500, "title": big.clone()},
+                {"uid": "item-b", "last_activity_at_ms": 400, "title": big.clone()}
+            ],
+            "items_next_cursor": "400|item-b"
+        });
+        let res = Backend::finish_bundle_with_etag(items_nonnull, None).unwrap();
+        assert_eq!(res["truncated"], true);
+        assert_eq!(res["items"].as_array().unwrap().len(), 1);
+        assert_eq!(res["items_next_cursor"], "500|item-a");
+
+        // Oversized bots.hub bundle must rewind bots_next_cursor to retained bots.len().
+        let bots_bundle = json!({
+            "bots": [
+                {"id": "b1", "name": big.clone()},
+                {"id": "b2", "name": big.clone()},
+                {"id": "b3", "name": big}
+            ],
+            "bots_next_cursor": null
+        });
+        let res = Backend::finish_bundle_with_etag(bots_bundle, None).unwrap();
+        assert_eq!(res["truncated"], true);
+        assert_eq!(res["bots"].as_array().unwrap().len(), 1);
+        assert_eq!(res["bots_next_cursor"], "1");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_photo_does_not_leak_temp_file_on_agy_auth_screen() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("mk-photo-auth-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        reg.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&reg),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let id = SessionId(777);
+        let mut peer = reg
+            .insert_mock_live_session_for_test(id, dir.clone())
+            .unwrap();
+        peer.write_all(b"You are not logged into Antigravity.\r\nClick here to authenticate.\r\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if reg
+                .session_capture(id)
+                .is_some_and(|s| krill_proto::screen::agy::auth_login_screen(&s))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reg.session_capture(id)
+                .is_some_and(|s| krill_proto::screen::agy::auth_login_screen(&s)),
+            "mock session must display agy auth screen"
+        );
+
+        let paste_dir = std::env::temp_dir().join("krill-paste");
+        let before: HashSet<_> = fs::read_dir(&paste_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+
+        // 1x1 valid PNG bytes, base64-encoded.
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let reply: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "photo",
+                    "session": id.0,
+                    "mime": "image/png",
+                    "data": png_b64,
+                    "prompt": "check"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(reply["ok"], false, "expected auth_required error: {reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("auth_required")
+        );
+
+        let after: HashSet<_> = fs::read_dir(&paste_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        let leaked: Vec<_> = after
+            .difference(&before)
+            .filter(|name| name.to_string_lossy().starts_with("mobile-"))
+            .collect();
+        assert!(leaked.is_empty(), "leaked temp photo files: {leaked:?}");
+        drop(peer);
         fs::remove_dir_all(&dir).ok();
     }
 }

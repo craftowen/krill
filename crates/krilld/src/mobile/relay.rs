@@ -301,6 +301,29 @@ fn parse_origin(origin: &str) -> io::Result<(bool, String, String, u16)> {
     Ok((tls, host_port.to_owned(), host, port))
 }
 
+struct RelaySupervisorGuard {
+    connected: Arc<AtomicBool>,
+    settled: Arc<AtomicBool>,
+    stop: Arc<Stop>,
+    shared: Arc<Shared>,
+}
+impl Drop for RelaySupervisorGuard {
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::Release);
+        self.settled.store(true, Ordering::Release);
+        {
+            let mut s = lock(&self.shared.state);
+            if s.relay
+                .as_ref()
+                .is_some_and(|r| Arc::ptr_eq(&r.stop, &self.stop))
+            {
+                s.relay = None;
+            }
+        }
+        self.shared.wake();
+    }
+}
+
 impl RelayClient {
     pub fn start(
         publication: Publication,
@@ -328,18 +351,30 @@ impl RelayClient {
             .stack_size(STACK)
             .spawn(move || {
                 crate::alloc::mobile_thread().ok();
-                supervise_loop(
-                    &publication,
-                    wake_tx,
-                    wake_rx,
-                    &c_flag,
-                    &set_flag,
-                    &a_flag,
-                    &s_flag,
-                    &sh,
-                    &reg,
-                    &h,
-                );
+                let _guard = RelaySupervisorGuard {
+                    connected: Arc::clone(&c_flag),
+                    settled: Arc::clone(&set_flag),
+                    stop: Arc::clone(&s_flag),
+                    shared: Arc::clone(&sh),
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    supervise_loop(
+                        &publication,
+                        wake_tx,
+                        wake_rx,
+                        &c_flag,
+                        &set_flag,
+                        &a_flag,
+                        &s_flag,
+                        &sh,
+                        &reg,
+                        &h,
+                    );
+                }))
+                .is_err()
+                {
+                    tracing::error!("mobile-relay supervisor thread panicked");
+                }
             })?;
         Ok(Self {
             connected,
@@ -389,17 +424,24 @@ fn supervise_loop(
     let wake_writer = Arc::new(Mutex::new(wake_tx));
     let mut delay = Duration::from_millis(200);
     while !stop.cancelled() {
-        let res = run_once(
-            publication,
-            &wake_writer,
-            &mut wake_rx,
-            connected,
-            settled,
-            stop,
-            shared,
-            registry,
-            hello,
-        );
+        let res = if let Ok(res) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_once(
+                publication,
+                &wake_writer,
+                &mut wake_rx,
+                connected,
+                settled,
+                stop,
+                shared,
+                registry,
+                hello,
+            )
+        })) {
+            res
+        } else {
+            tracing::error!("mobile-relay run_once panicked; backing off");
+            Err(io::Error::other("mobile relay panicked"))
+        };
         let first_settle = !settled.swap(true, Ordering::AcqRel);
         let was_connected = connected.swap(false, Ordering::AcqRel);
         if was_connected || first_settle {
@@ -825,14 +867,33 @@ fn handle_mux_frame(
                 .stack_size(STACK)
                 .spawn(move || {
                     crate::alloc::mobile_thread().ok();
+                    let mut guard = RelayConnGuard {
+                        shared: sh,
+                        outbox: out,
+                        id,
+                        conn_id,
+                        code: 1011,
+                    };
                     let code = {
                         let _close = rx.close_guard();
                         let opened = Instant::now();
-                        match serve_mux_client(
-                            conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg,
-                            &h,
-                        ) {
-                            Err(err) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            serve_mux_client(
+                                conn_id,
+                                challenge,
+                                &rx,
+                                &close_tx,
+                                local,
+                                server,
+                                &guard.outbox,
+                                &guard.shared,
+                                id,
+                                &reg,
+                                &h,
+                            )
+                        })) {
+                            Ok(Ok(())) => 1000,
+                            Ok(Err(err)) => {
                                 // 폰이 인증 중 1011을 받은 원인(예산 만료인지)을 가릴 수 있게 남긴다. 비밀값은 없다.
                                 if err.kind() == io::ErrorKind::TimedOut {
                                     tracing::info!(
@@ -842,19 +903,14 @@ fn handle_mux_frame(
                                 }
                                 super::gateway::auth_close_code(&err).unwrap_or(1011)
                             }
-                            _ => 1000,
+                            Err(_) => {
+                                tracing::error!(conn_id, "mobile-relay-ws thread panicked");
+                                1011
+                            }
                         }
                     };
-                    // 연결 슬롯을 먼저 비워 즉시 재접속하는 클라이언트가 MAX_PENDING/MAX_CONNECTIONS에 걸리지 않게 한다.
-                    {
-                        let mut s = lock(&sh.state);
-                        if let Some(c) = s.connections.remove(&id) {
-                            c.socket.shutdown();
-                        }
-                    }
-                    out.send_close(conn_id, code);
-                    sh.wake();
-                    crate::alloc::purge();
+                    guard.code = code;
+                    drop(guard);
                 })
                 .is_err()
             {
@@ -1017,14 +1073,20 @@ fn serve_mux_client(
         .stack_size(STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
-            let result = (|| -> io::Result<()> {
-                while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
-                    send(&ipc::encode_frame(kind, &body)?)?;
-                }
-                Ok(())
-            })();
-            close_clone.close();
-            result
+            let _close = CloseMailboxGuard(close_clone);
+            if let Ok(result) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                    while let Some((kind, body)) = ipc::read_frame(&mut outgoing)? {
+                        send(&ipc::encode_frame(kind, &body)?)?;
+                    }
+                    Ok(())
+                }))
+            {
+                result
+            } else {
+                tracing::error!("mobile-relay-out thread panicked");
+                Err(io::Error::other("mobile-relay-out panicked"))
+            }
         })?;
     let installed = Arc::clone(&feed);
     let hello_owned = hello.clone();
@@ -1033,13 +1095,16 @@ fn serve_mux_client(
         .stack_size(RPC_STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
-            let done = server.try_clone();
+            let _done = RelayUnixShutdownGuard(server.try_clone().ok());
             installed.install();
-            let result = registry.serve_mobile(server, &hello_owned);
-            if let Ok(done) = done {
-                done.shutdown(Shutdown::Both).ok();
+            if let Ok(result) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.serve_mobile(server, &hello_owned)
+            })) {
+                result
+            } else {
+                tracing::error!("mobile-relay-ipc thread panicked");
+                Err(io::Error::other("mobile-relay-ipc panicked"))
             }
-            result
         });
     let result = if worker.is_ok() {
         (|| -> io::Result<()> {
@@ -1073,6 +1138,44 @@ fn serve_mux_client(
     match result {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
         other => other,
+    }
+}
+
+struct RelayConnGuard {
+    shared: Arc<Shared>,
+    outbox: Outbox,
+    id: u64,
+    conn_id: u32,
+    code: u16,
+}
+impl Drop for RelayConnGuard {
+    fn drop(&mut self) {
+        // 연결 슬롯을 먼저 비워 즉시 재접속하는 클라이언트가 MAX_PENDING/MAX_CONNECTIONS에 걸리지 않게 한다.
+        {
+            let mut s = lock(&self.shared.state);
+            if let Some(c) = s.connections.remove(&self.id) {
+                c.socket.shutdown();
+            }
+        }
+        self.outbox.send_close(self.conn_id, self.code);
+        self.shared.wake();
+        crate::alloc::purge();
+    }
+}
+
+struct CloseMailboxGuard(Arc<Mailbox<(u8, Vec<u8>)>>);
+impl Drop for CloseMailboxGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct RelayUnixShutdownGuard(Option<UnixStream>);
+impl Drop for RelayUnixShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done.shutdown(Shutdown::Both).ok();
+        }
     }
 }
 
@@ -1363,5 +1466,42 @@ mod tests {
 
         let empty_err = connect_any_addr(&[], Duration::from_secs(1)).unwrap_err();
         assert_eq!(empty_err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[test]
+    fn relay_unwind_guards_release_connection_slot_send_close_and_shutdown_unix_peer() {
+        let (wake_tx, _wake_rx) = UnixStream::pair().unwrap();
+        let out_rx = Arc::new(Mailbox::new(OUTBOX_BYTES, PEER_QUEUE_BYTES, 128));
+        let outbox = Outbox {
+            tx: Arc::clone(&out_rx),
+            wake: Arc::new(Mutex::new(wake_tx)),
+        };
+        let (peer_a, mut peer_b) = UnixStream::pair().unwrap();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _unix_guard = RelayUnixShutdownGuard(Some(peer_a));
+            let _mb_guard = CloseMailboxGuard(Arc::new(Mailbox::new(64, 64, 4)));
+            let _out = outbox.clone();
+            panic!("simulated mux unwind");
+        }));
+        assert!(res.is_err());
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            peer_b.read(&mut buf).unwrap(),
+            0,
+            "peer must observe EOF after unwind"
+        );
+
+        // Also test CloseMailboxGuard closes mailbox on unwind.
+        let mb = Arc::new(Mailbox::<(u8, Vec<u8>)>::new(64, 64, 4));
+        let mb_clone = Arc::clone(&mb);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = CloseMailboxGuard(mb_clone);
+            panic!("simulated out unwind");
+        }));
+        assert!(res.is_err());
+        assert_eq!(
+            mb.send(0, (ws::BINARY, vec![1]), 1).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 }

@@ -117,6 +117,31 @@ test('closing a sheet discards hidden pairing inputs so secrets cannot keep safe
  sctx.S.closeSheet();
  assert.equal(doc.activeElement,trigger);
 });
+test('MOB-03: stale async dialog close event does not abort replacement sheet signal',async()=>{
+ const lines=read('app.js').split('\n'),pick=m=>lines.find(l=>l.includes(m));
+ const E=class{constructor(tag,text,cls){this.tagName=tag;this.textContent=text||'';this.className=cls||'';this.children=[];this.attrs={};this.dataset={};this.hidden=false;this.isConnected=true;this.listeners={};}append(...ns){for(const n of ns){n.parentElement=this;this.children.push(n);}}prepend(...ns){for(const n of ns){n.parentElement=this;this.children.unshift(n);}}insertBefore(n,b){n.parentElement=this;const i=b?this.children.indexOf(b):-1;if(i<0)this.children.push(n);else this.children.splice(i,0,n);}replaceChildren(...ns){for(const c of this.children)c.isConnected=false;this.children=[];this.append(...ns);}setAttribute(k,v){this.attrs[k]=v;}removeAttribute(k){delete this.attrs[k];}addEventListener(k,fn){(this.listeners[k]||=[]).push(fn);}dispatch(k,ev={}){for(const fn of this.listeners[k]||[])fn(ev);}querySelector(){return null;}contains(n){return n===this||this.children.some(c=>c.contains?.(n));}focus(){doc.activeElement=this;}blur(){if(doc.activeElement===this)doc.activeElement=doc.body;}};
+ const doc={body:new E('body'),activeElement:null};doc.body.classList={add(){},remove(){}};
+ const dlg=new E('dialog'),body=new E('div'),notice=new E('div');notice.hidden=true;dlg.open=false;
+ dlg.showModal=()=>{dlg.open=true;};
+ // Simulate HTML Living Standard async close event queued by dialog.close()
+ dlg.close=()=>{dlg.open=false;setTimeout(()=>dlg.dispatch('close'),0);};
+ dlg.append(body);doc.body.append(dlg,notice);
+ const sctx=vm.createContext({document:doc,dialog:dlg,sheetBody:body,notice,lastFocus:null,lastTrigger:null,AbortController,el:(t,tx,c)=>new E(t,tx,c),t:s=>s,button:(l,a,c)=>{const b=new E('button',l,c);b.action=a;return b;},setTimeout,clearTimeout,M:{agentIcon:()=>new E('svg')}});
+ vm.runInContext([pick('let noticeTimer'),pick('function restoreFocus()'),pick('function closeSheet()'),pick("dialog.addEventListener('close'"),pick('function sheet(')].join('\n')+'\nglobalThis.S={sheet,closeSheet};',sctx);
+ let secondSignal=null,firstSignal=null;
+ sctx.S.sheet('More actions',[{label:'Bot settings',action:()=>{sctx.S.sheet('Bot settings',[],undefined,(_b,sig)=>{secondSignal=sig;});}}],undefined,(_b,sig)=>{firstSignal=sig;});
+ const actionBtn=body.children.find(c=>c.className==='sheet-group').children[0];
+ await actionBtn.action();
+ assert.equal(firstSignal.aborted,true,'first sheet signal aborts when closed');
+ assert.equal(secondSignal.aborted,false,'replacement sheet signal stays active immediately');
+ await new Promise(r=>setTimeout(r,15));
+ assert.equal(dlg.open,true,'replacement sheet remains open');
+ assert.equal(secondSignal.aborted,false,'stale async close event must NOT abort replacement sheet signal');
+ // Native Escape close (without calling closeSheet) still aborts replacement signal.
+ dlg.close();
+ await new Promise(r=>setTimeout(r,15));
+ assert.equal(secondSignal.aborted,true,'native dialog close aborts active sheet signal');
+});
 test('update body reader limits individual and total decoded bytes, including chunked bodies',async()=>{
  for(const kind of ['header','chunked','total']){const f=fixture(),fetch=f.context.fetch;f.context.fetch=async(url,options)=>{const response=await fetch(url,options);if(url.endsWith('/'))return response;if(kind==='header')return new Response('x',{headers:{'content-length':String(3*1024*1024)}});if(kind==='chunked')return new Response(new ReadableStream({start(controller){controller.enqueue(new Uint8Array(3*1024*1024));controller.close();}}));return new Response(new Uint8Array(1024*1024));};await assert.rejects(f.context.KrillMobile.updates.prepare(f.hash,new AbortController().signal),/too large/);assert.equal(f.cache.size,0);}
 });

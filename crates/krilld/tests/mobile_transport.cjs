@@ -2688,3 +2688,40 @@ test("MB-61 & MB-62: Tailscale-only host rid:null never falsely matches adopt() 
   assert.equal(reauth.preferred_route, "relay", "MB-62: stale pairingDirect must not overwrite preferred_route back to tailscale");
   h.transport.close();
 });
+test("MOB-13: pending read RPC awaiting reconnected() rejects immediately on close() and authBlocked", async () => {
+  // Case 1: transport.close() immediately rejects pending reconnected() waiter.
+  {
+    const h = harness(),
+      { pending, socket } = await h.start(4);
+    h.response(socket, { sessions: [] });
+    await pending;
+    const read = h.transport.rpc({ action: "git" });
+    await flush();
+    // Drop the socket mid-read so rpc() falls into reconnected() waiter.
+    socket.emit("close", { code: 1006 });
+    await flush();
+    assert.equal(h.transport.updateBusy, true, "pending read holds updateBusy before close()");
+    h.transport.close();
+    await assert.rejects(read, /Disconnected/);
+    assert.equal(h.transport.updateBusy, false, "updateBusy clears immediately on close()");
+  }
+  // Case 2: permanent auth rejection (WS 1008) immediately rejects pending reconnected() waiter.
+  {
+    const h = harness(),
+      { pending, socket } = await h.start(4);
+    h.response(socket, { sessions: [] });
+    await pending;
+    const read = h.transport.rpc({ action: "git" });
+    await flush();
+    socket.emit("close", { code: 1006 });
+    await flush();
+    // Advance past reconnect backoff so the next socket opens and receives WS 1008.
+    await h.tick(2000);
+    const retrySocket = h.sockets.at(-1);
+    retrySocket.emit("close", { code: 1008 });
+    await flush();
+    await assert.rejects(read, /Disconnected/);
+    assert.equal(h.transport.updateBusy, false, "updateBusy clears immediately on authBlocked");
+    h.transport.close();
+  }
+});

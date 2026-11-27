@@ -736,7 +736,9 @@ async function tabBarAndLayoutContracts(){
  assert(/\bbottom:\s*0\b/.test(mobileAppRule),'#mobile-app anchors to bottom:0 instead of 100vh/100dvh');
  assert(!/100d?vh/.test(mobileAppRule),'#mobile-app must not use 100vh or 100dvh');
  assert(!css.includes('100dvh'),'app.css avoids 100dvh so overflow:hidden Android WebViews never inflate to 100lvh');
- assert(/\.home-list\{[^}]*padding-bottom:\s*calc\(140px\s*\+\s*env\(safe-area-inset-bottom\)\)/.test(css),'.home-list clears .home-fab and .tab-bar');
+ assert(/\.home-list\{[^}]*padding-bottom:\s*calc\(24px\s*\+\s*env\(safe-area-inset-bottom\)\)/.test(css),'.home-list uses clean 24px bottom padding without orphaned .home-fab reserve');
+ assert(css.includes('.screen:has(>.tab-bar)>:is(.home-list,.detail-list,.account-list,.settings-list){padding-bottom:24px}'),'MOB-25: lists above .tab-bar do not double-count safe-area-inset-bottom');
+ assert(!css.includes('.home-fab{'),'MOB-25: orphaned .home-fab rule removed');
  assert(/\.workspace-bottom-bar\{[^}]*\bflex:\s*none\b/.test(css)&&/\.workspace-bottom-bar\{[^}]*\bflex-wrap:\s*nowrap\b/.test(css),'.workspace-bottom-bar stays flex:none and nowrap');
  assert(/\.tab-bar\{[^}]*background:\s*var\(--bg-base\)/.test(css)&&/\.tab-bar\{[^}]*border-top:\s*1px solid var\(--border-subtle\)/.test(css),'.tab-bar uses Orca bgBase + borderSubtle');
  assert(/\.tab-bar\{[^}]*max\(env\(safe-area-inset-bottom\),16px\)/.test(css),'.tab-bar reserves >=16px safe-area bottom inset');
@@ -3461,8 +3463,274 @@ async function projectInlineRemoteHost(){
  assert(css.includes('.workspaces .repo-host{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;min-width:0;max-width:45%;color:var(--muted-foreground);font-size:var(--font-meta);font-weight:400;line-height:1.3;overflow:hidden}'),'inline remote host style');
  assert(css.includes('.workspaces .repo-host>svg{width:calc(12px * var(--ui-scale,1));height:calc(12px * var(--ui-scale,1));flex:none;color:currentColor}'),'inline server icon sizing');
  assert(css.includes('.workspaces .repo-host-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'),'inline remote host ellipsis');
- assert(css.includes('.device-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:var(--radius-pill)'),'global .device-badge preserved for bots screen');
+ assert(css.includes('.device-badge{display:inline-block;vertical-align:middle;padding:2px 7px;border-radius:var(--radius-pill)'),'LIVE-04: global .device-badge uses inline-block so text-overflow:ellipsis works');
  console.log('PASS project inline remote host: primary omitted, remote server+name inline, title/aria-label, active switch, single-host filter, status grouping & CSS contract');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await projectInlineRemoteHost();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function v0334MobileFixesRegressions(){
+ const css=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.css'),'utf8');
+ // Contrast helper (WCAG 2.1 relative luminance)
+ const hexRgb=h=>{const v=h.replace('#','');return [0,2,4].map(i=>parseInt(v.slice(i,i+2),16)/255);};
+ const lum=h=>hexRgb(h).map(c=>c<=0.03928?c/12.92:((c+0.055)/1.055)**2.4).reduce((a,c,i)=>a+c*[0.2126,0.7152,0.0722][i],0);
+ const ratio=(a,b)=>{const l1=lum(a),l2=lum(b);return (Math.max(l1,l2)+0.05)/(Math.min(l1,l2)+0.05);};
+
+ // 1) CSS contracts: MOB-06/LIVE-03, MOB-07, MOB-08, MOB-09, MOB-17, MOB-18, MOB-19, MOB-20, MOB-24/LIVE-05, LIVE-02, LIVE-06, LIVE-09
+ assert(!css.includes('body[data-screen=workspaces] #notice'),'MOB-06: clobbered equal-specificity workspace notice rule removed');
+ const idxNonSess=css.indexOf('body:not([data-screen=session]) #notice');
+ const idxTabBar=css.indexOf('body:has(.tab-bar) #notice{bottom:calc(76px');
+ const idxWsTab=css.indexOf('body:has(.workspace-bottom-bar):has(.tab-bar) #notice{bottom:calc(144px');
+ const idxComposer=css.indexOf('body:has(.chat-composer) #notice{bottom:calc(110px');
+ assert(idxNonSess>0&&idxTabBar>idxNonSess&&idxWsTab>idxTabBar&&idxComposer>idxWsTab,'MOB-06/LIVE-03: ordered :has() #notice rules clear tab bar, workspace bar, and composer');
+ assert(/\.chat-model-sheet\{[^}]*bottom:\s*var\(--keyboard-inset,0px\)/.test(css)&&/\.chat-model-sheet\{[^}]*var\(--keyboard-inset,0px\)/.test(css),'MOB-07: .chat-model-sheet offsets bottom and max-height for virtual keyboard');
+ assert(css.includes('.scanner-frame{')&&css.includes('border:2px solid var(--on-accent)')&&css.includes('.scanner-close{position:absolute;top:calc(8px + env(safe-area-inset-top));right:12px;background:rgb(0 0 0 / 45%);color:var(--on-accent)}')&&css.includes('.scanner:not(.photo-only) .scanner-link{color:var(--on-accent);'),'MOB-08: live scanner controls use invariant white --on-accent');
+ assert(css.includes('.scanner.photo-only .scanner-hint,.scanner.photo-only .scanner-close{color:var(--foreground)}'),'MOB-08: photo-only Light override preserved');
+ const lightBlock=css.match(/:root\[data-theme=light\]\{([^}]*)\}/)?.[1]||'';
+ const mediaLightBlock=css.match(/@media\(prefers-color-scheme:light\)\{:root:not\(\[data-theme=dark\]\):not\(\[data-theme=light\]\)\{([^}]*)\}\}/)?.[1]||'';
+ assert(!lightBlock.includes('--terminal-muted:')&&!mediaLightBlock.includes('--terminal-muted:'),'MOB-09: Light theme does not darken --terminal-muted over always-dark --terminal-bg');
+ assert(ratio('#a9b1d6','#1a1b26')>=4.5,'MOB-09: terminal-muted contrast >= 4.5:1');
+ const lightWorking=lightBlock.match(/--status-working:(#[0-9a-fA-F]{6})/)?.[1];
+ const lightWaiting=lightBlock.match(/--status-waiting:(#[0-9a-fA-F]{6})/)?.[1];
+ assert(lightWorking&&lightWaiting,'MOB-24: Light status tokens defined');
+ assert(ratio(lightWorking,'#f5f5f5')>=4.5,'MOB-24/LIVE-05: Light --status-working on #f5f5f5 passes WCAG AA');
+ assert(ratio(lightWaiting,'#f5f5f5')>=4.5&&ratio('#ffffff',lightWaiting)>=4.5,'MOB-24/LIVE-05: Light --status-waiting passes WCAG AA on pills and badges');
+ assert(mediaLightBlock.includes(`--status-working:${lightWorking}`)&&mediaLightBlock.includes(`--status-waiting:${lightWaiting}`),'MOB-24: prefers-color-scheme:light mirrors data-theme=light tokens');
+ assert(css.includes('.sheet:has(.bot-panel-sheet){overflow:hidden;')&&css.includes('.bot-panel-body{flex:1;min-height:0;max-height:none;'),'MOB-17: Bot Panel sheet uses flex containment without hardcoded 60svh double scroll');
+ assert(css.includes('#mobile-app .bot-seg-tab{')&&css.includes('.bot-seg-tab>span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis}'),'MOB-18: .bot-seg-tab overrides min-width and ellipsizes inner label');
+ for(const sel of ['#mobile-app .chat-code-wrap-btn{','#mobile-app .chat-code-copy{','#mobile-app .composer-queue,#mobile-app .composer-steer{','#mobile-app .voice-stop{','#mobile-app .voice-chip-x{'])assert(css.includes(sel),`MOB-19: ${sel} prefixed with #mobile-app`);
+ assert(css.includes('#mobile-app .bot-header-title-btn{')&&css.includes('height:auto;padding:2px 4px')&&css.includes('font-size:clamp(14px,calc(14px * var(--ui-scale,1)),16px)'),'MOB-20: bot header clamps title/sub typography and uses flexible height');
+ assert(css.includes('.voice-add-row{display:flex;flex-direction:row;')&&css.includes('.voice-settings-card>.voice-vocab-block{'),'LIVE-02: Voice / Pipito card has row form and padded vocab block');
+ assert(css.includes('.chat-table{width:max-content;min-width:100%;')&&css.includes('overflow-wrap:normal;word-break:normal;'),'LIVE-06: markdown .chat-table scrolls horizontally without breaking tokens mid-word');
+ assert(css.includes('.key-reset-row{padding:6px 12px;'),'LIVE-09: Terminal Reset order row aligned with 12px card padding');
+
+ // 2) MOB-04: voiceAttach async abort, double-tap guard, AudioContext throw cleanup
+ {
+  const appSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8');
+  const lines=appSrc.split('\n');
+  const voiceSlice=lines.slice(lines.findIndex(l=>l.includes('const voiceEncodeWav=')),lines.findIndex(l=>l.includes('M.voice='))+1).join('\n');
+  let gumResolvers=[],stoppedTracks=0,acCount=0,throwAC=false,errToasts=[];
+  const f=fixture('home'),E=f.root.constructor;
+  const ctx=vm.createContext({
+   M:{},
+   el:(t,tx,c)=>new E(t,tx,c),
+   t:s=>s,
+   button:(l,a,c)=>{const b=new E('button',l,c);b.action=a;return b;},
+   error:e=>errToasts.push(e),
+   navigator:{mediaDevices:{getUserMedia:()=>new Promise(r=>gumResolvers.push(r))}},
+   AudioContext:class{constructor(){acCount++;if(throwAC)throw Error('ac boom');this.sampleRate=16000;this.destination={};}createMediaStreamSource(){return {connect(){},disconnect(){}};}createScriptProcessor(){return {connect(){},disconnect(){}};}close(){return Promise.resolve();}},
+   isSecureContext:true,Float32Array,ArrayBuffer,DataView,Uint8Array,btoa:s=>Buffer.from(s,'binary').toString('base64'),setInterval,clearInterval,Date,Math,Promise,Error,Event:class{constructor(t){this.type=t;}},
+  });
+  vm.runInContext(voiceSlice,ctx);
+  const ta=new E('textarea'),host=new E('div');
+  const ac1=new AbortController();
+  const ctl1=ctx.M.voice.attach(ta,host,{ctx:{signal:ac1.signal,rpc:async()=>({text:'hi'})}});
+  const mic1=ctl1.el.children[0];
+  const p1=mic1.action(),p2=mic1.action(); // double-tap while getUserMedia pending
+  assert.equal(gumResolvers.length,1,'MOB-04: double-tap guard prevents duplicate getUserMedia');
+  ac1.abort(); // abort before getUserMedia resolves
+  gumResolvers.shift()({getTracks:()=>[{stop(){stoppedTracks++;}}]});
+  await Promise.all([p1,p2]);
+  assert.equal(stoppedTracks,1,'MOB-04: abort-before-resolve stops leaked MediaStream track');
+  assert.equal(acCount,0,'MOB-04: abort-before-resolve creates zero AudioContext');
+  assert.equal(ctx.M.voice.active,false,'MOB-04: voiceActiveCount remains 0');
+  // AudioContext throw stops tracks
+  throwAC=true;
+  const ctl2=ctx.M.voice.attach(ta,host,{ctx:{signal:new AbortController().signal,rpc:async()=>({})}});
+  const p3=ctl2.el.children[0].action();
+  gumResolvers.shift()({getTracks:()=>[{stop(){stoppedTracks++;}}]});
+  await assert.rejects(p3,/ac boom/);
+  assert.equal(stoppedTracks,2,'MOB-04: AudioContext failure stops MediaStream track');
+  assert.equal(ctx.M.voice.active,false);
+  f.abort.abort();
+ }
+
+ // 3) MOB-12: To Do empty targets mid-load increments loadSeq & clears loading
+ {
+  let resolveTodoA;
+  const hostA={id:'h-a',name:'Mac A',active:false,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},sessions:[],repositories:[]}};
+  const hostB={id:'h-b',name:'Mac B',active:true,connection:{phase:'idle'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},sessions:[],repositories:[]}};
+  let filterHosts=[hostA,hostB];
+  const f=fixture('up-next',{state:{connection:{phase:'idle'},snapshot:hostB.snapshot}});
+  f.ctx.connections=[hostA,hostB];
+  f.ctx.filteredConnections=()=>filterHosts;
+  f.ctx.rpcForHost=(hid,req)=>{
+   if(hid==='h-a'&&req.action==='bots.todo')return new Promise(r=>resolveTodoA=r);
+   return Promise.resolve({});
+  };
+  f.view.update();
+  await f.flush();
+  assert.equal(typeof resolveTodoA,'function','Host A bots.todo in-flight');
+  // Switch filter to offline Host B while Host A is still in-flight
+  filterHosts=[hostB];
+  f.view.update();
+  resolveTodoA({bots:[{id:'b1',name:'Bot A'}],items:[{uid:'it-1',bot_id:'b1',title:'Stale A item',status:'needs_you'}],requests:[],suggestions:[],failed_automations:[],etag:'e1'});
+  await f.flush();
+  assert(!f.root.textContent.includes('Stale A item'),'MOB-12: stale Host A response must not overwrite Host B To Do');
+  const clearCard=f.all().find(n=>n.className==='todo-clear-card inset-group');
+  assert(clearCard,'MOB-12: loading reset allows clearCard to render when no targets remain');
+  f.abort.abort();
+ }
+
+ // 4) MOB-14 & LIVE-02 & LIVE-09: Settings Voice host targeting, rollback on error, vocab block, Reset order row
+ {
+  const hostA={id:'h-a',name:'Offline A',active:true,connection:{phase:'idle'},cached:false,snapshot:{sessions:[],repositories:[]}};
+  const hostB={id:'h-b',name:'Online B',active:false,connection:{phase:'ready'},cached:false,snapshot:{sessions:[],repositories:[]}};
+  const voiceCalls=[];
+  let failSet=false;
+  const f=fixture('settings',{
+   state:{connection:{phase:'idle'}},
+   rpc:()=>{throw Error('MOB-14: must not call offline active host ctx.rpc');},
+  });
+  f.ctx.connections=[hostA,hostB];
+  f.ctx.rpcForHost=async(hid,req)=>{
+   voiceCalls.push([hid,req.action]);
+   if(req.action==='voice.status')return {status:'ready'};
+   if(req.action==='voice.config_get')return {refine_enabled:false,pinned_vocab:['Krill'],auto_vocab:[]};
+   if(req.action==='voice.config_set'){if(failSet)throw Error('boom');return {refine_enabled:!!req.refine_enabled,pinned_vocab:['Krill',...(req.add_pinned?[req.add_pinned]:[])],auto_vocab:[]};}
+   return {};
+  };
+  f.view.update();
+  await f.flush();
+  assert(voiceCalls.some(([h,a])=>h==='h-b'&&a==='voice.config_get'),'MOB-14: Settings Voice targets ready secondary host B');
+  assert(f.all().some(n=>n.className==='voice-vocab-block'),'LIVE-02: Voice vocab wrapped in .voice-vocab-block');
+  const refineChk=f.all().find(n=>n.tagName==='INPUT'&&n.type==='checkbox'&&n.attrs['aria-label']==='AI Refine');
+  const vocabForm=f.all().find(n=>n.className==='voice-add-row');
+  const vocabIn=vocabForm.children[0];
+  failSet=true;
+  refineChk.checked=true;emit(refineChk,'change');await f.flush();
+  assert.equal(refineChk.checked,false,'MOB-14: refineChk reverts when voice.config_set fails');
+  vocabIn.value='KeepMe';emit(vocabForm,'submit');await f.flush();
+  assert.equal(vocabIn.value,'KeepMe','MOB-14: vocabIn preserves user text on saveVoice error');
+  failSet=false;
+  emit(vocabForm,'submit');await f.flush();
+  assert.equal(vocabIn.value,'','MOB-14: vocabIn clears after saveVoice succeeds');
+  f.abort.abort();
+  // LIVE-09: Terminal Settings Reset order wrapped in .setting-row.key-reset-row
+  const ft=fixture('settings',{route:{subpage:'terminal'}});
+  const resetBtn=ft.byText('Reset order');
+  assert(resetBtn.parentElement&&resetBtn.parentElement.className.includes('setting-row')&&resetBtn.parentElement.className.includes('key-reset-row'),'LIVE-09: Reset order wrapped in .setting-row.key-reset-row');
+  ft.abort.abort();
+ }
+
+ // 5) MOB-15: Bots Hub Decision Deck / Access / Suggestions busy guards prevent duplicate RPCs on double-tap
+ {
+  let resolveAnswer,resolveAccess,resolveSug;
+  let answerCalls=0,accessCalls=0,sugCalls=0;
+  const host={id:'h1',name:'Mac',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},sessions:[],repositories:[]}};
+  const f=fixture('bots',{state:{connection:{phase:'ready'},snapshot:host.snapshot}});
+  f.ctx.connections=[host];
+  f.ctx.filteredConnections=()=>[host];
+  f.ctx.rpcForHost=(_hid,req)=>{
+   if(req.action==='bots.hub')return Promise.resolve({
+    bots:[{id:'b1',name:'Alpha',slug:'alpha',agent_id:'claude'}],
+    items:[{uid:'it1',bot_id:'b1',title:'Pick deploy',status:'needs_you',events:[{id:'ev1',kind:'question',decisions:[{question:'Deploy?',options:['Yes','No'],recommended:0}]}]}],
+    requests:[{token:'tok1',bot_id:'b1',source:'slack',sender_name:'Alice',status:'pending'}],
+    statuses:[],groups:[],sessions:[],etag:'eh1',
+   });
+   if(req.action==='bots.item.answer'){answerCalls++;return new Promise(r=>resolveAnswer=r);}
+   if(req.action==='bots.access.decide'){accessCalls++;return new Promise(r=>resolveAccess=r);}
+   if(req.action==='bots.suggestions.start'){sugCalls++;return new Promise(r=>resolveSug=r);}
+   return Promise.resolve({});
+  };
+  f.view.update();
+  await f.flush();
+  const yesBtn=f.all().find(n=>n.tagName==='BUTTON'&&n.attrs['aria-label']==='Yes');
+  assert(yesBtn,'decision deck option button exists');
+  const pA1=yesBtn.action(),pA2=yesBtn.action();
+  assert.equal(answerCalls,1,'MOB-15: Decision Deck double-tap fires single RPC');
+  assert.equal(yesBtn.disabled,true,'MOB-15: Decision Deck button disabled while in flight');
+  resolveAnswer({});await Promise.all([pA1,pA2]);
+  const approveBtns=f.all().filter(n=>n.tagName==='BUTTON'&&n.textContent==='Approve');
+  const accBtn=approveBtns.at(-1);
+  const pB1=accBtn.action(),pB2=accBtn.action();
+  assert.equal(accessCalls,1,'MOB-15: Access Approve double-tap fires single RPC');
+  resolveAccess({});await Promise.all([pB1,pB2]);
+  f.abort.abort();
+  // Suggestions double-tap guard in To Do
+  const fsug=fixture('up-next',{state:{connection:{phase:'ready'},snapshot:host.snapshot}});
+  fsug.ctx.connections=[host];
+  fsug.ctx.filteredConnections=()=>[host];
+  fsug.ctx.rpcForHost=(_hid,req)=>{
+   if(req.action==='bots.todo')return Promise.resolve({
+    bots:[{id:'b1',name:'Alpha'}],items:[],requests:[],
+    suggestions:[{id:'s1',bot_id:'b1',title:'Run lint',why:'Clean'}],
+    failed_automations:[],etag:'es1',
+   });
+   if(req.action==='bots.suggestions.start'){sugCalls++;return new Promise(r=>resolveSug=r);}
+   return Promise.resolve({});
+  };
+  fsug.view.update();
+  await fsug.flush();
+  const startBtn=fsug.byText('Start');
+  const pS1=startBtn.action(),pS2=startBtn.action();
+  assert.equal(sugCalls,1,'MOB-15: Suggestions Start double-tap fires single RPC');
+  resolveSug({});await Promise.all([pS1,pS2]);
+  fsug.abort.abort();
+ }
+
+ // 6) MOB-16: Workspace Project Search IME guard on Enter
+ {
+  const f=fixture('workspaces',{state:{snapshot:{host:{display_name:'Mac'},repositories:[{key:'r1',label:'krill',path:'/krill'}],sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}});
+  f.byText('Workspace Options').action();
+  f.all().find(n=>n.classList.contains('project-picker')).action();
+  const projSearch=f.all().find(n=>n.className==='project-filter-search');
+  assert(projSearch,'project search input exists');
+  projSearch.value='krill';emit(projSearch,'input');
+  const ev1=Object.assign(new Event('keydown',{cancelable:true}),{key:'Enter',isComposing:true});
+  projSearch.dispatchEvent(ev1);
+  assert.equal(ev1.defaultPrevented,false,'MOB-16: projectSearch ignores Enter during isComposing');
+  const ev2=Object.assign(new Event('keydown',{cancelable:true}),{key:'Enter',keyCode:229});
+  projSearch.dispatchEvent(ev2);
+  assert.equal(ev2.defaultPrevented,false,'MOB-16: projectSearch ignores Enter during keyCode 229');
+  f.abort.abort();
+ }
+
+ // 7) LIVE-07: Bot slug resolution & unknown bot ID renders clean Bot not found state without phantom composer
+ {
+  const host={id:'h1',name:'Mac',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},sessions:[],repositories:[]}};
+  // Slug resolution redirects to canonical ID
+  const fSlug=fixture('bots',{
+   route:{botId:'release-captain'},
+   state:{connection:{phase:'ready'},snapshot:host.snapshot},
+   rpc:async req=>{
+    if(req.action==='bots.workspace')return {bot:null,bots:[{id:'bot-rc-123',slug:'release-captain',name:'Release Captain',agent_id:'claude'}],items:[],statuses:[],suggestions:[],requests:[],sessions:[],etag:'e1'};
+    return {};
+   },
+  });
+  await fSlug.flush();
+  assert.equal(fSlug.routes.at(-1),'/bots/bot-rc-123','LIVE-07: #/bots/<slug> resolves and redirects to canonical bot ID');
+  fSlug.abort.abort();
+  // Unknown bot ID renders Bot not found, non-green dot, and NO phantom composer
+  const fUnknown=fixture('bots',{
+   route:{botId:'does-not-exist'},
+   state:{connection:{phase:'ready'},snapshot:host.snapshot},
+   rpc:async req=>{
+    if(req.action==='bots.workspace')return {bot:null,bots:[{id:'bot-rc-123',slug:'release-captain',name:'Release Captain',agent_id:'claude'}],items:[],statuses:[],suggestions:[],requests:[],sessions:[],etag:'e2'};
+    return {};
+   },
+  });
+  await fUnknown.flush();
+  assert(fUnknown.root.textContent.includes('Bot not found'),'LIVE-07: unknown bot renders Bot not found');
+  const dot=fUnknown.all().find(n=>String(n.className||'').includes('bot-header-meta-dot'));
+  assert(dot&&!dot.className.includes('connected'),'LIVE-07: unknown bot header dot is non-green');
+  assert(!fUnknown.all().some(n=>n.className==='bot-first-chat-form'),'LIVE-07: unknown bot renders NO phantom active composer');
+  fUnknown.abort.abort();
+ }
+
+ // 8) LIVE-08: To Do Approvals section does not render duplicate Confirmation requests heading
+ {
+  const orchStore={runs:[{id:'r1',title:'Run 1',status:'active'}],tasks:[{id:'t1',run_id:'r1',title:'Task 1'}],gates:[{id:'g1',run_id:'r1',task_id:'t1',status:'pending',question:'Ship it?',options:['Approve']}],questions:[]};
+  const host={id:'h1',name:'Mac',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},orchestration:orchStore,sessions:[],repositories:[]}};
+  const f=fixture('up-next',{state:{connection:{phase:'ready'},snapshot:host.snapshot}});
+  f.ctx.connections=[host];
+  f.ctx.filteredConnections=()=>[host];
+  f.ctx.rpcForHost=async()=>({bots:[],items:[],requests:[],suggestions:[],failed_automations:[],etag:'e1'});
+  f.view.update();
+  await f.flush();
+  const headings=f.all().filter(n=>n.tagName==='H2').map(n=>n.textContent);
+  assert(headings.some(h=>h.includes('Approvals needed')),'LIVE-08: Approvals needed heading present');
+  assert(!headings.some(h=>h.includes('Confirmation requests')),'LIVE-08: duplicate Confirmation requests heading removed inside Approvals needed');
+  f.abort.abort();
+ }
+ console.log('PASS v0.3.34 mobile fixes regressions: CSS/WCAG contracts, MOB-04/12/14/15/16, LIVE-02/04/06/07/08/09');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await projectInlineRemoteHost();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();await v0334MobileFixesRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

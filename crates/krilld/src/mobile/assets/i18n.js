@@ -941,6 +941,8 @@
     "connector worker panicked": "커넥터 워커에서 오류가 발생했습니다",
     "failed to spawn connector worker thread": "커넥터 워커 스레드를 시작하지 못했습니다",
     "{0} is already running": "{0}이(가) 이미 실행 중입니다",
+    "Bot not found": "봇을 찾을 수 없습니다",
+    "Back to Bots": "봇 목록으로",
     "Bot not found: {0}": "봇을 찾을 수 없습니다: {0}",
     "Bot item not found: {0}": "봇 항목을 찾을 수 없습니다: {0}",
     "Schedule not found: {0}": "자동화를 찾을 수 없습니다: {0}",

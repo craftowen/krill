@@ -2046,26 +2046,30 @@ globalThis.MkTerminalCodec = (() => {
         if (!key.repeatable) return;
         this.heldPointer = e.pointerId;
         el.setPointerCapture?.(e.pointerId);
-        const token = this.repeatToken;
+        const token = this.repeatToken,
+          generation = this.generation;
+        const handleKeyError = (e) => {
+          if (this.disposed || generation !== this.generation) return;
+          const activeRepeat = token === this.repeatToken;
+          if (activeRepeat) this.stopRepeat();
+          if (e?.disconnected) {
+            if (!["disconnected", "ended", "denied"].includes(this.phase))
+              this.disconnect("disconnected", "Disconnected");
+            return;
+          }
+          if (activeRepeat) this.error(e);
+        };
         const tick = async () => {
           try {
             await this.sendKey(key.id);
             if (token === this.repeatToken && !this.disposed)
               this.repeatTimer = setTimeout(tick, 45);
           } catch (e) {
-            if (token === this.repeatToken) {
-              this.stopRepeat();
-              this.error(e);
-            }
+            handleKeyError(e);
           }
         };
         const initial = this.sendKey(key.id);
-        initial.catch((e) => {
-          if (token === this.repeatToken) {
-            this.stopRepeat();
-            this.error(e);
-          }
-        });
+        initial.catch(handleKeyError);
         this.repeatTimer = setTimeout(() => {
           initial.then(
             () => {
