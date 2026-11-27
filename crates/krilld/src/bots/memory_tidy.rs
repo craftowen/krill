@@ -175,6 +175,12 @@ fn run_memory_tidy_inner(
     ensure_no_symlink_path(&home)?;
     let mem_dir = home.join("memory");
     ensure_no_symlink_path(&mem_dir)?;
+    if mem_dir.exists() && !mem_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bot memory path is not a directory: {}", mem_dir.display()),
+        ));
+    }
     let old = store.get_memory(bot_id)?;
     let parsed = parse_memory_facts(&old);
     if parsed.is_empty() {
