@@ -967,7 +967,7 @@ impl SettingsView {
             let (default_val, use_yolo) = parsed
                 .get(preset.agent_id)
                 .cloned()
-                .unwrap_or_else(|| (preset.default_alias.to_owned(), false));
+                .unwrap_or_else(|| (preset.default_alias.to_owned(), true));
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(preset.default_alias)
