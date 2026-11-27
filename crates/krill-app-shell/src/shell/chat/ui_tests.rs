@@ -6678,7 +6678,12 @@ fn chat_markdown_file_links_after_korean_text_and_inline_code_click_and_open(
             .unwrap()
             .as_nanos()
     ));
-    let outputs = dir.join("Application Support/dev.krill.app/bots/bot-7/outputs");
+    let outputs = dir
+        .join("Application Support")
+        .join("dev.krill.app")
+        .join("bots")
+        .join("bot-7")
+        .join("outputs");
     std::fs::create_dir_all(&outputs).unwrap();
     let gallery = outputs.join("yunjadong-profile-gallery.html");
     let png1 = outputs.join("01c-balanced-lowkey-depth.png");
@@ -6695,7 +6700,11 @@ fn chat_markdown_file_links_after_korean_text_and_inline_code_click_and_open(
     )
     .unwrap();
 
-    let enc = |p: &std::path::Path| format!("file://{}", p.to_string_lossy().replace(' ', "%20"));
+    let enc = |p: &std::path::Path| {
+        gpui::http_client::Url::from_file_path(p)
+            .expect("temp path converts to file:// URL")
+            .to_string()
+    };
     let gallery_url = enc(&gallery);
     let png1_url = enc(&png1);
     let png2_url = enc(&png2);

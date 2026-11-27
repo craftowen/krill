@@ -513,12 +513,16 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
     let dir = TempDir::new("md-link-resolve");
     let gallery = dir
         .0
-        .join("Application Support/outputs/yunjadong-profile-gallery.html");
+        .join("Application Support")
+        .join("outputs")
+        .join("yunjadong-profile-gallery.html");
     let png = dir
         .0
-        .join("Application Support/outputs/01c-balanced-lowkey-depth.png");
-    let korean_md = dir.0.join("한글 폴더/노트 파일.md");
-    let rust_src = dir.0.join("src/view.rs");
+        .join("Application Support")
+        .join("outputs")
+        .join("01c-balanced-lowkey-depth.png");
+    let korean_md = dir.0.join("한글 폴더").join("노트 파일.md");
+    let rust_src = dir.0.join("src").join("view.rs");
     let shell_script = dir.0.join("run.sh");
     let mac_command = dir.0.join("evil.command");
     for f in [
@@ -532,9 +536,14 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
         fs::create_dir_all(f.parent().unwrap()).unwrap();
         fs::write(f, b"ok").unwrap();
     }
+    let to_file_url = |p: &Path| {
+        gpui::http_client::Url::from_file_path(p)
+            .expect("temp path converts to file:// URL")
+            .to_string()
+    };
 
     // 1. Percent-encoded file:// URL with `%20` spaces (.html & .png -> system open, safe)
-    let gallery_url = format!("file://{}", gallery.to_string_lossy().replace(' ', "%20"));
+    let gallery_url = to_file_url(&gallery);
     assert_eq!(
         resolve_markdown_link(&gallery_url, None),
         Some(MarkdownLinkTarget::LocalPath {
@@ -564,7 +573,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
     );
 
     // 3. Unencoded spaces inside file:// URL also resolve cleanly
-    let raw_space_url = format!("file://{}", png.to_string_lossy());
+    let raw_space_url = to_file_url(&png).replace("%20", " ");
     assert_eq!(
         resolve_markdown_link(&raw_space_url, None),
         Some(MarkdownLinkTarget::LocalPath {
@@ -577,10 +586,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
     );
 
     // 4. Percent-encoded Korean UTF-8 + `file://localhost/...`
-    let encoded_korean = format!(
-        "file://localhost{}/%ED%95%9C%EA%B8%80%20%ED%8F%B4%EB%8D%94/%EB%85%B8%ED%8A%B8%20%ED%8C%8C%EC%9D%BC.md",
-        dir.0.to_string_lossy()
-    );
+    let encoded_korean = to_file_url(&korean_md).replacen("file:///", "file://localhost/", 1);
     assert_eq!(
         resolve_markdown_link(&encoded_korean, None),
         Some(MarkdownLinkTarget::LocalPath {
@@ -593,7 +599,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
     );
 
     // 5. `#L10-L20` and `#L12C4-L20C8` source line fragments
-    let rust_url = format!("file://{}#L10-L20", rust_src.to_string_lossy());
+    let rust_url = format!("{}#L10-L20", to_file_url(&rust_src));
     assert_eq!(
         resolve_markdown_link(&rust_url, None),
         Some(MarkdownLinkTarget::LocalPath {
@@ -604,7 +610,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
             text_script: false,
         })
     );
-    let rust_col_url = format!("file://{}#L12C4-L20C8", rust_src.to_string_lossy());
+    let rust_col_url = format!("{}#L12C4-L20C8", to_file_url(&rust_src));
     assert_eq!(
         resolve_markdown_link(&rust_col_url, None),
         Some(MarkdownLinkTarget::LocalPath {
@@ -634,7 +640,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
 
     // 7. Executable / script classification
     assert_eq!(
-        resolve_markdown_link(&format!("file://{}", shell_script.to_string_lossy()), None),
+        resolve_markdown_link(&to_file_url(&shell_script), None),
         Some(MarkdownLinkTarget::LocalPath {
             path: shell_script,
             line: None,
@@ -644,7 +650,7 @@ fn resolve_markdown_link_handles_file_urls_korean_spaces_anchors_and_security() 
         })
     );
     assert_eq!(
-        resolve_markdown_link(&format!("file://{}", mac_command.to_string_lossy()), None),
+        resolve_markdown_link(&to_file_url(&mac_command), None),
         Some(MarkdownLinkTarget::LocalPath {
             path: mac_command,
             line: None,
