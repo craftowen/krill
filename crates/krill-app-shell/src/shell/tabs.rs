@@ -295,11 +295,7 @@ impl Shell {
                 let bot_for_tab = (!is_launcher && !is_group && self.layout.file(pane).is_none())
                     .then(|| self.bot_for_pane(pane))
                     .flatten();
-                let is_bot_home = bot_for_tab.is_some_and(|bot| {
-                    self.layout
-                        .session(pane)
-                        .is_some_and(|sid| bot.home_session().is_some_and(|h| h.session_id == sid))
-                });
+                let is_bot_home = self.is_bot_home_pane(pane);
                 let unclosable = tab.pinned || is_bot_home;
                 let display_label = if is_bot_home {
                     "Home".to_owned()
@@ -1055,13 +1051,46 @@ impl Shell {
         }
     }
 
-    /// OWE-734: 탭 닫기 요청. 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
+    pub(super) fn is_bot_home_pane(&self, pane: PaneId) -> bool {
+        if self.is_split_launcher(pane)
+            || self.is_group_pane(pane)
+            || self.layout.file(pane).is_some()
+        {
+            return false;
+        }
+        self.bot_for_pane(pane).is_some_and(|bot| {
+            self.layout
+                .session(pane)
+                .is_some_and(|sid| bot.home_session().is_some_and(|h| h.session_id == sid))
+        })
+    }
+
+    pub(super) fn is_bot_home_tab(&self, index: usize) -> bool {
+        self.layout.tabs().get(index).is_some_and(|tab| {
+            self.is_bot_home_pane(tab.focused)
+                || self
+                    .layout
+                    .tab_panes(index)
+                    .iter()
+                    .any(|&pane| self.is_bot_home_pane(pane))
+        })
+    }
+
+    pub(super) fn is_tab_unclosable(&self, index: usize) -> bool {
+        self.layout.is_tab_pinned(index) || self.is_bot_home_tab(index)
+    }
+
+    /// OWE-734: 탭 닫기 요청. 봇 홈 탭은 닫지 않고, 고정된 탭(`pinned`)이면 확인 모달을 띄우고, 아니면 바로 닫는다.
     pub(super) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.layout.tabs().get(index) else {
             return;
         };
         let anchor = tab.focused;
         self.tab_context_menu = None;
+        if self.is_bot_home_tab(index) {
+            cx.notify();
+            return;
+        }
         if self.layout.is_tab_pinned(index) {
             self.confirm_close_tab = Some(anchor);
             cx.notify();
@@ -1195,7 +1224,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= self.layout.tabs().len() {
+        if index >= self.layout.tabs().len() || self.is_bot_home_tab(index) {
             return;
         }
         self.tab_context_menu = None;
@@ -1405,32 +1434,32 @@ impl Shell {
         }
     }
 
-    /// OWE-734: `keep_index`와 고정된 탭을 제외한 나머지 탭을 일괄 닫는다.
+    /// OWE-734: `keep_index`와 고정된 탭·봇 홈 탭을 제외한 나머지 탭을 일괄 닫는다.
     pub(super) fn close_other_tabs(&mut self, keep_index: usize, cx: &mut Context<Self>) {
         let closing = self
             .tabs_in_workspace(keep_index, cx)
             .into_iter()
-            .filter(|&i| i != keep_index && !self.layout.is_tab_pinned(i))
+            .filter(|&i| i != keep_index && !self.is_tab_unclosable(i))
             .collect();
         self.close_workspace_tabs(closing, keep_index, cx);
     }
 
-    /// 현재 워크스페이스에서 오른쪽의 비고정 탭만 닫는다.
+    /// 현재 워크스페이스에서 오른쪽의 닫을 수 있는 탭만 닫는다.
     pub(super) fn close_tabs_to_right(&mut self, index: usize, cx: &mut Context<Self>) {
         let closing = self
             .tabs_in_workspace(index, cx)
             .into_iter()
-            .filter(|&i| i > index && !self.layout.is_tab_pinned(i))
+            .filter(|&i| i > index && !self.is_tab_unclosable(i))
             .collect();
         self.close_workspace_tabs(closing, self.layout.active(), cx);
     }
 
-    /// 현재 워크스페이스에서 왼쪽의 비고정 탭만 닫는다.
+    /// 현재 워크스페이스에서 왼쪽의 닫을 수 있는 탭만 닫는다.
     pub(super) fn close_tabs_to_left(&mut self, index: usize, cx: &mut Context<Self>) {
         let closing = self
             .tabs_in_workspace(index, cx)
             .into_iter()
-            .filter(|&i| i < index && !self.layout.is_tab_pinned(i))
+            .filter(|&i| i < index && !self.is_tab_unclosable(i))
             .collect();
         self.close_workspace_tabs(closing, self.layout.active(), cx);
     }
@@ -1522,17 +1551,19 @@ impl Shell {
         let index = self.layout.tab_of_pane(anchor)?;
         let tab = self.layout.tabs().get(index)?;
         let is_pinned = tab.pinned;
+        let is_bot_home = self.is_bot_home_tab(index);
+        let is_unclosable = is_pinned || is_bot_home;
         let current_color = tab.color;
         let visible = self.tabs_in_workspace(index, cx);
         let has_closable_others = visible
             .iter()
-            .any(|&i| i != index && !self.layout.is_tab_pinned(i));
+            .any(|&i| i != index && !self.is_tab_unclosable(i));
         let has_closable_right = visible
             .iter()
-            .any(|&i| i > index && !self.layout.is_tab_pinned(i));
+            .any(|&i| i > index && !self.is_tab_unclosable(i));
         let has_closable_left = visible
             .iter()
-            .any(|&i| i < index && !self.layout.is_tab_pinned(i));
+            .any(|&i| i < index && !self.is_tab_unclosable(i));
         let has_closable_editors = visible
             .iter()
             .any(|&i| !self.layout.is_tab_pinned(i) && self.layout.is_editor_tab(i));
@@ -1888,32 +1919,40 @@ impl Shell {
                     })),
             )
             .child(div().my_1().h(px(1.)).w_full().bg(p.border))
-            // OWE-870: 탭 이름 변경(더블클릭과 같은 대화상자).
+            // OWE-870: 탭 이름 변경(더블클릭과 같은 대화상자). 봇 홈 탭은 이름이 고정되어 비활성화한다.
             .child(
-                menu_item("tab-menu-rename", text::RENAME_TAB.get(), true, None).on_click(
-                    cx.listener(move |this, _, window, cx| {
+                menu_item(
+                    "tab-menu-rename",
+                    text::RENAME_TAB.get(),
+                    !is_bot_home,
+                    None,
+                )
+                .when(!is_bot_home, |d| {
+                    d.on_click(cx.listener(move |this, _, window, cx| {
                         let Some(index) = this.take_tab_menu_target(cx) else {
                             return;
                         };
                         this.begin_tab_rename(index, window, cx);
-                    }),
-                ),
+                    }))
+                }),
             )
             .child(
                 menu_item(
                     "tab-menu-close",
                     text::CLOSE_TAB_MENU.get(),
-                    !is_pinned,
+                    !is_unclosable,
                     krill_app_core::keys::shortcut_label(window, &super::CloseTab),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let Some(index) = this.take_tab_menu_target(cx) else {
-                        return;
-                    };
-                    if !this.layout.is_tab_pinned(index) {
-                        this.request_close_tab(index, cx);
-                    }
-                })),
+                .when(!is_unclosable, |d| {
+                    d.on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
+                        if !this.is_tab_unclosable(index) {
+                            this.request_close_tab(index, cx);
+                        }
+                    }))
+                }),
             )
             .child(
                 menu_item(

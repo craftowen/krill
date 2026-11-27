@@ -1350,6 +1350,7 @@ impl Sidebar {
             .filter(|p| p.host.is_local())
             .cloned()
             .collect();
+        let local_project_order = self.project_order_for(&HostId::Local);
         let ctx = WorktreeContext {
             meta: Some(&self.meta),
             prs: Some(&self.prs),
@@ -1372,7 +1373,7 @@ impl Sidebar {
             recently_created: Some(&self.recently_created_worktrees),
             pending_worktrees: &pending,
             removed_projects: Some(&self.removed_projects),
-            project_order: Some(&self.project_order),
+            project_order: Some(&local_project_order),
             worktree_order: Some(&self.worktree_order),
         };
         rows_with_options(
@@ -1403,7 +1404,8 @@ impl Sidebar {
                 repos.push(repo.clone());
             }
         };
-        for (repo, _) in ordered_projects(&self.snapshot, Some(&self.project_order)) {
+        let local_order = self.project_order_for(&HostId::Local);
+        for (repo, _) in ordered_projects(&self.snapshot, Some(&local_order)) {
             push_repo(repo);
         }
         for remote in &self.remote_hosts {
@@ -1412,7 +1414,8 @@ impl Sidebar {
                 || !remote.snapshot.trees.is_empty()
                 || self.remote_info.contains_key(&remote.id)
             {
-                for (repo, _) in ordered_projects(&remote.snapshot, Some(&self.project_order)) {
+                let remote_order = self.project_order_for(&HostId::Remote(remote.id.clone()));
+                for (repo, _) in ordered_projects(&remote.snapshot, Some(&remote_order)) {
                     push_repo(repo);
                 }
             }
@@ -1426,6 +1429,7 @@ impl Sidebar {
         collapsed: &BTreeSet<PathBuf>,
     ) -> Vec<Row> {
         let host_id = HostId::Remote(remote.id.clone());
+        let remote_project_order = self.project_order_for(&host_id);
         let pending: Vec<_> = self
             .pending_worktrees
             .iter()
@@ -1449,7 +1453,7 @@ impl Sidebar {
             // host do not make them descendants of local worktrees.
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
-            project_order: Some(&self.project_order),
+            project_order: Some(&remote_project_order),
             worktree_order: Some(&self.worktree_order),
             ..WorktreeContext::default()
         };

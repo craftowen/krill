@@ -5456,9 +5456,9 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
     assert_eq!(
         order,
         [
-            PathBuf::from("/p/c"),
-            PathBuf::from("/p/a"),
-            PathBuf::from("/p/b")
+            (HostId::Local, PathBuf::from("/p/c")),
+            (HostId::Local, PathBuf::from("/p/a")),
+            (HostId::Local, PathBuf::from("/p/b")),
         ]
     );
     fs::remove_dir_all(&dir).ok();
@@ -7047,7 +7047,10 @@ fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_
             ]),
         };
         s.options.sort_by = SortBy::Smart;
-        s.project_order = vec!["/repo".into(), "/other".into()];
+        s.project_order = vec![
+            (HostId::Local, "/repo".into()),
+            (HostId::Local, "/other".into()),
+        ];
         s.rebuild(cx);
     });
     cx.run_until_parked();
@@ -7092,7 +7095,10 @@ fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_
             };
             assert_eq!(s.options.sort_by, SortBy::Created);
             assert_eq!(cards(s), ["/b", "/a", "/repo", "/other"].map(PathBuf::from));
-            assert_eq!(s.project_order, ["/repo", "/other"].map(PathBuf::from));
+            assert_eq!(
+                s.project_order,
+                ["/repo", "/other"].map(|p| (HostId::Local, PathBuf::from(p)))
+            );
             s.move_worktree(Path::new("/b"), Path::new("/repo"), cx);
             assert_eq!(cards(s), ["/a", "/repo", "/b", "/other"].map(PathBuf::from));
             // A drop into a different repository must not move or regroup cards.
@@ -7110,18 +7116,31 @@ fn dragging_worktree_cards_changes_manual_order_and_persists_without_reordering_
         ["/a", "/repo", "/b"].map(PathBuf::from)
     );
     assert_eq!(restored.options.sort_by, SortBy::Name);
-    // Existing five-segment files still load with an empty manual card order.
+    // Existing five-segment files still load with an empty manual card order and map legacy paths to Local.
+    let legacy_paths: Vec<PathBuf> = restored
+        .project_order
+        .iter()
+        .map(|(_, p)| p.clone())
+        .collect();
     let mut legacy = vec![FORMAT_VERSION];
     for segment in [
         postcard::to_stdvec(&restored.prefs).unwrap(),
         postcard::to_stdvec(&restored.options).unwrap(),
         postcard::to_stdvec(&lineage::LineageState::default()).unwrap(),
         postcard::to_stdvec(&UiExpansionState::default()).unwrap(),
-        postcard::to_stdvec(&restored.project_order).unwrap(),
+        postcard::to_stdvec(&legacy_paths).unwrap(),
     ] {
         legacy.extend(segment);
     }
-    assert!(decode_state(&legacy).unwrap().5.is_empty());
+    let decoded_legacy = decode_state(&legacy).unwrap();
+    assert!(decoded_legacy.5.is_empty());
+    assert_eq!(
+        decoded_legacy.4,
+        legacy_paths
+            .into_iter()
+            .map(|p| (HostId::Local, p))
+            .collect::<Vec<_>>()
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -7326,8 +7345,8 @@ fn focusing_session_expands_collapsed_project_and_selects_session_row_across_hos
     view.update(cx, |s, cx| {
         s.set_focused_on(remote_host.clone(), Some(SessionId(7)), cx);
         assert!(!s.is_host_collapsed(&remote_host));
-        assert!(!s.is_collapsed(Path::new("/srv/repo-r")));
-        assert!(!s.is_collapsed(Path::new("/srv/repo-r/feat-r")));
+        assert!(!s.is_collapsed_on(&remote_host, Path::new("/srv/repo-r")));
+        assert!(!s.is_collapsed_on(&remote_host, Path::new("/srv/repo-r/feat-r")));
         assert_eq!(
             s.selected_workspace(),
             Some((remote_host.clone(), PathBuf::from("/srv/repo-r/feat-r")))
@@ -8609,6 +8628,15 @@ fn project_header_hover_overlay_and_non_connected_host_controls(cx: &mut TestApp
         (f32::from(header_b.right()) - f32::from(actions_b.right())).abs() <= 8.,
         "hover action overlay must align to the right edge of the header"
     );
+    // UI-02: actions overlay must remain transparent while unhovered even when the row is selected.
+    let overlay_style = view.read_with(vcx, |_, cx| {
+        let mut el = view::project_actions_overlay("repo-actions-0".into(), crate::ui::palette(cx));
+        gpui::Styled::style(&mut el).background.clone()
+    });
+    assert!(
+        overlay_style.is_none(),
+        "repo-actions overlay must stay transparent when unhovered"
+    );
 
     // Non-connected statuses (Connecting, Disconnected, AuthFailed) keep inline host status & reconnect control.
     for (status, expect_reconnect) in [
@@ -8647,4 +8675,81 @@ fn project_header_hover_overlay_and_non_connected_host_controls(cx: &mut TestApp
             );
         });
     }
+}
+
+#[gpui::test]
+fn remote_collapsed_reveal_fold_and_toggle_card_sessions(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let studio = HostId::Remote("studio".into());
+    let repo = PathBuf::from("/remote/proj");
+    let wt = PathBuf::from("/remote/proj/wt-1");
+    let session = Session {
+        id: SessionId(77),
+        status: AgentStatus::UNKNOWN,
+        worktree: Some(wt.clone()),
+        cwd: Some(wt.clone()),
+        account: None,
+    };
+    view.update(vcx, |s, cx| {
+        s.set_remote_snapshot_for_test(
+            "studio",
+            HostStatus::Connected,
+            Snapshot {
+                sessions: vec![session.clone()],
+                trees: BTreeMap::from([(repo.clone(), vec![repo.clone(), wt.clone()])]),
+            },
+            cx,
+        );
+        // Collapse remote repo via fold_on, then focus remote session and reveal it.
+        s.fold_on(&studio, &repo, Some(false), cx);
+        assert!(s.is_collapsed_on(&studio, &repo));
+        s.set_focused_on(studio.clone(), Some(SessionId(77)), cx);
+        s.reveal_focused(cx);
+        assert!(
+            !s.is_collapsed_on(&studio, &repo),
+            "reveal_focused must uncollapse remote_collapsed repo"
+        );
+        assert!(
+            s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Session(sess, true) if sess.id == SessionId(77))),
+            "revealed remote session must appear in rows"
+        );
+
+        // Select remote worktree card, collapse via Left Arrow (fold_cursor(false)), then expand via Right Arrow and via toggle_card_sessions_on.
+        let wt_idx = s
+            .rows
+            .iter()
+            .enumerate()
+            .position(|(i, r)| {
+                s.row_host(i) == &studio && matches!(r, Row::Worktree(p) if p == &wt)
+            })
+            .unwrap();
+        s.cursor = Some(wt_idx);
+        s.fold_cursor(false, cx);
+        assert!(s.is_collapsed_on(&studio, &wt));
+        assert!(!s.expanded_cards.contains(&wt));
+
+        // Keyboard Right Arrow (fold_cursor(true)) expands both remote_collapsed and expanded_cards.
+        s.fold_cursor(true, cx);
+        assert!(!s.is_collapsed_on(&studio, &wt));
+        assert!(s.expanded_cards.contains(&wt));
+
+        // Collapse via Left Arrow again, then click pill bar (toggle_card_sessions_on) to re-expand.
+        s.fold_cursor(false, cx);
+        assert!(s.is_collapsed_on(&studio, &wt));
+        assert!(!s.expanded_cards.contains(&wt));
+        s.toggle_card_sessions_on(&studio, &wt, cx);
+        assert!(
+            !s.is_collapsed_on(&studio, &wt),
+            "toggle_card_sessions_on must clear remote_collapsed"
+        );
+        assert!(s.expanded_cards.contains(&wt));
+        assert!(
+            s.rows
+                .iter()
+                .any(|r| matches!(r, Row::Session(sess, true) if sess.id == SessionId(77)))
+        );
+    });
 }

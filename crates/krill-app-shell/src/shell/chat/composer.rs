@@ -861,7 +861,13 @@ impl Shell {
         let agent_state = self.session_agent_state(&key.0, key.1, cx);
         let interrupt_latched =
             self.is_chat_interrupt_latched(&key, cx) || self.is_chat_stop_cooldown(&key, cx);
-        let draft_empty = input_state.read(cx).value().trim().is_empty() && !has_attachments;
+        let draft_empty = {
+            let state = input_state.read(cx);
+            super::strip_image_token_spans(state.value().as_ref(), state.tokens())
+                .trim()
+                .is_empty()
+                && !has_attachments
+        };
         let primary_action = super::composer_primary_action(super::ComposerPrimaryInput {
             agent_state,
             submission,

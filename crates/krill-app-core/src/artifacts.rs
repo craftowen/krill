@@ -818,6 +818,8 @@ impl View {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
                             .text_size(ui::TEXT_XS)
                             .text_color(p.destructive)
                             .child(error.clone()),
@@ -825,6 +827,7 @@ impl View {
                     .child(
                         ui::secondary("artifacts-retry", text::RETRY.get())
                             .debug_selector(|| "artifacts-retry".into())
+                            .flex_none()
                             .disabled(
                                 self.loading
                                     || self.deleting_slug.is_some()
@@ -1410,10 +1413,11 @@ impl Render for View {
                                     div()
                                         .debug_selector(|| "artifacts-table".into())
                                         .flex_1()
-                                        // Column widths + five gaps + horizontal padding.
+                                        // Column widths + five rem-scaled gaps + rem-scaled horizontal padding + zoom-scaled actions column.
                                         .min_w(
-                                            px(160. + 84. + 72. + 116. + 116. + 184.)
-                                                + ui::SPACE_3 * 7.,
+                                            px(120. + 84. + 72. + 136. + 136.)
+                                                + gpui::rems(13. + 0.75 * 7.)
+                                                    .to_pixels(window.rem_size()),
                                         )
                                         .h_full()
                                         .min_h_0()
@@ -1853,6 +1857,66 @@ mod regression_tests {
         });
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn artifacts_table_delete_at_zoom_and_long_error_retry_stay_unclipped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            View::with_calls(
+                Arc::new(|_| Ok(sample_page(&["one"]))),
+                Arc::new(|_| Ok(())),
+                None,
+                cx,
+            )
+        });
+        vcx.run_until_parked();
+
+        // UI-19: artifact-delete-0 stays inside artifacts-table bounds at 100% and 200% zoom.
+        for zoom in [1.0_f32, 2.0_f32] {
+            vcx.update(|window, cx| {
+                window.set_rem_size(px(16. * zoom));
+                cx.refresh_windows();
+            });
+            vcx.simulate_resize(gpui::size(px(760.), px(600.)));
+            vcx.run_until_parked();
+            let table = vcx.debug_bounds("artifacts-table").unwrap();
+            let del = vcx.debug_bounds("artifact-delete-0").unwrap();
+            assert!(
+                f32::from(del.right()) <= f32::from(table.right()) + 1.0,
+                "zoom={zoom}: artifact-delete-0 right {} exceeds artifacts-table right {}",
+                f32::from(del.right()),
+                f32::from(table.right())
+            );
+        }
+
+        // UI-23: 160-char unbroken error text must not push artifacts-retry outside banner/viewport.
+        vcx.update(|window, cx| {
+            window.set_rem_size(px(16.));
+            view.update(cx, |v, cx| {
+                v.error = Some(format!(
+                    "https://share.krill.page/error/{}",
+                    "x".repeat(160)
+                ));
+                cx.notify();
+            });
+        });
+        vcx.simulate_resize(gpui::size(px(680.), px(600.)));
+        vcx.run_until_parked();
+        let banner = vcx.debug_bounds("artifacts-error-banner").unwrap();
+        let retry = vcx.debug_bounds("artifacts-retry").unwrap();
+        assert!(
+            f32::from(retry.right()) <= f32::from(banner.right()) + 1.0
+                && f32::from(retry.right()) <= 680.0,
+            "artifacts-retry right {} clipped past banner {} / 680px viewport",
+            f32::from(retry.right()),
+            f32::from(banner.right())
+        );
     }
 }
 

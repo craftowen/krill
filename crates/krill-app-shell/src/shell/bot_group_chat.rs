@@ -76,6 +76,18 @@ pub(super) struct RoomState {
     pub last_poll_ms: u64,
     pub focus_composer: ComposerFocus,
     pub scroll: ScrollHandle,
+    pub follow_paused: bool,
+    pub last_tail_message_id: Option<String>,
+    pub initial_scrolled: std::cell::Cell<bool>,
+}
+
+fn is_group_timeline_near_bottom(scroll: &ScrollHandle) -> bool {
+    let max_y = f32::from(scroll.max_offset().y);
+    if max_y <= 1.0 {
+        return true;
+    }
+    let cur_y = -f32::from(scroll.offset().y);
+    (max_y - cur_y) <= 24.0
 }
 
 #[derive(Default)]
@@ -779,6 +791,14 @@ impl Shell {
                     cx.notify();
                     return;
                 }
+                let had_room = state.room.is_some();
+                let prev_tail = state.last_tail_message_id.clone().or_else(|| {
+                    state
+                        .room
+                        .as_ref()
+                        .and_then(|r| r.messages.last())
+                        .map(|m| m.message_id.clone())
+                });
                 let mut applied_snapshot = false;
                 match room_res {
                     Ok(BotRpcResponse::GroupRoom(view)) => {
@@ -807,6 +827,26 @@ impl Shell {
                     }
                     Ok(_) => {}
                     Err(err) => state.error = Some(err),
+                }
+                if applied_snapshot {
+                    let next_tail = state
+                        .room
+                        .as_ref()
+                        .and_then(|r| r.messages.last())
+                        .map(|m| m.message_id.clone());
+                    if !had_room {
+                        state.follow_paused = false;
+                        state.initial_scrolled.set(true);
+                        state.scroll.scroll_to_bottom();
+                    } else if next_tail != prev_tail && next_tail.is_some() {
+                        if is_group_timeline_near_bottom(&state.scroll) {
+                            state.follow_paused = false;
+                            state.scroll.scroll_to_bottom();
+                        } else {
+                            state.follow_paused = true;
+                        }
+                    }
+                    state.last_tail_message_id = next_tail;
                 }
                 if applied_snapshot {
                     // Drop cached member items for sessions that are no longer active so the room
@@ -1126,6 +1166,7 @@ impl Shell {
                             if let Some(room) = &mut room_state.room {
                                 room.active_thread_id
                                     .get_or_insert_with(|| message.thread_id.clone());
+                                let posted_id = message.message_id.clone();
                                 if !room
                                     .messages
                                     .iter()
@@ -1133,6 +1174,10 @@ impl Shell {
                                 {
                                     room.messages.push(message);
                                 }
+                                room_state.follow_paused = false;
+                                room_state.last_tail_message_id = Some(posted_id);
+                                room_state.initial_scrolled.set(true);
+                                room_state.scroll.scroll_to_bottom();
                             }
                         }
                         Ok(_) => {
@@ -1865,13 +1910,17 @@ impl Shell {
             }
         }
 
-        let scroll = self
-            .bot_ui
-            .group_chat
-            .rooms
-            .get(key)
-            .map(|r| r.scroll.clone());
+        let scroll = self.bot_ui.group_chat.rooms.get(key).map(|r| {
+            if !r.initial_scrolled.get()
+                && r.room.as_ref().is_some_and(|rv| !rv.messages.is_empty())
+            {
+                r.initial_scrolled.set(true);
+                r.scroll.scroll_to_bottom();
+            }
+            r.scroll.clone()
+        });
 
+        let wheel_key = key.clone();
         let mut scroller = div()
             .id("bot-group-timeline")
             .debug_selector(|| "bot-group-timeline".into())
@@ -1880,6 +1929,11 @@ impl Shell {
             .overflow_y_scroll()
             .px_4()
             .py_4()
+            .on_scroll_wheel(cx.listener(move |this, _, _, _| {
+                if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&wheel_key) {
+                    state.follow_paused = !is_group_timeline_near_bottom(&state.scroll);
+                }
+            }))
             .child(list);
         if let Some(handle) = scroll {
             scroller = scroller.track_scroll(&handle);

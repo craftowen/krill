@@ -73,6 +73,7 @@ impl Render for Dialog {
         };
         let has_repo_choice = !host_options.is_empty();
         let has_host_choice = host_options.len() > 1;
+        let select_menu_width = px(420.).min(inner_width.max(px(160.)));
         let body = match &self.phase {
             Phase::Edit(error) => body
                 .when(!host_options.is_empty(), |d| {
@@ -88,7 +89,7 @@ impl Render for Dialog {
                                 Select::new(&self.project_picker)
                                     .id("worktree-project-picker")
                                     .w_full()
-                                    .menu_width(px(420.))
+                                    .menu_width(select_menu_width)
                                     .placeholder(text::PROJECT_PLACEHOLDER.get())
                                     .search_placeholder(text::PROJECT_SEARCH.get())
                                     .accessibility_label(text::REPO_LABEL.get()),
@@ -108,7 +109,7 @@ impl Render for Dialog {
                                 Select::new(&self.host_picker)
                                     .id("worktree-host-picker")
                                     .w_full()
-                                    .menu_width(px(420.))
+                                    .menu_width(select_menu_width)
                                     .placeholder(text::HOST_LABEL.get())
                                     .search_placeholder(text::HOST_SEARCH.get())
                                     .accessibility_label(text::HOST_LABEL.get()),

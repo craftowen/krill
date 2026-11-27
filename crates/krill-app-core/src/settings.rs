@@ -4439,6 +4439,9 @@ impl SettingsView {
             return;
         }
         self.visible = visible;
+        if !visible {
+            self.stop_voice_shortcut_capture();
+        }
         if let Some(view) = &self.remote_krill {
             view.update(cx, |view, cx| {
                 view.set_visible(visible && self.tab == AdminTab::Machines, cx);
@@ -4482,6 +4485,7 @@ impl SettingsView {
         }
         self.disarm(cx);
         self.shortcuts = shortcuts::Recorder::default();
+        self.stop_voice_shortcut_capture();
         if tab == AdminTab::Machines && !self.tailscale_loaded {
             self.refresh_tailscale_peers(cx);
         }
@@ -4588,12 +4592,21 @@ impl SettingsView {
             self.rename.as_ref().map(|(_, input)| input),
             self.search.as_ref().map(|(input, _)| input),
             self.shortcuts.search.as_ref().map(|(input, _)| input),
+            self.voice.word_input.as_ref(),
         ]
         .into_iter()
         .flatten()
         {
             if crate::jump::entity_input_is_composing(input, window, app) {
                 return true;
+            }
+        }
+        if let Some(view) = self.remote_krill.as_ref() {
+            let handles = view.read(app).client_input_handles(app);
+            for input in &handles {
+                if crate::jump::entity_input_is_composing(input, window, app) {
+                    return true;
+                }
             }
         }
         if self
@@ -6120,6 +6133,8 @@ impl SettingsView {
                     &host,
                     req_gen,
                 );
+                let mut next_error: Option<SharedString> = None;
+                let mut notify_external = false;
                 match result {
                     Ok(consumed) => {
                         if host.is_local() {
@@ -6133,16 +6148,15 @@ impl SettingsView {
                             match consumed.outcome {
                                 ResetConsumeOutcome::Reset
                                 | ResetConsumeOutcome::AlreadyRedeemed => {
-                                    this.account_error = None;
-                                    cx.defer(notify_external_change);
+                                    notify_external = true;
                                 }
                                 ResetConsumeOutcome::NoCredit => {
-                                    this.account_error = Some(
+                                    next_error = Some(
                                         status_text::PROVIDER_RESET_USAGE_NO_CREDIT.get().into(),
                                     );
                                 }
                                 ResetConsumeOutcome::NothingToReset => {
-                                    this.account_error = Some(
+                                    next_error = Some(
                                         status_text::PROVIDER_RESET_USAGE_NOTHING.get().into(),
                                     );
                                 }
@@ -6151,12 +6165,17 @@ impl SettingsView {
                     }
                     Err(err) => {
                         if is_current {
-                            this.account_error = Some(err.into());
+                            next_error = Some(err.into());
                         }
                     }
                 }
                 if is_current {
+                    this.account_error = None;
                     this.refresh_accounts_async(cx);
+                    this.account_error = next_error;
+                    if notify_external {
+                        cx.defer(notify_external_change);
+                    }
                 }
                 cx.notify();
             })
@@ -7078,6 +7097,14 @@ impl SettingsView {
         .detach();
     }
 
+    fn apply_recording_pause_sync_outcome(&mut self, outcome: &Result<bool, PauseError>) {
+        match outcome {
+            Ok(_) => self.history_pause_supported = Some(true),
+            Err(PauseError::Unsupported) => self.history_pause_supported = Some(false),
+            Err(PauseError::Failed(_)) => {}
+        }
+    }
+
     /// 앱 시작 시 저장된 일시중지 값을 데몬에 전달한다. 실제 상태 디렉터리에서만 보내고,
     /// 실패는 조용히 둔다(토글을 누르면 다시 확인한다).
     pub fn sync_recording_paused(cx: &mut Context<Self>) {
@@ -7093,7 +7120,7 @@ impl SettingsView {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.history_pause_supported = Some(outcome.is_ok());
+                this.apply_recording_pause_sync_outcome(&outcome);
                 cx.notify();
             })
             .ok();
@@ -10377,17 +10404,35 @@ impl SettingsView {
                             .debug_selector(move || cmd_id.clone())
                             .child(gpui_component::input::Input::new(&cmd_input).small()),
                     )
-                    .child(
-                        div()
+                    .child({
+                        let args_label = div()
+                            .id(gpui::ElementId::Name(
+                                format!("admin-agent-args-label-{agent_id}").into(),
+                            ))
                             .text_color(p.muted_foreground)
-                            .child(text::AGENT_ARGS.get()),
-                    )
+                            .child(text::AGENT_ARGS.get());
+                        if self.search_focus.rendered.get() {
+                            args_label
+                        } else {
+                            self.search_focus
+                                .anchored(p, text::AGENT_ARGS.get(), args_label)
+                        }
+                    })
                     .child(gpui_component::input::Input::new(&args_input).small())
-                    .child(
-                        div()
+                    .child({
+                        let env_label = div()
+                            .id(gpui::ElementId::Name(
+                                format!("admin-agent-env-label-{agent_id}").into(),
+                            ))
                             .text_color(p.muted_foreground)
-                            .child(text::AGENT_ENV.get()),
-                    )
+                            .child(text::AGENT_ENV.get());
+                        if self.search_focus.rendered.get() {
+                            env_label
+                        } else {
+                            self.search_focus
+                                .anchored(p, text::AGENT_ENV.get(), env_label)
+                        }
+                    })
                     .child(gpui_component::input::Textarea::new(&env_input).small())
                     .when_some(status, |d, (msg, is_err)| {
                         d.child(
@@ -12788,6 +12833,10 @@ impl SettingsView {
         }
         // 접힌 곳에 있는 항목은 펼쳐 둔다.
         match tab {
+            AdminTab::Agents if title == text::AGENT_ARGS || title == text::AGENT_ENV => {
+                let default_agent = current(cx).default_agent;
+                self.agent_expanded.insert(default_agent);
+            }
             AdminTab::Machines => self.reveal_machine_search_hit(title, cx),
             AdminTab::Mobile => self.mobile.reveal_search_hit(title),
             _ => {}
@@ -13412,11 +13461,21 @@ impl Render for SettingsView {
                 .w_full()
                 .min_w_0()
                 .id("admin-tab-body")
-                .debug_selector(|| "admin-tab-body".into())
-                .when(
+                .debug_selector(|| "admin-tab-body".into());
+            let body = if !self.search_focus.rendered.get()
+                && self.search_focus.title.is_some_and(|t| {
+                    t == current_tab.title_message()
+                        || (current_tab == AdminTab::Updates && t == text::UPDATES_TITLE)
+                        || (current_tab == AdminTab::Disk && t == text::SPACE_TITLE)
+                }) {
+                self.search_focus
+                    .anchored(p, self.search_focus.title.map_or("", |t| t.get()), body)
+            } else {
+                body.when(
                     !self.search_focus.rendered.get() && self.search_pending,
                     |body| body.anchor_scroll(Some(self.search_focus.anchor.clone())),
-                );
+                )
+            };
             let inset = frame.body_inset();
             // 디스크의 삭제 띠는 스크롤되지 않게 본문 아래에 둔다.
             let footer = (current_tab == AdminTab::Disk)
@@ -13949,6 +14008,50 @@ mod host_fence_tests {
                 );
                 prompt.update(cx, |ta, cx| ta.unmark_text(window, cx));
                 assert!(!v.input_is_composing(window, cx));
+
+                // UI-14: voice.word_input preedit must be detected.
+                let word_input = mk_input(window, cx);
+                v.voice.word_input = Some(word_input.clone());
+                word_input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "voice.word_input preedit must be detected"
+                );
+                word_input.update(cx, |input, cx| input.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+
+        // UI-14: PairingView (Machines -> Add another computer) client inputs preedit must be detected.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_tab(AdminTab::Machines, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let pairing = v
+                    .remote_krill
+                    .clone()
+                    .expect("Machines tab must initialize PairingView");
+                let handles = pairing.read(cx).client_input_handles(cx);
+                for input in handles {
+                    input.update(cx, |input, cx| {
+                        input.focus(window, cx);
+                        input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                    });
+                    assert!(
+                        v.input_is_composing(window, cx),
+                        "PairingView client input preedit must be detected"
+                    );
+                    input.update(cx, |input, cx| input.unmark_text(window, cx));
+                    assert!(!v.input_is_composing(window, cx));
+                }
             });
         });
 
@@ -13956,6 +14059,8 @@ mod host_fence_tests {
     }
 }
 mod updates;
+#[cfg(test)]
+mod v0334_tests;
 
 pub fn usage_color(pct: u8, normal: gpui::Hsla, p: &crate::ui::Palette) -> gpui::Hsla {
     match usage_tone(pct) {

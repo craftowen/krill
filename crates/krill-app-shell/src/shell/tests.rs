@@ -15348,3 +15348,374 @@ fn close_daemon_session_clears_workspace_closing_on_error(cx: &mut TestAppContex
         );
     });
 }
+
+#[gpui::test]
+fn bot_home_tab_is_protected_across_close_bulk_close_and_rename(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("ui03-bot-home-protect"));
+    let home_sid = SessionId(701);
+    let side_sid = SessionId(702);
+    let (home_pane, side_pane) = view.update(cx, |s, cx| {
+        let p0 = s.layout.active_tab().focused;
+        s.layout.set_session(p0, home_sid);
+        s.layout.new_tab();
+        let p1 = s.layout.active_tab().focused;
+        s.layout.set_session(p1, side_sid);
+        s.sidebar_bots = vec![section_bot(
+            "bot-alpha",
+            "Alpha",
+            vec![
+                live_chat("bot-alpha", 701, None),
+                live_chat("bot-alpha", 702, Some("side-thread")),
+            ],
+        )];
+        s.layout.activate(0);
+        cx.notify();
+        (p0, p1)
+    });
+    cx.run_until_parked();
+
+    // 1. Direct request_close_tab, maybe_close_pane, CloseTab, ClosePane, and begin_tab_rename on Home tab are all no-ops.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            assert!(s.is_bot_home_tab(0));
+            assert!(s.is_tab_unclosable(0));
+            s.request_close_tab(0, cx);
+            s.maybe_close_pane(home_pane, cx);
+            s.begin_tab_rename(0, window, cx);
+            assert!(s.tab_rename.is_none());
+        });
+    });
+    cx.simulate_keystrokes("cmd-w");
+    cx.simulate_keystrokes("cmd-shift-w");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.layout.tabs().len(), 2);
+        assert!(s.layout.tab_of_pane(home_pane).is_some());
+        assert!(!s.closed_sessions.contains(&home_sid));
+    });
+
+    // 2. Bulk close ("Close Other Tabs" / "Close Tabs to Left") from side tab preserves Home tab.
+    view.update(cx, |s, cx| {
+        let side_idx = s.layout.tab_of_pane(side_pane).unwrap();
+        s.close_other_tabs(side_idx, cx);
+        s.close_tabs_to_left(side_idx, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.layout.tab_of_pane(home_pane).is_some());
+        assert!(!s.closed_sessions.contains(&home_sid));
+    });
+}
+
+#[gpui::test]
+fn bot_group_chat_timeline_auto_scrolls_on_load_and_send_and_preserves_scroll_up(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupRoomView, BotGroupSummary,
+        BotId, BotRpcRequest, BotRpcResponse,
+    };
+    let (view, cx) = open(cx, state_path("ui04-group-scroll"));
+    let host = krill_app_core::hosts::HostId::Local;
+    let group_id = "grp-scroll".to_owned();
+    let bot_id = BotId::new("b1").unwrap();
+    let msgs: Vec<BotGroupMessage> = (0..30)
+        .map(|i| BotGroupMessage {
+            message_id: format!("m-{i}"),
+            group_id: group_id.clone(),
+            thread_id: "t-1".into(),
+            sender_id: "owner".into(),
+            sender_name: "Owner".into(),
+            body: format!("Message line {i}\n{}\n", "details ".repeat(12)),
+            mentions: Vec::new(),
+            created_at_ms: 1_700_000_000_000 + u64::try_from(i).unwrap() * 1000,
+            in_progress: false,
+        })
+        .collect();
+    let room_msgs = std::sync::Arc::new(std::sync::Mutex::new(msgs));
+    let room_msgs_rpc = room_msgs.clone();
+    let gid_rpc = group_id.clone();
+    let bid_rpc = bot_id.clone();
+
+    let key = super::bot_group_chat::GroupRoomKey {
+        host: host.clone(),
+        group_id: group_id.clone(),
+        thread_id: Some("t-1".into()),
+    };
+    let rpc: krill_bots_ui::bots::rpc::BotRpcCall = std::sync::Arc::new(move |req| match req {
+        BotRpcRequest::ReadGroupRoom { .. } => Ok(BotRpcResponse::GroupRoom(BotGroupRoomView {
+            group: BotGroupChat {
+                id: gid_rpc.clone(),
+                name: "Test Group".into(),
+                bot_ids: vec![bid_rpc.clone()],
+                description: String::new(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            reply_audience: BotGroupReplyAudience::All,
+            threads: Vec::new(),
+            active_thread_id: Some("t-1".into()),
+            messages: room_msgs_rpc.lock().unwrap().clone(),
+            has_earlier: true,
+            active_turns: Vec::new(),
+        })),
+        BotRpcRequest::SendGroupMessage { text, .. }
+        | BotRpcRequest::SendGroupMessageWithAudience { text, .. } => {
+            let posted = BotGroupMessage {
+                message_id: "m-new".into(),
+                group_id: gid_rpc.clone(),
+                thread_id: "t-1".into(),
+                sender_id: "owner".into(),
+                sender_name: "Owner".into(),
+                body: text.clone(),
+                mentions: Vec::new(),
+                created_at_ms: 1_700_000_999_000,
+                in_progress: false,
+            };
+            room_msgs_rpc.lock().unwrap().push(posted.clone());
+            Ok(BotRpcResponse::GroupMessagePosted {
+                message: posted,
+                dispatched_bots: Vec::new(),
+            })
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    cx.simulate_resize(gpui::size(px(900.), px(420.)));
+    view.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        s.bot_rpc_override = Some(rpc);
+        s.sidebar_bots = vec![section_bot("b1", "Bot1", Vec::new())];
+        s.sidebar_groups = vec![super::bot_section::SidebarGroup {
+            host: host.clone(),
+            summary: BotGroupSummary {
+                group: BotGroupChat {
+                    id: group_id.clone(),
+                    name: "Test Group".into(),
+                    bot_ids: vec![bot_id.clone()],
+                    description: String::new(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                reply_audience: BotGroupReplyAudience::All,
+                threads: Vec::new(),
+                latest_message: None,
+                active_turns: Vec::new(),
+            },
+        }];
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_group_pane(
+            pane,
+            Some(krill_app_core::layout::GroupPaneTarget {
+                group_id: group_id.clone(),
+                thread_id: Some("t-1".into()),
+            }),
+        );
+        s.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
+        s.poll_group_room(key.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // 1. Initial load scrolls down to the bottom of the overflowing timeline.
+    view.read_with(cx, |s, _| {
+        let state = s.bot_ui.group_chat.rooms.get(&key).unwrap();
+        let max_y = f32::from(state.scroll.max_offset().y);
+        let cur_y = -f32::from(state.scroll.offset().y);
+        assert!(
+            max_y > 50.0,
+            "timeline must overflow viewport; max_y={max_y}"
+        );
+        assert!(
+            (max_y - cur_y) <= 24.0,
+            "initial load must scroll to bottom (cur_y={cur_y}, max_y={max_y})"
+        );
+    });
+
+    // 2. When user scrolls up away from bottom, a polled reply preserves scroll position.
+    view.update(cx, |s, cx| {
+        let state = s.bot_ui.group_chat.rooms.get_mut(&key).unwrap();
+        state.scroll.set_offset(point(px(0.), px(0.)));
+        state.follow_paused = true;
+        room_msgs.lock().unwrap().push(BotGroupMessage {
+            message_id: "m-reply".into(),
+            group_id: group_id.clone(),
+            thread_id: "t-1".into(),
+            sender_id: "b1".into(),
+            sender_name: "Bot1".into(),
+            body: "New reply while scrolled up".into(),
+            mentions: Vec::new(),
+            created_at_ms: 1_700_000_500_000,
+            in_progress: false,
+        });
+        s.poll_group_room(key.clone(), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        let state = s.bot_ui.group_chat.rooms.get(&key).unwrap();
+        assert!(
+            f32::from(state.scroll.offset().y).abs() < 1.0,
+            "polled reply must preserve scrolled-up reading position: {:?}",
+            state.scroll.offset().y
+        );
+    });
+
+    // 3. Sending a new message re-enables follow and scrolls back to the bottom.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let input = s.ensure_group_composer(&key, window, cx);
+            input.update(cx, |st, cx| st.set_value("hello team", window, cx));
+            if let Some(r) = s.bot_ui.group_chat.rooms.get_mut(&key) {
+                r.draft = "hello team".into();
+            }
+            s.send_group_composer_message(key.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        let state = s.bot_ui.group_chat.rooms.get(&key).unwrap();
+        let max_y = f32::from(state.scroll.max_offset().y);
+        let cur_y = -f32::from(state.scroll.offset().y);
+        assert!(
+            (max_y - cur_y) <= 24.0,
+            "sending a message must scroll timeline back to bottom (cur_y={cur_y}, max_y={max_y})"
+        );
+    });
+}
+
+#[gpui::test]
+fn voice_shortcut_sync_retries_after_initial_error_and_updates_shortcut(cx: &mut TestAppContext) {
+    use krill_proto::voice::{VoiceConfig, VoiceReply};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (view, cx) = open(cx, state_path("ui06-voice-sync-retry"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    let voice_call: krill_app_core::voice::VoiceCall = Arc::new(move |_| {
+        let n = calls_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "daemon starting",
+            ))
+        } else {
+            Ok(VoiceReply::Config(VoiceConfig {
+                desktop_shortcut: "cmd-shift-v".into(),
+                ..VoiceConfig::default()
+            }))
+        }
+    });
+
+    // 1. First sync fails transiently -> must not stay permanently locked as loaded.
+    view.update(cx, |s, cx| {
+        s.voice.call = Some(voice_call);
+        s.ensure_voice_shortcut_synced(cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.voice.shortcut_loaded,
+            "failed fetch must leave shortcut_loaded=false"
+        );
+        assert!(!s.voice.shortcut_loading);
+    });
+
+    // 2. Retry succeeds -> loads custom shortcut and marks shortcut_loaded=true.
+    view.update(cx, |s, cx| {
+        s.ensure_voice_shortcut_synced(cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.voice.shortcut_loaded);
+        assert_eq!(s.voice.shortcut, "cmd-shift-v");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[gpui::test]
+fn onboarding_wizard_traps_focus_blocks_shell_shortcuts_and_closes_on_escape_from_shell(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("ui11-onboarding-guard"));
+    let (root, env) = first_run_env("ui11-onboarding-guard");
+    cx.update(|_, cx| krill_app_core::onboarding::open_checks(&env, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("onboarding-wizard").is_some());
+    view.read_with(cx, |s, _| {
+        assert!(s.has_dialog_or_viewer_overlay());
+        assert!(s.has_blocking_overlay());
+    });
+
+    // Cmd+D must be blocked while onboarding modal is open.
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible().len(), 1);
+
+    // Tab stays trapped inside onboarding-wizard focus scope.
+    for _ in 0..8 {
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let wiz_focus = view
+                .read(cx)
+                .onboarding
+                .as_ref()
+                .unwrap()
+                .view
+                .read(cx)
+                .focus_handle();
+            assert!(
+                wiz_focus.contains_focused(window, cx),
+                "Tab must stay trapped inside onboarding-wizard"
+            );
+        });
+    }
+
+    // Even if focus moves back to Shell root, Cmd+W closes the onboarding modal via close_topmost_blocking_overlay.
+    cx.update(|window, cx| {
+        let shell_focus = view.read(cx).focus.clone();
+        window.focus(&shell_focus, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("onboarding-wizard").is_none());
+    view.read_with(cx, |s, _| {
+        assert!(s.onboarding.is_none());
+        assert_eq!(s.layout.tabs().len(), 1);
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[gpui::test]
+fn narrowed_sidebar_column_clips_titlebar_overflow(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("ui20-sidebar-clip"));
+    cx.simulate_resize(gpui::size(px(900.), px(600.)));
+    view.update(cx, |s, cx| {
+        s.sidebar_collapsed = false;
+        s.layout.sidebar_width = 140.0;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let sidebar_col = cx.debug_bounds("sidebar-column").unwrap();
+    assert!(
+        f32::from(sidebar_col.size.width) <= 141.0,
+        "sidebar-column must respect narrowed width 140px; got {:?}",
+        sidebar_col.size.width
+    );
+    let titlebar = cx.debug_bounds("sidebar-titlebar").unwrap();
+    assert!(
+        f32::from(titlebar.right()) <= f32::from(sidebar_col.right()) + 1.0,
+        "sidebar-titlebar right {} must stay clipped inside sidebar-column right {}",
+        f32::from(titlebar.right()),
+        f32::from(sidebar_col.right())
+    );
+    // Any titlebar toggle button must not extend past sidebar-column into the center tab bar.
+    if let Some(toggle) = cx.debug_bounds("sidebar-toggle-btn") {
+        assert!(
+            f32::from(toggle.right()) <= f32::from(sidebar_col.right()) + 1.0,
+            "sidebar-toggle-btn right {} bled past sidebar-column right {}",
+            f32::from(toggle.right()),
+            f32::from(sidebar_col.right())
+        );
+    }
+}

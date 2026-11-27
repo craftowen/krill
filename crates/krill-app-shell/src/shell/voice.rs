@@ -55,6 +55,8 @@ pub(super) struct ShellVoiceState {
     pub(super) phase: VoicePhase,
     pub(super) shortcut: String,
     pub(super) shortcut_loaded: bool,
+    pub(super) shortcut_loading: bool,
+    pub(super) shortcut_gen: u64,
     pub(super) error: Option<SharedString>,
     pub(super) last_dictated: HashMap<VoiceComposerTarget, String>,
     pub(super) call: Option<VoiceCall>,
@@ -68,6 +70,8 @@ impl Default for ShellVoiceState {
             phase: VoicePhase::Idle,
             shortcut: DEFAULT_DESKTOP_SHORTCUT.to_owned(),
             shortcut_loaded: false,
+            shortcut_loading: false,
+            shortcut_gen: 0,
             error: None,
             last_dictated: HashMap::new(),
             call: None,
@@ -105,24 +109,34 @@ impl ShellVoiceState {
 impl Shell {
     /// 데몬에 저장된 최신 `desktop_shortcut`을 비동기로 동기화한다.
     pub(super) fn ensure_voice_shortcut_synced(&mut self, cx: &mut Context<Self>) {
-        if self.voice.shortcut_loaded {
+        if self.voice.shortcut_loaded || self.voice.shortcut_loading {
             return;
         }
-        self.voice.shortcut_loaded = true;
+        self.voice.shortcut_loading = true;
+        self.voice.shortcut_gen = self.voice.shortcut_gen.wrapping_add(1);
+        let generation = self.voice.shortcut_gen;
         let call = self.voice.caller();
         cx.spawn(async move |this, cx| {
             let cfg = cx
                 .background_executor()
                 .spawn(async move { voice::fetch_config(&call) })
                 .await;
-            if let Ok(cfg) = cfg {
-                this.update(cx, |this, _| {
-                    if !cfg.desktop_shortcut.trim().is_empty() {
+            this.update(cx, |this, cx| {
+                if this.voice.shortcut_gen != generation {
+                    return;
+                }
+                this.voice.shortcut_loading = false;
+                if let Ok(cfg) = cfg {
+                    this.voice.shortcut_loaded = true;
+                    if !cfg.desktop_shortcut.trim().is_empty()
+                        && this.voice.shortcut != cfg.desktop_shortcut
+                    {
                         this.voice.shortcut = cfg.desktop_shortcut;
+                        cx.notify();
                     }
-                })
-                .ok();
-            }
+                }
+            })
+            .ok();
         })
         .detach();
     }

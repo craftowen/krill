@@ -236,13 +236,12 @@ fn usage_tone_badge(pct: Option<u8>) -> (ui::BadgeTone, &'static str) {
     }
 }
 
-fn render_cell(
-    selector: String,
+fn render_cell_inner(
     title: &str,
     win: Option<&UsageWindow>,
     width: gpui::Pixels,
     p: &ui::Palette,
-) -> gpui::Stateful<gpui::Div> {
+) -> gpui::Div {
     let display = krill_app_core::accounts::display::window(
         win,
         i64::try_from(krill_app_core::accounts::display::now()).unwrap_or(i64::MAX),
@@ -255,10 +254,7 @@ fn render_cell(
     } else {
         p.muted_foreground
     };
-    let debug_id = selector.clone();
     div()
-        .id(gpui::SharedString::from(selector))
-        .debug_selector(move || debug_id.clone())
         .w(width)
         .flex_none()
         .flex()
@@ -316,6 +312,19 @@ fn render_cell(
                         .child(reset)
                 }),
         )
+}
+
+fn render_cell(
+    selector: String,
+    title: &str,
+    win: Option<&UsageWindow>,
+    width: gpui::Pixels,
+    p: &ui::Palette,
+) -> gpui::Stateful<gpui::Div> {
+    let debug_id = selector.clone();
+    render_cell_inner(title, win, width, p)
+        .id(gpui::SharedString::from(selector))
+        .debug_selector(move || debug_id.clone())
 }
 
 fn switch_account(weak: &WeakEntity<Shell>, account: &AccountInfo, cx: &mut App) {
@@ -742,6 +751,150 @@ fn render_remote_account_usage(
         advanced_notes(snap, account)
             .into_iter()
             .map(|note| div().child(note)),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct LocalTabGhostDims {
+    content_width: gpui::Pixels,
+    master_width: gpui::Pixels,
+    column_width: gpui::Pixels,
+    column_max_height: gpui::Pixels,
+}
+
+fn render_local_tab_ghost(
+    body_groups: &[AccountGroup],
+    body_snap: &AccountsSnapshot,
+    body_columns: &[String],
+    dims: LocalTabGhostDims,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let LocalTabGhostDims {
+        content_width,
+        master_width,
+        column_width,
+        column_max_height,
+    } = dims;
+    let mut master_col = div()
+        .w(master_width)
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap_1p5();
+    for (idx, group) in body_groups.iter().enumerate() {
+        let Some(account) = group.selected() else {
+            continue;
+        };
+        let status = krill_app_core::accounts::display::account(
+            account,
+            body_snap.status_for(&account.id),
+            krill_app_core::accounts::display::now(),
+        );
+        let status_visible = status.status != AccountStatus::Ok;
+        master_col = master_col.child(
+            div()
+                .w_full()
+                .px_2()
+                .py_2()
+                .rounded(ui::RADIUS_SM)
+                .border_1()
+                .border_color(p.border)
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(div().size(ui::STATE_DOT).rounded_full().flex_none())
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_SM)
+                                        .font_weight(if account.active {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui::FontWeight::MEDIUM
+                                        })
+                                        .child(account_name(account)),
+                                ),
+                        )
+                        .child(div().flex_none().flex().items_center().gap_1().child(
+                            if account.active {
+                                ui::badge(
+                                    p,
+                                    ui::BadgeTone::Success,
+                                    account_text::ACCOUNT_IN_USE.get(),
+                                )
+                                .into_any_element()
+                            } else {
+                                Button::new(("ghost-local-use", idx))
+                                    .small()
+                                    .primary()
+                                    .disabled(true)
+                                    .label(provider_text::PROVIDER_USE.get())
+                                    .into_any_element()
+                            },
+                        )),
+                )
+                .when(account.host_default, |d| {
+                    d.child(ui::badge(
+                        p,
+                        ui::BadgeTone::Muted,
+                        provider_text::PROVIDER_DEFAULT_LOGIN.get(),
+                    ))
+                })
+                .child(div().w_full().flex().items_start().gap_2().children(
+                    body_columns.iter().map(|label| {
+                        render_cell_inner(
+                            &column_title(body_snap, label),
+                            comparison_window(body_snap, account, label),
+                            column_width,
+                            p,
+                        )
+                    }),
+                ))
+                .when(status_visible, |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .text_size(ui::TEXT_2XS)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(ui::badge(p, ui::BadgeTone::Muted, status.label))
+                                    .child(div().child(status.updated.clone())),
+                            )
+                            .child(div().w_full().min_w_0().h_4()),
+                    )
+                }),
+        );
+    }
+    div().w(content_width).py_1().flex().items_start().child(
+        div()
+            .w(master_width)
+            .max_h(column_max_height)
+            .overflow_hidden()
+            .flex_none()
+            .child(master_col),
     )
 }
 
@@ -1493,6 +1646,53 @@ pub(super) fn provider_usage_menu(
                 - ui::STATUS_PROVIDER_CHROME_RESERVE.to_pixels(window.rem_size()))
             .clamp(ui::SPACE_4, ui::STATUS_PROVIDER_BODY_MAX_HEIGHT);
             let remote_tab = is_remote_tab_for(cx, provider, has_remote_hosts);
+            // Account for the local row's .py_1() at the current zoom.
+            let column_max_height = (body_max_height - window.rem_size() * 0.5).max(ui::SPACE_1);
+            if has_remote_hosts && remote_tab {
+                let local_ghost = render_local_tab_ghost(
+                    &body_groups,
+                    &body_snap,
+                    &body_columns,
+                    LocalTabGhostDims {
+                        content_width,
+                        master_width,
+                        column_width,
+                        column_max_height,
+                    },
+                    p,
+                );
+                let remote_view = render_remote_hosts_tab(
+                    provider,
+                    &body_other_hosts,
+                    content_width,
+                    &body_weak,
+                    &body_menu,
+                    p,
+                );
+                return div()
+                    .w(content_width)
+                    .grid()
+                    .child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .invisible()
+                            .child(local_ghost),
+                    )
+                    .child(
+                        div()
+                            .row_start(1)
+                            .col_start(1)
+                            .child(provider_body_viewport(
+                                "status-provider-remote-scroll",
+                                remote_view,
+                                content_width,
+                                body_max_height,
+                            )),
+                    )
+                    .into_any_element();
+            }
+
             let selected_group = selected_account_for(cx, provider, &body_groups);
             let selected_id = selected_group
                 .as_ref()
@@ -1663,11 +1863,8 @@ pub(super) fn provider_usage_menu(
                 );
             }
 
-            // Account for the local row's .py_1() at the current zoom.
-            let column_max_height = (body_max_height - window.rem_size() * 0.5).max(ui::SPACE_1);
             let detail_max_height = (room - ui::SPACE_2 - px(2.)).min(px(560.)).max(ui::SPACE_4);
-            let detail_flyout = if !remote_tab
-                && let Some(panel_group) = selected_group
+            let detail_flyout = if let Some(panel_group) = selected_group
                 && let Some(panel_account) = panel_group.selected().cloned()
             {
                 let armed = body_weak
@@ -1774,54 +1971,25 @@ pub(super) fn provider_usage_menu(
                 return local_view.into_any_element();
             }
 
-            if remote_tab {
-                let remote_view = render_remote_hosts_tab(
-                    provider,
-                    &body_other_hosts,
-                    content_width,
-                    &body_weak,
-                    &body_menu,
-                    p,
-                );
-                div()
-                    .w(content_width)
-                    .grid()
-                    .child(
-                        div()
-                            .row_start(1)
-                            .col_start(1)
-                            .invisible()
-                            .child(local_view),
-                    )
-                    .child(
-                        div()
-                            .row_start(1)
-                            .col_start(1)
-                            .child(provider_body_viewport(
-                                "status-provider-remote-scroll",
-                                remote_view,
-                                content_width,
-                                body_max_height,
-                            )),
-                    )
-                    .into_any_element()
-            } else {
-                let remote_ghost =
-                    render_remote_hosts_tab_ghost(provider, &body_other_hosts, content_width, p);
-                div()
-                    .w(content_width)
-                    .grid()
-                    .child(div().row_start(1).col_start(1).invisible().child(
-                        provider_body_viewport(
+            let remote_ghost =
+                render_remote_hosts_tab_ghost(provider, &body_other_hosts, content_width, p);
+            div()
+                .w(content_width)
+                .grid()
+                .child(
+                    div()
+                        .row_start(1)
+                        .col_start(1)
+                        .invisible()
+                        .child(provider_body_viewport(
                             "status-provider-remote-scroll",
                             remote_ghost,
                             content_width,
                             body_max_height,
-                        ),
-                    ))
-                    .child(div().row_start(1).col_start(1).child(local_view))
-                    .into_any_element()
-            }
+                        )),
+                )
+                .child(div().row_start(1).col_start(1).child(local_view))
+                .into_any_element()
         })
         .disabled(true),
     );

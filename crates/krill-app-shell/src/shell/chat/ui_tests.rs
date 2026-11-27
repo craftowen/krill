@@ -6571,3 +6571,66 @@ fn remote_chat_image_stages_via_remote_fs_and_recovers_after_transient_error(
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[gpui::test]
+fn removing_attached_image_leaves_send_disabled_and_hides_queue_steer(cx: &mut TestAppContext) {
+    use krill_proto::control::AgentState;
+    let dir = TestTempDir::new("chat-removed-image-empty");
+    let img_path = dir.path().join("shot.png");
+    image::RgbaImage::from_pixel(32, 32, image::Rgba([200, 40, 40, 255]))
+        .save(&img_path)
+        .unwrap();
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-removed-image-empty",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            let recorded = sent.clone();
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            let _ = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            shell.attach_dropped_paths_to_chat(
+                &local_key(SESSION),
+                &gpui::ExternalPaths(vec![img_path.clone()].into()),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // Remove the attached image (leaving only the dead removed-image inline token in TextareaState).
+    let remove_btn = cx.debug_bounds("chat-attachment-remove-0").unwrap();
+    cx.simulate_click(remove_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // While idle: clicking Send must be a disabled no-op (zero bytes sent).
+    if let Some(send_btn) = cx.debug_bounds("desktop-chat-send") {
+        cx.simulate_click(send_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    assert!(sent.lock().unwrap().is_empty());
+
+    // While working: Queue and Steer must be hidden because draft is effectively empty after stripping removed image tokens.
+    set_phase2b_session_state(&shell, cx, AgentState::Working, 500);
+    assert!(
+        cx.debug_bounds("chat-composer-queue").is_none(),
+        "UI-12: Queue must be hidden when only a removed-image token remains"
+    );
+    assert!(
+        cx.debug_bounds("chat-composer-steer").is_none(),
+        "UI-12: Steer must be hidden when only a removed-image token remains"
+    );
+}

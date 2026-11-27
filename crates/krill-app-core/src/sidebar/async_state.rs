@@ -815,7 +815,7 @@ mod tests {
             &options,
             &lin,
             &ui,
-            &[repo.clone(), card.clone()],
+            &[(HostId::Local, repo.clone()), (HostId::Local, card.clone())],
             &[],
         )
         .unwrap();
@@ -823,7 +823,7 @@ mod tests {
         let (release, held) = tokio::sync::oneshot::channel();
         sidebar.update(cx, |s, cx| {
             s.disk.next_initial_io = Some(held);
-            s.project_order = vec![card.clone(), repo.clone()];
+            s.project_order = vec![(HostId::Local, card.clone()), (HostId::Local, repo.clone())];
             s.set_group_by(options::GroupBy::WorkspaceStatus, cx);
             s.set_group_by(options::GroupBy::Repo, cx);
             s.set_card_property(options::CardProperty::Issue, true, cx);
@@ -854,7 +854,7 @@ mod tests {
             &options,
             &lin,
             &ui,
-            &[repo.clone(), card.clone()],
+            &[(HostId::Local, repo.clone()), (HostId::Local, card.clone())],
             &[],
         )
         .unwrap();
@@ -862,7 +862,10 @@ mod tests {
         cx.run_until_parked();
         let (saved_prefs, saved_options, saved_lin, saved_ui, saved_order, _) =
             load_state(&path).unwrap();
-        assert_eq!(saved_order, [card.clone(), repo.clone()]);
+        assert_eq!(
+            saved_order,
+            [(HostId::Local, card.clone()), (HostId::Local, repo.clone()),]
+        );
         assert_eq!(saved_options.group_by, options::GroupBy::Repo);
         assert_eq!(saved_options.sort_by, options::SortBy::Recent);
         assert!(saved_options.card_properties.issue);

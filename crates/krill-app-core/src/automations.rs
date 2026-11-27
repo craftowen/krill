@@ -23,8 +23,8 @@ use krill_proto::schedule::{
 use crate::i18n::catalog::automations as text;
 use crate::i18n::catalog::settings as stext;
 use crate::settings::schedules::{
-    capture_session_output, format_command_args, format_run_minute, parse_command_args,
-    run_phase_badge_spec,
+    RunOutcome, capture_session_output, format_command_args, format_run_minute, parse_command_args,
+    run_outcome, run_outcome_badge_spec,
 };
 use crate::ui;
 
@@ -454,6 +454,7 @@ pub struct EditorModal {
 pub struct View {
     focus: FocusHandle,
     modal_focus: FocusHandle,
+    restore_focus_pending: Option<()>,
     state_dir: Option<PathBuf>,
     default_cwd: String,
     screen: PageView,
@@ -510,6 +511,7 @@ impl View {
         let mut view = Self {
             focus: cx.focus_handle(),
             modal_focus: cx.focus_handle(),
+            restore_focus_pending: None,
             state_dir,
             default_cwd: fallback_cwd,
             screen: PageView::List,
@@ -769,15 +771,23 @@ impl View {
             })
         };
 
+        let id_input = make_input(text::NAME_PLACEHOLDER.get(), init_id, window, cx);
+        let cron_input = make_input(
+            stext::SCHEDULE_FIELD_CRON_PLACEHOLDER.get(),
+            init_cron,
+            window,
+            cx,
+        );
+        if editing_id.is_some() {
+            cron_input.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            id_input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        self.restore_focus_pending = None;
         self.modal = Some(EditorModal {
             editing_id,
-            id: make_input(text::NAME_PLACEHOLDER.get(), init_id, window, cx),
-            cron: make_input(
-                stext::SCHEDULE_FIELD_CRON_PLACEHOLDER.get(),
-                init_cron,
-                window,
-                cx,
-            ),
+            id: id_input,
+            cron: cron_input,
             cwd: make_input(
                 stext::SCHEDULE_FIELD_CWD_PLACEHOLDER.get(),
                 init_cwd,
@@ -847,12 +857,22 @@ impl View {
     }
 
     pub fn close_modal(&mut self, cx: &mut Context<Self>) {
+        self.close_modal_in(None, cx);
+    }
+
+    fn close_modal_in(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         if self.modal.as_ref().is_some_and(|m| m.submitting) {
             return;
         }
         self.form_generation = self.form_generation.wrapping_add(1);
         self.modal = None;
         self.template_menu_open = false;
+        if let Some(window) = window {
+            self.restore_focus_pending = None;
+            window.focus(&self.focus, cx);
+        } else {
+            self.restore_focus_pending = Some(());
+        }
         cx.notify();
     }
 
@@ -1133,12 +1153,12 @@ impl View {
         match self.last_run_filter {
             LastRunFilter::All => {}
             LastRunFilter::Failed => {
-                if last_run.is_none_or(|r| r.phase != "failed") {
+                if last_run.is_none_or(|r| run_outcome(r) != RunOutcome::Failed) {
                     return false;
                 }
             }
             LastRunFilter::Succeeded => {
-                if last_run.is_none_or(|r| r.phase != "finished") {
+                if last_run.is_none_or(|r| run_outcome(r) != RunOutcome::Succeeded) {
                     return false;
                 }
             }
@@ -1345,6 +1365,7 @@ impl View {
 
     fn render_list_view(
         &mut self,
+        rem_size: gpui::Pixels,
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -1838,13 +1859,13 @@ impl View {
                 };
                 let last_run = self.latest_run_for(&id);
                 let (last_run_text, last_run_color) = if let Some(r) = last_run {
-                    let (_, phase_label) = run_phase_badge_spec(&r.phase);
-                    let color = if r.phase == "failed" {
-                        p.destructive
-                    } else if r.phase == "finished" {
-                        p.success
-                    } else {
-                        p.muted_foreground
+                    let (_, phase_label) = run_outcome_badge_spec(r);
+                    let color = match run_outcome(r) {
+                        RunOutcome::Failed => p.destructive,
+                        RunOutcome::Succeeded => p.success,
+                        RunOutcome::Active | RunOutcome::Skipped | RunOutcome::Unknown => {
+                            p.muted_foreground
+                        }
                     };
                     (
                         format!("{phase_label} · {}", format_run_minute(r.minute)),
@@ -2138,10 +2159,10 @@ impl View {
                                 div()
                                     .debug_selector(|| "automations-table".into())
                                     .flex_1()
-                                    // Column widths + seven gaps + horizontal padding.
+                                    // Column widths + seven rem-scaled gaps + rem-scaled horizontal padding + zoom-scaled actions column.
                                     .min_w(
-                                        px(140. + 136. + 108. + 116. + 124. + 84. + 88. + 196.)
-                                            + ui::SPACE_3 * 9.,
+                                        px(140. + 136. + 108. + 116. + 124. + 84. + 88.)
+                                            + gpui::rems(14. + 0.75 * 9.).to_pixels(rem_size),
                                     )
                                     .h_full()
                                     .min_h_0()
@@ -2176,7 +2197,7 @@ impl View {
             self.runs.iter().filter(|r| r.id == id).cloned().collect();
         let completed_count = matching_runs
             .iter()
-            .filter(|r| r.phase == "finished")
+            .filter(|r| run_outcome(r) == RunOutcome::Succeeded)
             .count();
 
         let tab_bar = div()
@@ -2254,7 +2275,7 @@ impl View {
                 let last_run_str = matching_runs.first().map_or_else(
                     || text::LAST_RUN_NONE.get().to_owned(),
                     |r| {
-                        let (_, lbl) = run_phase_badge_spec(&r.phase);
+                        let (_, lbl) = run_outcome_badge_spec(r);
                         format!("{lbl} · {}", format_run_minute(r.minute))
                     },
                 );
@@ -2596,7 +2617,7 @@ impl View {
                     );
                 } else {
                     for (idx, run) in matching_runs.iter().enumerate() {
-                        let (tone, badge_label) = run_phase_badge_spec(&run.phase);
+                        let (tone, badge_label) = run_outcome_badge_spec(run);
                         let run_clone = run.clone();
                         let ret_id = sched.id.clone();
                         rows = rows.child(
@@ -2738,16 +2759,20 @@ impl View {
         let mut failed_7d = 0usize;
         for run in &self.runs {
             if run.minute >= min_7d {
-                if run.phase == "finished" {
-                    success_7d += 1;
-                    if run.minute >= min_24h {
-                        success_24h += 1;
+                match run_outcome(run) {
+                    RunOutcome::Succeeded => {
+                        success_7d += 1;
+                        if run.minute >= min_24h {
+                            success_24h += 1;
+                        }
                     }
-                } else if run.phase == "failed" {
-                    failed_7d += 1;
-                    if run.minute >= min_24h {
-                        failed_24h += 1;
+                    RunOutcome::Failed => {
+                        failed_7d += 1;
+                        if run.minute >= min_24h {
+                            failed_24h += 1;
+                        }
                     }
+                    RunOutcome::Active | RunOutcome::Skipped | RunOutcome::Unknown => {}
                 }
             }
         }
@@ -2794,12 +2819,10 @@ impl View {
             .filter(|r| {
                 let status_ok = match self.run_status_filter {
                     RunStatusFilter::All => true,
-                    RunStatusFilter::Successful => r.phase == "finished",
-                    RunStatusFilter::Failed => r.phase == "failed",
-                    RunStatusFilter::InProgress => {
-                        matches!(r.phase.as_str(), "started" | "spawned")
-                    }
-                    RunStatusFilter::Skipped => r.phase == "skipped",
+                    RunStatusFilter::Successful => run_outcome(r) == RunOutcome::Succeeded,
+                    RunStatusFilter::Failed => run_outcome(r) == RunOutcome::Failed,
+                    RunStatusFilter::InProgress => run_outcome(r) == RunOutcome::Active,
+                    RunStatusFilter::Skipped => run_outcome(r) == RunOutcome::Skipped,
                 };
                 if !status_ok {
                     return false;
@@ -2840,7 +2863,7 @@ impl View {
             );
         } else {
             for (idx, run) in filtered_runs.into_iter().enumerate() {
-                let (tone, badge_label) = run_phase_badge_spec(&run.phase);
+                let (tone, badge_label) = run_outcome_badge_spec(&run);
                 let run_click = run.clone();
                 rows = rows.child(
                     div()
@@ -3080,7 +3103,7 @@ impl View {
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (tone, badge_label) = run_phase_badge_spec(&run.phase);
+        let (tone, badge_label) = run_outcome_badge_spec(run);
         let run_id = run.id.clone();
 
         div()
@@ -3105,11 +3128,14 @@ impl View {
                     .border_color(p.border)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .gap_0p5()
                             .child(
                                 div()
+                                    .truncate()
                                     .text_size(ui::TEXT_MD)
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.foreground)
@@ -3117,6 +3143,7 @@ impl View {
                             )
                             .child(
                                 div()
+                                    .truncate()
                                     .text_size(ui::TEXT_XS)
                                     .text_color(p.muted_foreground)
                                     .child(format!(
@@ -3128,6 +3155,7 @@ impl View {
                     )
                     .child(
                         div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -3218,7 +3246,9 @@ impl View {
             .w(px(960.))
             .max_w((window.viewport_size().width - ui::SPACE_4 * 2.).max(px(0.)))
             .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).max(px(0.)))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_modal(cx)))
+            .on_mouse_down_out(
+                cx.listener(|this, _, window, cx| this.close_modal_in(Some(window), cx)),
+            )
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
@@ -3274,7 +3304,9 @@ impl View {
                                     .debug_selector(|| "automations-modal-close".into())
                                     .icon(IconName::Close)
                                     .disabled(submitting)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_modal_in(Some(window), cx);
+                                    })),
                                 "automations-modal-close",
                                 text::CLOSE.get(),
                             )),
@@ -3607,7 +3639,9 @@ impl View {
                                 ui::ghost("automations-modal-cancel", stext::SCHEDULE_CANCEL.get())
                                     .debug_selector(|| "automations-modal-cancel".into())
                                     .disabled(submitting)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_modal_in(Some(window), cx);
+                                    })),
                             )
                             .child(
                                 ui::primary(
@@ -3682,52 +3716,61 @@ impl Render for View {
             }
         }
 
+        if self.modal.is_none() && self.restore_focus_pending.take().is_some() {
+            window.focus(&self.focus, cx);
+        }
         let top_bar = self.render_top_bar(p, cx);
         let main_content = match self.screen.clone() {
-            PageView::List => self.render_list_view(p, cx),
+            PageView::List => self.render_list_view(window.rem_size(), p, cx),
             PageView::Detail { id, tab } => self.render_detail_view(&id, tab, p, cx),
             PageView::RunsDashboard => self.render_runs_dashboard(p, cx),
             PageView::RunDetails { run, .. } => self.render_run_details_view(&run, p, cx),
         };
         let modal = self.render_editor_modal(window, p, cx);
 
-        div()
-            .id("automations-page")
-            .debug_selector(|| "automations-page".into())
-            .track_focus(&self.focus)
-            .capture_action(
-                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
-                    if this.input_is_composing(window, cx) {
-                        window.prevent_default();
+        ui::modal_focus_scope(
+            div()
+                .id("automations-page")
+                .debug_selector(|| "automations-page".into())
+                .capture_action(cx.listener(
+                    |this, _: &gpui_component::input::Escape, window, cx| {
+                        if this.input_is_composing(window, cx) {
+                            window.prevent_default();
+                        }
+                    },
+                ))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                        if window.default_prevented() || this.input_is_composing(window, cx) {
+                            return;
+                        }
+                        if this.modal.is_some() {
+                            this.close_modal_in(Some(window), cx);
+                        } else {
+                            this.handle_escape(cx);
+                        }
+                        cx.stop_propagation();
                     }
-                }),
-            )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
-                    if window.default_prevented() || this.input_is_composing(window, cx) {
-                        return;
-                    }
-                    this.handle_escape(cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .bg(p.background)
-            .font_family(ui::FONT_UI)
-            .text_size(ui::TEXT_MD)
-            .text_color(p.foreground)
-            .child(top_bar)
-            .children(self.error.clone().map(|err| {
-                div()
-                    .px_5()
-                    .pb_2()
-                    .child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
-            }))
-            .child(main_content)
-            .children(modal)
+                }))
+                .size_full()
+                .relative()
+                .flex()
+                .flex_col()
+                .bg(p.background)
+                .font_family(ui::FONT_UI)
+                .text_size(ui::TEXT_MD)
+                .text_color(p.foreground)
+                .child(top_bar)
+                .children(self.error.clone().map(|err| {
+                    div()
+                        .px_5()
+                        .pb_2()
+                        .child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
+                }))
+                .child(main_content)
+                .children(modal),
+            &self.focus,
+        )
     }
 }
 
@@ -4325,5 +4368,189 @@ mod tests {
             );
         });
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[gpui::test]
+    fn nonzero_finished_run_classified_as_failed_across_automations(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let now_min = current_epoch_minute();
+        let failed_run = ScheduleRun {
+            id: "nightly".into(),
+            minute: now_min.saturating_sub(5),
+            phase: "finished".into(),
+            status: Some(1),
+            session: None,
+            cwd: Some("/tmp/repo".into()),
+            output: Some("exit 1".into()),
+            error: None,
+            trigger: None,
+            run_number: None,
+            duration_ms: None,
+            timed_out: None,
+        };
+        let sched = Schedule {
+            id: "nightly".into(),
+            cron: "0 9 * * *".into(),
+            cwd: "/tmp/repo".into(),
+            command: vec!["claude".into(), "-p".into()],
+            prompt: "audit".into(),
+            enabled: true,
+            workspace_mode: WorkspaceMode::Isolate,
+            ..Schedule::default()
+        };
+        let (view, visual) = cx.add_window_view(|_, cx| {
+            let mut v = View::new(None, Some(PathBuf::from("/tmp/repo")), cx);
+            v.schedules = vec![sched];
+            v.runs = vec![failed_run.clone()];
+            v
+        });
+        visual.run_until_parked();
+
+        // List LastRunFilter::Failed matches; LastRunFilter::Succeeded does not.
+        view.update(visual, |v, _| {
+            v.last_run_filter = LastRunFilter::Failed;
+            assert!(v.matches_schedule(&v.schedules[0]));
+            v.last_run_filter = LastRunFilter::Succeeded;
+            assert!(!v.matches_schedule(&v.schedules[0]));
+            assert_eq!(run_outcome(&v.runs[0]), RunOutcome::Failed);
+            assert_eq!(
+                run_outcome_badge_spec(&v.runs[0]).0,
+                ui::BadgeTone::Destructive
+            );
+        });
+
+        // Runs Dashboard filters classify exit=1 finished run under Failed, never Successful.
+        view.update(visual, |v, cx| {
+            v.screen = PageView::RunsDashboard;
+            v.run_status_filter = RunStatusFilter::Failed;
+            cx.notify();
+        });
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("automations-runs-table").is_some());
+    }
+
+    #[gpui::test]
+    fn automations_modal_focus_scope_focuses_editor_and_restores_on_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, visual) =
+            cx.add_window_view(|_, cx| View::new(None, Some(PathBuf::from("/tmp/repo")), cx));
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let focus = view.read(cx).focus.clone();
+            window.focus(&focus, cx);
+        });
+        visual.run_until_parked();
+
+        // Tab stays trapped inside automations-page focus scope.
+        for _ in 0..8 {
+            visual.simulate_keystrokes("tab");
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                assert!(
+                    view.read(cx).focus.contains_focused(window, cx),
+                    "Tab must stay trapped inside automations-page"
+                );
+            });
+        }
+
+        // open_editor_modal moves focus inside modal_focus; close_modal restores focus to self.focus.
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| v.open_editor_modal(None, window, cx));
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            assert!(
+                view.read(cx).modal_focus.contains_focused(window, cx),
+                "open_editor_modal must move focus inside modal_focus"
+            );
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| v.close_modal_in(Some(window), cx));
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            assert!(
+                view.read(cx).focus.is_focused(window),
+                "close_modal must restore focus to self.focus"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn automations_table_delete_and_run_details_rerun_stay_unclipped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let sched = Schedule {
+            id: "daily".into(),
+            cron: "0 9 * * *".into(),
+            cwd: "/tmp/repo".into(),
+            command: vec!["claude".into(), "-p".into()],
+            prompt: "audit".into(),
+            enabled: true,
+            workspace_mode: WorkspaceMode::Isolate,
+            ..Schedule::default()
+        };
+        let (view, visual) = cx.add_window_view(|_, cx| {
+            let mut v = View::new(None, Some(PathBuf::from("/tmp/repo")), cx);
+            v.schedules = vec![sched];
+            v
+        });
+        // UI-19: Delete button fits inside automations-table at both 100% and 150% zoom.
+        for zoom in [1.0_f32, 1.5_f32] {
+            visual.update(|window, cx| {
+                window.set_rem_size(px(16. * zoom));
+                cx.refresh_windows();
+            });
+            visual.simulate_resize(gpui::size(px(1080.), px(700.)));
+            visual.run_until_parked();
+            let table = visual.debug_bounds("automations-table").unwrap();
+            let del = visual.debug_bounds("automation-delete-daily").unwrap();
+            assert!(
+                f32::from(del.right()) <= f32::from(table.right()) + 1.0,
+                "zoom={zoom}: automation-delete-daily right {} exceeds automations-table right {}",
+                f32::from(del.right()),
+                f32::from(table.right())
+            );
+        }
+
+        // UI-22: Long cwd in RunDetails truncates without pushing Rerun off-screen at 680px.
+        visual.update(|window, cx| {
+            window.set_rem_size(px(16.));
+            view.update(cx, |v, cx| {
+                let long_cwd = format!("/Users/dev/{}", "very-deep-worktree-segment/".repeat(7));
+                v.screen = PageView::RunDetails {
+                    run: Box::new(ScheduleRun {
+                        id: "daily-with-long-cwd".into(),
+                        minute: current_epoch_minute(),
+                        phase: "finished".into(),
+                        status: Some(0),
+                        session: None,
+                        cwd: Some(long_cwd),
+                        output: Some("ok".into()),
+                        error: None,
+                        trigger: None,
+                        run_number: None,
+                        duration_ms: None,
+                        timed_out: None,
+                    }),
+                    return_to_detail: None,
+                };
+                cx.notify();
+            });
+        });
+        visual.simulate_resize(gpui::size(px(680.), px(600.)));
+        visual.run_until_parked();
+        let rerun = visual.debug_bounds("automations-run-rerun").unwrap();
+        assert!(
+            f32::from(rerun.right()) <= 680.0,
+            "automations-run-rerun right {} clipped past 680px viewport",
+            f32::from(rerun.right())
+        );
     }
 }

@@ -110,6 +110,14 @@ impl Default for Panel {
     }
 }
 impl Panel {
+    #[cfg(test)]
+    pub(super) fn set_signed_out_relay_for_test(&mut self) {
+        self.mode = ConnectMode::Tunnel;
+        self.account.required = true;
+        self.account.email = None;
+        self.offer = None;
+    }
+
     pub fn new(call: Call) -> Self {
         Self {
             mode: ConnectMode::Tunnel,
@@ -536,6 +544,19 @@ impl SettingsView {
         )
     }
 
+    pub(super) fn empty_qr_label(&self, busy: bool) -> &'static str {
+        let signed_out_relay = self.mobile.mode == ConnectMode::Tunnel
+            && self.mobile.account.required
+            && self.mobile.account.email.is_none();
+        if signed_out_relay {
+            text::QR_NEEDS_LOGIN.get()
+        } else if busy {
+            text::PREPARING.get()
+        } else {
+            text::QR_PLACEHOLDER.get()
+        }
+    }
+
     fn mobile_mode_desc(&self) -> &'static str {
         if self.mobile.mode == ConnectMode::Tailscale {
             text::TAILSCALE_DESC.get()
@@ -579,16 +600,7 @@ impl SettingsView {
                         )),
                 )
         } else {
-            let signed_out_relay = self.mobile.mode == ConnectMode::Tunnel
-                && self.mobile.account.required
-                && self.mobile.account.email.is_none();
-            let label = if signed_out_relay {
-                text::QR_NEEDS_LOGIN.get()
-            } else if self.mobile.pairing == PairingState::Waiting {
-                text::PREPARING.get()
-            } else {
-                text::QR_PLACEHOLDER.get()
-            };
+            let label = self.empty_qr_label(self.mobile.pairing == PairingState::Waiting);
             qr_placeholder(p, side, label)
                 .id("mobile-qr-empty")
                 .debug_selector(|| "mobile-qr-empty".into())
@@ -1128,17 +1140,9 @@ impl SettingsView {
                 .bg(crate::ui::theme::QR_LIGHT)
                 .child(qr_canvas(qr.clone()).size(qr_size))
         } else {
-            qr_placeholder(
-                p,
-                qr_size + px(16.),
-                if busy {
-                    text::PREPARING.get()
-                } else {
-                    text::QR_PLACEHOLDER.get()
-                },
-            )
-            .id("mobile-page-qr-empty")
-            .debug_selector(|| "mobile-page-qr-empty".into())
+            qr_placeholder(p, qr_size + px(16.), self.empty_qr_label(busy))
+                .id("mobile-page-qr-empty")
+                .debug_selector(|| "mobile-page-qr-empty".into())
         };
 
         let mut actions = div().flex().flex_wrap().items_center().gap_2();

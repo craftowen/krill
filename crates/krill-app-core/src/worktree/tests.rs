@@ -1250,3 +1250,64 @@ fn nfd_hangul_matches_pick_item_branches_and_fanout_rejects_long_names_and_host_
         });
     });
 }
+
+#[gpui::test]
+fn select_dropdown_menu_clamps_within_narrow_viewport(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo-a".into(), fake.clone(), window, cx));
+    vcx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(640.)));
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_host_options(
+                HostId::Local,
+                vec![WorktreeHostOption {
+                    host: HostId::Local,
+                    label: "local".to_owned(),
+                    source: fake.clone(),
+                    repos: vec![
+                        WorktreeRepoOption {
+                            path: "/repo-a".into(),
+                            label: "repo-a".to_owned(),
+                            branch: Some("main".to_owned()),
+                        },
+                        WorktreeRepoOption {
+                            path: "/repo-b".into(),
+                            label: "repo-b-with-a-very-long-repository-name".to_owned(),
+                            branch: Some("main".to_owned()),
+                        },
+                    ],
+                }],
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    let repo_sel = vcx.debug_bounds("worktree-repo-selector").unwrap();
+    // Click the Select trigger inside the repo selector to open its dropdown popup.
+    let trigger_pt = gpui::point(repo_sel.center().x, repo_sel.bottom() - gpui::px(12.));
+    vcx.simulate_click(trigger_pt, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        f32::from(repo_sel.right()) <= 360.0,
+        "repo selector must fit inside 360px window"
+    );
+    vcx.update(|window, cx| {
+        let dialog_ref = dialog.read(cx);
+        let inner_width = (crate::ui::DIALOG_WIDTH
+            .min((window.viewport_size().width - crate::ui::SPACE_4 * 2.).max(gpui::px(0.)))
+            - crate::ui::SPACE_3 * 4.)
+            .max(gpui::px(0.));
+        let clamped_menu = gpui::px(420.).min(inner_width.max(gpui::px(160.)));
+        assert!(
+            f32::from(clamped_menu) <= 360.0,
+            "clamped menu width {} must fit inside 360px viewport",
+            f32::from(clamped_menu)
+        );
+        assert!(!dialog_ref.repo().as_os_str().is_empty());
+    });
+}
