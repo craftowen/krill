@@ -197,10 +197,12 @@ fn workflow_call_with_timeouts(
             })();
             match result {
                 Ok(Ok(out)) => {
+                    resolved.record_outcome_for_epoch(epoch, true, None);
                     return_pooled_conn(&resolved, PoolChannel::Workflow, conn, epoch);
                     return Ok(out);
                 }
                 Ok(Err(err)) => {
+                    resolved.record_outcome_for_epoch(epoch, true, None);
                     return_pooled_conn(&resolved, PoolChannel::Workflow, conn, epoch);
                     return Err(io::Error::other(err));
                 }
@@ -213,8 +215,12 @@ fn workflow_call_with_timeouts(
                                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                             ));
                     if attempt == 0 && retryable {
+                        if !from_pool {
+                            resolved.record_outcome_for_epoch(epoch, false, Some(&err));
+                        }
                         continue;
                     }
+                    resolved.record_outcome_for_epoch(epoch, false, Some(&err));
                     return Err(err);
                 }
             }
@@ -269,6 +275,7 @@ fn daemon_call_with_timeouts(
             let features = conn.negotiated.features;
             match exchange(features, &mut conn.stream, req) {
                 Ok(reply) => {
+                    resolved.record_outcome_for_epoch(epoch, true, None);
                     return_pooled_conn(&resolved, PoolChannel::History, conn, epoch);
                     return Ok(reply);
                 }
@@ -281,8 +288,12 @@ fn daemon_call_with_timeouts(
                                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                             ));
                     if attempt == 0 && retryable {
+                        if !from_pool {
+                            resolved.record_outcome_for_epoch(epoch, false, Some(&err));
+                        }
                         continue;
                     }
+                    resolved.record_outcome_for_epoch(epoch, false, Some(&err));
                     return Err(err);
                 }
             }

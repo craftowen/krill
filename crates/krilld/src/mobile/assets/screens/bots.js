@@ -129,6 +129,11 @@ default:
 return detail ? t(detail) : t("Couldn’t start the chat");
 }
 };
+const formatSource = (source, t) => {
+const raw = String(source || "").trim();
+if (!raw) return "";
+return raw.toLowerCase() === "email" ? t("Email") : t(raw);
+};
 const safeMsg = (e, t) => {
 const refusal = readBotRefusal(e);
 if (refusal) return mobileBotRefusalText(refusal, t);
@@ -137,6 +142,10 @@ if (!raw) return t("Request failed. Check the desktop connection and try again."
 if (/os error|sqlite|rusqlite|secrets\.enc|vault|dpapi|\/Users\/|\/home\/|\/var\/|\/tmp\/|\\\\/i.test(raw)) {
 return t("Request failed. Check the desktop connection and try again.");
 }
+if (/^group not found(?::|$)/i.test(raw)) return t("Group not found");
+if (/^group thread not found(?::|$)/i.test(raw)) return t("Group thread not found");
+if (/group message text must be between 1 and 32768 bytes/i.test(raw)) return t("Message must be between 1 and 32,768 bytes.");
+if (/^permission denied(?::|$)/i.test(raw)) return t("Permission denied");
 const botNotFound = /^bot not found:\s*(.+)$/i.exec(raw);
 if (botNotFound) return t("Bot not found: {0}", botNotFound[1]);
 const itemNotFound = /^bot item not found:\s*(.+)$/i.exec(raw);
@@ -676,10 +685,34 @@ return t("Created item");
 return raw;
 };
 const botDisplayName = (bots, botId) => bots.find((b) => b.id === botId)?.name || botId;
+function avatarContrastColor(hex) {
+const clean = String(hex || "").trim().replace(/^#/, "");
+let r, g, b;
+if (clean.length === 3 || clean.length === 4) {
+r = parseInt(clean[0] + clean[0], 16);
+g = parseInt(clean[1] + clean[1], 16);
+b = parseInt(clean[2] + clean[2], 16);
+} else if (clean.length === 6 || clean.length === 8) {
+r = parseInt(clean.slice(0, 2), 16);
+g = parseInt(clean.slice(2, 4), 16);
+b = parseInt(clean.slice(4, 6), 16);
+} else {
+return "#ffffff";
+}
+const lin = (v) => {
+const c = v / 255;
+return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+};
+const lum = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+return lum > 0.36 ? "#0a0a0a" : "#ffffff";
+}
 function renderAvatar(el, bot, avatarInfo) {
 const hasColor = isValidColor(bot?.avatar_color);
 const badge = el("span", undefined, `bot-avatar${hasColor ? " has-color" : ""}`);
-if (hasColor) badge.style.backgroundColor = bot.avatar_color;
+if (hasColor) {
+badge.style.backgroundColor = bot.avatar_color;
+badge.style.color = avatarContrastColor(bot.avatar_color);
+}
 if (avatarInfo && isSafeAvatarSrc(avatarInfo.mime, avatarInfo.data_base64)) {
 const img = el("img", undefined, "bot-avatar-img");
 img.alt = "";
@@ -722,12 +755,14 @@ throw err;
 }
 }
 const openBotDetail = (ctx, botId, hostId, tab) => {
+const prevHost = resolveHostConn(ctx, null)?.id ?? null;
+const hostChanged = Boolean(hostId && hostId !== prevHost);
 if (hostId && ctx.activateHost) ctx.activateHost(hostId);
 if (ctx.state?.ui) {
 ctx.state.ui.botPendingTab = tab || "chat";
 ctx.state.ui.activeBotGroup = null;
 }
-ctx.go(`/bots/${encodeURIComponent(botId)}`);
+ctx.go(`/bots/${encodeURIComponent(botId)}`, hostChanged);
 };
 /** Ensures a bot's Home Chat starts after an agent switch; resolves with the worded refusal, or null (`5fba3d89`). */
 async function ensureBotHomeChat(ctx, t, botId, hostId) {
@@ -1124,7 +1159,7 @@ const boxNodes = [];
 for (const req of pending) {
 const row = el("div", undefined, "bots-row");
 const copy = el("div", undefined, "bots-row-main");
-const meta = [req.source, botDisplayName(bots, req.bot_id), multiHost && req._hostName ? req._hostName : null]
+const meta = [formatSource(req.source, t), botDisplayName(bots, req.bot_id), multiHost && req._hostName ? req._hostName : null]
 .filter(Boolean)
 .join(" · ");
 copy.append(
@@ -1300,7 +1335,7 @@ const res = await fn();
 if (ctx.signal.aborted) return;
 if (toastMsg) ctx.toast?.(toastMsg);
 const shouldClose = typeof closeAfter === "function" ? closeAfter(res) : closeAfter;
-if (shouldClose) ctx.closeSheet?.();
+if (shouldClose && !sheetSignal?.aborted) ctx.closeSheet?.();
 await refreshHost(ctx, curItem._hostId).catch(() => {});
 ctx.syncTabBar?.();
 await onReload();
@@ -2029,7 +2064,7 @@ function openCreateBotSheet(ctx, t, reload, targetHosts = []) {
 const { el, button } = ctx;
 let pickedHostId = targetHosts[0]?.id || null;
 const agentsFor = (hid) => (targetHosts.find((h) => h.id === hid)?.snapshot?.agents || ctx.state.snapshot?.agents || []);
-ctx.sheet(t("New Bot"), [], t("Create an autonomous bot with its own workspace and soul."), (body) => {
+ctx.sheet(t("New Bot"), [], t("Create an autonomous bot with its own workspace and soul."), (body, sheetSignal) => {
 const hostSelect = el("select");
 hostSelect.setAttribute("aria-label", t("Desktop"));
 const agentSelect = el("select");
@@ -2086,7 +2121,7 @@ emojiInput.setAttribute("aria-label", t("Emoji"));
 let templates = [];
 rpcHost(ctx, pickedHostId, { action: "bots.templates" })
 .then((res) => {
-if (ctx.signal.aborted) return;
+if (ctx.signal.aborted || sheetSignal?.aborted) return;
 templates = res?.templates || [];
 for (const tpl of templates) {
 const opt = el("option", tpl.name);
@@ -2113,7 +2148,7 @@ description: descInput.value.trim(),
 ...(emojiInput.value.trim() ? { emoji: emojiInput.value.trim() } : {}),
 ...(tplSelect.value ? { template_id: tplSelect.value } : {}),
 });
-ctx.closeSheet?.();
+if (!sheetSignal?.aborted) ctx.closeSheet?.();
 ctx.toast?.(t("Bot created"));
 try {
 await refreshHost(ctx, pickedHostId);
@@ -2152,7 +2187,7 @@ selected.clear();
 for (const b of botsFor(pickedHostId).slice(0, 2)) selected.add(b.id);
 };
 resetSelection();
-ctx.sheet(t("New Group Chat"), [], t("Coordinate multiple bots in shared threads."), (body) => {
+ctx.sheet(t("New Group Chat"), [], t("Coordinate multiple bots in shared threads."), (body, sheetSignal) => {
 const hostSelect = el("select");
 hostSelect.setAttribute("aria-label", t("Desktop"));
 const nameInput = el("input");
@@ -2206,7 +2241,7 @@ name,
 bot_ids: [...selected],
 description: descInput.value.trim(),
 });
-ctx.closeSheet?.();
+if (!sheetSignal?.aborted) ctx.closeSheet?.();
 ctx.toast?.(t("Group created"));
 await reload();
 };
@@ -2337,13 +2372,31 @@ const submitGroup = async () => {
 if (!ready() || !activeGroupId) return;
 const text = groupTextarea.value.trim();
 if (!text) throw Error(t("Enter a message"));
-groupVoice?.onSend?.(text);
 const gSeq = groupLoadSeq;
 const lSeq = loadSeq;
 const gid = activeGroupId;
 const tid = activeThreadId;
 const hid = activeGroupHost;
 const dk = currentGroupDraftKey();
+if (text.toLowerCase() === "/clear") {
+const prevIds = new Set((groupView?.threads || []).map((th) => th.thread_id));
+const res = await rpcHost(ctx, hid, { action: "bots.groups.new_thread", group_id: gid });
+if (ctx.signal.aborted) return;
+if (dk) ctx.state.drafts?.delete?.(dk);
+if (gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
+groupTextarea.value = "";
+if (res?.group) {
+groupView = res.group;
+const created = (groupView.threads || []).find((th) => !prevIds.has(th.thread_id));
+activeThreadId = created?.thread_id || groupView.threads?.[0]?.thread_id || null;
+draw();
+groupMsgBox.scrollTop = groupMsgBox.scrollHeight;
+} else {
+await loadGroup(gid, null, hid);
+}
+return;
+}
+groupVoice?.onSend?.(text);
 await rpcHost(ctx, hid, {
 action: "bots.groups.send",
 group_id: gid,
@@ -2356,6 +2409,7 @@ if (dk) ctx.state.drafts?.delete?.(dk);
 if (gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
 groupTextarea.value = "";
 await loadGroup(gid, tid, hid);
+groupMsgBox.scrollTop = groupMsgBox.scrollHeight;
 };
 const groupSendBtn = button(t("Send"), submitGroup, "primary small");
 const groupControls = el("div", undefined, "bot-item-controls");
@@ -2380,7 +2434,41 @@ let failure = null;
 let loadSeq = 0;
 let groupLoadSeq = 0;
 let lastHostSig = "";
+let groupPollTimer = null;
+let groupStopping = false;
+const stopGroupPolling = () => {
+clearTimeout(groupPollTimer);
+groupPollTimer = null;
+};
+const syncGroupPolling = () => {
+const visible = typeof document === "undefined" || document.visibilityState !== "hidden";
+const activeRun = Boolean(
+groupView?.active_run ||
+(groupView?.messages || []).some((m) => m.in_progress),
+);
+if (ctx.signal.aborted || !ready() || hubMode !== "groups" || !activeGroupId || !activeRun || !visible) {
+stopGroupPolling();
+return;
+}
+if (groupPollTimer) return;
+groupPollTimer = setTimeout(() => {
+groupPollTimer = null;
+if (ctx.signal.aborted || !activeGroupId || hubMode !== "groups") return;
+loadGroup(activeGroupId, activeThreadId, activeGroupHost, { silent: true }).catch(() => {
+if (!ctx.signal.aborted) syncGroupPolling();
+});
+}, 2000);
+groupPollTimer?.unref?.();
+};
+ctx.signal.addEventListener("abort", stopGroupPolling, { once: true });
+if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+const onGroupVis = () => syncGroupPolling();
+document.addEventListener("visibilitychange", onGroupVis);
+ctx.signal.addEventListener("abort", () => document.removeEventListener("visibilitychange", onGroupVis), { once: true });
+}
 const clearActiveGroup = () => {
+stopGroupPolling();
+groupStopping = false;
 groupLoadSeq++;
 activeGroupId = null;
 activeGroupHost = null;
@@ -2453,10 +2541,13 @@ botSessions = hydratedSessions;
 loaded = true;
 return true;
 };
-async function loadGroup(groupId, threadId, hostId = activeGroupHost) {
+async function loadGroup(groupId, threadId, hostId = activeGroupHost, opts = {}) {
 if (!ready() || !groupId) return;
 const gSeq = ++groupLoadSeq;
 const lSeq = loadSeq;
+const nearBottom =
+!opts.silent ||
+(groupMsgBox.scrollHeight || 0) - (groupMsgBox.scrollTop || 0) - (groupMsgBox.clientHeight || 0) <= 64;
 const res = await rpcHost(ctx, hostId, {
 action: "bots.groups.read",
 group_id: groupId,
@@ -2473,6 +2564,8 @@ groupView?.threads?.[0]?.thread_id ||
 groupView?.messages?.at?.(-1)?.thread_id ||
 null;
 draw();
+if (nearBottom) groupMsgBox.scrollTop = groupMsgBox.scrollHeight;
+syncGroupPolling();
 }
 async function load(reset = false) {
 const targets = botHosts();
@@ -2730,8 +2823,10 @@ groupPromotedTitle.textContent = groupView.group?.name || t("Group chats");
 groupPromotedMembers.textContent = (groupView.group?.bot_ids || []).map((id) => botDisplayName(bots, id)).join(", ");
 const threadNodes = [];
 for (const th of groupView.threads || []) {
+const rawTitle = th.title || "";
+const thTitle = rawTitle === "Main thread" || rawTitle === "New thread" ? t(rawTitle) : rawTitle || t("Thread");
 const tb = button(
-th.title || t("Thread"),
+thTitle,
 () => loadGroup(activeGroupId, th.thread_id, activeGroupHost),
 th.thread_id === activeThreadId ? "filter-chip active" : "filter-chip",
 );
@@ -2765,13 +2860,17 @@ sync(threadBar, threadNodes);
 const topNodes = [threadBar];
 if (groupView.active_run) {
 const stopBtn = button(
-t("Stop"),
+t(groupStopping ? "Stopping…" : "Stop"),
 async () => {
+if (groupStopping) return;
 const gSeq = groupLoadSeq;
 const lSeq = loadSeq;
 const gid = activeGroupId;
 const tid = activeThreadId;
 const hid = activeGroupHost;
+groupStopping = true;
+draw();
+try {
 await rpcHost(ctx, hid, {
 action: "bots.groups.stop",
 group_id: gid,
@@ -2779,10 +2878,14 @@ group_id: gid,
 });
 if (ctx.signal.aborted || gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
 await loadGroup(gid, tid, hid);
+} finally {
+groupStopping = false;
+if (!ctx.signal.aborted) draw();
+}
 },
 "ghost small",
 );
-stopBtn.disabled = !ready();
+stopBtn.disabled = !ready() || groupStopping;
 topNodes.push(stopBtn);
 }
 sync(groupTop, topNodes);
@@ -2793,14 +2896,19 @@ msgNodes.push(el("p", t("No messages yet."), "muted"));
 } else {
 for (const msg of msgs) {
 const item = el("div", undefined, "bot-group-msg");
+const senderName =
+msg.sender_id === "owner" || msg.sender_name === "owner"
+? t("You")
+: msg.sender_name || msg.sender_id;
 item.append(
-el("strong", `${msg.sender_name || msg.sender_id}${msg.in_progress ? ` · ${t("Working")}` : ""}`),
+el("strong", `${senderName}${msg.in_progress ? ` · ${t("Working")}` : ""}`),
 el("p", msg.body || ""),
 );
 msgNodes.push(item);
 }
 }
 sync(groupMsgBox, msgNodes);
+syncGroupPolling();
 const draftKey = currentGroupDraftKey();
 if (draftKey !== lastGroupDraftKey) {
 lastGroupDraftKey = draftKey;
@@ -2900,7 +3008,7 @@ botId: req.bot_id,
 hostId: req._hostId,
 hostName: multiHost() ? req._hostName : null,
 title: req.sender_name || req.sender_id || t("Sender"),
-subtitle: [req.source, botDisplayName(bots, req.bot_id)].filter(Boolean).join(" · "),
+subtitle: [formatSource(req.source, t), botDisplayName(bots, req.bot_id)].filter(Boolean).join(" · "),
 request: req,
 });
 }
@@ -3585,6 +3693,20 @@ activeSessionId = bucket.activeSessions.get(botId);
 }
 return Boolean(exact || bot || activeSessionId);
 };
+function botLiveQuestion(wantSid) {
+const cached = ctx.state.chatCache?.get?.(wantSid);
+const lp = cached?.composerStatus?.live_prompt;
+if (lp?.kind !== "numbered_menu" || !Array.isArray(lp.options) || !lp.options.length) return null;
+return {
+identity: `lp:${wantSid}:${lp.prompt || ""}:${lp.options.map((o) => o?.label || "").join("\0")}`,
+token: { prompt: lp.prompt || "", options: lp.options },
+title: lp.prompt || t("Choose an answer"),
+multiple: false,
+enabled: ready(),
+choices: lp.options.map((o) => ({ label: String(o?.label || ""), checked: false })),
+_fromLivePrompt: true,
+};
+}
 function ensureChatMounted() {
 const wantSid = Number(activeSessionId);
 const canMount = Number.isSafeInteger(wantSid) && wantSid > 0 && typeof M.chat?.mount === "function";
@@ -3602,6 +3724,7 @@ return;
 ensureBotSessionEntry(wantSid);
 if (chatMountedSid === wantSid && chatHandle) {
 chatHandle.setVisible?.(true);
+chatHandle.setQuestion?.(botLiveQuestion(wantSid));
 chatHandle.update?.();
 return;
 }
@@ -3615,8 +3738,23 @@ sessionId: wantSid,
 agentIcon: M.agentIcon,
 visible: true,
 botSession: true,
+getQuestion: () => botLiveQuestion(wantSid),
+onAnswerQuestion: async (token, selected) => {
+const choice = Array.isArray(selected) ? selected[0] : Number(selected);
+await ctx.rpc({
+action: "live_prompt_reply",
+session: wantSid,
+expected_prompt: token?.prompt || "",
+choice,
+});
+if (!ctx.signal.aborted && chatMountedSid === wantSid) {
+chatHandle?.setQuestion?.(null, { settled: true });
+chatHandle?.update?.();
+}
+},
 onSwitchTerm: () => openBotTerminalSession(ctx, t, wantSid, null),
 });
+chatHandle?.setQuestion?.(botLiveQuestion(wantSid));
 }
 async function startOrOpenBotChat(promptText) {
 if (chatStarting || !ready()) return;
@@ -3961,7 +4099,7 @@ itemsCursor = res?.next_cursor || null;
 draw();
 }
 function openCreateItemSheet() {
-ctx.sheet(t("New Item"), [], t("Track a task or decision for this bot."), (body) => {
+ctx.sheet(t("New Item"), [], t("Track a task or decision for this bot."), (body, sheetSignal) => {
 const titleInput = el("input");
 titleInput.type = "text";
 titleInput.placeholder = t("Item title");
@@ -3980,7 +4118,7 @@ title,
 ...(descInput.value.trim() ? { description: descInput.value.trim() } : {}),
 status: "planned",
 });
-ctx.closeSheet?.();
+if (!sheetSignal?.aborted) ctx.closeSheet?.();
 ctx.toast?.(t("Item created"));
 await load(true);
 };
@@ -3989,7 +4127,7 @@ body.append(titleInput, descInput, button(t("Create Item"), create, "primary"));
 }
 function openEditAgentSheet() {
 if (!bot) return;
-ctx.sheet(t("Agent"), [], t("Change this bot's provider, model, or effort."), (body) => {
+ctx.sheet(t("Agent"), [], t("Change this bot's provider, model, or effort."), (body, sheetSignal) => {
 const snapshotAgents = ctx.state.snapshot?.agents || [];
 const baseChoices = [
 { id: "claude", name: "Claude Code" },
@@ -4063,7 +4201,7 @@ modelSelect.value = "";
 }
 rpcHost(ctx, null, { action: "bots.models", agent_id: agentId })
 .then((res) => {
-if (ctx.signal.aborted || seq !== modelSeq) return;
+if (ctx.signal.aborted || sheetSignal?.aborted || seq !== modelSeq) return;
 const listItems = Array.isArray(res?.models) ? res.models : [];
 modelSelect.replaceChildren();
 const d = el("option", t("Default"));
@@ -4106,7 +4244,7 @@ agent_id: nextAgent,
 ...(nextEffort ? { effort: nextEffort } : { clear_effort: true }),
 });
 if (res?.bot) bot = res.bot;
-ctx.closeSheet?.();
+if (!sheetSignal?.aborted) ctx.closeSheet?.();
 if (agentChanged && !bot?.paused) {
 const refusal = await ensureBotHomeChat(ctx, t, botId);
 ctx.toast?.(refusal || t("Saved"), refusal ? 3000 : undefined);
@@ -4248,7 +4386,7 @@ ctx.sheet(lbl, actions, t(sess.working ? "Working" : "Active"));
 }
 function openSessionsListSheet() {
 const live = liveBotSessions();
-ctx.sheet(t("Chats ({0})", live.length), [], "", (body) => {
+ctx.sheet(t("Chats ({0})", live.length), [], "", (body, sheetSignal) => {
 const grp = el("div", undefined, "sheet-group");
 if (!live.length) {
 grp.append(el("p", t("No active chats"), "empty"));
@@ -4285,7 +4423,7 @@ t("Stop"),
 async () => {
 await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: sid });
 ctx.toast?.(t("Session stopped"));
-ctx.closeSheet?.();
+if (!sheetSignal?.aborted) ctx.closeSheet?.();
 await load(true);
 },
 "icon-button tab-sheet-close",
@@ -4674,7 +4812,7 @@ for (const st of statuses) {
 const row = el("div", undefined, "bots-row");
 const main = el("div", undefined, "bots-row-main");
 main.append(
-el("strong", st.source),
+el("strong", formatSource(st.source, t)),
 el(
 "small",
 [statusLabel(st.state, t), st.account_label, errorCategoryLabel(st.error_category, t)].filter(Boolean).join(" · "),

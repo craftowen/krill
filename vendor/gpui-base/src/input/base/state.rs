@@ -2071,6 +2071,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.is_multi_line() && !action.secondary && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
+            if self.ime_marked_range.is_some() {
+                self.unmark_text(window, cx);
+            }
             if !self.selections.is_single() {
                 // Insert a newline (with per-line indent) at every cursor.
                 self.selections.merge_overlapping();
@@ -2862,6 +2865,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         let Some(mut new_text) = clipboard.text().filter(|text| !text.is_empty()) else {
             return;
         };
+        if self.ime_marked_range.is_some() {
+            self.unmark_text(window, cx);
+        }
         // A paste is one atomic edit, never part of a typing run.
         self.undo_manager.set_pending_intent(EditIntent::Atomic);
 
@@ -3571,6 +3577,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         M::hide_context_menu(self, cx);
+        if self.ime_marked_range.is_some() {
+            self.unmark_text(window, cx);
+        }
         self.undo_manager.break_transaction_coalescing();
 
         // NOTE: Do not cancel select, when blur.

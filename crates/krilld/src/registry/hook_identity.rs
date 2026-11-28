@@ -20,6 +20,7 @@ pub(super) fn origin(root: u32, foreground: Option<u32>, event: &HookEvent) -> O
     origin_with(root, foreground, event, |pid| {
         let start_us = crate::sys::start_us(pid).ok()?;
         let name = crate::sys::process_name(pid).ok()?;
+        let pgid = crate::sys::process_group(pid).ok()?;
         let parent = if pid == root {
             0
         } else {
@@ -28,6 +29,7 @@ pub(super) fn origin(root: u32, foreground: Option<u32>, event: &HookEvent) -> O
         // A PID must identify the same process throughout the kernel queries.
         (crate::sys::start_us(pid).ok()? == start_us).then_some(Process {
             parent,
+            pgid,
             name,
             start_us,
         })
@@ -44,6 +46,7 @@ pub(super) fn origin(_root: u32, _foreground: Option<u32>, _event: &HookEvent) -
 #[cfg(any(test, target_os = "macos"))]
 struct Process {
     parent: u32,
+    pgid: u32,
     name: String,
     start_us: u64,
 }
@@ -52,6 +55,7 @@ struct Process {
 #[cfg(any(test, target_os = "macos"))]
 struct Agent {
     pid: u32,
+    pgid: u32,
     start_us: u64,
     provider: ProviderKind,
 }
@@ -77,16 +81,30 @@ fn origin_with(
         return Origin::Unverified;
     };
     let event_us = event.id.unix_ns / 1_000;
-    let Some((_, Some(outer))) = ancestry(root, foreground, event_us, &mut process) else {
+    let Some((_, fg_outer)) = ancestry(root, foreground, event_us, &mut process) else {
         return Origin::Unverified;
     };
-    let Some((Some(caller), _)) = ancestry(root, event.ppid, event_us, &mut process) else {
+    let Some((Some(caller), Some(caller_outer))) =
+        ancestry(root, event.ppid, event_us, &mut process)
+    else {
         return Origin::Unverified;
     };
-    if caller == outer && caller.provider == expected {
-        Origin::Foreground
+    if let Some(outer) = fg_outer {
+        if caller == outer && caller.provider == expected {
+            Origin::Foreground
+        } else {
+            Origin::Auxiliary
+        }
+    } else if foreground == root {
+        // Krill's `set +m` launch wrapper keeps the foreground agent in `root`'s process group
+        // (`tcgetpgrp == root`), so `ancestry(root, foreground)` stops at the shell wrapper.
+        if caller == caller_outer && caller.pgid == foreground && caller.provider == expected {
+            Origin::Foreground
+        } else {
+            Origin::Auxiliary
+        }
     } else {
-        Origin::Auxiliary
+        Origin::Unverified
     }
 }
 
@@ -118,6 +136,7 @@ fn ancestry(
         if let Some(provider) = provider(&current.name) {
             let agent = Agent {
                 pid,
+                pgid: current.pgid,
                 start_us: current.start_us,
                 provider,
             };
@@ -184,10 +203,54 @@ mod tests {
         origin_with(root, fg, e, |pid| {
             rows.iter().find(|row| row.0 == pid).map(|row| Process {
                 parent: row.1,
+                pgid: fg.unwrap_or(pid),
                 name: row.2.into(),
                 start_us: 1,
             })
         })
+    }
+
+    #[test]
+    fn set_plus_m_wrapper_foreground_agent_is_foreground_and_nested_or_bg_is_auxiliary() {
+        let lookup = |pid| match pid {
+            10 => Some(Process {
+                parent: 1,
+                pgid: 10,
+                name: "zsh".into(),
+                start_us: 1,
+            }),
+            11 => Some(Process {
+                parent: 10,
+                pgid: 10,
+                name: "agy".into(),
+                start_us: 1,
+            }),
+            12 => Some(Process {
+                parent: 11,
+                pgid: 10,
+                name: "claude".into(),
+                start_us: 1,
+            }),
+            13 => Some(Process {
+                parent: 10,
+                pgid: 13,
+                name: "agy".into(),
+                start_us: 1,
+            }),
+            _ => None,
+        };
+        assert_eq!(
+            origin_with(10, Some(10), &event("agy", 11), lookup),
+            Origin::Foreground
+        );
+        assert_eq!(
+            origin_with(10, Some(10), &event("claude", 12), lookup),
+            Origin::Auxiliary
+        );
+        assert_eq!(
+            origin_with(10, Some(10), &event("agy", 13), lookup),
+            Origin::Auxiliary
+        );
     }
 
     #[test]
@@ -265,6 +328,7 @@ mod tests {
             assert_eq!(
                 origin_with(10, Some(11), &event("claude", 11), |pid| Some(Process {
                     parent: if pid == 11 { 10 } else { 1 },
+                    pgid: 11,
                     name: if pid == 11 { "claude" } else { "zsh" }.into(),
                     start_us: if pid == 11 { caller_start } else { root_start },
                 })),
@@ -281,6 +345,7 @@ mod tests {
                 queries += 1;
                 Some(Process {
                     parent: if pid == 11 { 12 } else { 11 },
+                    pgid: 11,
                     name: "claude".into(),
                     start_us: 1,
                 })
@@ -294,6 +359,7 @@ mod tests {
                 queries += 1;
                 Some(Process {
                     parent: pid.saturating_add(1),
+                    pgid: 1,
                     name: "claude".into(),
                     start_us: 1,
                 })

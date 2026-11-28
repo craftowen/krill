@@ -33,9 +33,8 @@ const UNVERIFIED: &str =
 const LIST_FAILED: &str = "Antigravity did not return its model list. Try again in a moment.";
 const LOADING: &str = "Antigravity models are still loading. Try again in a moment.";
 const WAIT: &str = "Wait for an idle Antigravity chat with an empty composer.";
-const CONTROL: &str = "Changes the model in this running Antigravity chat. Antigravity also saves it as the default for new sessions.";
-const NOTE: &str = "Antigravity also saves this as the default for new sessions.";
 const NOT_CONFIRMED: &str = "Antigravity received the model command, but its confirmation was not recognized. It will not be resent.";
+const FOOTER_SYNC_WAIT: Duration = Duration::from_millis(600);
 
 /// One row of `agy models`. When present, the effort is part of the id, so `/model <id>` sets both at once.
 #[derive(Debug, PartialEq, Eq)]
@@ -714,8 +713,8 @@ impl Adapter for Agy {
             return set(catalog, "reason", WAIT.into());
         }
         set(catalog, "supported", true.into());
-        set(catalog, "reason", CONTROL.into());
-        set(catalog, "note", NOTE.into());
+        super::remove(catalog, "reason");
+        super::remove(catalog, "note");
         if let Some(family) = footer_with(&screen, Some(&families))
             .and_then(|(label, _)| families.iter().find(|family| family.label == label))
         {
@@ -773,11 +772,13 @@ impl Adapter for Agy {
         }
         let command = format!("/model {}", level.id);
         let working = live.working();
-        super::command(
+        let (revision, seq) = super::command_waiting(
             &tap,
             working,
             revision.0,
+            seq.0,
             command.as_bytes(),
+            |screen| verified(screen) && composer(screen, None),
             |screen, pasted| {
                 verified(screen)
                     && if pasted {
@@ -791,19 +792,35 @@ impl Adapter for Agy {
         while started.elapsed() < CONFIRM {
             std::thread::sleep(Duration::from_millis(25));
             let (screen, after, _) = tap.capture();
-            if after.0 > revision.0
-                && composer(&screen, None)
-                // Mid-turn output pushes the note away, and the footer is Antigravity's own report.
-                && (working
-                    && footer_with(&screen, Some(&families))
-                        .is_some_and(|(label, eff)| label == family.label && eff == level.effort)
-                    || confirmed(&screen, &level.label)
-                        && native::contains_phrase(
-                            &native::fresh_text(&tap, seq.0),
-                            &format!("set to {}", level.label),
-                        ))
-            {
-                return Ok(done(false));
+            if after.0 > revision && composer(&screen, None) {
+                let footer_matched = footer_with(&screen, Some(&families))
+                    .is_some_and(|(label, eff)| label == family.label && eff == level.effort);
+                if working && footer_matched {
+                    return Ok(done(false));
+                }
+                if confirmed(&screen, &level.label)
+                    && native::contains_phrase(
+                        &native::fresh_text(&tap, seq),
+                        &format!("set to {}", level.label),
+                    )
+                {
+                    if !footer_matched {
+                        // Antigravity prints `⎿ Model set to ...` slightly before repainting its
+                        // bottom footer; wait briefly so an immediate follow-up `chat_composer` or
+                        // `set_effort` observes the fresh model.
+                        let sync_deadline = Instant::now() + FOOTER_SYNC_WAIT;
+                        while Instant::now() < sync_deadline {
+                            std::thread::sleep(Duration::from_millis(25));
+                            let (next_screen, _, _) = tap.capture();
+                            if footer_with(&next_screen, Some(&families)).is_some_and(
+                                |(label, eff)| label == family.label && eff == level.effort,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(done(false));
+                }
             }
         }
         Ok(json!({"applied":false,"supported":true,"reason":NOT_CONFIRMED}))
@@ -811,11 +828,18 @@ impl Adapter for Agy {
 
     fn set_effort(&self, context: &Context, live: &Live<'_>, effort: &str) -> io::Result<Value> {
         let (families, _) = cached(context);
-        let (label, _) = footer_with(
-            &live.tap()?.capture().0,
-            families.as_deref().map(Vec::as_slice),
-        )
-        .ok_or_else(no_current_model)?;
+        let tap = live.tap()?;
+        let deadline = Instant::now() + FOOTER_SYNC_WAIT;
+        let label = loop {
+            let (screen, _, _) = tap.capture();
+            if let Some((label, _)) = footer_with(&screen, families.as_deref().map(Vec::as_slice)) {
+                break label;
+            }
+            if !composer(&screen, None) || Instant::now() >= deadline {
+                return Err(no_current_model());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         let family = families
             .iter()
             .flat_map(|families| families.iter())

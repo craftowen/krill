@@ -51,7 +51,7 @@ globalThis.MkKeyboard = (() => {
     if (
       next > 0 &&
       doc?.activeElement?.closest?.(
-        ".command-dock,.chat-composer,.sheet,.workspace-search,.gate-card",
+        ".command-dock,.chat-composer,.sheet,.workspace-search,.gate-card,.bot-group-panel,.bot-item-form,.bot-first-chat-form,.bots-redeem-form,.voice-add-row,.chat-search-bar",
       ) &&
       ((globalThis.scrollY || 0) > 0 || (vv.offsetTop || 0) > 0)
     ) {
@@ -70,6 +70,7 @@ globalThis.MkKeyboard = (() => {
     if (changed) {
       inset = next;
       doc?.documentElement?.style.setProperty("--keyboard-inset", `${inset}px`);
+      doc?.documentElement?.classList?.toggle?.("keyboard-open", inset > 0);
     }
 
     if (notify) for (const fn of listeners) fn(inset);

@@ -86,13 +86,13 @@ return titleWord(stripped);
 return stripped;
 }
 // Build inline formatting with text nodes/elements only; transcript HTML never becomes markup.
-function renderInline(el, parent, text, depth = 0) {
+function renderInline(el, parent, text, depth = 0, richOpts = null) {
 if (depth >= 8) {
 parent.append(el("span", text));
 return;
 }
 const tokens =
-/\\([\\`*_~[\]])|(`+)(.*?)\2(?!`)|(\*\*|__|~~|\*)(?=\S)(.+?\S|\S)\4|(?<![A-Za-z0-9_])_(?=\S)(.+?\S|\S)_(?![A-Za-z0-9_])|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+/\\([\\`*_~[\]])|(`+)(.*?)\2(?!`)|(\*\*|__|~~|\*)(?=\S)(.+?\S|\S)\4|(?<![A-Za-z0-9_])_(?=\S)(.+?\S|\S)_(?![A-Za-z0-9_])|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
 let end = 0;
 for (const match of text.matchAll(tokens)) {
 if (match.index > end)
@@ -104,15 +104,34 @@ else if (mark || ubody !== undefined) {
 const tag =
 mark === "~~" ? "del" : mark === "**" || mark === "__" ? "strong" : "em",
 node = el(tag);
-renderInline(el, node, ubody ?? body, depth + 1);
+renderInline(el, node, ubody ?? body, depth + 1, richOpts);
 parent.append(node);
 } else if (/^(https?:\/\/|mailto:)/i.test(href)) {
 const node = el("a");
 node.setAttribute("href", href);
 node.setAttribute("target", "_blank");
 node.setAttribute("rel", "noopener noreferrer");
-renderInline(el, node, label, depth + 1);
+renderInline(el, node, label, depth + 1, richOpts);
 parent.append(node);
+} else if (/^file:\/\//i.test(href)) {
+const [rawPath, hashPart] = href.replace(/^file:\/\/(?:localhost)?/i, "").split("#");
+let decoded = rawPath;
+try { decoded = decodeURIComponent(rawPath); } catch {}
+const base = decoded.split(/[\\/]/).filter(Boolean).pop() || decoded;
+const lineBadge = hashPart && /^L\d+(?:-L?\d+)?/i.test(hashPart) ? `#${hashPart}` : "";
+const cleanLabel = label && !/^file:\/\//i.test(label) ? (lineBadge && !label.includes("#") ? `${label}${lineBadge}` : label) : `${base}${lineBadge}`;
+const chip = el("span", cleanLabel, "chat-file-chip");
+chip.setAttribute("title", `${decoded}${lineBadge}`);
+chip.tabIndex = 0;
+const copyPath = () => {
+if (richOpts?.onFileChip) { richOpts.onFileChip(`${decoded}${lineBadge}`, decoded); return; }
+try { globalThis.navigator?.clipboard?.writeText?.(`${decoded}${lineBadge}`); } catch {}
+};
+chip.addEventListener("click", copyPath);
+chip.addEventListener("keydown", (e) => {
+if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copyPath(); }
+});
+parent.append(chip);
 } else parent.append(el("span", match[0]));
 end = match.index + match[0].length;
 }
@@ -477,16 +496,23 @@ wrap = el("div", undefined, "chat-md"),
 blocks = parseRichBlocks(text);
 const rich = (tag, value, cls) => {
 const node = el(tag, undefined, cls);
-renderInline(el, node, value);
+renderInline(el, node, value, 0, richOpts);
 return node;
 };
-const cells = (line) =>
-line
-.trim()
-.replace(/^\|/, "")
-.replace(/\|$/, "")
-.split("|")
-.map((s) => s.trim());
+const cells = (line) => {
+const trimmed = line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "");
+const out = [];
+let cur = "", inCode = false;
+for (let i = 0; i < trimmed.length; i++) {
+const ch = trimmed[i];
+if (ch === "\\" && !inCode && trimmed[i + 1] === "|") { cur += "|"; i++; continue; }
+if (ch === "`") { inCode = !inCode; cur += ch; continue; }
+if (ch === "|" && !inCode) { out.push(cur.trim()); cur = ""; continue; }
+cur += ch;
+}
+out.push(cur.trim());
+return out;
+};
 const tableLine = (line) => /^\s*\|.*\|\s*$/.test(line),
 separator = (line) => cells(line).every((s) => /^:?-{3,}:?$/.test(s)),
 hrLine = (line) =>
@@ -896,6 +922,7 @@ if (e && !pinned(state, id, e)) state.chatCache.delete(id);
 }
 function mountChat(root, opts) {
 const { ctx, sessionId, onSwitchTerm, agentIcon, botSession } = opts,
+owningTransport = ctx.transport,
 agentName = (a) => M.agentName?.(a) || a;
 const { el, button, state } = ctx,
 drafts = state.drafts || (state.drafts = new Map()),
@@ -1169,27 +1196,36 @@ resetHistory ||
 // Only the reader moving up stops following; pins and late layout growth never do.
 let lastTop = 0,
 lastHeight = 0,
-lastViewport = feed.clientHeight;
+lastViewport = feed.clientHeight,
+programmaticScroll = false,
+userScrollIntentAt = 0;
 function syncScroll() {
 lastTop = feed.scrollTop;
 lastHeight = feed.scrollHeight;
 lastViewport = feed.clientHeight;
 }
+function markUserScroll() {
+userScrollIntentAt = Date.now();
+}
+feed.addEventListener("pointerdown", markUserScroll, { passive: true });
 feed.addEventListener("scroll", () => {
 const top = feed.scrollTop,
 gap = feed.scrollHeight - top - feed.clientHeight;
 // Layout clamps and our own pins/prepends are not a new request to read backwards.
+const recentUserIntent = Date.now() - userScrollIntentAt < 1500;
 const upward =
+!programmaticScroll &&
 top < lastTop - 1 &&
-lastHeight === feed.scrollHeight &&
-lastViewport === feed.clientHeight;
+(recentUserIntent ||
+(lastHeight === feed.scrollHeight &&
+lastViewport === feed.clientHeight));
+const prevTop = lastTop;
 syncScroll();
 // A reader back at the newest row resumes live updates. A trimmed window keeps its place.
 if (gap <= 1 && entry.live && !earlierPending && entry.items.at(-1)?.id === entry.live.items.at(-1)?.id) {
 returnToLatest();
 return;
 }
-if (!canReadEarlier()) return;
 if (gap <= 1) {
 following = true;
 if (entry.unreadFromId) {
@@ -1197,9 +1233,10 @@ entry.unreadFromId = null;
 unreadDivider?.remove();
 }
 } else if (upward) following = false;
-else if (gap < 60) following = true;
+else if (gap < 60 && top >= prevTop) following = true;
 syncLiveCardVisibility();
 syncJumpButton();
+if (!canReadEarlier()) return;
 const threshold = historyThreshold();
 if (top > threshold) {
 autoBlocked = null;
@@ -1214,11 +1251,11 @@ function earlierGesture() {
 if (!capability("chat_tail") || !canReadEarlier() || feed.scrollHeight > feed.clientHeight + 1) return;
 following = false; syncLiveCardVisibility(); fillPages = 0; autoBlocked = null; earlierQueued = true; drainEarlier();
 }
-feed.addEventListener("touchstart", e => {touchStartY = e.touches?.[0]?.clientY ?? null; touchHistory = false;}, {passive:true});
-feed.addEventListener("touchmove", e => {if (touchStartY !== null && !touchHistory && (e.touches?.[0]?.clientY ?? touchStartY) - touchStartY > 12) {touchHistory = true; earlierGesture();}}, {passive:true});
+feed.addEventListener("touchstart", e => {markUserScroll(); touchStartY = e.touches?.[0]?.clientY ?? null; touchHistory = false;}, {passive:true});
+feed.addEventListener("touchmove", e => {markUserScroll(); if (touchStartY !== null && !touchHistory && (e.touches?.[0]?.clientY ?? touchStartY) - touchStartY > 12) {touchHistory = true; earlierGesture();}}, {passive:true});
 feed.addEventListener("touchend", () => touchStartY = null, {passive:true});
 feed.addEventListener("touchcancel", () => touchStartY = null, {passive:true});
-feed.addEventListener("wheel", e => {const now = Date.now(), continuing = now - wheelAt < 250; wheelAt = now; if (e.deltaY < 0 && !continuing) earlierGesture();}, {passive:true});
+feed.addEventListener("wheel", e => {markUserScroll(); const now = Date.now(), continuing = now - wheelAt < 250; wheelAt = now; if (e.deltaY < 0 && !continuing) earlierGesture();}, {passive:true});
 function followLatest() {
 if (failedEarlier) requestLatest();
 earlierEpoch++;
@@ -1240,8 +1277,11 @@ syncLiveCardVisibility();
 syncJumpButton();
 }
 function pinLatest() {
-if (visible && following && !entry.live)
+if (visible && following && !entry.live) {
+programmaticScroll = true;
 feed.scrollTop = feed.scrollHeight || 0;
+programmaticScroll = false;
+}
 syncScroll();
 syncJumpButton();
 }
@@ -1444,15 +1484,7 @@ syncQueueButtons();
 input.addEventListener("change", syncDraft);
 input.addEventListener("blur", syncDraft);
 input.addEventListener("focus", () => {
-if (
-!entry.live &&
-(following ||
-(feed.scrollHeight || 0) -
-(feed.scrollTop || 0) -
-(feed.clientHeight || 0) <
-120)
-) {
-following = true;
+if (!entry.live && following) {
 pinLatestSoon();
 }
 });
@@ -2137,7 +2169,14 @@ if (choice.group === "efforts") {
 applyModel(null, choice.id); return;
 }
 const effort = entry.composerStatus?.effort;
-applyModel(choice, choice.efforts?.length === 1 ? choice.efforts[0] : choice.efforts?.includes(effort) ? effort : undefined); return;
+const modelEffort = chatAgent() === "claude"
+? undefined
+: choice.efforts?.length === 1
+? choice.efforts[0]
+: choice.efforts?.includes(effort)
+? effort
+: undefined;
+applyModel(choice, modelEffort); return;
 }
 const current = trigger();
 if (
@@ -2152,6 +2191,21 @@ return;
 }
 if (choice.text === "/model" && capability("composer_models")) {
 openModelCommand(token.start, token.end);
+return;
+}
+if (
+choice.text === "/clear" &&
+!currentAttachments().length &&
+!input.value.slice(0, token.start).trim() &&
+!input.value.slice(token.end).trim()
+) {
+closeSuggestions();
+entry.draftVersion = (entry.draftVersion || 0) + 1;
+input.value = "";
+drafts.delete(sessionId);
+saveDrafts();
+sizeInput();
+dispatchPrompt({ text: "/clear", photos: [], steer: false, fromDraft: true });
 return;
 }
 input.selectionStart = token.start;
@@ -2172,6 +2226,7 @@ if (event.key === "Escape") {
 event.preventDefault();
 event.stopPropagation();
 closeSuggestions();
+return;
 } else if (
 (event.key === "ArrowDown" || event.key === "ArrowUp") &&
 choices.length
@@ -2182,15 +2237,20 @@ choiceIndex =
 (choiceIndex + (event.key === "ArrowDown" ? 1 : choices.length - 1)) %
 choices.length;
 markChoice();
+return;
 } else if (
-event.key === "Enter" ||
-(event.key === "Tab" && choices.length)
+(event.key === "Enter" || event.key === "Tab") &&
+choices.length
 ) {
 event.preventDefault();
 event.stopPropagation();
-if (choices.length) selectChoice(choiceIndex);
-}
+selectChoice(choiceIndex);
 return;
+} else if (event.key === "Enter" && !choices.length) {
+closeSuggestions();
+} else {
+return;
+}
 }
 if (event.key === "Enter") {
 const modSubmit = Boolean(event.metaKey || event.ctrlKey),
@@ -2329,12 +2389,18 @@ current: effort === status?.effort,
 label: t(EFFORT_LABELS.get(effort) || effort),
 });
 entry.modelChoices = { scope: context, items };
+modelSheetState = {
+context,
+effortSupported,
+models: items.filter((it) => it.group === "models"),
+statusEfforts: status?.efforts || [],
+activeModelId: items.find((it) => it.group === "models" && it.current)?.id || activeModelId || null,
+activeEffort: status?.effort || null,
+};
 paintChoices(
 items,
 models.length
-? data?.note
-? t(data.note)
-: undefined
+? undefined
 : t(
 data?.reason ||
 "Model selection is unavailable for this session.",
@@ -2348,40 +2414,88 @@ t("Model selection is unavailable for this session."),
 );
 }
 }
+let modelSheetState = null,
+queuedEffort = null;
+function buildModelSheetItems(sheetState) {
+if (!sheetState) return [];
+const items = sheetState.models.map((m) => ({
+...m,
+current: m.id === sheetState.activeModelId,
+}));
+const activeItem = sheetState.models.find((m) => m.id === sheetState.activeModelId);
+const rawEfforts = activeItem?.efforts?.length
+? activeItem.efforts
+: sheetState.statusEfforts || [];
+const efforts = sortEfforts(rawEfforts);
+if (sheetState.effortSupported && efforts.length > 1) {
+for (const eff of efforts) {
+items.push({
+id: eff,
+group: "efforts",
+current: eff === sheetState.activeEffort,
+label: t(EFFORT_LABELS.get(eff) || eff),
+});
+}
+}
+return items;
+}
+function paintModelSheetError(message) {
+if (picker?.kind !== "models" || suggestions.hidden) return;
+const items = modelSheetState ? buildModelSheetItems(modelSheetState) : choices;
+paintChoices(items.length ? items : [], message);
+for (const child of Array.from(modelDialog.children || [])) {
+if (String(child.className || "").includes("chat-picker-note")) {
+child.className = "danger chat-picker-note";
+}
+}
+}
 async function applyModel(choice, effort) {
-if (
-entry.modelPending ||
-entry.sending ||
-!active() ||
-state.connection?.phase !== "ready"
-)
+if (entry.sending || !active() || state.connection?.phase !== "ready")
 return;
+if (entry.modelPending) {
+if (!choice && effort) queuedEffort = effort;
+return;
+}
 const context = scope(),
 version = suggestVersion,
-operation = { scope: context };
+operation = { scope: context },
+sendEffort = choice && chatAgent() === "claude" ? undefined : effort,
+prevSheetState = modelSheetState ? { ...modelSheetState } : null;
 entry.modelPending = operation;
 if (picker?.kind === "models" && !suggestions.hidden) {
 suggestions.dataset.pending = "true";
-const chosen =
-choice ||
-choices.find((item) => item.group === "efforts" && item.id === effort);
+if (modelSheetState && modelSheetState.context === context) {
+if (choice) {
+modelSheetState.activeModelId = choice.id;
+const nextEfforts = choice.efforts?.length
+? choice.efforts
+: modelSheetState.statusEfforts || [];
+if (sendEffort) modelSheetState.activeEffort = sendEffort;
+else if (nextEfforts.length && !nextEfforts.includes(modelSheetState.activeEffort)) {
+modelSheetState.activeEffort = nextEfforts[0] || null;
+}
+} else if (effort) {
+modelSheetState.activeEffort = effort;
+}
+paintChoices(buildModelSheetItems(modelSheetState));
+const chosen = choice
+? choices.find((item) => item.group === "models" && item.id === choice.id)
+: choices.find((item) => item.group === "efforts" && item.id === effort);
 if (chosen?.node) chosen.node.dataset.pending = "true";
-for (const item of choices) if (item.node) item.node.disabled = true;
-const container = choiceList.parentElement || suggestions;
-for (const child of Array.from(container.children || []))
-if (child.tagName === "P" || child.tag === "p") child.remove();
-container.insertBefore(
-el("p", t("Applying…"), "muted chat-picker-status"),
-choiceList,
-);
+for (const item of choices) {
+if (item.node && (choice ? item.group === "models" : true))
+item.node.disabled = true;
+}
+}
 }
 updateComposer();
+let succeeded = false;
 try {
 const result = await ctx.rpc({
 action: choice ? "set_model" : "set_effort",
 session: sessionId,
-...(choice ? {model:choice.id} : {}),
-...(effort ? {effort} : {}),
+...(choice ? { model: choice.id } : {}),
+...(sendEffort ? { effort: sendEffort } : {}),
 });
 if (
 !ownsEntry() ||
@@ -2391,6 +2505,7 @@ scope() !== context
 return;
 discovery.clear();
 if (result?.applied === true) {
+succeeded = true;
 entry.modelChoices = null;
 const id =
 typeof result.model === "string" ? result.model : choice?.id,
@@ -2398,7 +2513,7 @@ nextEffort =
 result.effort === null
 ? null
 : result.effort ||
-effort ||
+sendEffort ||
 entry.model?.effort ||
 entry.composerStatus?.effort ||
 null;
@@ -2434,19 +2549,31 @@ statusEffortBefore: entry.composerStatus.effort,
 };
 entry.composerStatusAt = 0;
 entry.composerProbes = 0;
-if (entry.composerStatus && (result.effort !== undefined || effort))
+if (entry.composerStatus && (result.effort !== undefined || sendEffort))
 entry.composerStatus.effort = nextEffort;
 clearTimeout(appliedTimer);
 modelBtn.dataset.applied = "true";
 appliedTimer = setTimeout(() => {
 delete modelBtn.dataset.applied;
 }, 1500);
-if (active() && version === suggestVersion) closeSuggestions();
-} else if (active() && version === suggestVersion)
-paintChoices(
-[],
-t(result?.reason || "Model change was not confirmed."),
-);
+if (active() && version === suggestVersion) {
+if (!choice) {
+closeSuggestions();
+} else if (picker?.kind === "models" && !suggestions.hidden) {
+if (modelSheetState && modelSheetState.context === context) {
+modelSheetState.activeModelId = id || choice.id;
+modelSheetState.activeEffort = nextEffort;
+const nextItems = buildModelSheetItems(modelSheetState);
+entry.modelChoices = { scope: context, items: nextItems };
+paintChoices(nextItems);
+}
+}
+}
+} else if (active() && version === suggestVersion) {
+if (prevSheetState) modelSheetState = prevSheetState;
+queuedEffort = null;
+paintModelSheetError(t(result?.reason || "Model change was not confirmed."));
+}
 } catch (error) {
 if (
 active() &&
@@ -2454,12 +2581,13 @@ entry.modelPending === operation &&
 scope() === context &&
 version === suggestVersion
 ) {
+if (prevSheetState) modelSheetState = prevSheetState;
+queuedEffort = null;
 const generic = t(
 "Request failed. Check the desktop connection and try again.",
 ),
 cleaned = error?.message ? cleanRpcError(error, t) : "";
-paintChoices(
-[],
+paintModelSheetError(
 cleaned && cleaned !== generic
 ? cleaned
 : t("Model change was not confirmed."),
@@ -2467,9 +2595,14 @@ cleaned && cleaned !== generic
 }
 } finally {
 delete suggestions.dataset.pending;
+const followEffort = succeeded && choice ? queuedEffort : null;
+queuedEffort = null;
 if (entry.modelPending === operation) {
 entry.modelPending = null;
 if (ownsEntry()) entry.notifyComposer?.();
+}
+if (followEffort && active() && scope() === context && version === suggestVersion) {
+void applyModel(null, followEffort);
 }
 }
 }
@@ -2498,6 +2631,12 @@ else if (entry.model && ((data.effort && data.effort !== entry.model.statusEffor
 const gotModel = Boolean(data?.model || (data?.supported && data?.model_label));
 entry.composerProbes = gotModel ? 0 : (entry.composerProbes || 0) + 1;
 entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
+if (opts.getQuestion) {
+const nextQ = opts.getQuestion();
+if (nextQ || (liveQuestion && liveQuestion._fromLivePrompt)) setQuestion(nextQ || null);
+}
+syncQuestionCards();
+syncLiveFallbackPrompt();
 clearStatusRetry();
 if (!gotModel && entry.composerProbes < 12 && isVisible() && state.connection?.phase === "ready") {
 const delay = entry.composerProbes === 1 ? 700 : 1500;
@@ -2658,6 +2797,12 @@ else delete pre.dataset.wrapped;
 function richOptsFor(key) {
 return {
 t,
+onFileChip: (label, path) => {
+run(async () => {
+await writeClipboardText(el, t, path || label);
+if (!disposed) ctx.toast?.(t("Path copied"));
+});
+},
 renderCodeWrap: (block, pre) => {
 const wrapKey = `code-wrap:${key}:${block.blockIndex}`,
 wrapBtn = button("", () => {
@@ -2838,16 +2983,6 @@ unreadDivider = null;
 function syncStopLatch() {
 const sess = state.sessions?.get(sessionId);
 if (
-entry.stopping &&
-(sess?.state !== "Working" ||
-(entry.stopStamp &&
-sess?.state_since_unix_ns &&
-sess.state_since_unix_ns !== entry.stopStamp))
-) {
-entry.stopping = false;
-entry.stopStamp = null;
-}
-if (
 entry.stopCooldownUntil &&
 (sess?.state !== "Working" ||
 (entry.stopCooldownStamp &&
@@ -2856,6 +2991,8 @@ sess.state_since_unix_ns !== entry.stopCooldownStamp))
 ) {
 entry.stopCooldownUntil = 0;
 entry.stopCooldownStamp = null;
+clearTimeout(stopCooldownTimer);
+stopCooldownTimer = null;
 }
 }
 const isStopCooldown = () =>
@@ -2907,8 +3044,30 @@ row.append(
 button(
 t("Retry"),
 () => {
+delete item.failed;
 entry.queuePaused = false;
 updateComposer();
+},
+"ghost small",
+),
+button(
+t("Edit"),
+() => {
+entry.queuedPrompts = (entry.queuedPrompts || []).filter((q) => q.id !== item.id);
+if (!entry.queuedPrompts.length) entry.queuePaused = false;
+entry.draftVersion = (entry.draftVersion || 0) + 1;
+input.value = item.text || "";
+if (input.value) drafts.set(sessionId, input.value);
+else drafts.delete(sessionId);
+saveDrafts();
+if (item.attachments?.length) {
+entry.photoVersion++;
+entry.attachments = item.attachments.slice();
+syncEntryPhoto();
+}
+sizeInput();
+updateComposer();
+input.focus?.();
 },
 "ghost small",
 ),
@@ -2918,15 +3077,16 @@ row.append(
 button(
 t("Remove queued"),
 () => {
+const wasHead = entry.queuedPrompts?.[0]?.id === item.id;
 const remaining = (entry.queuedPrompts || []).filter(
 (q) => q.id !== item.id,
 );
-if (!remaining.length || entry.queuedPrompts?.[0]?.id === item.id) {
+if (!remaining.length || (wasHead && !remaining[0]?.failed)) {
 entry.queuePaused = false;
 }
 entry.queuedPrompts = remaining;
 renderQueuedStrip();
-if (!entry.queuePaused) flushQueued();
+if (!entry.queuePaused) Promise.resolve().then(() => { if (!disposed) flushQueued(); });
 },
 "ghost small",
 ),
@@ -3070,8 +3230,24 @@ t(
 }
 }
 voiceCtl?.onSend?.(text);
-await ctx.rpc(rpcPayload);
-if (entry.progress === progress) entry.progress.phase = "accepted";
+const rpcRes = await ctx.rpc(rpcPayload);
+if (rpcRes?.cleared) {
+clearTranscript(true);
+entry.offset = 0;
+entry.generation = "";
+entry.initialized = false;
+entry.latestRecovery = false;
+entry.progress = null;
+entry.queuedPrompts = [];
+entry.queuePaused = false;
+entry.questionDraft = null;
+subscribed = false;
+subscribedOffset = null;
+subscribedConn = null;
+renderItems();
+} else if (entry.progress === progress) {
+entry.progress.phase = "accepted";
+}
 entry.notifyComposer?.();
 if (fromDraft) {
 if (
@@ -3101,29 +3277,10 @@ entry.progress.phase = "error";
 entry.progress.error = message;
 }
 if (queuedItem) {
-const currentDraft =
-ownsEntry() && !disposed ? input.value : drafts.get(sessionId) || "";
-const currentAtts = entry.attachments || [];
-if (!String(currentDraft).trim() && !currentAtts.length) {
-entry.draftVersion = (entry.draftVersion || 0) + 1;
-if (queuedItem.text) drafts.set(sessionId, queuedItem.text);
-else drafts.delete(sessionId);
-saveDrafts();
-if (ownsEntry() && !disposed) {
-input.value = queuedItem.text || "";
-sizeInput();
-}
-if (attList.length) {
-entry.photoVersion++;
-entry.attachments = attList.slice();
-syncEntryPhoto();
-}
-if (entry.queuedPrompts?.length) entry.queuePaused = true;
-} else {
+queuedItem.failed = true;
 entry.queuePaused = true;
 entry.queuedPrompts ||= [];
 entry.queuedPrompts.unshift(queuedItem);
-}
 }
 throw Error(message);
 } finally {
@@ -3180,7 +3337,9 @@ attachBtn.disabled =
 !!liveQuestion || entry.sending || atts.length >= MAX_PHOTOS;
 syncQueueButtons();
 renderQueuedStrip();
-flushQueued();
+Promise.resolve().then(() => {
+if (!disposed) flushQueued();
+});
 attachment.replaceChildren();
 if (!atts.length) return;
 for (const att of atts) {
@@ -3198,7 +3357,7 @@ const text =
 att.status === "pending"
 ? t("Preparing photo…")
 : att.status === "error"
-? t("Photo preparation failed. Retry or remove it.")
+? att.error || t("Photo preparation failed. Retry or remove it.")
 : t("Photo ready. It will be sent with this message.");
 chip.append(
 el(
@@ -3207,14 +3366,18 @@ el(
 att.status === "error" ? "danger" : "muted",
 ),
 );
-if (att.status === "error")
-chip.append(
-button(
+if (att.status === "error") {
+const retryPhotoBtn = button(
 t("Retry photo"),
-() => preparePhoto(att.file, att),
+() => {
+if (entry.sending) return;
+preparePhoto(att.file, att);
+},
 "ghost small",
-),
 );
+retryPhotoBtn.disabled = !!entry.sending;
+chip.append(retryPhotoBtn);
+}
 chip.append(
 button(
 t("Remove photo"),
@@ -3298,45 +3461,50 @@ if (e.detail > 1 || !active() || sendBtn.disabled || stopDisabled())
 return;
 entry.stopping = true;
 const stamp = state.sessions?.get(sessionId)?.state_since_unix_ns || null;
-entry.stopStamp = stamp;
 entry.stopCooldownStamp = stamp;
-entry.stopCooldownUntil = Date.now() + 2000;
+entry.stopCooldownUntil = Date.now() + 1800;
 clearTimeout(stopCooldownTimer);
 stopCooldownTimer = setTimeout(() => {
 stopCooldownTimer = null;
 if (!disposed) updateComposer();
-}, 2000);
+}, 1800);
 stopCooldownTimer?.unref?.();
 updateComposer();
 run(async () => {
 try {
 const res = await ctx.rpc({ action: "interrupt", session: sessionId });
 if (res?.interrupted === false) {
-entry.stopping = false;
-entry.stopStamp = null;
-if (!disposed) updateComposer();
-else entry.notifyComposer?.();
+entry.stopCooldownUntil = 0;
+entry.stopCooldownStamp = null;
+clearTimeout(stopCooldownTimer);
+stopCooldownTimer = null;
 if (ownsEntry()) await ctx.refresh?.();
 } else if (!disposed) {
 await pollNow();
 await ctx.refresh?.();
 }
 } catch (err) {
-entry.stopping = false;
-entry.stopStamp = null;
 entry.stopCooldownUntil = 0;
 entry.stopCooldownStamp = null;
 clearTimeout(stopCooldownTimer);
 stopCooldownTimer = null;
+throw err;
+} finally {
+entry.stopping = false;
 if (!disposed) updateComposer();
 else entry.notifyComposer?.();
-throw err;
 }
 });
 });
 composer.addEventListener("submit", (e) => {
 e.preventDefault();
-if (!suggestions.hidden) return;
+if (!suggestions.hidden) {
+if (!choices.length || input.value.trim().toLowerCase() === "/clear") {
+closeSuggestions();
+} else {
+return;
+}
+}
 dispatchPrompt({
 text: input.value,
 photos: currentAttachments(),
@@ -3526,6 +3694,168 @@ liveCard.hidden =
 !liveQuestion || Boolean(activeQuestionKey && following && !entry.live);
 syncComposerHeight();
 }
+let fallbackPermCard = null,
+fallbackPermMode = null,
+fallbackPermBusy = false;
+function fillLivePromptControls(children, itemText, lp, isBusy, setBusy) {
+if (lp?.kind === "numbered_menu" && Array.isArray(lp.options) && lp.options.length) {
+if (lp.is_plan_approval) children.push(el("span", t("Plan approval"), "chat-plan-badge"));
+children.push(el("p", itemText || lp.prompt || "", "chat-p"));
+const row = el("div", undefined, "chat-perm-actions");
+lp.options.forEach((opt, optIdx) => {
+const b = button(
+opt.label || String(optIdx + 1),
+() =>
+run(async () => {
+setBusy(true);
+try {
+await ctx.rpc({
+action: "live_prompt_reply",
+session: sessionId,
+expected_prompt: lp.prompt || itemText || "",
+choice: optIdx,
+});
+if (!disposed) {
+await pollNow();
+await refreshStatus(true);
+}
+} finally {
+setBusy(false);
+}
+}),
+optIdx === 0 ? "primary small" : "secondary small",
+);
+b.disabled = isBusy || state.connection?.phase !== "ready";
+row.append(b);
+});
+children.push(row);
+if (lp.allows_other) {
+const otherIdx = lp.options.findIndex((o) => isWriteInLabel(o?.label));
+const targetIdx = otherIdx >= 0 ? otherIdx : lp.options.length - 1;
+const permOtherInput = el("input");
+permOtherInput.type = "text";
+permOtherInput.placeholder = t("Other (write-in)…");
+permOtherInput.setAttribute("aria-label", t("Other answer notes"));
+const permOtherBtn = button(
+t("Send other"),
+() => {
+const customText = String(permOtherInput.value || "").trim();
+if (!customText || isBusy) return;
+run(async () => {
+setBusy(true);
+try {
+await ctx.rpc({
+action: "live_prompt_reply",
+session: sessionId,
+expected_prompt: lp.prompt || itemText || "",
+choice: targetIdx,
+custom_text: customText,
+});
+permOtherInput.value = "";
+if (!disposed) {
+await pollNow();
+await refreshStatus(true);
+}
+} finally {
+setBusy(false);
+}
+});
+},
+"primary small chat-other-submit",
+);
+permOtherBtn.disabled = isBusy || state.connection?.phase !== "ready" || !String(permOtherInput.value || "").trim();
+permOtherInput.addEventListener("input", () => {
+permOtherBtn.disabled = isBusy || state.connection?.phase !== "ready" || !String(permOtherInput.value || "").trim();
+});
+const permOtherRow = el("div", undefined, "chat-other-row");
+permOtherRow.append(permOtherInput, permOtherBtn);
+children.push(permOtherRow);
+}
+return true;
+}
+if (lp?.kind === "yes_no") {
+children.push(el("p", itemText || lp.prompt || "", "chat-p"));
+const row = el("div", undefined, "chat-perm-actions");
+for (const [label, yesNo, cls] of [
+[t("Approve"), true, "primary small"],
+[t("Reject"), false, "secondary small"],
+]) {
+const b = button(
+label,
+() =>
+run(async () => {
+setBusy(true);
+try {
+await ctx.rpc({
+action: "live_prompt_reply",
+session: sessionId,
+expected_prompt: lp.prompt || itemText || "",
+yes: yesNo,
+});
+if (!disposed) {
+await pollNow();
+await refreshStatus(true);
+}
+} finally {
+setBusy(false);
+}
+}),
+cls,
+);
+b.disabled = isBusy || state.connection?.phase !== "ready";
+row.append(b);
+}
+children.push(row);
+return true;
+}
+return false;
+}
+function syncLiveFallbackPrompt() {
+const statusLp = entry.composerStatus?.agent === chatAgent() ? entry.composerStatus?.live_prompt : null;
+const lp = capability("live_prompt_reply") ? statusLp : null;
+const hasPermItem = entry.items.some((it) => it.kind === "permission");
+const show = Boolean(
+lp &&
+((lp.kind === "numbered_menu" && Array.isArray(lp.options) && lp.options.length) || lp.kind === "yes_no") &&
+!hasPermItem &&
+!activeQuestionKey &&
+!(lp.kind === "numbered_menu" && liveQuestion),
+);
+if (!show) {
+if (fallbackPermCard) {
+fallbackPermCard.remove();
+resize?.unobserve(fallbackPermCard);
+fallbackPermCard = null;
+fallbackPermMode = null;
+}
+return;
+}
+const modeKey = JSON.stringify([lp, fallbackPermBusy, state.connection?.phase === "ready"]);
+if (!fallbackPermCard) {
+fallbackPermCard = el("article", undefined, "chat-card chat-permission");
+fallbackPermCard.dataset.livePermission = "true";
+fallbackPermMode = null;
+}
+for (const child of Array.from(feed.children || []))
+if (child.className === "chat-empty") child.remove();
+const before = optimisticCard?.parentElement === feed ? optimisticCard : null;
+if (fallbackPermCard.parentElement !== feed || (before && fallbackPermCard.nextSibling !== before)) {
+feed.insertBefore(fallbackPermCard, before);
+resize?.observe(fallbackPermCard);
+}
+if (fallbackPermMode === modeKey) return;
+fallbackPermMode = modeKey;
+const children = [
+el("header", `${t("Permission")} • ${t(lp.is_plan_approval ? "Plan approval" : "Approval")}`, "chat-role"),
+];
+fillLivePromptControls(children, lp.prompt || "", lp, fallbackPermBusy, (busy) => {
+fallbackPermBusy = busy;
+fallbackPermMode = null;
+if (!disposed) syncLiveFallbackPrompt();
+});
+fallbackPermCard.replaceChildren(...children);
+pinLatest();
+}
 function syncQuestionCards() {
 activeQuestionKey = computeActiveQuestionKey();
 for (const card of cards.values()) {
@@ -3686,7 +4016,71 @@ target.row.click?.();
 target.row.focus?.();
 });
 });
-footer.append(status, send, write);
+const lpForModal =
+capability("live_prompt_reply") &&
+entry.composerStatus?.agent === chatAgent()
+? entry.composerStatus?.live_prompt
+: null;
+const otherModalIndex =
+lpForModal?.kind === "numbered_menu" && lpForModal.allows_other
+? question.choices.findIndex((c) => isWriteInLabel(c?.label))
+: -1;
+let otherRow = null;
+if (otherModalIndex >= 0) {
+const otherInput = el("input");
+otherInput.type = "text";
+otherInput.placeholder = t("Other (write-in)…");
+otherInput.setAttribute("aria-label", t("Other answer notes"));
+const otherBtn = button(
+t("Send other"),
+() => {
+const txt = String(otherInput.value || "").trim();
+if (!txt || entry.questionSending || disposed) return;
+run(async () => {
+entry.questionSending = true;
+panel.error = "";
+renderReplyPanel(panel);
+renderLiveQuestion();
+try {
+await ctx.rpc({
+action: "live_prompt_reply",
+session: sessionId,
+expected_prompt: lpForModal.prompt || question.title || "",
+choice: otherModalIndex,
+custom_text: txt,
+});
+if (disposed || ctx.signal?.aborted) return;
+otherInput.value = "";
+if (panelOpen(panel)) ctx.closeSheet?.();
+ctx.toast?.(t("Answer sent"));
+await pollNow();
+await refreshStatus(true);
+} catch (err) {
+if (!disposed && panelOpen(panel)) {
+panel.error = cleanRpcError(err, t);
+renderReplyPanel(panel);
+}
+} finally {
+entry.questionSending = false;
+if (!disposed) {
+renderLiveQuestion();
+if (panelOpen(panel)) renderReplyPanel(panel);
+updateComposer();
+}
+}
+});
+},
+"primary small chat-other-submit",
+);
+otherBtn.disabled = true;
+otherInput.addEventListener("input", () => {
+otherBtn.disabled = entry.questionSending || !String(otherInput.value || "").trim();
+});
+otherRow = el("div", undefined, "chat-other-row");
+otherRow.append(otherInput, otherBtn);
+}
+if (otherRow) footer.append(otherRow, status, send, write);
+else footer.append(status, send, write);
 root.append(heading, list, footer);
 body.append(root);
 renderReplyPanel(panel);
@@ -3814,8 +4208,10 @@ if (!following && anchor && anchor.node.parentElement) {
 const top = anchor.node.getBoundingClientRect
 ? anchor.node.getBoundingClientRect().top
 : (anchor.node.offsetTop || 0) - feed.scrollTop;
+programmaticScroll = true;
 feed.scrollTop += top - anchor.top;
-lastTop = feed.scrollTop;
+programmaticScroll = false;
+syncScroll();
 }
 }
 function optimisticText() {
@@ -4278,6 +4674,7 @@ latestBtn.hidden =
 !entry.latestRecovery;
 history.hidden = earlierBtn.hidden && latestBtn.hidden;
 syncQuestionCards();
+syncLiveFallbackPrompt();
 syncLiveCardVisibility();
 syncOptimistic();
 skeleton.hidden = !(
@@ -4456,7 +4853,9 @@ entry.composerStatus?.agent === chatAgent()
 ? entry.composerStatus?.live_prompt
 : null,
 lp =
-isLatest && capability("live_prompt_reply") ? statusLp : null,
+isLatest && !activeQuestionKey && capability("live_prompt_reply")
+? statusLp
+: null,
 modeKey = lp ? JSON.stringify([lp, permBusy]) : "hist";
 if (permMode === modeKey) return;
 permMode = modeKey;
@@ -4467,88 +4866,11 @@ el(
 "chat-role",
 ),
 ];
-if (
-lp?.kind === "numbered_menu" &&
-Array.isArray(lp.options) &&
-lp.options.length
-) {
-if (lp.is_plan_approval)
-children.push(el("span", t("Plan approval"), "chat-plan-badge"));
-children.push(el("p", item.text || lp.prompt || "", "chat-p"));
-const row = el("div", undefined, "chat-perm-actions");
-lp.options.forEach((opt, optIdx) => {
-const b = button(
-opt.label || String(optIdx + 1),
-() =>
-run(async () => {
-permBusy = true;
+if (!fillLivePromptControls(children, item.text, lp, permBusy, (busy) => {
+permBusy = busy;
 permMode = null;
-syncPermission();
-try {
-await ctx.rpc({
-action: "live_prompt_reply",
-session: sessionId,
-expected_prompt: lp.prompt || item.text || "",
-choice: optIdx,
-});
-if (!disposed) {
-await pollNow();
-await refreshStatus(true);
-}
-} finally {
-permBusy = false;
-if (!disposed) {
-permMode = null;
-syncPermission();
-}
-}
-}),
-optIdx === 0 ? "primary small" : "secondary small",
-);
-b.disabled = permBusy || state.connection?.phase !== "ready";
-row.append(b);
-});
-children.push(row);
-} else if (lp?.kind === "yes_no") {
-children.push(el("p", item.text || lp.prompt || "", "chat-p"));
-const row = el("div", undefined, "chat-perm-actions");
-for (const [label, yesNo, cls] of [
-[t("Approve"), true, "primary small"],
-[t("Reject"), false, "secondary small"],
-]) {
-const b = button(
-label,
-() =>
-run(async () => {
-permBusy = true;
-permMode = null;
-syncPermission();
-try {
-await ctx.rpc({
-action: "live_prompt_reply",
-session: sessionId,
-expected_prompt: lp.prompt || item.text || "",
-yes: yesNo,
-});
-if (!disposed) {
-await pollNow();
-await refreshStatus(true);
-}
-} finally {
-permBusy = false;
-if (!disposed) {
-permMode = null;
-syncPermission();
-}
-}
-}),
-cls,
-);
-b.disabled = permBusy || state.connection?.phase !== "ready";
-row.append(b);
-}
-children.push(row);
-} else {
+if (!disposed) syncPermission();
+})) {
 children.push(
 el("p", item.text, "chat-p"),
 el(
@@ -4657,7 +4979,10 @@ otherIndex < 0 ||
 return;
 run(async () => {
 entry.questionSending = true;
+cardError = "";
 syncCard();
+renderLiveQuestion();
+updateComposer();
 try {
 await ctx.rpc({
 action: "live_prompt_reply",
@@ -4672,9 +4997,15 @@ if (!disposed) {
 await pollNow();
 await refreshStatus(true);
 }
+} catch (error) {
+if (!disposed) cardError = cleanRpcError(error, t);
 } finally {
 entry.questionSending = false;
-if (!disposed) syncCard();
+if (!disposed) {
+syncCard();
+renderLiveQuestion();
+updateComposer();
+}
 }
 });
 },
@@ -4857,9 +5188,11 @@ buttons.push({ button: b, baseLabel });
 list.append(b);
 }
 custom.addEventListener("input", syncCard);
+const otherRow = el("div", undefined, "chat-other-row");
+otherRow.append(custom, otherSendBtn);
 const actions = el("div", undefined, "chat-actions");
-actions.append(sendAnswerBtn, otherSendBtn, termBtn, copyBtn);
-body.append(list, custom, statusNote, actions);
+actions.append(sendAnswerBtn, termBtn, copyBtn);
+body.append(list, otherRow, statusNote, actions);
 card._syncQuestion = syncCard;
 syncCard();
 }
@@ -5087,6 +5420,9 @@ toolRuns.clear();
 tailRun = null;
 optimisticCard = null;
 optimisticShown = "";
+fallbackPermCard = null;
+fallbackPermMode = null;
+fallbackPermBusy = false;
 feed.replaceChildren();
 resize?.disconnect();
 resize?.observe(feed);
@@ -5375,8 +5711,10 @@ entry.generation && res.generation && entry.generation !== res.generation,
 if (
 res.reset ||
 changed ||
-(!res.bound && (entry.items.length || entry.latestRecovery))
+(!res.bound && (entry.items.length || entry.latestRecovery)) ||
+(typeof res.page_start === "number" && res.page_start > entry.offset)
 ) {
+if (!(typeof res.page_start === "number" && res.page_start > entry.offset))
 requestLatest();
 pollNow();
 return;
@@ -5768,7 +6106,14 @@ if (subscribed) {
 subscribed = false;
 subscribedOffset = null;
 subscribedConn = null;
-if (!state.cached && state.connection?.phase === "ready") {
+const unsubTransport = owningTransport?.ready ? owningTransport : null;
+if (unsubTransport) {
+try {
+Promise.resolve(
+unsubTransport.rpc({ action: "chat_unsubscribe", session: sessionId }),
+).catch(() => {});
+} catch {}
+} else if (!state.cached && state.connection?.phase === "ready") {
 try {
 Promise.resolve(
 ctx.rpc({ action: "chat_unsubscribe", session: sessionId }),

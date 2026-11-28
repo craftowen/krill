@@ -69,6 +69,8 @@ impl View {
             }
         }
         if self.detail_tab != tab {
+            // Flush unsaved SOUL.md edits before leaving Settings on the same bot (`BOT-22`).
+            self.flush_unsaved_soul_edits(cx);
             // Settings opens on Orca's list, not on the page it was last left at; a row that
             // asked for a page (Home's Upcoming) set it just before.
             if self.detail_tab == DetailTab::Settings {

@@ -815,27 +815,26 @@ impl View {
             );
         }
 
+        let effort_options = effort_options_for_runtime(&self.settings.agent_id);
+        let supports_effort = effort_options.len() > 1;
         let effort_pills = ui::segmented_control(
             p,
-            effort_options_for_runtime(&self.settings.agent_id)
-                .iter()
-                .copied()
-                .map(|eff| {
-                    let id = format!(
-                        "bots-settings-effort-{}",
-                        if eff.is_empty() { "default" } else { eff }
-                    );
-                    ui::segment(
-                        p,
-                        SharedString::from(id),
-                        effort_label(eff),
-                        self.settings.effort == eff,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        eff.clone_into(&mut this.settings.effort);
-                        cx.notify();
-                    }))
-                }),
+            effort_options.iter().copied().map(|eff| {
+                let id = format!(
+                    "bots-settings-effort-{}",
+                    if eff.is_empty() { "default" } else { eff }
+                );
+                ui::segment(
+                    p,
+                    SharedString::from(id),
+                    effort_label(eff),
+                    self.settings.effort == eff,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    eff.clone_into(&mut this.settings.effort);
+                    cx.notify();
+                }))
+            }),
         );
 
         let perm_pills = ui::segmented_control(
@@ -1047,14 +1046,16 @@ impl View {
                     .flex()
                     .flex_wrap()
                     .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(text::FIELD_EFFORT.get(), None, p))
-                            .child(effort_pills),
-                    )
+                    .when(supports_effort, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(ui::field_label(text::FIELD_EFFORT.get(), None, p))
+                                .child(effort_pills),
+                        )
+                    })
                     .child(
                         div()
                             .flex()

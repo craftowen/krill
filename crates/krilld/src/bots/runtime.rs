@@ -166,6 +166,7 @@ pub(crate) struct BotAccountSwitchLaunch {
     pub created_at_ms: u64,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub permission_mode: krill_proto::agent::Permission,
     pub extra_env: Vec<(Vec<u8>, Vec<u8>)>,
     pub mcp_cfg: BotMcpLaunchConfig,
     pub grant_token: Option<Zeroizing<String>>,
@@ -1107,8 +1108,8 @@ impl BotRuntime {
         let initial_seq = u64::from(has_prompt);
         let label = if let Some(ref l) = link_id {
             format!("{} ({l})", bot.name)
-        } else if let Some((ref gid, _)) = group_key {
-            format!("{} (group:{gid})", bot.name)
+        } else if let Some((ref gid, ref tid)) = group_key {
+            format!("{} (group:{gid}:{tid})", bot.name)
         } else {
             bot.name.clone()
         };
@@ -1868,6 +1869,115 @@ impl BotRuntime {
         Ok(())
     }
 
+    /// Returns the safe active-turn cancel byte sequence for `agent_id`.
+    /// Interactive TUI coding agents use single `Esc` (`\x1b`); raw shell/unknown PTYs use `Ctrl+C` (`\x03`).
+    #[must_use]
+    pub fn group_turn_cancel_bytes(agent_id: &str) -> &'static [u8] {
+        match krill_proto::agent::canonical_id(agent_id.trim()) {
+            "agy" | "antigravity" | "claude" | "openclaude" | "codex" | "opencode" | "pi"
+            | "omp" | "cursor" | "gemini" => b"\x1b",
+            _ => b"\x03",
+        }
+    }
+
+    /// Gracefully interrupts an active group turn without killing the warm PTY session:
+    /// clears pending/queued turn state and writes the agent-aware cancel key (`Esc` for TUI
+    /// coding agents, `Ctrl+C` only for raw shell/unknown PTYs).
+    pub fn interrupt_group_turn(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        bot_id: &BotId,
+        session_id: SessionId,
+    ) -> io::Result<()> {
+        {
+            // Canonical lock order: sessions -> turn_meta (MB-01).
+            let mut sessions = lock(&self.inner.sessions);
+            let Some(binding) = sessions.get_mut(&session_id) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "session {} is not bound to bot {}",
+                        session_id.0,
+                        bot_id.as_str()
+                    ),
+                ));
+            };
+            if &binding.bot_id != bot_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "session {} is not bound to bot {}",
+                        session_id.0,
+                        bot_id.as_str()
+                    ),
+                ));
+            }
+            binding.owner_turn_pending = false;
+            let mut meta_map = lock(&self.inner.turn_meta);
+            if let Some(meta) = meta_map.get_mut(&session_id) {
+                meta.active_turn_seq = None;
+                meta.pending_turns.clear();
+            }
+        }
+        self.inner.persist_bindings();
+
+        let agent_id = store
+            .get_bot(bot_id)
+            .ok()
+            .flatten()
+            .map(|b| b.agent_id)
+            .unwrap_or_default();
+        let cancel_bytes = Self::group_turn_cancel_bytes(&agent_id);
+        if let Err(err) = registry.deliver_bot_input(session_id, cancel_bytes, false)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Stops all live group PTY sessions belonging to `group_id` (optionally scoped to `thread_id`).
+    pub fn stop_sessions_for_group(
+        &self,
+        registry: &Registry,
+        relay: &BotToolRelay,
+        group_id: &str,
+        thread_id: Option<&str>,
+    ) -> Vec<SessionId> {
+        let targets: Vec<(BotId, SessionId)> = {
+            // Canonical lock order: sessions -> turn_meta (MB-01).
+            let sessions = lock(&self.inner.sessions);
+            let meta_map = lock(&self.inner.turn_meta);
+            sessions
+                .iter()
+                .filter_map(|(&sid, b)| {
+                    let (gid, tid) = meta_map.get(&sid)?.group_key.as_ref()?;
+                    if gid == group_id && thread_id.is_none_or(|want| tid == want) {
+                        Some((b.bot_id.clone(), sid))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let mut stopped = Vec::with_capacity(targets.len());
+        for (bid, sid) in targets {
+            if self.stop_session(registry, relay, &bid, sid).is_ok() {
+                stopped.push(sid);
+            }
+        }
+        stopped
+    }
+
+    /// Returns `true` if `session_id` is currently bound to `bot_id`.
+    #[must_use]
+    pub fn session_belongs_to_bot(&self, session_id: SessionId, bot_id: &BotId) -> bool {
+        lock(&self.inner.sessions)
+            .get(&session_id)
+            .is_some_and(|b| &b.bot_id == bot_id)
+    }
+
     /// Stops a single bot PTY session.
     pub fn stop_session(
         &self,
@@ -2589,6 +2699,7 @@ impl BotRuntime {
             created_at_ms,
             model: bot.model,
             effort: bot.effort,
+            permission_mode: bot.permission_mode,
             extra_env,
             mcp_cfg,
             grant_token: grant.map(|g| g.token),
@@ -6292,5 +6403,29 @@ mod tests {
         assert_eq!(b.status_message_id.as_deref(), Some("msg-2"));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn group_turn_cancel_bytes_uses_esc_for_tui_agents_and_ctrl_c_for_shell() {
+        for agent in [
+            "agy",
+            "antigravity",
+            "claude",
+            "openclaude",
+            "codex",
+            "opencode",
+            "pi",
+            "omp",
+            "cursor",
+            "gemini",
+        ] {
+            assert_eq!(
+                BotRuntime::group_turn_cancel_bytes(agent),
+                b"\x1b",
+                "interactive TUI agent {agent} must cancel active turn with single Esc"
+            );
+        }
+        assert_eq!(BotRuntime::group_turn_cancel_bytes("bash"), b"\x03");
+        assert_eq!(BotRuntime::group_turn_cancel_bytes(""), b"\x03");
     }
 }

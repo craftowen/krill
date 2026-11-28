@@ -1192,16 +1192,9 @@ fn fold_turns(
     out
 }
 
-/// Orca's `formatNativeChatDuration`: `16s`, `2m 5s`, `1h 3m 0s`.
+/// Formats completed turn durations in the active UI language (`16초`/`16s`, `2분 5초`/`2m 5s`, `1시간 2분`/`1h 2m`).
 pub(super) fn format_turn_duration(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let minutes = secs / 60;
-    if minutes < 60 {
-        return format!("{minutes}m {}s", secs % 60);
-    }
-    format!("{}h {}m {}s", minutes / 60, minutes % 60, secs % 60)
+    format_elapsed_secs(secs)
 }
 
 /// One change to a bot's item shown in its chat.
@@ -1258,7 +1251,11 @@ pub(crate) fn parse_inbound_notice(text: &str) -> Option<InboundNotice> {
         }
         if from.is_empty() {
             // Pointers from daemons before senders were named.
-            from.push("Krill orchestration".to_owned());
+            from.push(
+                krill_app_core::i18n::catalog::chat::ORCHESTRATION_SENDER
+                    .get()
+                    .to_owned(),
+            );
         }
         return Some(InboundNotice {
             kind,

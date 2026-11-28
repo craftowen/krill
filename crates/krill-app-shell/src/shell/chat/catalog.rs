@@ -80,7 +80,7 @@ pub(crate) struct AutocompleteState {
 
 impl AutocompleteState {
     pub(super) fn is_open(&self) -> bool {
-        self.trigger.is_some() && !self.items.is_empty()
+        self.trigger.is_some() && !self.loading && !self.items.is_empty()
     }
 
     pub(super) fn should_render_popover(&self) -> bool {
@@ -196,10 +196,14 @@ pub(super) fn detect_autocomplete_trigger(
     {
         return None;
     }
+    let after_cursor = text.get(cursor..).unwrap_or("");
+    let tail_len = after_cursor
+        .find(|ch: char| ch.is_whitespace() || ch.is_control())
+        .unwrap_or(after_cursor.len());
     Some(AutocompleteTrigger {
         kind: AutocompleteKind::File,
         query: query.to_owned(),
-        replace_range: (line_start + rel_at)..cursor,
+        replace_range: (line_start + rel_at)..(cursor + tail_len),
     })
 }
 
@@ -483,6 +487,58 @@ fn normalize_agent_family(agent: &str) -> &'static str {
     }
 }
 
+/// Returns true when the payload is a bare `/clear` command (ignoring surrounding whitespace and case).
+#[cfg(test)]
+pub(super) fn is_clear_slash_command(payload: &str) -> bool {
+    payload.trim().eq_ignore_ascii_case("/clear")
+}
+
+/// Returns true when the payload resets conversation context for `agent` (`/clear` on all agents,
+/// plus `/new` on Codex, `OpenCode`, omp, and Pi).
+pub(super) fn is_clear_slash_command_for_agent(agent: &str, payload: &str) -> bool {
+    let trimmed = payload.trim();
+    if trimmed.eq_ignore_ascii_case("/clear") {
+        return true;
+    }
+    if trimmed.eq_ignore_ascii_case("/new") {
+        let agent_trimmed = agent.trim();
+        return agent_trimmed.eq_ignore_ascii_case("pi")
+            || matches!(
+                normalize_agent_family(agent_trimmed),
+                "codex" | "opencode" | "omp"
+            );
+    }
+    false
+}
+
+/// Returns the native CLI slash command that resets conversation context for `agent`.
+/// Claude Code, Antigravity (`agy`), and Codex use `/clear` (Codex `/new` opens a git worktree modal);
+/// `OpenCode`, omp, and Pi use `/new`.
+pub(super) fn provider_clear_command(agent: &str) -> &'static str {
+    let trimmed = agent.trim();
+    if trimmed.eq_ignore_ascii_case("pi") {
+        return "/new";
+    }
+    match normalize_agent_family(trimmed) {
+        "opencode" | "omp" => "/new",
+        _ => "/clear",
+    }
+}
+
+/// Normalizes bare local slash commands before PTY delivery (trims trailing whitespace added by
+/// autocomplete and translates clear commands to the provider's native clear command).
+pub(super) fn normalize_local_slash_payload(agent: &str, payload: &str) -> String {
+    if is_clear_slash_command_for_agent(agent, payload) {
+        return provider_clear_command(agent).to_owned();
+    }
+    if slash_command_is_local_non_echoed(agent, payload)
+        || slash_command_opens_in_terminal(agent, payload, false)
+    {
+        return payload.trim().to_owned();
+    }
+    payload.to_owned()
+}
+
 /// Returns true when a bare slash command executes locally inside the CLI
 /// without echoing a `ChatItemKind::User` turn in the saved transcript.
 pub(super) fn slash_command_is_local_non_echoed(_agent: &str, payload: &str) -> bool {
@@ -494,6 +550,7 @@ pub(super) fn slash_command_is_local_non_echoed(_agent: &str, payload: &str) -> 
     matches!(
         cmd.as_str(),
         "clear"
+            | "new"
             | "compact"
             | "cost"
             | "doctor"
@@ -921,6 +978,37 @@ pub(super) fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn localized_remote_builtin_desc(slug: &str, raw_desc: &str) -> String {
+    use krill_app_core::i18n::catalog::chat as ctext;
+    let key = match slug.trim_start_matches('/').to_ascii_lowercase().as_str() {
+        "model" => Some(ctext::SLASH_MODEL_DESC),
+        "compact" => Some(ctext::SLASH_COMPACT_DESC),
+        "clear" => Some(ctext::SLASH_CLEAR_DESC),
+        "new" => Some(ctext::SLASH_NEW_DESC),
+        "review" => Some(ctext::SLASH_REVIEW_DESC),
+        "init" => Some(if raw_desc.contains("CLAUDE.md") {
+            ctext::SLASH_INIT_CLAUDE_DESC
+        } else {
+            ctext::SLASH_INIT_AGENTS_DESC
+        }),
+        "status" => Some(ctext::SLASH_STATUS_DESC),
+        "permissions" => Some(ctext::SLASH_PERMISSIONS_DESC),
+        "diff" => Some(ctext::SLASH_DIFF_DESC),
+        "plan" => Some(ctext::SLASH_PLAN_DESC),
+        "boost" => Some(ctext::SLASH_BOOST_DESC),
+        "goal" => Some(ctext::SLASH_GOAL_DESC),
+        "undo" => Some(ctext::SLASH_UNDO_DESC),
+        "redo" => Some(ctext::SLASH_REDO_DESC),
+        "share" => Some(ctext::SLASH_SHARE_DESC),
+        "cost" => Some(ctext::SLASH_COST_DESC),
+        "doctor" => Some(ctext::SLASH_DOCTOR_DESC),
+        "btw" => Some(ctext::SLASH_BTW_DESC),
+        "side" => Some(ctext::SLASH_SIDE_DESC),
+        _ => None,
+    };
+    key.map_or_else(|| raw_desc.to_owned(), |m| m.get().to_owned())
+}
+
 /// Parses a daemon `command_catalog` JSON workflow response into filtered `AutocompleteCandidate` items.
 pub(super) fn parse_remote_slash_items(
     raw: &str,
@@ -932,8 +1020,8 @@ pub(super) fn parse_remote_slash_items(
     }
     let items = root.pointer("/data/items")?.as_array()?;
     let query_lower = strip_control_chars(query).to_lowercase();
-    let mut candidates = Vec::new();
-    for entry in items {
+    let mut ranked: Vec<(u8, usize, AutocompleteCandidate)> = Vec::new();
+    for (idx, entry) in items.iter().enumerate() {
         let raw_name = entry
             .get("text")
             .or_else(|| entry.get("name"))
@@ -948,18 +1036,18 @@ pub(super) fn parse_remote_slash_items(
         } else {
             format!("/{clean}")
         };
-        let desc = strip_control_chars(
+        let is_builtin = entry.get("scope").and_then(serde_json::Value::as_str) == Some("Built-in");
+        let raw_desc = strip_control_chars(
             entry
                 .get("description")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
         );
-        if !query_lower.is_empty()
-            && !label.to_lowercase().contains(&query_lower)
-            && !desc.to_lowercase().contains(&query_lower)
-        {
-            continue;
-        }
+        let desc = if is_builtin {
+            localized_remote_builtin_desc(&label, &raw_desc)
+        } else {
+            raw_desc.clone()
+        };
         let source = match entry
             .get("kind")
             .and_then(serde_json::Value::as_str)
@@ -968,24 +1056,49 @@ pub(super) fn parse_remote_slash_items(
             .as_str()
         {
             "skill" => AutocompleteSource::Skill,
-            "command"
-                if entry.get("scope").and_then(serde_json::Value::as_str) == Some("Built-in") =>
-            {
-                AutocompleteSource::Builtin
-            }
+            "command" if is_builtin => AutocompleteSource::Builtin,
             _ => AutocompleteSource::Command,
         };
-        candidates.push(AutocompleteCandidate {
-            insert_text: format!("{label} "),
-            label,
-            detail: desc,
-            source,
-        });
-        if candidates.len() >= MAX_AUTOCOMPLETE_ITEMS {
-            break;
-        }
+        let slug_lower = label.trim_start_matches(['/', '$']).to_lowercase();
+        let rank = if query_lower.is_empty() {
+            match source {
+                AutocompleteSource::Builtin => 0,
+                AutocompleteSource::Command => 1,
+                AutocompleteSource::Skill => 2,
+                AutocompleteSource::File => 3,
+            }
+        } else if slug_lower == query_lower || label.to_lowercase() == query_lower {
+            0
+        } else if slug_lower.starts_with(&query_lower) {
+            1
+        } else if slug_lower.contains(&query_lower) {
+            2
+        } else if desc.to_lowercase().contains(&query_lower)
+            || raw_desc.to_lowercase().contains(&query_lower)
+        {
+            3
+        } else {
+            continue;
+        };
+        ranked.push((
+            rank,
+            idx,
+            AutocompleteCandidate {
+                insert_text: format!("{label} "),
+                label,
+                detail: desc,
+                source,
+            },
+        ));
     }
-    Some(candidates)
+    ranked.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+    Some(
+        ranked
+            .into_iter()
+            .take(MAX_AUTOCOMPLETE_ITEMS)
+            .map(|(_, _, c)| c)
+            .collect(),
+    )
 }
 
 /// Parses a daemon `mention_files` JSON workflow response into safe relative `AutocompleteCandidate` items.
@@ -1007,22 +1120,15 @@ pub(super) fn parse_remote_mention_items(
             .unwrap_or("");
         let clean = strip_control_chars(raw_path).trim().to_owned();
         if clean.is_empty()
-            || clean.starts_with('/')
             || clean.contains('\\')
-            || Path::new(&clean)
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_)))
+            || !is_allowed_workspace_rel_path(Path::new(&clean))
         {
             continue;
         }
         if !query_lower.is_empty() && !clean.to_lowercase().contains(&query_lower) {
             continue;
         }
-        let insert_text = if clean.contains(char::is_whitespace) {
-            format!("@\"{clean}\" ")
-        } else {
-            format!("@{clean} ")
-        };
+        let insert_text = format_file_insert_text(&clean);
         candidates.push(AutocompleteCandidate {
             label: clean,
             detail: String::new(),
@@ -1265,5 +1371,41 @@ mod tests {
         ));
         assert!(slash_command_opens_in_terminal("opencode", "/models", true));
         assert!(slash_command_opens_in_terminal("omp", "/model", true));
+    }
+
+    #[test]
+    fn clear_slash_command_detection_and_provider_normalization() {
+        assert!(is_clear_slash_command("/clear"));
+        assert!(is_clear_slash_command(" /CLEAR "));
+        assert!(!is_clear_slash_command("/clear now"));
+        assert!(!is_clear_slash_command("clear"));
+
+        assert_eq!(provider_clear_command("agy"), "/clear");
+        assert_eq!(provider_clear_command("antigravity"), "/clear");
+        assert_eq!(provider_clear_command("claude"), "/clear");
+        assert_eq!(provider_clear_command("codex"), "/clear");
+        assert_eq!(provider_clear_command("opencode"), "/new");
+        assert_eq!(provider_clear_command("pi"), "/new");
+        assert_eq!(provider_clear_command("omp"), "/new");
+
+        assert!(is_clear_slash_command_for_agent("codex", "/new"));
+        assert!(is_clear_slash_command_for_agent("opencode", "/new"));
+        assert!(!is_clear_slash_command_for_agent("claude", "/new"));
+        assert!(slash_command_is_local_non_echoed("codex", "/new"));
+
+        assert_eq!(normalize_local_slash_payload("agy", "/clear "), "/clear");
+        assert_eq!(normalize_local_slash_payload("codex", " /CLEAR "), "/clear");
+        assert_eq!(
+            normalize_local_slash_payload("opencode", " /CLEAR "),
+            "/new"
+        );
+        assert_eq!(
+            normalize_local_slash_payload("claude", "/compact "),
+            "/compact"
+        );
+        assert_eq!(
+            normalize_local_slash_payload("agy", "hello world "),
+            "hello world "
+        );
     }
 }

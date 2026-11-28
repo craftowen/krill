@@ -18,9 +18,45 @@ pub(super) enum ChatBodySegment {
 
 const MAX_SEGMENT_CACHE_ENTRIES: usize = 256;
 const MAX_SEGMENT_CACHE_BYTES: usize = 64 * 1024;
+const MAX_OVERSIZED_CACHE_ENTRIES: usize = 8;
 
 type SegmentCacheKey = (u64, usize);
 type SegmentCacheEntry = (String, Arc<[ChatBodySegment]>);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct OversizedSegmentKey {
+    hash: u64,
+    len: usize,
+    head: [u8; 32],
+    tail: [u8; 32],
+}
+
+impl OversizedSegmentKey {
+    fn from_text(text: &str) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let bytes = text.as_bytes();
+        let mut head = [0u8; 32];
+        let mut tail = [0u8; 32];
+        let h_len = bytes.len().min(32);
+        head[..h_len].copy_from_slice(&bytes[..h_len]);
+        let t_start = bytes.len().saturating_sub(32);
+        let t_len = bytes.len() - t_start;
+        tail[..t_len].copy_from_slice(&bytes[t_start..]);
+        Self {
+            hash: hasher.finish(),
+            len: bytes.len(),
+            head,
+            tail,
+        }
+    }
+}
+
+#[derive(Default)]
+struct OversizedSegmentCache {
+    map: HashMap<OversizedSegmentKey, Arc<[ChatBodySegment]>>,
+    order: VecDeque<OversizedSegmentKey>,
+}
 
 #[derive(Default)]
 struct SegmentCache {
@@ -48,7 +84,29 @@ fn fence(line: &str) -> Option<(char, usize, &str)> {
 
 pub(super) fn parse_chat_segments_cached(text: &str) -> Arc<[ChatBodySegment]> {
     if text.len() > MAX_SEGMENT_CACHE_BYTES {
-        return Arc::from(parse_chat_segments_uncached(text));
+        let key = OversizedSegmentKey::from_text(text);
+        thread_local! {
+            static OVERSIZED: RefCell<OversizedSegmentCache> =
+                RefCell::new(OversizedSegmentCache::default());
+        }
+        if let Some(hit) = OVERSIZED.with(|cell| cell.borrow().map.get(&key).map(Arc::clone)) {
+            return hit;
+        }
+        let segs: Arc<[ChatBodySegment]> = Arc::from(parse_chat_segments_uncached(text));
+        OVERSIZED.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if !cache.map.contains_key(&key) {
+                while cache.map.len() >= MAX_OVERSIZED_CACHE_ENTRIES {
+                    let Some(oldest) = cache.order.pop_front() else {
+                        break;
+                    };
+                    cache.map.remove(&oldest);
+                }
+                cache.order.push_back(key.clone());
+            }
+            cache.map.insert(key, Arc::clone(&segs));
+        });
+        return segs;
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -188,7 +246,13 @@ pub(super) fn normalize_code_language(tag: &str) -> Option<String> {
         "rb" | "ruby" => "Ruby",
         "diff" | "patch" => "Diff",
         "dockerfile" | "docker" => "Dockerfile",
-        "text" | "txt" | "plaintext" | "plain" => "Text",
+        "text" | "txt" | "plaintext" | "plain" => {
+            return Some(
+                krill_app_core::i18n::catalog::chat::PLAIN_TEXT
+                    .get()
+                    .to_owned(),
+            );
+        }
         _ => return Some(token.to_owned()),
     };
     Some(normalized.to_owned())

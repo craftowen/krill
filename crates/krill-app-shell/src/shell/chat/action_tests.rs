@@ -991,7 +991,7 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
         .debug_bounds("desktop-chat-stop")
         .expect("Working session must show Stop button even with draft text");
 
-    // Rapid double click / repeated click must send b"\x03" only once and latch the turn.
+    // Rapid double click / repeated click must send Esc (b"\x1b") only once during cooldown.
     cx.simulate_mouse_down(
         stop_bounds.center(),
         gpui::MouseButton::Left,
@@ -1014,7 +1014,7 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
     );
     cx.run_until_parked();
 
-    assert_eq!(*sent.lock().unwrap(), vec![b"\x03".to_vec()]);
+    assert_eq!(*sent.lock().unwrap(), vec![b"\x1b".to_vec()]);
     cx.update(|_, app_cx| {
         let shell = view.read(app_cx);
         assert_eq!(input.read(app_cx).value(), "unsent draft");
@@ -1023,16 +1023,35 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
             1,
             "interrupting must preserve staged draft attachments"
         );
-        assert!(shell.is_chat_interrupt_latched(&local_key(SESSION), app_cx));
+        assert!(shell.is_chat_stop_cooldown(&local_key(SESSION), app_cx));
     });
 
-    // Leaving Working clears the latch; a new Working turn re-enables Stop.
+    // After the 2s cooldown expires while still Working, retry sends b"\x1b" again (NEVER \x03).
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    cx.update(|_, app_cx| {
+        assert!(
+            !view
+                .read(app_cx)
+                .is_chat_stop_cooldown(&local_key(SESSION), app_cx)
+        );
+    });
+    let retry_bounds = cx.debug_bounds("desktop-chat-stop").unwrap();
+    cx.simulate_click(retry_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![b"\x1b".to_vec(), b"\x1b".to_vec()]
+    );
+
+    // Leaving Working clears the cooldown immediately and restores Send.
     set_session_state(&view, cx, krill_proto::control::AgentState::Done, 200);
     cx.update(|_, app_cx| {
         assert!(
             !view
                 .read(app_cx)
-                .is_chat_interrupt_latched(&local_key(SESSION), app_cx)
+                .is_chat_stop_cooldown(&local_key(SESSION), app_cx)
         );
     });
     assert!(cx.debug_bounds("desktop-chat-send").is_some());
@@ -1042,7 +1061,7 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
         assert!(
             !view
                 .read(app_cx)
-                .is_chat_interrupt_latched(&local_key(SESSION), app_cx)
+                .is_chat_stop_cooldown(&local_key(SESSION), app_cx)
         );
     });
     let stop_again = cx.debug_bounds("desktop-chat-stop").unwrap();
@@ -1050,7 +1069,7 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
     cx.run_until_parked();
     assert_eq!(
         *sent.lock().unwrap(),
-        vec![b"\x03".to_vec(), b"\x03".to_vec()]
+        vec![b"\x1b".to_vec(), b"\x1b".to_vec(), b"\x1b".to_vec()]
     );
 }
 
@@ -1096,7 +1115,11 @@ fn chat_stop_is_blocked_while_prompt_is_in_flight(cx: &mut gpui::TestAppContext)
         });
     });
     assert!(
-        !sent.lock().unwrap().iter().any(|bytes| bytes == b"\x03"),
-        "b\"\\x03\" must never be sent while prompt delivery is in flight"
+        !sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|bytes| bytes == b"\x03" || bytes == b"\x1b"),
+        "interrupt bytes must never be sent while prompt delivery is in flight"
     );
 }

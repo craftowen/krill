@@ -231,6 +231,13 @@ pub fn parent_pid(pid: u32) -> io::Result<u32> {
     Ok(info.pbsi_ppid)
 }
 
+/// 프로세스 그룹 ID(`proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`). `set +m` 래퍼 아래 포그라운드 에이전트 귀속에 쓴다.
+pub fn process_group(pid: u32) -> io::Result<u32> {
+    // SAFETY: `proc_bsdshortinfo`는 정수 필드만 있고 PROC_PIDT_SHORTBSDINFO의 출력 구조체다.
+    let info = unsafe { pidinfo::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO)? };
+    Ok(info.pbsi_pgid)
+}
+
 /// Current directory, rejecting PID reuse during the query.
 pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
     let start = start_us(pid)?;

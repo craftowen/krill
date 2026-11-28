@@ -3180,7 +3180,11 @@ impl Shell {
 
     /// Every manager API may lock a slot owned by an SSH connection attempt.
     /// UI code reads only these accepted snapshots; backend updates are ordered.
-    fn sync_hosts_after_reconnect(&mut self, reconnect: Option<String>, cx: &mut Context<Self>) {
+    pub(super) fn sync_hosts_after_reconnect(
+        &mut self,
+        reconnect: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.role == WindowRole::Floating {
             return;
         }
@@ -3284,6 +3288,14 @@ impl Shell {
                     && this.paths == paths
                 {
                     this.host_aliases = aliases;
+                    let prev_connected: std::collections::HashSet<krill_app_core::hosts::HostId> =
+                        this.host_statuses
+                            .iter()
+                            .filter(|(_, status)| {
+                                *status == krill_app_core::hosts::HostStatus::Connected
+                            })
+                            .map(|(spec, _)| krill_app_core::hosts::HostId::Remote(spec.id.clone()))
+                            .collect();
                     this.host_statuses = statuses;
                     let prev_targets = std::mem::replace(&mut this.host_targets, targets);
                     let invalidated: Vec<krill_app_core::hosts::HostId> = prev_targets
@@ -3293,6 +3305,21 @@ impl Shell {
                         })
                         .map(|(host, _)| host)
                         .collect();
+                    let newly_connected: Vec<krill_app_core::hosts::HostId> = this
+                        .host_statuses
+                        .iter()
+                        .filter(|(_, status)| {
+                            *status == krill_app_core::hosts::HostStatus::Connected
+                        })
+                        .map(|(spec, _)| krill_app_core::hosts::HostId::Remote(spec.id.clone()))
+                        .filter(|host| !prev_connected.contains(host))
+                        .collect();
+                    let mut repoll_hosts = invalidated.clone();
+                    for host in &newly_connected {
+                        if !repoll_hosts.contains(host) {
+                            repoll_hosts.push(host.clone());
+                        }
+                    }
                     if !invalidated.is_empty() {
                         for host in &invalidated {
                             krill_bots_ui::bots::invalidate_host_connections(host);
@@ -3304,6 +3331,13 @@ impl Shell {
                             .retain(|(host, _)| !invalidated.contains(host));
                         this.remote_orch_generations
                             .retain(|host, _| !invalidated.contains(host));
+                    }
+                    if !repoll_hosts.is_empty() {
+                        // Cancel stale in-flight chat polls so reconnected/re-paired remote chats
+                        // immediately re-poll on the new target (`BOT-19`).
+                        this.chat
+                            .poll_tasks
+                            .retain(|(host, _), _| !repoll_hosts.contains(host));
                     }
                     this.purge_stale_remote_session_authority();
                     this.prune_remote_orchestration(cx);
@@ -3343,9 +3377,14 @@ impl Shell {
                             .update(cx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
                     }
                     this.sync_settings_account_hosts(cx);
+                    this.sync_bots_modal_hosts(cx);
                     this.sync(cx);
                     this.sync_diff_workspace(cx);
                     this.refresh_bots_badge(cx);
+                    if !repoll_hosts.is_empty() {
+                        this.poll_visible_chats(cx);
+                        this.repoll_visible_group_rooms_for_hosts(&repoll_hosts, cx);
+                    }
                     cx.notify();
                 }
                 if this.host_refresh_again || !this.host_pending_reconnects.is_empty() {

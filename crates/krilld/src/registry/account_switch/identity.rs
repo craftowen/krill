@@ -161,7 +161,17 @@ pub(in crate::registry) fn discover(
     root: u32,
     foreground: Option<u32>,
 ) -> io::Result<Option<Identity>> {
-    discover_with(provider, root, foreground, ExpectedId::Any)
+    discover_with(provider, root, foreground, ExpectedId::Any, &[])
+}
+
+/// Like [`discover`], skipping any conversation IDs explicitly retired by `/clear`.
+pub(in crate::registry) fn discover_excluding(
+    provider: ProviderKind,
+    root: u32,
+    foreground: Option<u32>,
+    excluded_ids: &[String],
+) -> io::Result<Option<Identity>> {
+    discover_with(provider, root, foreground, ExpectedId::Any, excluded_ids)
 }
 
 /// Inspect foreground ancestry of a resumed process looking for `expected_id`.
@@ -173,7 +183,13 @@ pub(in crate::registry) fn discover_resumed(
     foreground: Option<u32>,
     expected_id: &str,
 ) -> io::Result<Option<Identity>> {
-    discover_with(provider, root, foreground, ExpectedId::Exact(expected_id))
+    discover_with(
+        provider,
+        root,
+        foreground,
+        ExpectedId::Exact(expected_id),
+        &[],
+    )
 }
 
 /// Inspect foreground ancestry preferring `expected_id`, falling back to an
@@ -184,7 +200,13 @@ pub(in crate::registry) fn discover_preferring(
     foreground: Option<u32>,
     expected_id: &str,
 ) -> io::Result<Option<Identity>> {
-    discover_with(provider, root, foreground, ExpectedId::Prefer(expected_id))
+    discover_with(
+        provider,
+        root,
+        foreground,
+        ExpectedId::Prefer(expected_id),
+        &[],
+    )
 }
 
 fn discover_with(
@@ -192,6 +214,7 @@ fn discover_with(
     root: u32,
     foreground: Option<u32>,
     expected_id: ExpectedId<'_>,
+    excluded_ids: &[String],
 ) -> io::Result<Option<Identity>> {
     if !matches!(
         provider,
@@ -216,7 +239,7 @@ fn discover_with(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    let found = from_paths_mode(provider, paths, expected_id)?;
+    let found = from_paths_mode_excluding(provider, paths, expected_id, excluded_ids)?;
     if found.is_some() {
         return Ok(found);
     }
@@ -235,7 +258,7 @@ fn discover_with(
     if crate::sys::start_us(root).ok() != Some(root_start) {
         return Ok(None);
     }
-    from_paths_mode(provider, paths, expected_id)
+    from_paths_mode_excluding(provider, paths, expected_id, excluded_ids)
 }
 
 #[cfg(test)]
@@ -243,7 +266,7 @@ fn from_paths(
     provider: ProviderKind,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<Option<Identity>> {
-    from_paths_mode(provider, paths, ExpectedId::Any)
+    from_paths_mode_excluding(provider, paths, ExpectedId::Any, &[])
 }
 
 #[cfg(test)]
@@ -252,20 +275,31 @@ fn from_paths_with(
     paths: impl IntoIterator<Item = PathBuf>,
     expected_id: Option<&str>,
 ) -> io::Result<Option<Identity>> {
-    from_paths_mode(
+    from_paths_mode_excluding(
         provider,
         paths,
         expected_id.map_or(ExpectedId::Any, ExpectedId::Exact),
+        &[],
     )
 }
 
+#[cfg(any(test, windows))]
 fn from_paths_mode(
     provider: ProviderKind,
     paths: impl IntoIterator<Item = PathBuf>,
     mode: ExpectedId<'_>,
 ) -> io::Result<Option<Identity>> {
+    from_paths_mode_excluding(provider, paths, mode, &[])
+}
+
+fn from_paths_mode_excluding(
+    provider: ProviderKind,
+    paths: impl IntoIterator<Item = PathBuf>,
+    mode: ExpectedId<'_>,
+    excluded_ids: &[String],
+) -> io::Result<Option<Identity>> {
     if provider == ProviderKind::Antigravity {
-        return agy_from_paths(paths, mode);
+        return agy_from_paths(paths, mode, excluded_ids);
     }
     let mut preferred: Option<Identity> = None;
     let mut fallback: Option<Identity> = None;
@@ -290,6 +324,9 @@ fn from_paths_mode(
             }
             Err(error) => return Err(error),
         };
+        if excluded_ids.iter().any(|excluded| excluded == &id) {
+            continue;
+        }
         if Some(id.as_str()) == mode.expected() {
             if let Some(previous) = &preferred {
                 if previous.id != id || !same_file::is_same_file(&previous.path, &path)? {
@@ -367,6 +404,7 @@ fn agy_identity(home: PathBuf, id: String) -> Identity {
 fn agy_from_paths(
     paths: impl IntoIterator<Item = PathBuf>,
     mode: ExpectedId<'_>,
+    excluded_ids: &[String],
 ) -> io::Result<Option<Identity>> {
     let paths: Vec<_> = paths.into_iter().collect();
     if let Some(expected) = mode.expected() {
@@ -414,6 +452,9 @@ fn agy_from_paths(
         let Some((home, id)) = crate::agent_history::vault::agy_root_and_id_from_path(path) else {
             continue;
         };
+        if excluded_ids.iter().any(|excluded| excluded == &id) {
+            continue;
+        }
         if let Some(previous) = &found {
             if previous.id != id || previous.home != home {
                 return Err(io::ErrorKind::InvalidData.into());

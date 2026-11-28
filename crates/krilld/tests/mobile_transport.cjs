@@ -2725,3 +2725,44 @@ test("MOB-13: pending read RPC awaiting reconnected() rejects immediately on clo
     h.transport.close();
   }
 });
+
+test("MPWA-17 & MPWA-18: voice.warm is a read RPC and bots.models/set_effort get 45s long deadlines", async () => {
+  // MPWA-17: socket drop mid-voice.warm does NOT poison uncertainMutation / updateBusy after reconnect.
+  {
+    const h = harness(),
+      { pending, socket } = await h.start(4);
+    h.response(socket, { sessions: [] });
+    await pending;
+    const warm = h.transport.rpc({ action: "voice.warm" });
+    await flush();
+    socket.emit("close", { code: 1006 });
+    await flush();
+    await h.tick(1000);
+    const retry = h.sockets.at(-1);
+    assert.notEqual(retry, socket);
+    await h.advance(retry, 4);
+    h.response(retry, { sessions: [] });
+    await flush();
+    h.response(retry, { ok: true });
+    await warm;
+    assert.equal(h.transport.updateBusy, false, "MPWA-17: voice.warm never leaves updateBusy stuck");
+    h.transport.close();
+  }
+  // MPWA-18: bots.models and set_effort both survive past 16s (using 45s LONG_RPC_ACTIONS deadline).
+  for (const action of ["bots.models", "set_effort"]) {
+    const h = harness(),
+      { pending, socket } = await h.start(4);
+    h.response(socket, { sessions: [] });
+    await pending;
+    let settled = false;
+    const p = h.transport.rpc({ action, session: 1 }).then(() => { settled = true; });
+    await flush();
+    await h.tick(16000);
+    assert.equal(settled, false, `MPWA-18: ${action} does not timeout at 15s`);
+    assert.equal(h.transport.state.phase, "ready", `MPWA-18: ${action} keeps socket alive past 15s`);
+    h.response(socket, { ok: true });
+    await p;
+    assert.equal(settled, true);
+    h.transport.close();
+  }
+});

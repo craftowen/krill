@@ -1472,3 +1472,241 @@ fn unbracketed_turn_watcher_stops_when_transport_becomes_stale(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui::test]
+fn clear_command_resets_chat_calls_daemon_chat_clear_and_sends_provider_clear_command(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::agent_history::{ChatItem, ChatItemKind, ChatPollSnapshot};
+    use krill_proto::input::Delivery;
+
+    let (view, cx, _, sent) = fixture(cx, "chat-clear-agy", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let workflow_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_calls = workflow_calls.clone();
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.apply_chat_poll(
+                SESSION,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "conv-old-1".into(),
+                    transcript_path: "/tmp/old.jsonl".into(),
+                    next_offset: 120,
+                    reset: false,
+                    bound: true,
+                    items: vec![
+                        ChatItem {
+                            kind: ChatItemKind::User,
+                            text: "old question".into(),
+                            ..Default::default()
+                        },
+                        ChatItem {
+                            kind: ChatItemKind::Assistant,
+                            text: "old answer".into(),
+                            ..Default::default()
+                        },
+                    ],
+                },
+            );
+            shell.chat.workflow_call = Some(Arc::new(move |req: &str| {
+                recorded_calls.lock().unwrap().push(req.to_owned());
+                if req.contains("\"chat_clear\"") {
+                    Ok(r#"{"ok":true,"data":{"cleared":true}}"#.to_owned())
+                } else {
+                    Ok(r#"{"ok":true,"data":{"agent":"agy","session_id":"","transcript_path":"","next_offset":0,"reset":false,"bound":false,"items":[]}}"#.to_owned())
+                }
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            // Include trailing space and mixed case (as produced by autocomplete or manual typing).
+            input.update(cx, |state, cx| state.set_value("/CLEAR ", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+
+    // Immediately after submit, local chat log must already be empty and unbound.
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SESSION)];
+        assert!(log.items.is_empty(), "local items must clear immediately");
+        assert!(!log.bound, "log must unbind on /clear");
+        assert_eq!(log.offset, 0);
+        assert_eq!(log.binding, (String::new(), String::new()));
+    });
+
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(80));
+    cx.run_until_parked();
+
+    // Daemon `chat_clear` RPC must have been called for this session.
+    let calls = workflow_calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|c| c.contains("\"action\":\"chat_clear\"")
+            && c.contains(&format!("\"session\":{}", SESSION.0))),
+        "expected daemon chat_clear RPC call, got: {calls:?}"
+    );
+
+    // PTY must receive trimmed `/clear` (no trailing space) + `\r`.
+    let payloads = sent.lock().unwrap();
+    assert_eq!(payloads.len(), 2, "expected paste + Enter: {payloads:?}");
+    assert_eq!(
+        payloads[0], b"\x1b[200~/clear\x1b[201~",
+        "clear command must be trimmed with no trailing space"
+    );
+    assert_eq!(payloads[1], b"\r");
+
+    // Subsequent unbound poll must keep chat empty; new conversation poll binds cleanly.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, _| {
+            shell.apply_chat_poll(
+                SESSION,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: String::new(),
+                    transcript_path: String::new(),
+                    next_offset: 0,
+                    reset: false,
+                    bound: false,
+                    items: Vec::new(),
+                },
+            );
+            assert!(shell.chat.logs[&local_key(SESSION)].items.is_empty());
+
+            shell.apply_chat_poll(
+                SESSION,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "conv-new-2".into(),
+                    transcript_path: "/tmp/new.jsonl".into(),
+                    next_offset: 50,
+                    reset: false,
+                    bound: true,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::User,
+                        text: "fresh prompt".into(),
+                        ..Default::default()
+                    }],
+                },
+            );
+            let log = &shell.chat.logs[&local_key(SESSION)];
+            assert_eq!(log.items.len(), 1);
+            assert_eq!(log.items[0].text, "fresh prompt");
+            assert_eq!(log.binding.0, "conv-new-2");
+        });
+    });
+}
+
+#[gpui::test]
+fn clear_command_translates_to_new_for_codex_and_runs_from_autocomplete_and_quick_menu(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::agent_history::ChatPollSnapshot;
+    use krill_proto::input::Delivery;
+
+    let (view, cx, _, sent) = fixture(cx, "chat-clear-codex", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.apply_chat_poll(
+                SESSION,
+                ChatPollSnapshot {
+                    agent: "codex".into(),
+                    session_id: "codex-old".into(),
+                    transcript_path: "/tmp/codex-old.jsonl".into(),
+                    next_offset: 80,
+                    reset: false,
+                    bound: true,
+                    items: Vec::new(),
+                },
+            );
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("/cl", window, cx));
+            // Simulate open slash autocomplete with `/clear` selected.
+            let ac = shell
+                .chat
+                .autocomplete
+                .entry(local_key(SESSION))
+                .or_default();
+            ac.trigger = Some(crate::shell::chat::catalog::AutocompleteTrigger {
+                kind: crate::shell::chat::catalog::AutocompleteKind::Slash,
+                query: "cl".into(),
+                replace_range: 0..3,
+            });
+            ac.items = vec![crate::shell::chat::catalog::AutocompleteCandidate {
+                label: "/clear".into(),
+                detail: "Clear conversation".into(),
+                insert_text: "/clear ".into(),
+                source: crate::shell::chat::catalog::AutocompleteSource::Builtin,
+            }];
+            ac.selected = 0;
+
+            // Tab (execute_zero_arg = false) completes `/clear` without submitting.
+            assert!(shell.accept_chat_autocomplete(&local_key(SESSION), None, false, window, cx));
+            assert_eq!(input.read(cx).value().as_ref(), "/clear");
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "Tab must not submit /clear"
+            );
+
+            // Re-open autocomplete while exact `/clear` is typed: direct-submit check must be true.
+            let ac = shell
+                .chat
+                .autocomplete
+                .entry(local_key(SESSION))
+                .or_default();
+            ac.trigger = Some(crate::shell::chat::catalog::AutocompleteTrigger {
+                kind: crate::shell::chat::catalog::AutocompleteKind::Slash,
+                query: "clear".into(),
+                replace_range: 0..6,
+            });
+            ac.items = vec![crate::shell::chat::catalog::AutocompleteCandidate {
+                label: "/clear".into(),
+                detail: "Clear conversation".into(),
+                insert_text: "/clear ".into(),
+                source: crate::shell::chat::catalog::AutocompleteSource::Builtin,
+            }];
+            assert!(
+                shell.chat_autocomplete_should_submit_directly(&local_key(SESSION), &input, cx),
+                "exact /clear with popup open must submit on first Enter"
+            );
+
+            // Accepting `/clear` with Enter/click (execute_zero_arg = true) submits immediately.
+            assert!(shell.accept_chat_autocomplete(&local_key(SESSION), Some(0), true, window, cx));
+        });
+    });
+
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(80));
+    cx.run_until_parked();
+
+    let payloads = sent.lock().unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        payloads[0], b"\x1b[200~/clear\x1b[201~",
+        "codex must receive /clear directly (live codex /new opens a worktree modal)"
+    );
+    assert_eq!(payloads[1], b"\r");
+}

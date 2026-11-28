@@ -110,12 +110,20 @@ pub(super) fn load(cwd: &Path, query: &str) -> io::Result<Value> {
     scan.deadline = Instant::now() + Duration::from_millis(150);
     if let Ok(bytes) = git {
         for raw in bytes.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            if scan.paths.len() >= MAX_ITEMS || Instant::now() >= scan.deadline {
+                scan.truncated = true;
+                break;
+            }
+            let Ok(path) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            if !scan.matches_query(path) {
+                continue;
+            }
             if !scan.visit() {
                 break;
             }
-            if let Ok(path) = std::str::from_utf8(raw) {
-                scan.add(Path::new(path));
-            }
+            scan.add_matched(Path::new(path));
         }
     } else if root.ancestors().any(|p| p.join(".git").exists()) {
         // A failed/oversized Git listing must not bypass its ignore rules via the fallback walk.
@@ -147,14 +155,23 @@ impl Scan<'_> {
         true
     }
 
-    fn add(&mut self, path: &Path) {
-        if path.to_str().is_some_and(|p| {
-            p.replace(std::path::MAIN_SEPARATOR, "/")
+    fn matches_query(&self, path: &str) -> bool {
+        self.query.is_empty()
+            || path
+                .replace(std::path::MAIN_SEPARATOR, "/")
                 .to_lowercase()
                 .contains(self.query)
-        }) && let Some(path) = relative_file(self.root, path)
-        {
+    }
+
+    fn add_matched(&mut self, path: &Path) {
+        if let Some(path) = relative_file(self.root, path) {
             self.paths.insert(path);
+        }
+    }
+
+    fn add(&mut self, path: &Path) {
+        if path.to_str().is_some_and(|p| self.matches_query(p)) {
+            self.add_matched(path);
         }
     }
 

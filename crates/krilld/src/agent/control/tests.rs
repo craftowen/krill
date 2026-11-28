@@ -1068,3 +1068,130 @@ fn launched_at_stays_immutable_across_all_atomic_rewrites_and_backfills_legacy_f
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn clear_chat_binding_retires_old_conversation_persists_and_allows_agy_rebind_preserving_metadata()
+{
+    let dir = std::env::temp_dir().join(format!(
+        "krill-clear-chat-binding-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(88);
+    let account = LaunchAccount {
+        id: "acc-agy-1".into(),
+        env_key: "ANTIGRAVITY_CLI_HOME".into(),
+        dir: "/tmp/agy-profile-1".into(),
+    };
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "agy".into(),
+                permission: Permission::Yolo,
+            },
+            Some("conv-old-1".into()),
+            b"/work/bot-7".to_vec(),
+            Some(account.clone()),
+        )
+        .unwrap();
+    control
+        .remember_bot_instructions(session, "bot-7 soul")
+        .unwrap();
+    control.bind_discovered_session(
+        session,
+        "conv-old-1",
+        Some(Path::new(
+            "/tmp/brain/conv-old-1/.system_generated/logs/transcript_full.jsonl",
+        )),
+    );
+
+    // 1. `/clear` retires the old conversation while preserving profile, YOLO permission, account, and bot instructions.
+    control
+        .clear_chat_binding(session, &[], &[])
+        .expect("clear_chat_binding");
+    let stored_after_clear = control.stored(session).unwrap().unwrap();
+    assert_eq!(stored_after_clear.session_id, None);
+    assert_eq!(stored_after_clear.transcript_path, None);
+    assert_eq!(stored_after_clear.permission, Permission::Yolo);
+    assert_eq!(stored_after_clear.account, Some(account.clone()));
+    assert_eq!(
+        stored_after_clear.bot_instructions.as_deref(),
+        Some("bot-7 soul")
+    );
+
+    // 2. Persists across a fresh Control reload (daemon restart).
+    let reloaded = Control::new(Some(&dir));
+    let cleared = reloaded.cleared_bindings(session);
+    assert!(cleared.session_ids.iter().any(|id| id == "conv-old-1"));
+    assert!(
+        cleared
+            .transcript_paths
+            .iter()
+            .any(|p| p.contains("conv-old-1"))
+    );
+    assert!(cleared.cleared_at.is_some());
+
+    // 3. Delayed pre-clear hook and discovery for the retired conversation are ignored (never resurrect).
+    let stale_stop = br#"{"hook_event_name":"Stop","conversation_id":"conv-old-1","transcript_path":"/tmp/brain/conv-old-1/.system_generated/logs/transcript_full.jsonl"}"#;
+    assert!(
+        reloaded.record_hook_session_with_context(session, stale_stop, Some("agy"), None),
+        "delayed pre-clear hook must be treated as stale/foreign"
+    );
+    assert_eq!(reloaded.stored(session).unwrap().unwrap().session_id, None);
+    reloaded.bind_discovered_session(
+        session,
+        "conv-old-1",
+        Some(Path::new(
+            "/tmp/brain/conv-old-1/.system_generated/logs/transcript_full.jsonl",
+        )),
+    );
+    assert_eq!(reloaded.stored(session).unwrap().unwrap().session_id, None);
+
+    // 4. Next turn's `agy` PreInvocation hook with a NEW conversation ID binds cleanly and preserves YOLO + account.
+    let next_turn_hook = br#"{"hook_event_name":"PreInvocation","conversation_id":"conv-new-2","transcript_path":"/tmp/brain/conv-new-2/.system_generated/logs/transcript_full.jsonl"}"#;
+    assert!(
+        !reloaded.record_hook_session_with_context(session, next_turn_hook, Some("agy"), None),
+        "new post-clear agy conversation must bind cleanly"
+    );
+    let rebound = reloaded.stored(session).unwrap().unwrap();
+    assert_eq!(rebound.session_id.as_deref(), Some("conv-new-2"));
+    assert_eq!(
+        rebound.transcript_path.as_deref(),
+        Some("/tmp/brain/conv-new-2/.system_generated/logs/transcript_full.jsonl")
+    );
+    assert_eq!(rebound.permission, Permission::Yolo);
+    assert_eq!(rebound.account, Some(account.clone()));
+    assert_eq!(rebound.bot_instructions.as_deref(), Some("bot-7 soul"));
+
+    // 5. Same-provider foreground PreInvocation rotation (e.g. terminal `/clear` in agy) also preserves YOLO + account
+    //    and retires conv-new-2.
+    let term_clear_hook = br#"{"hook_event_name":"PreInvocation","conversation_id":"conv-new-3","transcript_path":"/tmp/brain/conv-new-3/.system_generated/logs/transcript_full.jsonl"}"#;
+    assert!(
+        !reloaded.record_foreground_hook_session(session, term_clear_hook, "agy", None),
+        "same-provider foreground PreInvocation rotation must succeed"
+    );
+    let rotated = reloaded.stored(session).unwrap().unwrap();
+    assert_eq!(rotated.session_id.as_deref(), Some("conv-new-3"));
+    assert_eq!(rotated.permission, Permission::Yolo);
+    assert_eq!(rotated.account, Some(account));
+    assert!(
+        reloaded
+            .cleared_bindings(session)
+            .session_ids
+            .iter()
+            .any(|id| id == "conv-new-2")
+    );
+
+    // 6. forget() cleans up the cleared sidecar file as well.
+    reloaded.forget(session);
+    assert!(reloaded.cleared_bindings(session).is_empty());
+    assert!(!dir.join("agent-launches/88.cleared.json").exists());
+
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -39,6 +39,7 @@ pub(crate) fn base_text_view_style(theme: &crate::Theme) -> gpui_base::TextViewS
     table.corner_radii.top_right = Some(radius.into());
     table.corner_radii.bottom_left = Some(radius.into());
     table.corner_radii.bottom_right = Some(radius.into());
+    table.overflow.x = Some(gpui::Overflow::Scroll);
     let mut code_block = gpui::StyleRefinement::default();
     code_block.corner_radii = table.corner_radii.clone();
     let table_head = gpui::StyleRefinement::default()

@@ -56,6 +56,81 @@ pub(crate) struct LaunchAccount {
     pub dir: String,
 }
 
+/// Per-session record of conversations explicitly cleared via `/clear` (persisted as
+/// `agent-launches/<id>.cleared.json`) so polling, live handle discovery, and delayed
+/// pre-clear hooks never resurrect cleared transcripts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ClearedBindings {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<u64>,
+}
+
+const MAX_CLEARED_ENTRIES: usize = 32;
+
+impl ClearedBindings {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.session_ids.is_empty() && self.transcript_paths.is_empty() && self.cleared_at.is_none()
+    }
+
+    pub(crate) fn contains(&self, sid: Option<&str>, path: Option<&Path>) -> bool {
+        if let Some(id) = sid.map(str::trim).filter(|s| !s.is_empty())
+            && self.session_ids.iter().any(|old| old == id)
+        {
+            return true;
+        }
+        if let Some(p) = path
+            .and_then(Path::to_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && self.transcript_paths.iter().any(|old| old == p)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn record_id(&mut self, id: &str) {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !self.session_ids.iter().any(|old| old == trimmed) {
+            if self.session_ids.len() >= MAX_CLEARED_ENTRIES {
+                self.session_ids.remove(0);
+            }
+            self.session_ids.push(trimmed.to_owned());
+        }
+    }
+
+    fn record_path(&mut self, path: &str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !self.transcript_paths.iter().any(|old| old == trimmed) {
+            if self.transcript_paths.len() >= MAX_CLEARED_ENTRIES {
+                self.transcript_paths.remove(0);
+            }
+            self.transcript_paths.push(trimmed.to_owned());
+        }
+    }
+
+    fn unrecord(&mut self, sid: Option<&str>, path: Option<&str>) -> bool {
+        let before = (self.session_ids.len(), self.transcript_paths.len());
+        if let Some(id) = sid.map(str::trim).filter(|s| !s.is_empty()) {
+            self.session_ids.retain(|old| old != id);
+        }
+        if let Some(p) = path.map(str::trim).filter(|s| !s.is_empty()) {
+            self.transcript_paths.retain(|old| old != p);
+        }
+        (self.session_ids.len(), self.transcript_paths.len()) != before
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Control {
     dir: Option<PathBuf>,
@@ -69,6 +144,8 @@ pub(crate) struct Control {
     /// 한도 초과(`StopFailure` / `agy_rate_limited`)로 중단돼 계정 전환 뒤 작업을 이어갈 세션.
     rate_limited: Mutex<std::collections::HashSet<SessionId>>,
     account_retirements: Mutex<std::collections::HashSet<SessionId>>,
+    /// In-memory mirror of `agent-launches/<id>.cleared.json` for fast polling lookups.
+    cleared: Mutex<std::collections::HashMap<SessionId, ClearedBindings>>,
 }
 
 impl Control {
@@ -81,6 +158,7 @@ impl Control {
             account_resumes: Mutex::default(),
             rate_limited: Mutex::default(),
             account_retirements: Mutex::default(),
+            cleared: Mutex::default(),
         }
     }
 
@@ -249,6 +327,87 @@ impl Control {
             .join(format!("{}.json", session.0)))
     }
 
+    fn cleared_path(&self, session: SessionId) -> io::Result<PathBuf> {
+        Ok(self
+            .dir
+            .as_ref()
+            .ok_or(io::ErrorKind::NotFound)?
+            .join("agent-launches")
+            .join(format!("{}.cleared.json", session.0)))
+    }
+
+    fn read_cleared_locked(&self, session: SessionId) -> ClearedBindings {
+        if let Some(cached) = lock(&self.cleared).get(&session) {
+            return cached.clone();
+        }
+        let loaded = self
+            .cleared_path(session)
+            .ok()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<ClearedBindings>(&bytes).ok())
+            .unwrap_or_default();
+        if !loaded.is_empty() {
+            lock(&self.cleared).insert(session, loaded.clone());
+        }
+        loaded
+    }
+
+    fn write_cleared_locked(
+        &self,
+        session: SessionId,
+        bindings: &ClearedBindings,
+    ) -> io::Result<()> {
+        if bindings.is_empty() {
+            lock(&self.cleared).remove(&session);
+            if let Ok(path) = self.cleared_path(session) {
+                fs::remove_file(path).ok();
+            }
+            return Ok(());
+        }
+        lock(&self.cleared).insert(session, bindings.clone());
+        if let Ok(path) = self.cleared_path(session) {
+            let bytes = serde_json::to_vec(bindings).map_err(io::Error::other)?;
+            write_atomic_0600(&path, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the conversations explicitly retired by `/clear` for `session`.
+    pub(crate) fn cleared_bindings(&self, session: SessionId) -> ClearedBindings {
+        let _guard = lock(&self.config);
+        self.read_cleared_locked(session)
+    }
+
+    /// Detaches the current conversation from `session` and retires any previously bound
+    /// conversation IDs / transcript paths so subsequent polls and delayed hooks never
+    /// resurrect pre-clear messages. Preserves profile, permission, account, and bot metadata.
+    pub(crate) fn clear_chat_binding(
+        &self,
+        session: SessionId,
+        extra_sids: &[&str],
+        extra_paths: &[&str],
+    ) -> io::Result<()> {
+        let _guard = lock(&self.config);
+        let mut cleared = self.read_cleared_locked(session);
+        for sid in extra_sids {
+            cleared.record_id(sid);
+        }
+        for path in extra_paths {
+            cleared.record_path(path);
+        }
+        if let Ok(Some(mut stored)) = self.read_stored(session) {
+            if let Some(old_sid) = stored.session_id.take() {
+                cleared.record_id(&old_sid);
+            }
+            if let Some(old_tp) = stored.transcript_path.take() {
+                cleared.record_path(&old_tp);
+            }
+            self.write_stored_preserving_launched_at(session, &mut stored)?;
+        }
+        cleared.cleared_at = now_epoch_secs();
+        self.write_cleared_locked(session, &cleared)
+    }
+
     #[cfg(all(test, unix))]
     pub fn has(&self, session: SessionId) -> bool {
         self.launch_path(session).is_ok_and(|p| p.exists())
@@ -415,6 +574,10 @@ impl Control {
             return false;
         }
         let _guard = lock(&self.config);
+        let cleared = self.read_cleared_locked(session);
+        if cleared.contains(Some(id), None) {
+            return true;
+        }
         self.read_stored(session)
             .ok()
             .flatten()
@@ -502,6 +665,21 @@ impl Control {
             self.block_hibernation(session);
         }
         let _guard = lock(&self.config);
+        let is_explicit_resume = payload.as_ref().is_ok_and(|p| {
+            hook_event(p).is_some_and(|event| matches!(event, "SessionStart" | "sessionStart"))
+                && p.get("source").and_then(serde_json::Value::as_str) == Some("resume")
+        });
+        let mut cleared = self.read_cleared_locked(session);
+        if cleared.contains(id, transcript_path.map(Path::new)) {
+            if is_explicit_resume {
+                if cleared.unrecord(id, transcript_path) {
+                    self.write_cleared_locked(session, &cleared).ok();
+                }
+            } else {
+                // Delayed hook from a conversation retired by `/clear` must never resurrect it.
+                return true;
+            }
+        }
         let mut stored = match self.read_stored(session) {
             Ok(Some(stored)) => stored,
             Ok(None) => {
@@ -575,38 +753,60 @@ impl Control {
         });
         // A shell can start a different CLI after the previous one exits. Replace the
         // entire binding only with live caller evidence, never a nested tool's hint.
+        let event_name = payload.as_ref().ok().and_then(hook_event);
         let rebind = binding == HookBinding::Foreground
             && !explicit_subagent
             && id.is_some()
             && (provider_changed
                 || (stored.session_id.is_some() && identity_changed && !legitimate_rotation))
-            && payload
-                .as_ref()
-                .ok()
-                .and_then(hook_event)
-                .is_some_and(|event| {
-                    matches!(event, "SessionStart" | "sessionStart" | "PreInvocation")
-                });
+            && event_name.is_some_and(|event| {
+                matches!(event, "SessionStart" | "sessionStart" | "PreInvocation")
+            });
         let watching_resume = lock(&self.account_resumes).contains_key(&session);
         if rebind && !watching_resume {
-            if let Some(provider) = incoming_provider {
-                provider.as_str().clone_into(&mut stored.profile);
+            let in_process_agy_rotation = !provider_changed && event_name == Some("PreInvocation");
+            if in_process_agy_rotation {
+                // In-process Antigravity (`agy`) `/clear` rotation: `agy` emits `PreInvocation`
+                // (not `SessionStart`) with a new conversation ID inside the same live process.
+                // Retire the previous conversation and preserve permission, account, and bot metadata.
+                let mut cleared_changed = false;
+                if let Some(old_sid) = stored.session_id.as_deref() {
+                    cleared.record_id(old_sid);
+                    cleared_changed = true;
+                }
+                if let Some(old_tp) = stored.transcript_path.as_deref() {
+                    cleared.record_path(old_tp);
+                    cleared_changed = true;
+                }
+                if cleared_changed {
+                    cleared.cleared_at = now_epoch_secs();
+                    self.write_cleared_locked(session, &cleared).ok();
+                }
+            } else {
+                if let Some(provider) = incoming_provider {
+                    provider.as_str().clone_into(&mut stored.profile);
+                }
+                stored.permission = Permission::Manual;
+                stored.account = None;
+                stored.hibernation_blocked = true;
+                self.block_hibernation(session);
             }
-            stored.permission = Permission::Manual;
             stored.session_id = id.map(str::to_owned);
             stored.transcript_path = transcript_path.map(str::to_owned);
-            stored.cwd = payload
+            let next_cwd = payload
                 .as_ref()
                 .ok()
                 .and_then(|p| p.get("cwd").and_then(serde_json::Value::as_str))
                 .filter(|cwd| !cwd.is_empty() && cwd.len() <= 4096)
-                .map_or_else(
-                    || cwd_hint.unwrap_or_default().to_vec(),
-                    |cwd| cwd.as_bytes().to_vec(),
-                );
-            stored.account = None;
-            stored.hibernation_blocked = true;
-            self.block_hibernation(session);
+                .map(|cwd| cwd.as_bytes().to_vec())
+                .or_else(|| cwd_hint.filter(|c| !c.is_empty()).map(<[u8]>::to_vec));
+            if in_process_agy_rotation {
+                if let Some(cwd) = next_cwd {
+                    stored.cwd = cwd;
+                }
+            } else {
+                stored.cwd = next_cwd.unwrap_or_default();
+            }
             self.write_stored_preserving_launched_at(session, &mut stored)
                 .ok();
             return false;
@@ -694,6 +894,10 @@ impl Control {
             return;
         }
         let _guard = lock(&self.config);
+        let cleared = self.read_cleared_locked(session);
+        if cleared.contains(Some(session_id), transcript_path) {
+            return;
+        }
         let Ok(Some(mut stored)) = self.read_stored(session) else {
             return;
         };
@@ -762,7 +966,11 @@ impl Control {
         };
         let skip_name = format!("{}.json", exclude.0);
         for entry in entries.take(512).flatten() {
-            if entry.file_name().to_str() == Some(skip_name.as_str()) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n == skip_name || n.ends_with(".cleared.json"))
+            {
                 continue;
             }
             let Ok(bytes) = fs::read(entry.path()) else {
@@ -819,7 +1027,10 @@ impl Control {
             let name = entry.file_name();
             let Some(id) = name
                 .to_str()
-                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|name| {
+                    name.strip_suffix(".cleared.json")
+                        .or_else(|| name.strip_suffix(".json"))
+                })
                 .and_then(|name| name.parse::<u64>().ok())
                 .map(SessionId)
             else {
@@ -853,7 +1064,11 @@ impl Control {
         lock(&self.veto).remove(&session);
         self.clear_rate_limited(session);
         let _guard = lock(&self.config);
+        lock(&self.cleared).remove(&session);
         if let Ok(path) = self.launch_path(session) {
+            fs::remove_file(path).ok();
+        }
+        if let Ok(path) = self.cleared_path(session) {
             fs::remove_file(path).ok();
         }
     }

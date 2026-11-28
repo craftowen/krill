@@ -258,7 +258,7 @@ impl View {
 
     /// Orca `BotConnectorsHostNotice`: explains when connectors run on a remote host.
     fn render_host_notice(&self, p: &ui::Palette) -> gpui::Div {
-        let host_label = format!("{}", self.host);
+        let host_label = self.host_label();
         div()
             .debug_selector(|| "bot-connectors-host-notice".into())
             .mb_2()

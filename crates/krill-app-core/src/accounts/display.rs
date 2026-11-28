@@ -50,8 +50,10 @@ pub fn now() -> u64 {
 pub fn summary(usage: &Snapshot, now: u64) -> String {
     let now = i64::try_from(now).unwrap_or(i64::MAX);
     format!(
-        "5h {} · 7d {}",
+        "{} {} · {} {}",
+        text::WINDOW_5H.get(),
         window(usage.five_hour.as_ref(), now).text,
+        text::WINDOW_7D.get(),
         window(usage.seven_day.as_ref(), now).text
     )
 }

@@ -112,19 +112,38 @@ fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
     copied
 }
 
+const MAX_LIST_ITEMS: usize = 500;
+
 pub(super) fn list(state: &Path, inbox: &Path) -> io::Result<Value> {
     drop::prune(state, SystemTime::now());
-    let items: Vec<Value> = drop::list(state)?
-        .into_iter()
-        .map(|item| {
-            let ms = item
-                .added
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |at| u64::try_from(at.as_millis()).unwrap_or(u64::MAX));
-            json!({"id":item.id,"name":item.name,"size":item.size,"modified_unix_ms":ms})
-        })
-        .collect();
-    Ok(json!({"items":items,"inbox":inbox.to_string_lossy()}))
+    let inbox_str = inbox.to_string_lossy();
+    let max_bytes = krill_proto::ipc::MAX_FRAME.saturating_sub(4096);
+    let mut used = inbox_str.len().saturating_add(128);
+    let mut items: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    for item in drop::list(state)? {
+        if items.len() >= MAX_LIST_ITEMS {
+            truncated = true;
+            break;
+        }
+        let ms = item
+            .added
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |at| u64::try_from(at.as_millis()).unwrap_or(u64::MAX));
+        let entry = json!({"id":item.id,"name":item.name,"size":item.size,"modified_unix_ms":ms});
+        let entry_len = serde_json::to_string(&entry).map_or(256, |s| s.len() + 1);
+        if used.saturating_add(entry_len) > max_bytes {
+            truncated = true;
+            break;
+        }
+        used = used.saturating_add(entry_len);
+        items.push(entry);
+    }
+    let mut out = json!({"items":items,"inbox":inbox_str});
+    if truncated && let Some(obj) = out.as_object_mut() {
+        obj.insert("truncated".into(), true.into());
+    }
+    Ok(out)
 }
 
 pub(super) fn get(state: &Path, id: &str, offset: u64) -> io::Result<Value> {
@@ -380,5 +399,29 @@ mod tests {
         f.backend.registry = std::sync::Arc::downgrade(&registry);
         let snapshot = f.rpc(&json!({"action":"snapshot"})).unwrap();
         assert_eq!(snapshot["capabilities"]["drop"], true);
+    }
+
+    #[test]
+    fn list_caps_large_outbox_below_max_frame() {
+        let f = fixture();
+        let outbox = drop::outbox_dir(&f.state);
+        fs::create_dir_all(&outbox).unwrap();
+        for i in 0..(MAX_LIST_ITEMS + 30) {
+            let id = format!("{i:032x}");
+            let dir = outbox.join(&id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("file.txt"), b"x").unwrap();
+        }
+        let reply = f
+            .backend
+            .request(&json!({"action":"drop_list"}).to_string());
+        assert!(reply.len() < ipc::MAX_FRAME, "len={}", reply.len());
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(
+            parsed["data"]["items"].as_array().unwrap().len(),
+            MAX_LIST_ITEMS
+        );
+        assert_eq!(parsed["data"]["truncated"], true);
     }
 }

@@ -251,22 +251,10 @@ fn open_markdown_link(
     _window: &mut Window,
     cx: &mut App,
 ) {
-    let should_open = match event {
-        gpui::ClickEvent::Mouse(click) => {
-            matches!(
-                click.up.button,
-                gpui::MouseButton::Left | gpui::MouseButton::Middle
-            )
-        }
-        gpui::ClickEvent::Keyboard(_) => true,
-        gpui::ClickEvent::Touch(click) => !click.long_press,
-    };
-    if !should_open {
+    if !crate::terminal::path_link::should_open_link_click(event) {
         return;
     }
-    if let Some(clean) = crate::terminal::path_link::sanitize_external_url(url) {
-        cx.open_url(&clean);
-    }
+    crate::terminal::path_link::open_markdown_link_with_app(url, None, cx);
 }
 
 /// 마크다운 미리보기(gpui-component `TextView`). 원본↔미리보기 토글은 파일 탭 쪽(OWE-663/665)에서.

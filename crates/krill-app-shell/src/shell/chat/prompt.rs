@@ -496,6 +496,28 @@ impl Shell {
                         WatchStep::Wait => cx.background_executor().timer(POLL).await,
                     }
                 }
+                // Mid-turn steer on Claude/Codex: PTY delivery was already `Applied`, but JSONL
+                // often does not flush until the running tool call finishes (>15s). While the
+                // session remains `Working` on the same live transport, mark the pending steer
+                // `Queued` awaiting transcript echo instead of falsely escalating to ReviewRequired.
+                if steer {
+                    let stayed_working = this
+                        .update(cx, |this, cx| {
+                            if this.chat_prompt_transport_current(&origin)
+                                && this.session_agent_state(&task_key.0, task_key.1, cx)
+                                    == krill_proto::control::AgentState::Working
+                            {
+                                this.mark_pending_prompt_queued(&task_key, pending_id, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if stayed_working {
+                        return;
+                    }
+                }
             }
             // Applied only proves a PTY write, never provider consumption. Keep
             // the draft and require review rather than replaying or adding Enter.

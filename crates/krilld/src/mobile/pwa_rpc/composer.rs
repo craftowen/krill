@@ -98,6 +98,51 @@ fn command(
     }
 }
 
+const QUIET_WAIT: Duration = Duration::from_millis(800);
+
+fn is_transient_idle_wait(err: &io::Error) -> bool {
+    let msg = err.to_string();
+    msg == "Wait for an idle terminal with an empty native composer"
+        || msg == "Terminal input is busy"
+}
+
+/// Retries briefly (50ms steps up to 800ms) when an idle empty composer is only blocked by the
+/// 250ms `last_input_ns` or 100ms `last_output` quiet guard (e.g. sequential `set_model` ->
+/// `set_effort`). Returns `(revision, seq)` captured right before the successful write.
+fn command_waiting(
+    tap: &Tap,
+    working: bool,
+    initial_revision: u64,
+    initial_seq: u64,
+    bytes: &[u8],
+    ready: impl Fn(&Screen) -> bool,
+    accepts: impl Fn(&Screen, bool) -> bool,
+) -> io::Result<(u64, u64)> {
+    match command(tap, working, initial_revision, bytes, &accepts) {
+        Ok(()) => return Ok((initial_revision, initial_seq)),
+        Err(err) if !is_transient_idle_wait(&err) => return Err(err),
+        Err(_) => {}
+    }
+    let deadline = Instant::now() + QUIET_WAIT;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let (screen, revision, seq) = tap.capture();
+        if !ready(&screen) {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "Wait for an idle terminal with an empty native composer",
+                ));
+            }
+            continue;
+        }
+        match command(tap, working, revision.0, bytes, &accepts) {
+            Ok(()) => return Ok((revision.0, seq.0)),
+            Err(err) if is_transient_idle_wait(&err) && Instant::now() < deadline => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub(super) struct Context {
     pub home: PathBuf,
     pub cwd: PathBuf,
@@ -166,6 +211,14 @@ impl Backend {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         set(&mut value, "supported", supported.into());
+        if !supported
+            && let Some(reason) = catalog
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        {
+            set(&mut value, "reason", reason.into());
+        }
         set(&mut value, "effort_supported", false.into());
         if let Some(adapter) = adapter(&context.agent) {
             let live = self.live(session);
@@ -301,6 +354,12 @@ pub(super) fn command_context(
 fn set(value: &mut Value, key: &str, item: Value) {
     if let Some(fields) = value.as_object_mut() {
         fields.insert(key.into(), item);
+    }
+}
+
+fn remove(value: &mut Value, key: &str) {
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove(key);
     }
 }
 

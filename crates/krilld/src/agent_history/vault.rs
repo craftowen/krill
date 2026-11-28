@@ -2807,7 +2807,15 @@ pub(crate) fn is_agy_presence_lock(path: &Path) -> bool {
         && path.extension().is_some_and(|e| e == "lock")
 }
 
+#[cfg(test)]
 fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
+    agy_root_and_id_from_vnodes_excluding(paths, &[])
+}
+
+fn agy_root_and_id_from_vnodes_excluding(
+    paths: &[PathBuf],
+    exclude_ids: &[String],
+) -> Option<(PathBuf, String)> {
     let mut found: Option<(PathBuf, String)> = None;
     for p in paths {
         if !is_agy_presence_lock(p) {
@@ -2816,6 +2824,9 @@ fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
         let Some(candidate) = agy_root_and_id_from_path(p) else {
             continue;
         };
+        if exclude_ids.iter().any(|ex| ex == &candidate.1) {
+            continue;
+        }
         if let Some(previous) = &found {
             if previous != &candidate {
                 return None;
@@ -2827,7 +2838,11 @@ fn agy_root_and_id_from_vnodes(paths: &[PathBuf]) -> Option<(PathBuf, String)> {
     found
 }
 
-fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf, String)> {
+fn discover_agy_from_pids_excluding(
+    root_pid: u32,
+    fg_pid: Option<u32>,
+    exclude_ids: &[String],
+) -> Option<(PathBuf, String)> {
     let mut seeds = Vec::new();
     let mut seed_paths = Vec::new();
     let mut cur = fg_pid.unwrap_or(root_pid);
@@ -2852,7 +2867,7 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
         seeds.push(root_pid);
         seed_paths.extend(crate::sys::open_vnode_paths(root_pid));
     }
-    if let Some(found) = agy_root_and_id_from_vnodes(&seed_paths) {
+    if let Some(found) = agy_root_and_id_from_vnodes_excluding(&seed_paths, exclude_ids) {
         return Some(found);
     }
     if !seeds.is_empty()
@@ -2878,7 +2893,7 @@ fn discover_agy_from_pids(root_pid: u32, fg_pid: Option<u32>) -> Option<(PathBuf
             }
             frontier = next;
         }
-        if let Some(found) = agy_root_and_id_from_vnodes(&desc_paths) {
+        if let Some(found) = agy_root_and_id_from_vnodes_excluding(&desc_paths, exclude_ids) {
             return Some(found);
         }
     }
@@ -2897,6 +2912,12 @@ fn agy_transcript_for_conv(agy_root: &Path, conv_id: &str) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|p| p.is_file())
+}
+
+pub(crate) fn clear_live_agy_cache(session: krill_proto::SessionId) {
+    if let Some(cache_mutex) = AGY_LIVE_TITLE_CACHE.get() {
+        lock(cache_mutex).remove(&session.0);
+    }
 }
 
 pub(crate) fn cached_live_agy_identity(
@@ -2920,7 +2941,15 @@ pub(crate) fn discover_live_agy_identity(
     root_pid: u32,
     fg_pid: Option<u32>,
 ) -> Option<(PathBuf, String, PathBuf)> {
-    let (agy_root, conv_id) = discover_agy_from_pids(root_pid, fg_pid)?;
+    discover_live_agy_identity_excluding(root_pid, fg_pid, &[])
+}
+
+pub(crate) fn discover_live_agy_identity_excluding(
+    root_pid: u32,
+    fg_pid: Option<u32>,
+    exclude_ids: &[String],
+) -> Option<(PathBuf, String, PathBuf)> {
+    let (agy_root, conv_id) = discover_agy_from_pids_excluding(root_pid, fg_pid, exclude_ids)?;
     let path = agy_transcript_for_conv(&agy_root, &conv_id)
         .unwrap_or_else(|| agy_root.join("conversations").join(format!("{conv_id}.db")));
     Some((agy_root, conv_id, path))
@@ -3101,12 +3130,30 @@ pub(crate) fn cached_live_agy_title(
 
 /// 실행 중인 Antigravity(`agy`) 세션의 대화 제목·요약을 조회한다.
 /// OSC 0/2 터미널 타이틀을 내보내지 않는 `agy`를 위해 `annotations/<id>.pbtxt`와 트랜스크립트 첫 프롬프트를 읽는다.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "production callers use resolve_live_agy_title_excluding"
+    )
+)]
 pub(crate) fn resolve_live_agy_title(
     session: krill_proto::SessionId,
     root_pid: u32,
     fg_pid: Option<u32>,
     exited: bool,
     stored: Option<&crate::agent::control::StoredLaunch>,
+) -> (Option<String>, Option<(String, Option<PathBuf>)>) {
+    resolve_live_agy_title_excluding(session, root_pid, fg_pid, exited, stored, &[])
+}
+
+pub(crate) fn resolve_live_agy_title_excluding(
+    session: krill_proto::SessionId,
+    root_pid: u32,
+    fg_pid: Option<u32>,
+    exited: bool,
+    stored: Option<&crate::agent::control::StoredLaunch>,
+    exclude_ids: &[String],
 ) -> (Option<String>, Option<(String, Option<PathBuf>)>) {
     let cache_mutex = AGY_LIVE_TITLE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let needs_store_binding = needs_agy_store_binding(stored);
@@ -3181,13 +3228,15 @@ pub(crate) fn resolve_live_agy_title(
 
     if resolved_pair.is_none()
         && !exited
-        && let Some((agy_root, conv_id)) = discover_agy_from_pids(root_pid, fg_pid)
+        && let Some((agy_root, conv_id)) =
+            discover_agy_from_pids_excluding(root_pid, fg_pid, exclude_ids)
     {
         resolved_pair = Some((agy_root, conv_id));
     }
 
     if resolved_pair.is_none()
         && let Some((Some(prev_root), Some(prev_id), _, _)) = &cached_snapshot
+        && !exclude_ids.iter().any(|ex| ex == prev_id)
     {
         resolved_pair = Some((prev_root.clone(), prev_id.clone()));
     }

@@ -9,7 +9,7 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::Input;
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -142,7 +142,7 @@ impl View {
         &mut self,
         uid: String,
         body: &str,
-        input: Option<gpui::Entity<gpui_component::input::InputState>>,
+        input: Option<gpui::Entity<TextareaState>>,
         cx: &mut Context<Self>,
     ) {
         if self.items.busy {
@@ -280,7 +280,7 @@ impl View {
             );
         let mut content = div().flex().flex_col().gap_4().px(px(14.)).pt_3();
         if let Some(desc) = item.description.as_ref().filter(|d| !d.trim().is_empty()) {
-            content = content.child(self.render_description(desc, p, cx));
+            content = content.child(self.render_description(bot, desc, p, cx));
         }
         if !item.status.is_open()
             && let Some(note) = item
@@ -316,6 +316,7 @@ impl View {
             .overflow_y_scroll()
             .child(content);
         let wait_modal = self.render_wait_ask(p, window, cx);
+        let snooze_modal = self.render_snooze_pick(p, window, cx);
         div()
             .id("bot-item-pane")
             .debug_selector(|| "bot-item-pane".into())
@@ -333,6 +334,7 @@ impl View {
             .child(scroller)
             .child(self.render_comment_box(bot, item, p, window, cx))
             .children(wait_modal)
+            .children(snooze_modal)
     }
 
     /// Orca's field grid: Chat (opens it), then Done means.
@@ -622,9 +624,17 @@ impl View {
         header
     }
 
-    fn render_description(&self, desc: &str, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_description(
+        &self,
+        bot: &BotConfig,
+        desc: &str,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let open = self.items.desc_open;
         let clamped = clamps(desc);
+        let is_local = self.host.is_local();
+        let base_dir = self.bot_home_folder(bot);
         div()
             .debug_selector(|| "bot-item-description".into())
             .flex()
@@ -639,6 +649,8 @@ impl View {
                     .child(super::home_item_parts::markdown(
                         "bot-item-description-md",
                         desc,
+                        is_local,
+                        base_dir,
                     )),
             )
             .when(clamped, |d| {
@@ -827,13 +839,24 @@ impl View {
             .into_iter()
             .flatten()
         {
-            let (fid, uid, body, is_answer, option_index, ask_step_key) = (
+            let (
+                fid,
+                uid,
+                body,
+                is_answer,
+                option_index,
+                decision_id,
+                ask_step_key,
+                skip_remaining,
+            ) = (
                 fc.id,
                 item.uid.clone(),
                 fc.text.clone(),
                 fc.is_answer,
                 fc.option_index,
+                fc.decision_id.clone(),
                 fc.ask_step_key.clone(),
+                fc.skip_remaining,
             );
             let uid_discard = uid.clone();
             let body_retry = body.clone();
@@ -888,27 +911,50 @@ impl View {
                                             .hover(gpui::Styled::underline)
                                             .child(hm::COMMENT_RETRY.get())
                                             .on_click(cx.listener(move |this, _, _, cx| {
+                                                // Guard against busy BEFORE removing the card so Retry
+                                                // never silently drops the comment (`BOT-35`).
+                                                if this.items.busy {
+                                                    return;
+                                                }
                                                 if let Some(list) =
                                                     this.items.failed_comments.get_mut(&uid)
                                                 {
                                                     list.retain(|f| f.id != fid);
                                                 }
+                                                let clear_ta =
+                                                    this.items.comment_inputs.get(&uid).cloned();
+                                                let has_files = this
+                                                    .items
+                                                    .attachments
+                                                    .get(&uid)
+                                                    .is_some_and(|f| !f.is_empty());
                                                 if is_answer {
-                                                    this.answer_item_decision_with_cleanup(
+                                                    let retry_text = if option_index.is_some()
+                                                        && !body_retry.contains(" → ")
+                                                    {
+                                                        None
+                                                    } else {
+                                                        Some(body_retry.clone())
+                                                    };
+                                                    this.answer_item_decision_with_options(
                                                         uid.clone(),
-                                                        Some(body_retry.clone()),
+                                                        retry_text,
                                                         option_index,
+                                                        decision_id.clone(),
                                                         None,
-                                                        None,
-                                                        false,
+                                                        clear_ta,
+                                                        has_files,
                                                         ask_step_key.clone(),
+                                                        skip_remaining,
                                                         cx,
                                                     );
                                                 } else {
-                                                    this.send_item_comment(
+                                                    // Submit directly without re-appending `Attached:` (`BOT-35`).
+                                                    this.submit_item_comment_with_attachments(
                                                         uid.clone(),
                                                         &body_retry,
-                                                        None,
+                                                        clear_ta,
+                                                        has_files,
                                                         cx,
                                                     );
                                                 }
@@ -1237,6 +1283,8 @@ impl View {
             .filter(|t| !t.is_empty());
         let event_id = event.id;
         let comment_open = self.items.open_comments.contains(&event_id);
+        let is_local = self.host.is_local();
+        let base_dir = self.bot_home_folder(bot);
         let quote_source = words.clone();
         let mut body = div().pl_7().flex().flex_col().children(words.map(|w| {
             // Orca `d6cc2684` / `#47076`: while waiting on an open question, show the agent's
@@ -1257,6 +1305,8 @@ impl View {
                 .child(super::home_item_parts::markdown(
                     format!("bot-item-comment-md-{event_id}"),
                     &w,
+                    is_local,
+                    base_dir,
                 ));
             if clamped {
                 div()
@@ -1873,7 +1923,7 @@ impl View {
                 .when(replying, |d| {
                     d.w_full().flex_basis(gpui::relative(1.)).min_h(px(80.))
                 })
-                .child(Input::new(&i).appearance(false))
+                .child(Textarea::new(&i).appearance(false))
         });
         let send_input = self.items.comment_inputs.get(&uid).cloned();
         let mut tools = div()
@@ -1908,7 +1958,7 @@ impl View {
                 div()
                     .min_w_0()
                     .flex_1()
-                    .child(Input::new(&i).appearance(false))
+                    .child(Textarea::new(&i).appearance(false))
             }));
         }
         let send_btn = div()
