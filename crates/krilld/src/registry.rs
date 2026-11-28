@@ -2089,9 +2089,12 @@ impl Registry {
                     .as_ref()
                     .map(|bl| bl.instructions.as_str())
                     .or(s.bot_instructions.as_deref());
+                let effective_permission = bot_launch
+                    .as_ref()
+                    .map_or(s.permission, |bl| bl.permission_mode);
                 let (launch, session_id, account) = match crate::agent::resume_in_with_bot_mcp(
                     &effective_profile,
-                    s.permission,
+                    effective_permission,
                     session,
                     state.as_deref(),
                     resume_id.as_deref(),
@@ -2117,7 +2120,7 @@ impl Registry {
                 }
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
-                    permission: s.permission,
+                    permission: effective_permission,
                 };
                 if let Err(e) = self
                     .agents

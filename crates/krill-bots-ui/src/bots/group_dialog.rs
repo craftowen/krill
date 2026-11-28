@@ -12,11 +12,21 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use krill_app_core::hosts::HostId;
 use krill_proto::bots::{BotGroupChat, BotGroupReplyAudience, BotId};
 
 use super::{SidebarBot, avatar, group_faces};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
+
+/// One host choice offered in [`BotGroupMembersDialog`] when multiple hosts have `>= 2` bots (`BOT-39`).
+#[derive(Debug, Clone)]
+pub struct GroupDialogHost {
+    pub host: HostId,
+    pub label: String,
+    pub bots: Vec<SidebarBot>,
+    pub avatars: HashMap<BotId, Option<Arc<Image>>>,
+}
 
 const HERO_CLUSTER_SIZE: f32 = 112.;
 const FILTER_MIN_BOTS: usize = 10;
@@ -107,6 +117,9 @@ enum Mode {
 /// name and members (`BotGroupMembersDialog`).
 pub struct BotGroupMembersDialog {
     mode: Mode,
+    host: HostId,
+    host_label: Option<String>,
+    host_choices: Vec<GroupDialogHost>,
     bots: Vec<SidebarBot>,
     avatars: HashMap<BotId, Option<Arc<Image>>>,
     picked: Vec<BotId>,
@@ -225,6 +238,9 @@ impl BotGroupMembersDialog {
         name_input.update(cx, |s, cx| s.focus(window, cx));
         Self {
             mode,
+            host: HostId::Local,
+            host_label: None,
+            host_choices: Vec::new(),
             bots,
             avatars,
             picked,
@@ -234,6 +250,48 @@ impl BotGroupMembersDialog {
             filter_value: String::new(),
             _subs: vec![sub_name, sub_filter],
             focus: cx.focus_handle(),
+        }
+    }
+
+    /// Attaches a target host and optional display label for remote host badging (`BOT-39`).
+    #[must_use]
+    pub fn with_host_label(mut self, host: HostId, label: Option<String>) -> Self {
+        self.host = host;
+        self.host_label = label;
+        self
+    }
+
+    /// Attaches selectable hosts (each with `>= 2` bots) in New Group mode (`BOT-39`).
+    #[must_use]
+    pub fn with_hosts(mut self, selected: HostId, choices: Vec<GroupDialogHost>) -> Self {
+        if let Some(found) = choices.iter().find(|c| c.host == selected) {
+            self.host.clone_from(&found.host);
+            self.host_label = Some(found.label.clone());
+            self.bots.clone_from(&found.bots);
+            self.avatars.clone_from(&found.avatars);
+        } else {
+            self.host = selected;
+        }
+        self.host_choices = choices;
+        self
+    }
+
+    #[must_use]
+    pub fn selected_host(&self) -> &HostId {
+        &self.host
+    }
+
+    pub fn select_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        if &self.host == host {
+            return;
+        }
+        if let Some(found) = self.host_choices.iter().find(|c| &c.host == host) {
+            self.host.clone_from(&found.host);
+            self.host_label = Some(found.label.clone());
+            self.bots.clone_from(&found.bots);
+            self.avatars.clone_from(&found.avatars);
+            self.picked.clear();
+            cx.notify();
         }
     }
 
@@ -447,9 +505,33 @@ impl Render for BotGroupMembersDialog {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(ui::TEXT_LG)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_LG)
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(title),
+                                    )
+                                    .when_some(
+                                        (!self.host.is_local() && self.host_choices.len() <= 1)
+                                            .then(|| self.host_label.clone())
+                                            .flatten(),
+                                        |d, label| {
+                                            d.child(
+                                                div()
+                                                    .debug_selector(|| {
+                                                        "group-dialog-host-badge".into()
+                                                    })
+                                                    .child(ui::badge(
+                                                        p,
+                                                        ui::BadgeTone::Neutral,
+                                                        label,
+                                                    )),
+                                            )
+                                        },
+                                    ),
                             )
                             .child(
                                 div()
@@ -468,6 +550,30 @@ impl Render for BotGroupMembersDialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
                     ),
             )
+            .when(is_create && self.host_choices.len() > 1, |d| {
+                let mut pills = div()
+                    .debug_selector(|| "group-dialog-host-picker".into())
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1();
+                for (hidx, choice) in self.host_choices.iter().enumerate() {
+                    let active = choice.host == self.host;
+                    let hid = choice.host.clone();
+                    pills = pills.child(
+                        ui::segment(
+                            p,
+                            format!("group-dialog-host-{hidx}"),
+                            choice.label.clone(),
+                            active,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_host(&hid, cx);
+                        })),
+                    );
+                }
+                d.child(pills)
+            })
             .child(
                 div()
                     .w_full()

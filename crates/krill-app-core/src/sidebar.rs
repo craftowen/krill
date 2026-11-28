@@ -424,6 +424,37 @@ fn track_unread(
     }
 }
 
+/// Tracks unread state transitions for a remote host's sessions (`BOT-30`).
+fn track_remote_unread(
+    remote_unread: &mut BTreeSet<(String, SessionId)>,
+    host_id: &str,
+    old: &[Session],
+    new: &[Session],
+    focused: Option<SessionId>,
+) {
+    remote_unread.retain(|(h, id)| {
+        h != host_id
+            || new
+                .iter()
+                .any(|s| s.id == *id && s.status.state != AgentState::Exited && !s.agent_ended())
+    });
+    for s in new {
+        let before = old.iter().find(|o| o.id == s.id).map(|o| o.status.state);
+        let state = s.status.state;
+        if state == AgentState::Working {
+            remote_unread.remove(&(host_id.to_owned(), s.id));
+        } else if before.is_some_and(|b| b != state)
+            && matches!(
+                state,
+                AgentState::Done | AgentState::Waiting | AgentState::Blocked
+            )
+            && focused != Some(s.id)
+        {
+            remote_unread.insert((host_id.to_owned(), s.id));
+        }
+    }
+}
+
 fn basename(path: &Path) -> String {
     if windows_style(path) {
         let text = path.to_string_lossy();
@@ -1123,6 +1154,8 @@ pub struct Sidebar {
     focused_host: HostId,
     /// 보지 않은 사이 완료·대기로 바뀐 세션(OWE-662).
     unread: BTreeSet<SessionId>,
+    /// 보지 않은 사이 완료·대기로 바뀐 원격 호스트 세션(`BOT-30`).
+    remote_unread: BTreeSet<(String, SessionId)>,
     /// 에이전트 대시보드에서 사용자가 클릭해 확인한 완료(`Done | Exited`) 세션과 읽은 순서.
     read_done: BTreeMap<(HostId, SessionId), ReadDoneEntry>,
     /// 다음 완료 카드 읽음 처리에 부여할 단조 증가 순번.
@@ -1454,6 +1487,7 @@ impl Sidebar {
             focused_synced: None,
             focused_host: HostId::Local,
             unread: BTreeSet::new(),
+            remote_unread: BTreeSet::new(),
             read_done: BTreeMap::new(),
             next_read_done_seq: 0,
             agents: Vec::new(),
@@ -1815,7 +1849,17 @@ impl Sidebar {
         snapshot: Snapshot,
         cx: &mut Context<Self>,
     ) {
+        let focused = self
+            .focused
+            .filter(|_| self.focused_host == HostId::Remote(id.to_owned()));
         if let Some(remote) = self.remote_hosts.iter_mut().find(|r| r.id == id) {
+            track_remote_unread(
+                &mut self.remote_unread,
+                id,
+                &remote.snapshot.sessions,
+                &snapshot.sessions,
+                focused,
+            );
             remote.status = status;
             remote.snapshot = snapshot;
         } else {
@@ -1830,6 +1874,14 @@ impl Sidebar {
             });
         }
         self.prune_read_done_for_host(&HostId::Remote(id.to_owned()), cx);
+        self.rebuild(cx);
+    }
+
+    /// 테스트에서 원격 호스트를 제거한다.
+    #[doc(hidden)]
+    pub fn remove_remote_host_for_test(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.remote_hosts.retain(|r| r.id != id);
+        self.remote_unread.retain(|(h, _)| h != id);
         self.rebuild(cx);
     }
 
@@ -2010,6 +2062,8 @@ impl Sidebar {
                 });
                 s.remote_closed_sessions
                     .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
+                s.remote_unread
+                    .retain(|(id, _)| s.remote_hosts.iter().any(|entry| entry.id == *id));
                 s.remote_poll_pacing
                     .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
                 s.remote_orchestration.retain(|host, _| {
@@ -2322,6 +2376,16 @@ impl Sidebar {
                                     || s.remote_prompt_histories.get(&id) != Some(&histories)
                                     || s.remote_closed_sessions.get(&id) != Some(&closed)
                                 {
+                                    let focused_on_remote = s
+                                        .focused
+                                        .filter(|_| s.focused_host == HostId::Remote(id.clone()));
+                                    track_remote_unread(
+                                        &mut s.remote_unread,
+                                        &id,
+                                        &entry.snapshot.sessions,
+                                        &snap.sessions,
+                                        focused_on_remote,
+                                    );
                                     entry.status = HostStatus::Connected;
                                     entry.snapshot = snap;
                                     entry.meta = meta;
@@ -2523,9 +2587,14 @@ impl Sidebar {
                 }
             }
         }
-        if host.is_local() {
-            changed |= self.unread.remove(&id);
-            crate::alert::dismiss(id, cx);
+        match host {
+            HostId::Local => {
+                changed |= self.unread.remove(&id);
+                crate::alert::dismiss(id, cx);
+            }
+            HostId::Remote(host_id) => {
+                changed |= self.remote_unread.remove(&(host_id.clone(), id));
+            }
         }
         if changed {
             self.rebuild(cx);
@@ -2625,10 +2694,13 @@ impl Sidebar {
         self.unread.contains(&id)
     }
 
-    /// 호스트를 확인하는 미확인 여부 조회(미확인 추적은 로컬 호스트 세션에만 적용된다).
+    /// 호스트를 확인하는 미확인 여부 조회(로컬·원격 호스트 세션 모두 지원, `BOT-30`).
     #[must_use]
     pub fn is_unread_on(&self, host: &HostId, id: SessionId) -> bool {
-        host.is_local() && self.is_unread(id)
+        match host {
+            HostId::Local => self.unread.contains(&id),
+            HostId::Remote(host_id) => self.remote_unread.contains(&(host_id.clone(), id)),
+        }
     }
 
     /// 에이전트 대시보드에서 완료(`Done | Exited`) 카드가 이미 읽음 처리된 상태면 읽은 순번(`Some(seq)`)을 돌려준다.
@@ -2638,7 +2710,7 @@ impl Sidebar {
         if !matches!(session.status.state, AgentState::Done | AgentState::Exited) {
             return None;
         }
-        if host.is_local() && self.unread.contains(&session.id) {
+        if self.is_unread_on(host, session.id) {
             return None;
         }
         let entry = self.read_done.get(&(host.clone(), session.id))?;
@@ -2664,7 +2736,10 @@ impl Sidebar {
         id: SessionId,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut changed = host.is_local() && self.unread.remove(&id);
+        let mut changed = match host {
+            HostId::Local => self.unread.remove(&id),
+            HostId::Remote(host_id) => self.remote_unread.remove(&(host_id.clone(), id)),
+        };
         if let Some(session) = self.session_on(host, id)
             && matches!(session.status.state, AgentState::Done | AgentState::Exited)
         {
@@ -2766,10 +2841,14 @@ impl Sidebar {
         }
     }
 
-    /// Orca "Mark Unread" on a bot row: shows the session as unread again (local sessions only,
-    /// like the unread set itself).
+    /// Orca "Mark Unread" on a bot row: shows the session as unread again (local and remote
+    /// hosts, `BOT-30`).
     pub fn mark_session_unread(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
-        if host.is_local() && self.unread.insert(id) {
+        let inserted = match host {
+            HostId::Local => self.unread.insert(id),
+            HostId::Remote(host_id) => self.remote_unread.insert((host_id.clone(), id)),
+        };
+        if inserted {
             cx.notify();
         }
     }
@@ -2792,13 +2871,17 @@ impl Sidebar {
                 .find(|r| r.id == *id)
                 .map_or(&[], |r| &r.snapshot.sessions),
         };
-        let is_local = host.is_local();
         let unread = &self.unread;
+        let remote_unread = &self.remote_unread;
         self.read_done.retain(|(h, id), entry| {
             if h != host {
                 return true;
             }
-            if is_local && unread.contains(id) {
+            let is_unread = match h {
+                HostId::Local => unread.contains(id),
+                HostId::Remote(host_id) => remote_unread.contains(&(host_id.clone(), *id)),
+            };
+            if is_unread {
                 return false;
             }
             let Some(session) = sessions.iter().find(|s| s.id == *id) else {
@@ -2819,9 +2902,6 @@ impl Sidebar {
         path: &Path,
         cx: &mut Context<Self>,
     ) {
-        if !host.is_local() {
-            return;
-        }
         let ids: Vec<_> = self
             .snapshot_for(host)
             .sessions
@@ -2856,10 +2936,15 @@ impl Sidebar {
             self.focused != session || (session.is_some() && self.focused_host != next_host);
         self.focused = session;
         self.focused_host = next_host;
-        if !self.focused_host.is_local() {
+        if let HostId::Remote(host_id) = &self.focused_host {
+            let cleared =
+                session.is_some_and(|id| self.remote_unread.remove(&(host_id.clone(), id)));
             self.focused_synced = None;
             if changed {
                 self.reveal_focused(cx);
+            }
+            if changed || cleared {
+                cx.notify();
             }
             return;
         }
@@ -4900,7 +4985,7 @@ impl Sidebar {
                 item.title = title;
                 item.agent = agent;
                 item.state = Some(s.status.state);
-                item.unread = host.is_local() && self.unread.contains(&s.id);
+                item.unread = self.is_unread_on(&host, s.id);
                 item.age = age;
                 item.is_current_tab = is_current_tab;
                 item.is_current_worktree = is_current_worktree;
@@ -4976,8 +5061,9 @@ impl Sidebar {
                     .filter(|_| &host == focused_host)
                     .filter(|id| sessions_in_wt.iter().any(|s| s.id == *id))
                     .or_else(|| sessions_in_wt.first().map(|s| s.id));
-                let unread =
-                    host.is_local() && sessions_in_wt.iter().any(|s| self.unread.contains(&s.id));
+                let unread = sessions_in_wt
+                    .iter()
+                    .any(|s| self.is_unread_on(&host, s.id));
                 let pairs: Vec<_> = sessions_in_wt
                     .iter()
                     .filter(|s| {
@@ -5814,7 +5900,7 @@ impl Sidebar {
             .iter()
             .filter(|s| !s.is_exited() && s.worktree.as_deref() == Some(tree))
             .collect();
-        let unread = host.is_local() && sessions.iter().any(|s| self.unread.contains(&s.id));
+        let unread = sessions.iter().any(|s| self.is_unread_on(host, s.id));
         let pairs: Vec<_> = sessions
             .iter()
             .filter(|s| {
@@ -5921,3 +6007,47 @@ mod tests;
 
 #[cfg(test)]
 mod project_order_tests;
+
+#[cfg(test)]
+mod remote_unread_tests {
+    use super::*;
+
+    fn session_with_state(id: u64, state: AgentState) -> Session {
+        Session {
+            id: SessionId(id),
+            status: AgentStatus {
+                state,
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn remote_unread_tracks_background_done_and_clears_on_working_or_exit() {
+        let mut remote_unread = BTreeSet::new();
+        let old = vec![session_with_state(7, AgentState::Working)];
+        let done = vec![session_with_state(7, AgentState::Done)];
+
+        // Transition Working -> Done while unfocused marks (remote, 7) unread (`BOT-30`).
+        track_remote_unread(&mut remote_unread, "macmini", &old, &done, None);
+        assert!(remote_unread.contains(&("macmini".to_owned(), SessionId(7))));
+        assert!(!remote_unread.contains(&("other".to_owned(), SessionId(7))));
+
+        // Resuming Working clears unread.
+        track_remote_unread(&mut remote_unread, "macmini", &done, &old, None);
+        assert!(!remote_unread.contains(&("macmini".to_owned(), SessionId(7))));
+
+        // Transition while focused does not mark unread.
+        track_remote_unread(
+            &mut remote_unread,
+            "macmini",
+            &old,
+            &done,
+            Some(SessionId(7)),
+        );
+        assert!(!remote_unread.contains(&("macmini".to_owned(), SessionId(7))));
+    }
+}

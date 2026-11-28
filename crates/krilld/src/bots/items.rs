@@ -62,6 +62,9 @@ pub struct AnswerItemOutcome {
     pub item: BotItem,
     pub should_wake_bot: bool,
     pub answer_summary: String,
+    /// Originating live bot session (from `items.chat_id` or the asking event's `BotItemActor::Bot`)
+    /// so `AnswerBotItem` can wake the originating group/linked thread session (`BOT-17`).
+    pub origin_session_id: Option<krill_proto::SessionId>,
 }
 
 /// Lazily opened SQLite persistence for [`BotItem`], [`BotItemLink`], and [`BotItemEvent`].
@@ -647,7 +650,15 @@ impl BotItemsStore {
                     }
                 }
                 FieldPatch::Clear => item.snoozed_until_ms = None,
-                FieldPatch::Set(until) => item.snoozed_until_ms = Some(*until),
+                FieldPatch::Set(until) => {
+                    if *until <= now_ms {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "snoozed_until_ms must be in the future",
+                        ));
+                    }
+                    item.snoozed_until_ms = Some(*until);
+                }
             }
             let snooze_event = match (prev_snooze, item.snoozed_until_ms) {
                 (_, Some(until)) if prev_snooze != Some(until) => {
@@ -903,6 +914,33 @@ impl BotItemsStore {
         actor: &BotItemActor,
         now_ms: u64,
     ) -> io::Result<AnswerItemOutcome> {
+        self.answer_item_with_options(
+            item_id,
+            answer_text,
+            option_index,
+            decision_id,
+            request_id,
+            actor,
+            now_ms,
+            false,
+        )
+    }
+
+    /// Records an owner decision/answer for `item_id`. When `skip_remaining` is `true`
+    /// (`"Send anyway"` on a multi-question ask), unanswered questions in the same ask event
+    /// are treated as skipped so the item transitions `NeedsYou -> Working` and wakes the bot.
+    #[expect(clippy::too_many_arguments, reason = "owner item answer payload")]
+    pub fn answer_item_with_options(
+        &self,
+        item_id: &str,
+        answer_text: Option<&str>,
+        option_index: Option<u32>,
+        decision_id: Option<&str>,
+        request_id: Option<&str>,
+        actor: &BotItemActor,
+        now_ms: u64,
+        skip_remaining: bool,
+    ) -> io::Result<AnswerItemOutcome> {
         let req_id_trimmed = request_id
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -935,15 +973,16 @@ impl BotItemsStore {
                 )
             })?;
 
-            let (mail_state, existing_answer_id, snoozed): (
+            let (mail_state, existing_answer_id, snoozed, chat_id): (
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                Option<String>,
             ) = conn
                 .query_row(
-                    "SELECT mail_state, answer_id, snoozed_until_ms FROM items WHERE uid = ?1",
+                    "SELECT mail_state, answer_id, snoozed_until_ms, chat_id FROM items WHERE uid = ?1",
                     params![uid],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(sql_err)?;
 
@@ -954,12 +993,29 @@ impl BotItemsStore {
                     item,
                     should_wake_bot: false,
                     answer_summary: "already answered".to_owned(),
+                    origin_session_id: None,
                 });
             }
 
             let active_ask = (item.status == BotItemStatus::NeedsYou)
                 .then(|| active_decision_event(&item.events))
                 .flatten();
+            let origin_session_id = chat_id
+                .as_deref()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .map(krill_proto::SessionId)
+                .or_else(|| {
+                    active_ask.and_then(|ev| match ev.actor {
+                        BotItemActor::Bot { session_id, .. } => session_id,
+                        BotItemActor::Owner { .. } | BotItemActor::System { .. } => None,
+                    })
+                })
+                .or_else(|| {
+                    item.events.iter().rev().find_map(|ev| match ev.actor {
+                        BotItemActor::Bot { session_id, .. } => session_id,
+                        BotItemActor::Owner { .. } | BotItemActor::System { .. } => None,
+                    })
+                });
             let multi_ask = active_ask.filter(|ev| ev.decisions.len() > 1);
             let mut collected_multi = multi_ask
                 .map(|ask_ev| collect_decision_answers(&ask_ev.decisions, &item.events, ask_ev.id));
@@ -1021,8 +1077,9 @@ impl BotItemsStore {
                     let matched_lines =
                         apply_decision_answer_lines(&ask_ev.decisions, &raw_summary, collected);
                     if matched_lines > 0 {
-                        let all_done = collected.iter().all(Option::is_some);
-                        let summary = if all_done {
+                        let all_answered = collected.iter().all(Option::is_some);
+                        let all_done = skip_remaining || all_answered;
+                        let summary = if all_answered {
                             format_collected_decision_answers(&ask_ev.decisions, collected)
                         } else {
                             raw_summary.clone()
@@ -1036,8 +1093,9 @@ impl BotItemsStore {
                         if let Some(slot) = collected.get_mut(target_idx) {
                             *slot = Some(raw_summary);
                         }
-                        let all_done = collected.iter().all(Option::is_some);
-                        let summary = if all_done {
+                        let all_answered = collected.iter().all(Option::is_some);
+                        let all_done = skip_remaining || all_answered;
+                        let summary = if all_answered {
                             format_collected_decision_answers(&ask_ev.decisions, collected)
                         } else {
                             clamped.clone()
@@ -1121,6 +1179,7 @@ impl BotItemsStore {
                 item: updated,
                 should_wake_bot,
                 answer_summary: final_summary,
+                origin_session_id,
             })
         })
     }
@@ -3575,6 +3634,111 @@ mod tests {
 
         assert_eq!(store.count_needs_you(5_000).unwrap(), 1);
         assert_eq!(store.count_needs_you(10_001).unwrap(), 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn answer_item_skip_remaining_origin_session_and_past_snooze_rejection() {
+        let dir = std::env::temp_dir().join(format!("krill-items-v040-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let store = BotItemsStore::new(dir.join("items.sqlite"));
+        let bot_id = BotId::new("bot-q").unwrap();
+        let owner = BotItemActor::Owner { device: None };
+
+        let item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_id.clone(),
+                    title: "Multi-Q item".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Working),
+                    links: Vec::new(),
+                    waiting_reason: None,
+                },
+                &owner,
+                2_000,
+            )
+            .unwrap();
+
+        // BOT-47: past or zero snoozed_until_ms must be rejected with InvalidInput.
+        let err = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid.clone(),
+                    status: None,
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Set(1_999),
+                    waiting_reason: None,
+                },
+                &owner,
+                2_000,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // BOT-17: ask from a specific live session (e.g. group/linked chat session 777).
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot_id.clone(),
+            session_id: Some(krill_proto::SessionId(777)),
+        };
+        let asked = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid.clone(),
+                    status: Some(BotItemStatus::NeedsYou),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    comment: Some("Two questions".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "Q1".to_owned(),
+                            options: vec!["A".to_owned(), "B".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "Q2".to_owned(),
+                            options: vec!["C".to_owned(), "D".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
+                },
+                &bot_actor,
+                2_010,
+            )
+            .unwrap();
+        assert_eq!(asked.status, BotItemStatus::NeedsYou);
+
+        // BOT-16: answering with `skip_remaining: true` resolves remaining questions,
+        // transitions NeedsYou -> Working, wakes the bot, and surfaces `origin_session_id = Some(777)`.
+        let outcome = store
+            .answer_item_with_options(
+                &item.uid,
+                Some("Q1 -> A"),
+                None,
+                None,
+                None,
+                &owner,
+                2_020,
+                true,
+            )
+            .unwrap();
+        assert_eq!(outcome.item.status, BotItemStatus::Working);
+        assert!(outcome.should_wake_bot);
+        assert_eq!(outcome.origin_session_id, Some(krill_proto::SessionId(777)));
 
         fs::remove_dir_all(&dir).ok();
     }

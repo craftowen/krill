@@ -1326,9 +1326,16 @@ impl Shell {
         if !focus.contains_focused(window, cx) {
             window.focus(&focus, cx);
         }
-        let path = self
-            .bot_folder(bot)
-            .map_or_else(|| bot.slug.clone(), |p| p.to_string_lossy().into_owned());
+        let path = self.bot_folder(bot).map_or_else(
+            || {
+                if bot.host.is_local() {
+                    bot.slug.clone()
+                } else {
+                    format!("{} · {}", self.host_display_label(&bot.host, cx), bot.slug)
+                }
+            },
+            |p| p.to_string_lossy().into_owned(),
+        );
         let host = bot.host.clone();
         let id = bot.id.clone();
         let card = div()

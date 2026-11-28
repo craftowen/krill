@@ -62,7 +62,7 @@ use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 pub use crate::terminal::path_link::sanitize_http_url;
-pub use group_dialog::BotGroupMembersDialog;
+pub use group_dialog::{BotGroupMembersDialog, GroupDialogHost};
 pub use group_panel::{GroupChatScope, GroupItemsFilter};
 pub use home::HomeFilter;
 pub use home_item_parts::LinkedDispatchRef;
@@ -893,6 +893,7 @@ impl View {
         self.error = None;
         self.notice = None;
         if self.selected_bot_id.as_ref() != Some(&bot_id) {
+            self.soul_memory.reset_for_bot_switch();
             if let Some(prev_id) = self.selected_bot_id.clone() {
                 self.items.clear_seen_for(&prev_id);
             }
@@ -1356,7 +1357,39 @@ impl View {
                     .as_ref()
                     .filter(|(id, _)| id == &bot_id)
                     .map_or(0, |(_, s)| *s);
-                this.detail_loaded_scopes = Some((bot_id.clone(), prev_scopes | effective_scope));
+                // Only record scope bits whose required RPCs succeeded so failed detail loads
+                // retry when the user switches tabs away and back (`BOT-14`).
+                let mut succeeded_scopes = 0u8;
+                if (effective_scope & DETAIL_SCOPE_HOME) != 0
+                    && loaded.items_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.sessions_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.suggestions_res.as_ref().is_none_or(Result::is_ok)
+                {
+                    succeeded_scopes |= DETAIL_SCOPE_HOME;
+                }
+                if (effective_scope & DETAIL_SCOPE_SOUL_MEMORY) != 0
+                    && loaded.soul_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.memory_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.history_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.tidy_status_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.topics_res.as_ref().is_none_or(Result::is_ok)
+                {
+                    succeeded_scopes |= DETAIL_SCOPE_SOUL_MEMORY;
+                }
+                if (effective_scope & DETAIL_SCOPE_CONNECTORS) != 0
+                    && loaded.statuses_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.access_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.tracker_res.as_ref().is_none_or(Result::is_ok)
+                    && loaded.composio_res.as_ref().is_none_or(Result::is_ok)
+                {
+                    succeeded_scopes |= DETAIL_SCOPE_CONNECTORS;
+                }
+                if (effective_scope & DETAIL_SCOPE_TOOLS) != 0
+                    && loaded.relay_res.as_ref().is_none_or(Result::is_ok)
+                {
+                    succeeded_scopes |= DETAIL_SCOPE_TOOLS;
+                }
+                this.detail_loaded_scopes = Some((bot_id.clone(), prev_scopes | succeeded_scopes));
 
                 let mut errors = Vec::new();
                 let items_ok = match loaded.items_res {
@@ -2125,9 +2158,10 @@ impl View {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let now = now_unix_ms();
         let mut needs_by_bot: BTreeMap<&str, usize> = BTreeMap::new();
         for item in &self.all_open_items {
-            if item.status == BotItemStatus::NeedsYou {
+            if item.status == BotItemStatus::NeedsYou && !home::is_snoozed(item, now) {
                 *needs_by_bot.entry(item.owner_bot_id.as_str()).or_insert(0) += 1;
             }
         }
@@ -2422,6 +2456,25 @@ impl View {
             .flex_wrap()
             .items_center()
             .gap_1p5();
+        if self.available_hosts.len() > 1 {
+            for (hidx, (hid, label, target)) in self.available_hosts.iter().enumerate() {
+                let h_active = &self.host == hid;
+                let hid_c = hid.clone();
+                let target_c = target.clone();
+                let all_c = self.available_hosts.clone();
+                bar = bar.child(
+                    ui::segment(
+                        p,
+                        format!("bots-compact-host-{hidx}"),
+                        label.clone(),
+                        h_active,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_host_target(hid_c.clone(), target_c.clone(), all_c.clone(), cx);
+                    })),
+                );
+            }
+        }
         for bot in &self.bots {
             let bid = bot.id.clone();
             let active =
@@ -3289,6 +3342,29 @@ impl Render for View {
 /// Clears an `InputState` inside `Ok(...)` completion handlers using the cached window handle.
 pub(super) fn clear_input_on_window(
     slot: &mut Option<Entity<InputState>>,
+    window_handle: Option<AnyWindowHandle>,
+    cx: &mut gpui::App,
+) {
+    if let Some(input) = slot.as_ref() {
+        if let Some(handle) = window_handle {
+            let input_c = input.clone();
+            if handle
+                .update(cx, |_, window, cx| {
+                    input_c.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        *slot = None;
+    }
+}
+
+/// Clears a `TextareaState` inside its window when `window_handle` is available; falls back
+/// to dropping `slot` when no window handle is present.
+pub(super) fn clear_textarea_on_window(
+    slot: &mut Option<Entity<gpui_component::input::TextareaState>>,
     window_handle: Option<AnyWindowHandle>,
     cx: &mut gpui::App,
 ) {

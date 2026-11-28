@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use gpui::{
     App, Context, Entity, FontWeight, SharedString, Subscription, Window, div, prelude::*, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::bots::{
@@ -20,7 +20,10 @@ use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 use super::rpc::{call_checked, expect_ok, expect_variant};
-use super::{OpenSession, View, clear_input_on_window, now_unix_ms, opt_input_composing};
+use super::{
+    OpenSession, View, clear_input_on_window, clear_textarea_on_window, now_unix_ms,
+    opt_input_composing, opt_textarea_composing,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ItemFilter {
@@ -101,7 +104,9 @@ pub(super) struct FailedComment {
     pub text: String,
     pub is_answer: bool,
     pub option_index: Option<u32>,
+    pub decision_id: Option<String>,
     pub ask_step_key: Option<(String, u64)>,
+    pub skip_remaining: bool,
 }
 
 #[derive(Default)]
@@ -124,7 +129,7 @@ pub(super) struct ItemsState {
     pub(super) new_title_input: Option<Entity<InputState>>,
     pub(super) new_desc_input: Option<Entity<InputState>>,
     pub(super) composer_subs: Vec<Subscription>,
-    pub(super) comment_inputs: BTreeMap<String, Entity<InputState>>,
+    pub(super) comment_inputs: BTreeMap<String, Entity<TextareaState>>,
     pub(super) link_inputs: BTreeMap<String, Entity<InputState>>,
     pub(super) decision_inputs: BTreeMap<String, Entity<InputState>>,
     pub(super) close_note_inputs: BTreeMap<String, Entity<InputState>>,
@@ -298,7 +303,10 @@ impl ItemsState {
             || self
                 .comment_inputs
                 .values()
-                .chain(self.link_inputs.values())
+                .any(|i| i.read(app).focus_handle(app).is_focused(window))
+            || self
+                .link_inputs
+                .values()
                 .chain(self.decision_inputs.values())
                 .chain(self.close_note_inputs.values())
                 .any(|i| i.read(app).focus_handle(app).is_focused(window))
@@ -322,7 +330,10 @@ impl ItemsState {
             || self
                 .comment_inputs
                 .values()
-                .chain(self.link_inputs.values())
+                .any(|i| opt_textarea_composing(Some(i), window, app))
+            || self
+                .link_inputs
+                .values()
                 .chain(self.decision_inputs.values())
                 .chain(self.close_note_inputs.values())
                 .any(|i| crate::jump::entity_input_is_composing(i, window, app))
@@ -520,8 +531,12 @@ impl View {
             return;
         }
         if !self.items.comment_inputs.contains_key(uid) {
-            let input = cx
-                .new(|cx| InputState::new(window, cx).placeholder(text::COMMENT_PLACEHOLDER.get()));
+            let input = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(1, 6)
+                    .submit_on_enter(true)
+                    .placeholder(text::COMMENT_PLACEHOLDER.get())
+            });
             let uid_owned = uid.to_owned();
             let input_clone = input.clone();
             let sub = cx.subscribe_in(
@@ -532,7 +547,7 @@ impl View {
                     InputEvent::PressEnter {
                         secondary: false,
                         shift: false,
-                    } if !crate::jump::entity_input_is_composing(inp, window, cx) => {
+                    } if !opt_textarea_composing(Some(inp), window, cx) => {
                         let body = inp.read(cx).value().to_string();
                         this.send_item_comment(
                             uid_owned.clone(),
@@ -627,12 +642,16 @@ impl View {
                 ) && !crate::jump::entity_input_is_composing(inp, window, cx)
                 {
                     let ans = inp.read(cx).value().to_string();
-                    this.answer_item_decision_for(
+                    this.answer_item_decision_with_options(
                         uid_owned.clone(),
                         Some(ans),
                         None,
                         Some(dec_id_owned.clone()),
                         Some(input_clone.clone()),
+                        None,
+                        false,
+                        None,
+                        false,
                         cx,
                     );
                 }
@@ -902,7 +921,7 @@ impl View {
         &mut self,
         item_uid: String,
         body: &str,
-        clear_input: Option<Entity<InputState>>,
+        clear_input: Option<Entity<TextareaState>>,
         cx: &mut Context<Self>,
     ) {
         self.submit_item_comment_with_attachments(item_uid, body, clear_input, false, cx);
@@ -912,7 +931,7 @@ impl View {
         &mut self,
         item_uid: String,
         body: &str,
-        clear_input: Option<Entity<InputState>>,
+        clear_input: Option<Entity<TextareaState>>,
         clear_attachments: bool,
         cx: &mut Context<Self>,
     ) {
@@ -962,7 +981,7 @@ impl View {
                         }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
-                            clear_input_on_window(&mut slot, this.window_handle, cx);
+                            clear_textarea_on_window(&mut slot, this.window_handle, cx);
                         }
                         this.emit_badge(cx);
                     }
@@ -976,6 +995,8 @@ impl View {
                             false,
                             None,
                             None,
+                            None,
+                            false,
                             cx,
                         );
                     }
@@ -987,6 +1008,8 @@ impl View {
                             false,
                             None,
                             None,
+                            None,
+                            false,
                             cx,
                         );
                     }
@@ -1084,14 +1107,16 @@ impl View {
         clear_input: Option<Entity<InputState>>,
         cx: &mut Context<Self>,
     ) {
-        self.answer_item_decision_with_cleanup(
+        self.answer_item_decision_with_options(
             item_uid,
             answer_text,
             option_index,
             None,
             clear_input,
+            None,
             false,
             None,
+            false,
             cx,
         );
     }
@@ -1102,17 +1127,19 @@ impl View {
         answer_text: Option<String>,
         option_index: Option<u32>,
         decision_id: Option<String>,
-        clear_input: Option<Entity<InputState>>,
+        clear_input: Option<Entity<TextareaState>>,
         cx: &mut Context<Self>,
     ) {
-        self.answer_item_decision_with_cleanup(
+        self.answer_item_decision_with_options(
             item_uid,
             answer_text,
             option_index,
             decision_id,
+            None,
             clear_input,
             false,
             None,
+            false,
             cx,
         );
     }
@@ -1127,9 +1154,40 @@ impl View {
         answer_text: Option<String>,
         option_index: Option<u32>,
         decision_id: Option<String>,
-        clear_input: Option<Entity<InputState>>,
+        clear_input: Option<Entity<TextareaState>>,
         clear_attachments: bool,
         clear_ask_step: Option<(String, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_item_decision_with_options(
+            item_uid,
+            answer_text,
+            option_index,
+            decision_id,
+            None,
+            clear_input,
+            clear_attachments,
+            clear_ask_step,
+            false,
+            cx,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "coordinates optional attachment, skip_remaining, and multi-step cleanup on RPC success"
+    )]
+    pub(super) fn answer_item_decision_with_options(
+        &mut self,
+        item_uid: String,
+        answer_text: Option<String>,
+        option_index: Option<u32>,
+        decision_id: Option<String>,
+        clear_input: Option<Entity<InputState>>,
+        clear_textarea: Option<Entity<TextareaState>>,
+        clear_attachments: bool,
+        clear_ask_step: Option<(String, u64)>,
+        skip_remaining: bool,
         cx: &mut Context<Self>,
     ) {
         if self.items.busy {
@@ -1142,13 +1200,46 @@ impl View {
             cx.notify();
             return;
         }
+        // Resolve human-readable option label for Retry card recovery when a quick-reply chip
+        // sends `answer_text: None, option_index: Some(o)` (`BOT-35`).
+        let fallback_chip_label = option_index.and_then(|opt_idx| {
+            let idx = usize::try_from(opt_idx).ok()?;
+            let item = self.items.items.iter().find(|i| i.uid == item_uid)?;
+            let ev_and_dec = decision_id
+                .as_deref()
+                .and_then(|raw| raw.split_once(':'))
+                .and_then(|(ev_s, dec_s)| {
+                    Some((ev_s.parse::<u64>().ok()?, dec_s.parse::<usize>().ok()?))
+                });
+            if let Some((ev_id, dec_idx)) = ev_and_dec {
+                item.events
+                    .iter()
+                    .find(|e| e.id == ev_id)
+                    .and_then(|e| e.decisions.get(dec_idx))
+                    .and_then(|d| d.options.get(idx))
+                    .cloned()
+            } else {
+                item.events
+                    .iter()
+                    .rev()
+                    .find(|e| !e.decisions.is_empty())
+                    .and_then(|e| e.decisions.first())
+                    .and_then(|d| d.options.get(idx))
+                    .cloned()
+            }
+        });
         let rpc = self.rpc.clone();
         let req_host = self.host.clone();
         let req_gen = self.items.rpc_gen;
         let selected_bot_id = self.selected_bot_id.clone();
         let uid_for_clear = item_uid.clone();
-        let text_for_recover = cleaned_text.clone();
+        let text_for_recover = cleaned_text
+            .clone()
+            .filter(|w| !w.is_empty())
+            .or(fallback_chip_label);
+        let decision_id_for_recover = decision_id.clone();
         let ask_step_for_recover = clear_ask_step.clone();
+        let has_typed_text = cleaned_text.as_deref().is_some_and(|w| !w.is_empty());
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -1156,16 +1247,25 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    call_checked(
-                        &rpc,
-                        &BotRpcRequest::AnswerBotItem {
+                    let req = if skip_remaining {
+                        BotRpcRequest::AnswerBotItemWithOptions {
                             item_id: item_uid,
                             answer_text: cleaned_text,
                             option_index,
                             decision_id,
                             request_id: None,
-                        },
-                    )
+                            skip_remaining: true,
+                        }
+                    } else {
+                        BotRpcRequest::AnswerBotItem {
+                            item_id: item_uid,
+                            answer_text: cleaned_text,
+                            option_index,
+                            decision_id,
+                            request_id: None,
+                        }
+                    };
+                    call_checked(&rpc, &req)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1181,11 +1281,18 @@ impl View {
                             this.items.attachments.remove(&uid_for_clear);
                         }
                         if let Some(key) = clear_ask_step {
+                            if skip_remaining {
+                                this.items.skipped_asks.insert(key.clone());
+                            }
                             this.items.ask_steps.remove(&key);
                         }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
+                        }
+                        if let Some(inp) = clear_textarea {
+                            let mut slot = Some(inp);
+                            clear_textarea_on_window(&mut slot, this.window_handle, cx);
                         }
                         this.emit_badge(cx);
                     }
@@ -1194,11 +1301,18 @@ impl View {
                             this.items.attachments.remove(&uid_for_clear);
                         }
                         if let Some(key) = clear_ask_step {
+                            if skip_remaining {
+                                this.items.skipped_asks.insert(key.clone());
+                            }
                             this.items.ask_steps.remove(&key);
                         }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
+                        }
+                        if let Some(inp) = clear_textarea {
+                            let mut slot = Some(inp);
+                            clear_textarea_on_window(&mut slot, this.window_handle, cx);
                         }
                         if let Some(bot_id) = selected_bot_id
                             && this.selected_bot_id.as_ref() == Some(&bot_id)
@@ -1208,16 +1322,20 @@ impl View {
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
-                        // Orca #47485: restore a refused answer into the comment box and keep
-                        // Retry/Discard available so the owner never loses typed or picked answers.
+                        // Orca #47485 + BOT-35: restore a refused answer and keep Retry/Discard
+                        // available (preserving decision_id and skip_remaining, including quick-reply chips).
                         if let Some(words) = text_for_recover.filter(|w| !w.is_empty()) {
-                            this.restore_comment_draft(&uid_for_clear, &words, cx);
+                            if has_typed_text {
+                                this.restore_comment_draft(&uid_for_clear, &words, cx);
+                            }
                             this.record_failed_comment(
                                 &uid_for_clear,
                                 words,
                                 true,
                                 option_index,
+                                decision_id_for_recover,
                                 ask_step_for_recover,
+                                skip_remaining,
                                 cx,
                             );
                         }
@@ -1309,13 +1427,16 @@ impl View {
         }));
     }
 
+    #[expect(clippy::too_many_arguments, reason = "failed comment recovery fields")]
     pub(super) fn record_failed_comment(
         &mut self,
         item_uid: &str,
         text: String,
         is_answer: bool,
         option_index: Option<u32>,
+        decision_id: Option<String>,
         ask_step_key: Option<(String, u64)>,
+        skip_remaining: bool,
         _cx: &mut Context<Self>,
     ) {
         self.items.next_failed_id = self.items.next_failed_id.wrapping_add(1);
@@ -1329,7 +1450,9 @@ impl View {
                 text,
                 is_answer,
                 option_index,
+                decision_id,
                 ask_step_key,
+                skip_remaining,
             });
     }
 
@@ -2047,12 +2170,16 @@ impl View {
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 let val = inp_read.read(cx).value().to_string();
-                                                this.answer_item_decision_for(
+                                                this.answer_item_decision_with_options(
                                                     uid_custom.clone(),
                                                     Some(val),
                                                     None,
                                                     Some(dec_id_custom.clone()),
                                                     Some(inp_read.clone()),
+                                                    None,
+                                                    false,
+                                                    None,
+                                                    false,
                                                     cx,
                                                 );
                                             }),
@@ -2104,11 +2231,22 @@ impl View {
                                 })),
                         );
                     }
-                    LinkAction::RevealFile(path) => {
-                        row = row.child(
-                            ui::ghost(SharedString::from(link_id), text_label)
-                                .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                    LinkAction::RevealFile(raw_path) => {
+                        let is_local = self.host.is_local();
+                        let base_dir = self.selected_bot().and_then(|b| self.bot_home_folder(b));
+                        let resolved = super::home_item_parts::resolve_bot_item_file_path(
+                            &raw_path.to_string_lossy(),
+                            is_local,
+                            base_dir.as_deref(),
                         );
+                        if let Some(path) = resolved {
+                            row = row.child(
+                                ui::ghost(SharedString::from(link_id), text_label)
+                                    .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                            );
+                        } else {
+                            row = row.child(ui::badge(p, ui::BadgeTone::Neutral, text_label));
+                        }
                     }
                     LinkAction::None => {
                         row = row.child(ui::badge(p, ui::BadgeTone::Neutral, text_label));
@@ -2220,7 +2358,7 @@ impl View {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().flex_1().min_w_0().child(Input::new(&inp).small()))
+                            .child(div().flex_1().min_w_0().child(Textarea::new(&inp).small()))
                             .child(
                                 ui::secondary(
                                     SharedString::from(format!("bots-item-comment-btn-{uid_c}")),

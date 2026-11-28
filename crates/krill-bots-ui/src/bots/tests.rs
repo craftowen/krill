@@ -4195,7 +4195,6 @@ fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppConte
                 for (inp, val) in [
                     (&title_inp, "New Task"),
                     (&desc_inp, "Task desc"),
-                    (&comment_inp, "Comment body"),
                     (&link_inp, "https://example.com"),
                     (&decision_inp, "Staging"),
                     (&mem_add_inp, "New fact"),
@@ -4206,6 +4205,11 @@ fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppConte
                         let owned = val.to_owned();
                         ent.update(cx, |s, cx| s.set_value(owned, window, cx));
                     }
+                }
+                if let Some(ent) = &comment_inp {
+                    ent.update(cx, |s, cx| {
+                        s.set_value("Comment body".to_owned(), window, cx);
+                    });
                 }
                 (
                     title_inp,
@@ -4237,7 +4241,6 @@ fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppConte
         for inp in [
             &title_inp,
             &desc_inp,
-            &comment_inp,
             &link_inp,
             &decision_inp,
             &mem_add_inp,
@@ -4249,6 +4252,13 @@ fn r3a05_bot_panel_inputs_ignore_secondary_and_shift_enter(cx: &mut TestAppConte
         {
             for (secondary, shift) in [(true, true), (true, false), (false, true)] {
                 inp.update(cx, |_, cx| {
+                    cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
+                });
+            }
+        }
+        if let Some(ent) = &comment_inp {
+            for (secondary, shift) in [(true, true), (true, false), (false, true)] {
+                ent.update(cx, |_, cx| {
                     cx.emit(gpui_component::input::InputEvent::PressEnter { secondary, shift });
                 });
             }

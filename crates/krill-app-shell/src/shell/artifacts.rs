@@ -189,25 +189,7 @@ impl Shell {
             }
         });
         let target = self.target_for_host(&host);
-        let mut host_choices: Vec<(
-            krill_app_core::hosts::HostId,
-            String,
-            Option<krill_app_core::hosts::HostTarget>,
-        )> = self
-            .execution_locations(cx)
-            .into_iter()
-            .map(|(hid, label)| {
-                let tgt = self.target_for_host(&hid);
-                (hid, label, tgt)
-            })
-            .collect();
-        if !host_choices.iter().any(|(hid, _, _)| hid == &host) {
-            host_choices.push((
-                host.clone(),
-                self.host_display_label(&host, cx).to_string(),
-                target.clone(),
-            ));
-        }
+        let host_choices = self.bots_modal_host_choices(Some(&host), cx);
         if let Some(Modal::Bots(view)) = &self.modal {
             view.update(cx, |v, cx| {
                 v.set_host_target(host.clone(), target.clone(), host_choices, cx);
@@ -567,18 +549,102 @@ impl Shell {
             })
     }
 
+    fn bots_modal_host_choices(
+        &self,
+        ensure_host: Option<&krill_app_core::hosts::HostId>,
+        cx: &gpui::App,
+    ) -> Vec<(
+        krill_app_core::hosts::HostId,
+        String,
+        Option<krill_app_core::hosts::HostTarget>,
+    )> {
+        let mut host_choices: Vec<(
+            krill_app_core::hosts::HostId,
+            String,
+            Option<krill_app_core::hosts::HostTarget>,
+        )> = self
+            .execution_locations(cx)
+            .into_iter()
+            .map(|(hid, label)| {
+                let tgt = self.target_for_host(&hid);
+                (hid, label, tgt)
+            })
+            .collect();
+        if let Some(host) = ensure_host
+            && !host_choices.iter().any(|(hid, _, _)| hid == host)
+        {
+            host_choices.push((
+                host.clone(),
+                self.host_display_label(host, cx).to_string(),
+                self.target_for_host(host),
+            ));
+        }
+        host_choices
+    }
+
+    /// Refreshes the open/cached Bots modal's host list and active target when remote hosts
+    /// connect, reconnect, re-pair, or get removed (`BOT-20`).
+    pub(super) fn sync_bots_modal_hosts(&mut self, cx: &mut Context<Self>) {
+        let modal_view = match &self.modal {
+            Some(Modal::Bots(view)) => Some(view.clone()),
+            _ => None,
+        };
+        let cached_view = self
+            .bots_cache
+            .clone()
+            .filter(|cached| modal_view.as_ref() != Some(cached));
+        for view in modal_view.into_iter().chain(cached_view) {
+            let current_host = view.read(cx).host().clone();
+            let host_choices = self.bots_modal_host_choices(None, cx);
+            let next_host = if current_host.is_local()
+                || host_choices.iter().any(|(hid, _, _)| hid == &current_host)
+            {
+                current_host
+            } else {
+                krill_app_core::hosts::HostId::Local
+            };
+            let next_target = self.target_for_host(&next_host);
+            let choices = self.bots_modal_host_choices(Some(&next_host), cx);
+            view.update(cx, |v, cx| {
+                v.set_host_target(next_host, next_target, choices, cx);
+            });
+        }
+    }
+
+    fn is_remote_host_configured(
+        &self,
+        host: &krill_app_core::hosts::HostId,
+        cx: &gpui::App,
+    ) -> bool {
+        let krill_app_core::hosts::HostId::Remote(remote_id) = host else {
+            return true;
+        };
+        let sidebar = self.sidebar.read(cx);
+        if sidebar.is_suppressed_remote_host(host) {
+            return false;
+        }
+        self.host_statuses
+            .iter()
+            .any(|(spec, _)| spec.id == *remote_id)
+            || self.host_targets.contains_key(host)
+            || sidebar.remote_hosts().iter().any(|r| r.id == *remote_id)
+    }
+
     fn prune_inactive_bot_hosts(
         &mut self,
         active: &[krill_app_core::hosts::HostId],
         cx: &mut Context<Self>,
     ) {
+        // Keep cached remote bots/groups/avatars/panel alive across transient disconnects
+        // (`BOT-18`); only prune once a remote host is suppressed or removed from config.
         let stale: Vec<krill_app_core::hosts::HostId> = self
             .bot_ui
             .hosts
             .keys()
             .filter(|host| {
                 !active.contains(host)
-                    && (host.is_remote() && !self.is_remote_host_live_or_connecting(host, cx))
+                    && host.is_remote()
+                    && !self.is_remote_host_configured(host, cx)
             })
             .cloned()
             .collect();

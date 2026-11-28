@@ -30,6 +30,9 @@ const MAX_GROUP_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGES_PER_THREAD: usize = 200;
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 const DEFAULT_READ_LIMIT: usize = 100;
+/// Maximum consecutive bot-to-bot mention hops allowed in a group thread before requiring
+/// an owner message to reset the chain (`BOT-07`).
+pub const MAX_BOT_TO_BOT_HOPS: u32 = 4;
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +58,8 @@ struct GroupRuntimeData {
     turns: Vec<ActiveGroupTurn>,
     #[serde(default)]
     audiences: BTreeMap<String, BotGroupReplyAudience>,
+    #[serde(skip)]
+    bot_hops: BTreeMap<(String, String), u32>,
 }
 
 /// Dispatch plan produced when posting a message to a group thread.
@@ -65,6 +70,7 @@ pub(crate) struct GroupDispatchPlan {
     pub posted_message: BotGroupMessage,
     pub target_bots: Vec<BotConfig>,
     pub prompt_for_bot: String,
+    pub hop_limit_reached: bool,
 }
 
 /// Strictly-lazy durable coordinator for multi-bot group conversations.
@@ -107,6 +113,7 @@ impl GroupCoordinator {
             data.messages.retain(|m| m.group_id != group_id);
             data.turns.retain(|t| t.group_id != group_id);
             data.audiences.remove(group_id);
+            data.bot_hops.retain(|(gid, _), _| gid != group_id);
             self.persist_locked(data)?;
         }
         Ok(())
@@ -512,7 +519,7 @@ impl GroupCoordinator {
             }
         };
 
-        let target_bots: Vec<BotConfig> = member_bots
+        let mut target_bots: Vec<BotConfig> = member_bots
             .into_iter()
             .filter(|b| {
                 target_ids.contains(&b.id) && !b.paused && sender_bot_id.as_ref() != Some(&b.id)
@@ -560,6 +567,20 @@ impl GroupCoordinator {
             data.threads.push(created.clone());
             created
         };
+
+        let hop_key = (group.id.clone(), thread.thread_id.clone());
+        let mut hop_limit_reached = false;
+        if sender_bot_id.is_none() {
+            data.bot_hops.remove(&hop_key);
+        } else if !target_bots.is_empty() {
+            let hops = data.bot_hops.entry(hop_key).or_insert(0);
+            if *hops >= MAX_BOT_TO_BOT_HOPS {
+                target_bots.clear();
+                hop_limit_reached = true;
+            } else {
+                *hops = hops.saturating_add(1);
+            }
+        }
 
         let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
         let posted_message = BotGroupMessage {
@@ -612,6 +633,7 @@ impl GroupCoordinator {
             posted_message,
             target_bots,
             prompt_for_bot,
+            hop_limit_reached,
         })
     }
 
@@ -897,6 +919,74 @@ impl GroupCoordinator {
         Ok(stopped)
     }
 
+    /// Clears the active (or explicit) group thread by cancelling any active turns on it,
+    /// resetting bot-to-bot hop counters, and opening a fresh empty thread. Returns the
+    /// cleared thread ID (if one existed) so the caller can recycle bound member sessions,
+    /// together with the fresh [`BotGroupRoomView`].
+    pub(crate) fn clear_group_thread(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        thread_id: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<(Option<String>, BotGroupRoomView)> {
+        let group = store.get_group(group_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("group not found: {group_id}"),
+            )
+        })?;
+        let (cleared_tid, fresh_tid) = {
+            let _io = lock(&self.io_lock);
+            self.ensure_loaded_locked()?;
+            let mut guard = lock(&self.state);
+            let data = guard
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing state"))?;
+
+            let target_tid = thread_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    data.threads
+                        .iter()
+                        .filter(|t| t.group_id == group.id)
+                        .max_by_key(|t| t.updated_at_ms)
+                        .map(|t| t.thread_id.clone())
+                });
+
+            if let Some(ref tid) = target_tid {
+                data.turns
+                    .retain(|t| !(t.group_id == group.id && &t.thread_id == tid));
+                for msg in &mut data.messages {
+                    if msg.group_id == group.id && &msg.thread_id == tid && msg.in_progress {
+                        msg.in_progress = false;
+                        if msg.body.trim().is_empty() {
+                            "[stopped]".clone_into(&mut msg.body);
+                        }
+                    }
+                }
+                data.bot_hops.remove(&(group.id.clone(), tid.clone()));
+            }
+
+            let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let fresh = BotGroupThread {
+                thread_id: format!("thr-{now_ms}-{seq}"),
+                group_id: group.id.clone(),
+                title: "New thread".to_owned(),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms.saturating_add(1),
+            };
+            let fresh_id = fresh.thread_id.clone();
+            data.threads.push(fresh);
+            self.persist_locked(data)?;
+            (target_tid, fresh_id)
+        };
+        let room = self.read_group_room(store, group_id, Some(&fresh_tid), None, None)?;
+        Ok((cleared_tid, room))
+    }
+
     /// Rebinds active group turns when a bot session hands off to a new session on account switch.
     pub(crate) fn rebind_session(&self, old: SessionId, new: SessionId) {
         let _io = lock(&self.io_lock);
@@ -1043,6 +1133,7 @@ impl GroupCoordinator {
                     if data.audiences.remove(gid).is_some() {
                         changed = true;
                     }
+                    data.bot_hops.retain(|(g, _), _| g != gid);
                 }
                 if data.threads.len() != prev_t || data.messages.len() != prev_m {
                     changed = true;
@@ -1075,6 +1166,7 @@ impl GroupCoordinator {
             messages,
             turns,
             audiences,
+            bot_hops: BTreeMap::new(),
         });
         Ok(())
     }
@@ -1909,6 +2001,135 @@ mod tests {
             plan_bot.target_bots.is_empty(),
             "Bot mode must exclude sender_bot_id"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bot_to_bot_hops_cap_at_four_and_reset_on_owner_message_and_clear_thread_resets() {
+        let root = std::env::temp_dir().join(format!("krill-groups-hops-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+        let alice = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Alice".to_owned(),
+                    description: String::new(),
+                    agent_id: "claude".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let bob = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Bob".to_owned(),
+                    description: String::new(),
+                    agent_id: "claude".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_001,
+            )
+            .unwrap();
+
+        let grp = store
+            .create_group(
+                "Ops",
+                vec![alice.id.clone(), bob.id.clone()],
+                String::new(),
+                1_010,
+            )
+            .unwrap();
+        let groups = GroupCoordinator::new(root.clone());
+
+        // 4 consecutive bot-to-bot hops are allowed (`BOT-07`).
+        for hop in 0..MAX_BOT_TO_BOT_HOPS {
+            let (sender, target) = if hop % 2 == 0 {
+                (alice.id.as_str(), "@bob")
+            } else {
+                (bob.id.as_str(), "@alice")
+            };
+            let plan = groups
+                .prepare_message_dispatch_with_audience(
+                    &store,
+                    &grp.id,
+                    None,
+                    sender,
+                    &format!("hop {hop} {target}"),
+                    BotGroupReplyAudience::Mentions,
+                    1_020 + u64::from(hop),
+                )
+                .unwrap();
+            assert!(!plan.hop_limit_reached, "hop {hop} must not trip cap");
+            assert_eq!(plan.target_bots.len(), 1);
+        }
+
+        // 5th consecutive bot-to-bot hop hits the cap and dispatches 0 turns.
+        let capped = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp.id,
+                None,
+                alice.id.as_str(),
+                "hop 4 @bob",
+                BotGroupReplyAudience::Mentions,
+                1_030,
+            )
+            .unwrap();
+        assert!(capped.hop_limit_reached, "5th bot hop must hit hop limit");
+        assert!(capped.target_bots.is_empty());
+
+        // An owner message resets the hop counter back to 0.
+        let owner_plan = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp.id,
+                None,
+                "owner",
+                "@alice continue",
+                BotGroupReplyAudience::Mentions,
+                1_040,
+            )
+            .unwrap();
+        assert!(!owner_plan.hop_limit_reached);
+        assert_eq!(owner_plan.target_bots.len(), 1);
+
+        let after_reset = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp.id,
+                None,
+                alice.id.as_str(),
+                "fresh hop @bob",
+                BotGroupReplyAudience::Mentions,
+                1_050,
+            )
+            .unwrap();
+        assert!(!after_reset.hop_limit_reached);
+        assert_eq!(after_reset.target_bots.len(), 1);
+
+        // `clear_group_thread` (`BOT-05`) opens a fresh empty thread.
+        let old_tid = owner_plan.thread.thread_id.clone();
+        let (_, cleared) = groups
+            .clear_group_thread(&store, &grp.id, Some(&old_tid), 1_060)
+            .unwrap();
+        assert!(cleared.messages.is_empty());
+        assert_ne!(cleared.active_thread_id.as_deref(), Some(old_tid.as_str()));
 
         fs::remove_dir_all(&root).ok();
     }

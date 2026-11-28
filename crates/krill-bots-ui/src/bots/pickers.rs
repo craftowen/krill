@@ -366,10 +366,7 @@ impl BotAgentSetup {
 
     #[must_use]
     pub fn supports_effort(&self) -> bool {
-        matches!(
-            krill_proto::agent::canonical_id(self.runtime),
-            "claude" | "codex" | "agy" | "grok" | "opencode"
-        )
+        super::rpc::effort_options_for_runtime(self.runtime).len() > 1
     }
 
     #[must_use]

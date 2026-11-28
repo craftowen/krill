@@ -79,6 +79,8 @@ pub struct HomeHeaderMeta {
     pub working_count: usize,
     pub needs_you_count: usize,
     pub usage_limit_note: Option<String>,
+    /// Display label of the remote host when the bot lives on a remote peer (`BOT-38`).
+    pub remote_host_label: Option<String>,
 }
 
 /// Stable identity key for a flattened virtual row, used to preserve the scroll anchor across
@@ -440,8 +442,9 @@ pub(super) fn group_of(item: &BotItem, live: bool, stale_days: Option<u64>, now:
         _ if is_snoozed(item, now) => Group::Snoozed,
         _ if is_stale(item, live, stale_days, now) => Group::Stale,
         BotItemStatus::NeedsYou => Group::NeedsYou,
-        BotItemStatus::Working => Group::Working,
         BotItemStatus::Waiting => Group::Waiting,
+        _ if waiting_note(item).is_some() => Group::Waiting,
+        BotItemStatus::Working => Group::Working,
         BotItemStatus::Planned => Group::Planned,
     }
 }
@@ -729,6 +732,7 @@ impl View {
             working_count,
             needs_you_count,
             usage_limit_note,
+            remote_host_label: (!self.host.is_local()).then(|| self.host_label()),
         };
         if self.items.header_meta.as_ref() != Some(&next) {
             self.items.header_meta = Some(next);
@@ -756,6 +760,7 @@ impl View {
     #[must_use]
     pub fn home_filter(&self) -> Option<HomeFilter> {
         let selected = self.selected_bot_id.as_ref();
+        let now = now_unix_ms();
         let mut count = 0usize;
         let mut needs_you = 0usize;
         for item in
@@ -764,7 +769,7 @@ impl View {
             })
         {
             count += 1;
-            if item.status == BotItemStatus::NeedsYou {
+            if item.status == BotItemStatus::NeedsYou && !is_snoozed(item, now) {
                 needs_you += 1;
             }
         }
@@ -907,7 +912,7 @@ impl View {
                 continue;
             }
             max_number = max_number.max(item.number);
-            if filter_on && item.status != BotItemStatus::NeedsYou {
+            if filter_on && (item.status != BotItemStatus::NeedsYou || is_snoozed(item, now)) {
                 continue;
             }
             let live = self.item_live(item);
@@ -1233,12 +1238,37 @@ impl View {
                     .flex_col()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(ui::TEXT_MD)
-                            .line_height(px(20.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.sidebar_foreground)
-                            .child(bot.name.clone()),
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_MD)
+                                    .line_height(px(20.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.sidebar_foreground)
+                                    .child(bot.name.clone()),
+                            )
+                            .when_some(
+                                meta.remote_host_label
+                                    .clone()
+                                    .or_else(|| (!self.host.is_local()).then(|| self.host_label())),
+                                |d, host_label| {
+                                    d.child(
+                                        div()
+                                            .debug_selector(|| "bot-panel-header-host".into())
+                                            .flex_none()
+                                            .child(ui::badge(
+                                                p,
+                                                ui::BadgeTone::Neutral,
+                                                host_label,
+                                            )),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         div()
@@ -1955,6 +1985,7 @@ impl View {
             })
         };
         let snoozed = is_snoozed(item, now);
+        let is_needs_you = item.status == BotItemStatus::NeedsYou;
         let title = item.title.clone();
         let initial_wait_note = waiting_note(item).map(str::to_owned);
         let snooze_menu = {
@@ -2012,6 +2043,7 @@ impl View {
                             )
                             .child(hm::STATUS_WAITING.get())
                     })
+                    .disabled(is_needs_you)
                     .on_click(move |_, _, cx| {
                         this.update(cx, |v, cx| {
                             v.ask_waiting(
