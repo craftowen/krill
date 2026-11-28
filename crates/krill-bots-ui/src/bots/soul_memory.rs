@@ -39,6 +39,8 @@ pub(super) struct SoulMemoryState {
     pub(super) soul_input: Option<Entity<TextareaState>>,
     pub(super) soul_input_sub: Option<Subscription>,
     pub(super) saving_soul_content: Option<String>,
+    /// Queued SOUL.md edit captured while an earlier save was still in flight (`BOT-22`).
+    pub(super) pending_soul_save: Option<(BotId, String)>,
     pub(super) memory_input: Option<Entity<TextareaState>>,
     pub(super) sync_mask: u8,
     pub(super) deletion_violation: Option<MemoryDeletionViolation>,
@@ -89,12 +91,33 @@ impl SoulMemoryState {
         self.editing_fact = None;
     }
 
+    pub(super) fn reset_for_bot_switch(&mut self) {
+        self.loaded_bot_id = None;
+        self.soul_loaded.clear();
+        self.memory_loaded.clear();
+        self.saving_soul_content = None;
+        self.pending_soul_save = None;
+        self.memory_history.clear();
+        self.memory_topics.clear();
+        self.selected_topic = None;
+        self.topic_loaded.clear();
+        self.tidy_status = None;
+        self.last_tidy_summary = None;
+        self.editing_fact = None;
+        self.deletion_violation = None;
+        self.armed_forget = None;
+        self.request_sync(SYNC_SOUL | SYNC_MEMORY | SYNC_TOPIC);
+    }
+
     pub(super) fn apply_loaded_sections(
         &mut self,
         bot_id: &BotId,
         soul: Option<String>,
         memory: Option<String>,
     ) {
+        if soul.is_none() && memory.is_none() {
+            return;
+        }
         self.loaded_bot_id = Some(bot_id.clone());
         self.deletion_violation = None;
         self.armed_forget = None;
@@ -279,6 +302,10 @@ impl View {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.soul_memory.busy {
+            // Queue latest unsaved SOUL edit while a prior save is in flight so rapid
+            // blur/tab/back navigation never drops final changes (`BOT-22`), while returning
+            // `false` so Read-mode toggle (`UB-17`) waits until the edit is persisted.
+            self.soul_memory.pending_soul_save = Some((bot_id, content));
             return false;
         }
         let rpc = self.rpc.clone();
@@ -311,8 +338,17 @@ impl View {
                         this.soul_memory.soul_loaded = saved_copy;
                         this.panel_switch_dismissed_for = None;
                         this.notice = Some(SharedString::from(text::SOUL_SAVED.get()));
+                        if let Some((next_bot, next_content)) =
+                            this.soul_memory.pending_soul_save.take()
+                            && next_bot == expected_bot
+                            && next_content != this.soul_memory.soul_loaded
+                        {
+                            let _ = this.try_save_soul(next_bot, next_content, cx);
+                            return;
+                        }
                     }
                     Err(err) => {
+                        this.soul_memory.pending_soul_save = None;
                         this.error = Some(SharedString::from(err));
                     }
                 }
@@ -324,7 +360,7 @@ impl View {
         true
     }
 
-    pub(super) fn flush_unsaved_soul_edits(&mut self, cx: &mut Context<Self>) {
+    pub fn flush_unsaved_soul_edits(&mut self, cx: &mut Context<Self>) {
         let Some(bot_id) = self.selected_bot_id.clone() else {
             return;
         };
@@ -338,14 +374,33 @@ impl View {
     }
 
     pub fn save_memory(&mut self, bot_id: BotId, content: String, cx: &mut Context<Self>) {
+        self.save_memory_inner(bot_id, content, false, cx);
+    }
+
+    pub(super) fn save_memory_with_clear_quick_add(
+        &mut self,
+        bot_id: BotId,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.save_memory_inner(bot_id, content, true, cx)
+    }
+
+    fn save_memory_inner(
+        &mut self,
+        bot_id: BotId,
+        content: String,
+        clear_quick_add: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.soul_memory.busy {
-            return;
+            return false;
         }
         if let Err(violation) = validate_memory_edit(&self.soul_memory.memory_loaded, &content) {
             self.soul_memory.deletion_violation = Some(violation);
             self.notice = None;
             cx.notify();
-            return;
+            return false;
         }
         self.soul_memory.deletion_violation = None;
         let rpc = self.rpc.clone();
@@ -401,6 +456,13 @@ impl View {
                     )) => {
                         this.soul_memory.memory_loaded = next_content;
                         this.soul_memory.request_sync(SYNC_MEMORY);
+                        if clear_quick_add {
+                            clear_input_on_window(
+                                &mut this.settings.memory_add_input,
+                                this.window_handle,
+                                cx,
+                            );
+                        }
                         if !this.soul_memory.has_unsaved_edits(cx) {
                             this.panel_switch_dismissed_for = None;
                         }
@@ -420,6 +482,13 @@ impl View {
                     }
                     Ok((_, hist)) => {
                         this.soul_memory.memory_loaded = sent;
+                        if clear_quick_add {
+                            clear_input_on_window(
+                                &mut this.settings.memory_add_input,
+                                this.window_handle,
+                                cx,
+                            );
+                        }
                         if !this.soul_memory.has_unsaved_edits(cx) {
                             this.panel_switch_dismissed_for = None;
                         }
@@ -432,11 +501,19 @@ impl View {
                         this.error = Some(SharedString::from(err));
                     }
                 }
+                if let Some((next_bot, next_content)) = this.soul_memory.pending_soul_save.take()
+                    && next_bot == expected_bot
+                    && next_content != this.soul_memory.soul_loaded
+                {
+                    let _ = this.try_save_soul(next_bot, next_content, cx);
+                    return;
+                }
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+        true
     }
 
     pub fn forget_memory_fact(&mut self, bot_id: BotId, fact: String, cx: &mut Context<Self>) {
@@ -1240,6 +1317,7 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let host_name = self.refusal_host_name();
         let origin_host_gen = self.host_gen;
         let req_host = self.host.clone();
         self.soul_memory.busy = true;
@@ -1250,12 +1328,13 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    call_checked(
+                    super::rpc::call_checked_on(
                         &rpc,
                         &BotRpcRequest::StartSuggestion {
                             bot_id: bot_id_bg,
                             suggestion_id: sid_bg,
                         },
+                        host_name.as_deref(),
                     )
                 })
                 .await;

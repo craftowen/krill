@@ -1056,6 +1056,15 @@ impl BotsManager {
                 {
                     return BotRpcResponse::Error(err);
                 }
+                if params.permission_mode.is_none() {
+                    params.permission_mode = Some(
+                        registry
+                            .agent_control()
+                            .agents()
+                            .map(|a| a.permission)
+                            .unwrap_or_default(),
+                    );
+                }
                 if krill_proto::agent::canonical_id(params.agent_id.trim()) == "agy"
                     && let Some(ref model) = params.model
                     && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
@@ -1066,6 +1075,14 @@ impl BotsManager {
                 {
                     params.model = Some(family);
                     params.effort = Some(eff);
+                }
+                if let Err(err) = validate_bot_launch_overrides(
+                    registry,
+                    &params.agent_id,
+                    params.model.as_deref(),
+                    params.effort.as_deref(),
+                ) {
+                    return BotRpcResponse::Error(err);
                 }
                 match self.store.create_bot(*params, ts) {
                     Ok(bot) => {
@@ -1081,6 +1098,15 @@ impl BotsManager {
                 {
                     return BotRpcResponse::Error(err);
                 }
+                if params.base.permission_mode.is_none() {
+                    params.base.permission_mode = Some(
+                        registry
+                            .agent_control()
+                            .agents()
+                            .map(|a| a.permission)
+                            .unwrap_or_default(),
+                    );
+                }
                 if krill_proto::agent::canonical_id(params.base.agent_id.trim()) == "agy"
                     && let Some(ref model) = params.base.model
                     && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
@@ -1091,6 +1117,14 @@ impl BotsManager {
                 {
                     params.base.model = Some(family);
                     params.base.effort = Some(eff);
+                }
+                if let Err(err) = validate_bot_launch_overrides(
+                    registry,
+                    &params.base.agent_id,
+                    params.base.model.as_deref(),
+                    params.base.effort.as_deref(),
+                ) {
+                    return BotRpcResponse::Error(err);
                 }
                 match self.store.create_bot_v2(*params, ts) {
                     Ok(bot) => {
@@ -1141,6 +1175,34 @@ impl BotsManager {
                     {
                         params.model = krill_proto::bots::FieldPatch::Set(family);
                         params.effort = krill_proto::bots::FieldPatch::Set(eff);
+                    }
+                }
+                if let Some(eff_agent_raw) = params
+                    .agent_id
+                    .as_deref()
+                    .or_else(|| prev_bot.as_ref().map(|b| b.agent_id.as_str()))
+                {
+                    let next_model = match &params.model {
+                        krill_proto::bots::FieldPatch::Set(m) => Some(m.as_str()),
+                        krill_proto::bots::FieldPatch::Clear => None,
+                        krill_proto::bots::FieldPatch::Unchanged => {
+                            prev_bot.as_ref().and_then(|b| b.model.as_deref())
+                        }
+                    };
+                    let next_effort = match &params.effort {
+                        krill_proto::bots::FieldPatch::Set(e) => Some(e.as_str()),
+                        krill_proto::bots::FieldPatch::Clear => None,
+                        krill_proto::bots::FieldPatch::Unchanged => {
+                            prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                        }
+                    };
+                    if let Err(err) = validate_bot_launch_overrides(
+                        registry,
+                        eff_agent_raw,
+                        next_model,
+                        next_effort,
+                    ) {
+                        return BotRpcResponse::Error(err);
                     }
                 }
                 match self.store.update_bot(*params, ts) {
@@ -1624,41 +1686,35 @@ impl BotsManager {
                 option_index,
                 decision_id,
                 request_id,
-            } => match self.items.answer_item(
+            } => self.handle_answer_bot_item(
+                registry,
                 &item_id,
                 answer_text.as_deref(),
                 option_index,
                 decision_id.as_deref(),
                 request_id.as_deref(),
+                false,
                 &default_actor,
                 ts,
-            ) {
-                Ok(outcome) => {
-                    if outcome.should_wake_bot
-                        && let Ok(Some(bot)) = self.store.get_bot(&outcome.item.owner_bot_id)
-                        && !bot.paused
-                    {
-                        let wake_prompt = format!(
-                            "[Owner answered item #{}: {}]\nDecision: {}",
-                            outcome.item.number, outcome.item.title, outcome.answer_summary
-                        );
-                        self.runtime
-                            .deliver_or_wake_bot(
-                                registry,
-                                &self.store,
-                                &self.secrets,
-                                &self.tool_relay,
-                                &self.composio_base_url,
-                                &bot.id,
-                                &wake_prompt,
-                                ts,
-                            )
-                            .ok();
-                    }
-                    BotRpcResponse::Item(Box::new(outcome.item))
-                }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            ),
+            BotRpcRequest::AnswerBotItemWithOptions {
+                item_id,
+                answer_text,
+                option_index,
+                decision_id,
+                request_id,
+                skip_remaining,
+            } => self.handle_answer_bot_item(
+                registry,
+                &item_id,
+                answer_text.as_deref(),
+                option_index,
+                decision_id.as_deref(),
+                request_id.as_deref(),
+                skip_remaining,
+                &default_actor,
+                ts,
+            ),
             BotRpcRequest::MarkBotItemsOpened {
                 bot_id,
                 up_to_event_id,
@@ -1767,7 +1823,15 @@ impl BotsManager {
             },
             BotRpcRequest::DeleteGroup { group_id } => {
                 match self.groups.delete_group(&self.store, &group_id) {
-                    Ok(()) => BotRpcResponse::Ok,
+                    Ok(()) => {
+                        self.runtime.stop_sessions_for_group(
+                            registry,
+                            &self.tool_relay,
+                            &group_id,
+                            None,
+                        );
+                        BotRpcResponse::Ok
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -1839,9 +1903,17 @@ impl BotsManager {
             {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
-                        self.runtime
-                            .stop_session(registry, &self.tool_relay, &bid, sid)
-                            .ok();
+                        if let Err(err) =
+                            self.runtime
+                                .interrupt_group_turn(registry, &self.store, &bid, sid)
+                        {
+                            tracing::warn!(
+                                bot_id = %bid,
+                                session = sid.0,
+                                error = %err,
+                                "failed to interrupt group turn"
+                            );
+                        }
                     }
                     BotRpcResponse::Ok
                 }
@@ -1917,11 +1989,41 @@ impl BotsManager {
             ) {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
-                        self.runtime
-                            .stop_session(registry, &self.tool_relay, &bid, sid)
-                            .ok();
+                        if let Err(err) =
+                            self.runtime
+                                .interrupt_group_turn(registry, &self.store, &bid, sid)
+                        {
+                            tracing::warn!(
+                                bot_id = %bid,
+                                session = sid.0,
+                                error = %err,
+                                "failed to interrupt group member turn"
+                            );
+                        }
                     }
                     BotRpcResponse::Ok
+                }
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ClearGroupThread {
+                group_id,
+                thread_id,
+            } => match self.groups.clear_group_thread(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                ts,
+            ) {
+                Ok((cleared_tid, room)) => {
+                    if let Some(tid) = cleared_tid {
+                        self.runtime.stop_sessions_for_group(
+                            registry,
+                            &self.tool_relay,
+                            &group_id,
+                            Some(&tid),
+                        );
+                    }
+                    BotRpcResponse::GroupRoom(room)
                 }
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
@@ -2319,6 +2421,15 @@ impl BotsManager {
                 {
                     return BotRpcResponse::Error(err);
                 }
+                if params.base.permission_mode.is_none() {
+                    params.base.permission_mode = Some(
+                        registry
+                            .agent_control()
+                            .agents()
+                            .map(|a| a.permission)
+                            .unwrap_or_default(),
+                    );
+                }
                 if krill_proto::agent::canonical_id(params.base.agent_id.trim()) == "agy"
                     && let Some(ref model) = params.base.model
                     && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
@@ -2329,6 +2440,16 @@ impl BotsManager {
                 {
                     params.base.model = Some(family);
                     params.base.effort = Some(eff);
+                }
+                if !params.base.agent_id.trim().is_empty()
+                    && let Err(err) = validate_bot_launch_overrides(
+                        registry,
+                        &params.base.agent_id,
+                        params.base.model.as_deref(),
+                        params.base.effort.as_deref(),
+                    )
+                {
+                    return BotRpcResponse::Error(err);
                 }
                 match self
                     .store
@@ -2780,6 +2901,92 @@ impl BotsManager {
 
         map.into_values().collect()
     }
+
+    #[expect(clippy::too_many_arguments, reason = "item answer dispatch context")]
+    fn handle_answer_bot_item(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        answer_text: Option<&str>,
+        option_index: Option<u32>,
+        decision_id: Option<&str>,
+        request_id: Option<&str>,
+        skip_remaining: bool,
+        actor: &BotItemActor,
+        ts: u64,
+    ) -> BotRpcResponse {
+        match self.items.answer_item_with_options(
+            item_id,
+            answer_text,
+            option_index,
+            decision_id,
+            request_id,
+            actor,
+            ts,
+            skip_remaining,
+        ) {
+            Ok(outcome) => {
+                if outcome.should_wake_bot
+                    && let Ok(Some(bot)) = self.store.get_bot(&outcome.item.owner_bot_id)
+                    && !bot.paused
+                {
+                    let wake_prompt = format!(
+                        "[Owner answered item #{}: {}]\nDecision: {}",
+                        outcome.item.number, outcome.item.title, outcome.answer_summary
+                    );
+                    // Deliver to the originating live group/linked session when still alive
+                    // before falling back to private Home (`BOT-17`), and log failures.
+                    let delivered_origin = if let Some(origin_sid) = outcome.origin_session_id
+                        && registry.is_session_live(origin_sid)
+                        && self.runtime.session_belongs_to_bot(origin_sid, &bot.id)
+                    {
+                        match self.runtime.deliver_turn(
+                            registry,
+                            &self.store,
+                            origin_sid,
+                            &bot.id,
+                            &wake_prompt,
+                        ) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::warn!(
+                                    bot_id = %bot.id,
+                                    item_uid = %outcome.item.uid,
+                                    session = origin_sid.0,
+                                    error = %err,
+                                    "failed to deliver item answer wake prompt to originating session; falling back"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if !delivered_origin
+                        && let Err(err) = self.runtime.deliver_or_wake_bot(
+                            registry,
+                            &self.store,
+                            &self.secrets,
+                            &self.tool_relay,
+                            &self.composio_base_url,
+                            &bot.id,
+                            &wake_prompt,
+                            ts,
+                        )
+                    {
+                        tracing::warn!(
+                            bot_id = %bot.id,
+                            item_uid = %outcome.item.uid,
+                            error = %err,
+                            "failed to deliver item answer wake prompt"
+                        );
+                    }
+                }
+                BotRpcResponse::Item(Box::new(outcome.item))
+            }
+            Err(err) => BotRpcResponse::Error(err.to_string()),
+        }
+    }
 }
 
 /// Authorizes a request coming from inside a live bot session (`Scope::Session(bot_sid)`).
@@ -2933,6 +3140,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::TakeOverWorkspace { .. }
         | BotRpcRequest::SendBotRunAgain { .. }
         | BotRpcRequest::AnswerBotItem { .. }
+        | BotRpcRequest::AnswerBotItemWithOptions { .. }
         | BotRpcRequest::CreateGroup { .. }
         | BotRpcRequest::UpdateGroup { .. }
         | BotRpcRequest::DeleteGroup { .. }
@@ -2941,6 +3149,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::StopGroup { .. }
         | BotRpcRequest::SetGroupReplyAudience { .. }
         | BotRpcRequest::StopGroupMember { .. }
+        | BotRpcRequest::ClearGroupThread { .. }
         | BotRpcRequest::SetConnectorConfig { .. }
         | BotRpcRequest::SetSecret { .. }
         | BotRpcRequest::DeleteSecret { .. }
@@ -3659,12 +3868,24 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                         }
                     }
                 }
-                serde_json::to_string(&json!({
+                let mut resp = json!({
                     "message": plan.posted_message,
                     "dispatched_bots": dispatched,
                     "failed_bots": failed,
-                }))
-                .map_err(|e| e.to_string())
+                });
+                if plan.hop_limit_reached
+                    && let Some(obj) = resp.as_object_mut()
+                {
+                    obj.insert("hop_limit_reached".to_owned(), json!(true));
+                    obj.insert(
+                        "note".to_owned(),
+                        json!(format!(
+                            "Bot-to-bot mention hop limit ({}) reached for this thread; message was posted without dispatching further bot turns until the owner replies.",
+                            groups::MAX_BOT_TO_BOT_HOPS
+                        )),
+                    );
+                }
+                serde_json::to_string(&resp).map_err(|e| e.to_string())
             }
             "access_list" => {
                 let reqs = mgr
@@ -3868,6 +4089,46 @@ fn validate_agent_profile(registry: &Registry, raw_agent_id: &str) -> Result<(),
     } else {
         Err(format!("unknown agent profile: {trimmed}"))
     }
+}
+
+fn validate_bot_launch_overrides(
+    registry: &Registry,
+    raw_agent_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    let overrides = krill_proto::agent::LaunchOverrides {
+        model: model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        effort: effort
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+    };
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let trimmed = raw_agent_id.trim();
+    let effective_id = if trimmed.is_empty() {
+        "claude"
+    } else {
+        trimmed
+    };
+    let agents = registry
+        .agent_control()
+        .agents()
+        .map_err(|err| err.to_string())?;
+    let Some((_, profile)) = agents.resolve(effective_id) else {
+        return Err(format!("unknown agent profile: {effective_id}"));
+    };
+    krill_proto::agent::validate_launch_overrides(
+        krill_proto::agent::canonical_id(effective_id),
+        profile,
+        &overrides,
+    )
+    .map(|_| ())
 }
 
 fn classify_turn_error_refusal(
@@ -6575,6 +6836,68 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "bot items must be cleaned up even if delete_home fails"
+        );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn create_bot_default_permission_inherits_agent_setting_and_rejects_unsupported_effort() {
+        let state = std::env::temp_dir().join(format!("krill-bots-v040-{}", std::process::id()));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("agents.toml"), "permission = \"manual\"\n").unwrap();
+        let reg = Arc::new(Registry::new(None, Some(state.as_path())));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        // BOT-02: `permission_mode: None` ("Same as chats") must resolve to default agent permission
+        // (Manual), never silently escalating to Permission::Yolo.
+        let resp = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "SafeBot".to_owned(),
+                description: String::new(),
+                agent_id: "claude".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        );
+        let BotRpcResponse::Bot(bot) = resp else {
+            panic!("expected BotRpcResponse::Bot, got {resp:?}");
+        };
+        assert_eq!(
+            bot.permission_mode,
+            krill_proto::agent::Permission::Manual,
+            "permission_mode: None must NOT escalate to Yolo"
+        );
+
+        // BOT-11: unsupported effort for `opencode` / `cursor` must be rejected by daemon validation.
+        let bad = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "BadEffortBot".to_owned(),
+                description: String::new(),
+                agent_id: "opencode".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: Some("high".to_owned()),
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        );
+        assert!(
+            matches!(bad, BotRpcResponse::Error(_)),
+            "opencode with effort=high must fail validation, got {bad:?}"
         );
 
         mgr.shutdown();

@@ -227,11 +227,18 @@ impl Shell {
                 };
                 let agent = ui::status::infer_agent_from_title(raw_agent, &label);
                 let state = session.map_or(AgentState::Unknown, |s| s.status.state);
-                let unread = host.is_local()
-                    && self
-                        .layout
-                        .session(tab.focused)
-                        .is_some_and(|id| self.sidebar.read(cx).is_unread(id));
+                let unread = self
+                    .layout
+                    .session(tab.focused)
+                    .is_some_and(|id| self.sidebar.read(cx).is_unread_on(host, id))
+                    || self.layout.group_pane(tab.focused).is_some_and(|g| {
+                        self.sidebar_groups
+                            .iter()
+                            .find(|s| &s.host == host && s.group.id == g.group_id)
+                            .is_some_and(|s| {
+                                !selected && self.group_is_unread(host, &g.group_id, &s.summary)
+                            })
+                    });
                 let inferred = session
                     .and_then(|s| s.status.badge())
                     .map(|_| krill_app_core::i18n::catalog::general::INFERRED.get())

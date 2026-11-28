@@ -335,18 +335,39 @@ impl Shell {
             #[cfg(test)]
             return Some(view.clone());
         }
+        if let Some(prev) = &self.bot_ui.panel.view {
+            // Flush unsaved SOUL edits before swapping panel views across hosts (`BOT-41`).
+            prev.update(cx, krill_bots_ui::bots::View::flush_unsaved_soul_edits);
+        }
+        let host_label = self.host_display_label(host, cx).to_string();
         #[cfg(test)]
         let view = {
             let rpc = self.bot_rpc_on(host)?;
             let host_owned = host.clone();
+            let host_choices = vec![(host_owned.clone(), host_label, None)];
             cx.new(|cx| {
-                krill_bots_ui::bots::View::with_rpc_on_host(host_owned, rpc, None, cx).into_panel()
+                let mut v =
+                    krill_bots_ui::bots::View::with_rpc_on_host(host_owned.clone(), rpc, None, cx)
+                        .into_panel();
+                v.set_host_target(host_owned, None, host_choices, cx);
+                v
             })
         };
         #[cfg(not(test))]
         let view = {
-            let host = host.clone();
-            cx.new(|cx| krill_bots_ui::bots::View::new_on_host(host, target, None, cx).into_panel())
+            let host_owned = host.clone();
+            let host_choices = vec![(host_owned.clone(), host_label, target.clone())];
+            cx.new(|cx| {
+                let mut v = krill_bots_ui::bots::View::new_on_host(
+                    host_owned.clone(),
+                    target.clone(),
+                    None,
+                    cx,
+                )
+                .into_panel();
+                v.set_host_target(host_owned, target, host_choices, cx);
+                v
+            })
         };
         Self::subscribe_bots_view(&view, false, cx);
         // The header (drawn here) shows the view's filter and hides over an open item: redraw
@@ -462,6 +483,18 @@ impl Shell {
             .panel
             .deleted_chats
             .retain(|(h, sid)| h != &host || bot.sessions.iter().any(|s| s.session_id == *sid));
+        let switched_bot = self
+            .bot_ui
+            .panel
+            .shown
+            .as_ref()
+            .is_some_and(|(h, id, _)| h != &host || id != &bot.id);
+        if switched_bot && !self.bot_ui.panel.chat_query.is_empty() {
+            self.bot_ui.panel.chat_query.clear();
+            if let Some((input, _)) = &self.bot_ui.panel.chat_search {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+        }
         let detail = match (tab, self.bot_ui.panel.settings) {
             (BotPanelTab::Home, Some(page)) => Some(page),
             (BotPanelTab::Home, None) => Some(DetailTab::Items),

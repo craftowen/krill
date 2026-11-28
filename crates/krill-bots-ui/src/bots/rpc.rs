@@ -78,6 +78,7 @@ pub const BOT_EFFORT_OPTIONS: [&str; 6] = ["", "low", "medium", "high", "xhigh",
 
 const CLAUDE_EFFORT_OPTIONS: [&str; 5] = ["", "low", "medium", "high", "max"];
 const CODEX_EFFORT_OPTIONS: [&str; 5] = ["", "low", "medium", "high", "xhigh"];
+const NO_EFFORT_OPTIONS: [&str; 1] = [""];
 
 /// Reasoning effort choices accepted by `runtime_id` (empty string = runtime default).
 #[must_use]
@@ -85,7 +86,8 @@ pub fn effort_options_for_runtime(runtime_id: &str) -> &'static [&'static str] {
     match krill_proto::agent::canonical_id(runtime_id) {
         "claude" | "openclaude" => &CLAUDE_EFFORT_OPTIONS,
         "codex" | "grok" | "pi" | "omp" => &CODEX_EFFORT_OPTIONS,
-        _ => &BOT_EFFORT_OPTIONS,
+        "agy" => &BOT_EFFORT_OPTIONS,
+        _ => &NO_EFFORT_OPTIONS,
     }
 }
 
@@ -704,9 +706,12 @@ pub fn sidebar_snapshot_on(
     access: &[BotAccessRequest],
     sessions: &[BotSessionSummary],
 ) -> SidebarSnapshot {
+    let now = super::now_unix_ms();
     let needs: Vec<&BotId> = items
         .iter()
-        .filter(|item| item.status == BotItemStatus::NeedsYou)
+        .filter(|item| {
+            item.status == BotItemStatus::NeedsYou && !super::home::is_snoozed(item, now)
+        })
         .map(|item| &item.owner_bot_id)
         .chain(
             access
@@ -758,7 +763,11 @@ pub fn sidebar_snapshot_on(
                     attention: needs.iter().filter(|id| **id == &bot.id).count(),
                     items_need_you: items
                         .iter()
-                        .filter(|i| i.status == BotItemStatus::NeedsYou && i.owner_bot_id == bot.id)
+                        .filter(|i| {
+                            i.status == BotItemStatus::NeedsYou
+                                && !super::home::is_snoozed(i, now)
+                                && i.owner_bot_id == bot.id
+                        })
                         .count(),
                     access_requesters: access
                         .iter()
@@ -1655,5 +1664,37 @@ mod tests {
             "post-handshake failure must report epoch-fenced outcome for epoch 7"
         );
         invalidate_host_connections(&host);
+    }
+
+    #[test]
+    fn effort_options_for_runtime_matches_protocol_validation() {
+        // BOT-11: every effort option offered in UI must pass `validate_launch_overrides`,
+        // and unsupported runtimes (`opencode`, `cursor`, `gemini`) offer only default `""`.
+        for rt in ["opencode", "cursor", "gemini"] {
+            assert_eq!(
+                effort_options_for_runtime(rt),
+                &[""],
+                "{rt} must not advertise unsupported effort levels"
+            );
+        }
+        let agents = krill_proto::agent::Agents::load(None).expect("built-in agent profiles");
+        for rt in ["claude", "openclaude", "codex", "agy", "grok", "pi", "omp"] {
+            let opts = effort_options_for_runtime(rt);
+            assert!(opts.len() > 1, "{rt} must advertise effort levels");
+            let (_, profile) = agents.resolve(rt).expect("built-in agent profile");
+            for &eff in opts {
+                if eff.is_empty() {
+                    continue;
+                }
+                let ov = krill_proto::agent::LaunchOverrides {
+                    model: None,
+                    effort: Some(eff.to_owned()),
+                };
+                assert!(
+                    krill_proto::agent::validate_launch_overrides(rt, profile, &ov).is_ok(),
+                    "UI offered effort {eff:?} for {rt} rejected by validate_launch_overrides"
+                );
+            }
+        }
     }
 }

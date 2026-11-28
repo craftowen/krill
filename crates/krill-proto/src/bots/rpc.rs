@@ -901,6 +901,29 @@ pub enum BotRpcRequest {
         #[serde(deserialize_with = "rpc_inner_request")]
         request: Box<BotRpcRequest>,
     },
+    /// Clears the active (or specified) group chat thread by starting a fresh thread and
+    /// recycling member sessions bound to the cleared thread (`/clear` in Group Chat).
+    ClearGroupThread {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+    },
+    /// Answers a bot item with extended options (`skip_remaining: true` for `"Send anyway"`
+    /// on multi-question items so remaining questions are skipped, status transitions to
+    /// `Working`, and the bot wakes immediately). Appended at end for N-1 postcard safety.
+    AnswerBotItemWithOptions {
+        item_id: String,
+        #[serde(default)]
+        answer_text: Option<String>,
+        #[serde(default)]
+        option_index: Option<u32>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        skip_remaining: bool,
+    },
 }
 
 impl BotRpcRequest {
@@ -1495,6 +1518,29 @@ impl fmt::Debug for BotRpcRequest {
                 .field("capabilities", capabilities)
                 .field("request", request)
                 .finish(),
+            Self::ClearGroupThread {
+                group_id,
+                thread_id,
+            } => f
+                .debug_struct("ClearGroupThread")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .finish(),
+            Self::AnswerBotItemWithOptions {
+                item_id,
+                option_index,
+                decision_id,
+                request_id,
+                skip_remaining,
+                ..
+            } => f
+                .debug_struct("AnswerBotItemWithOptions")
+                .field("item_id", item_id)
+                .field("option_index", option_index)
+                .field("decision_id", decision_id)
+                .field("request_id", request_id)
+                .field("skip_remaining", skip_remaining)
+                .finish_non_exhaustive(),
         }
     }
 }

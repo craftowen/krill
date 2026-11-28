@@ -286,19 +286,55 @@ impl BotStore {
 
         let name = validate_bot_name(&base.name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-        let slug = match params.slug {
-            Some(requested) => {
-                validate_bot_slug(requested.as_str())
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-                if slug_is_taken(&self.root, &bots, requested.as_str()) {
+        let slug = if let Some(requested) = params.slug {
+            validate_bot_slug(requested.as_str())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+            if slug_is_taken(&self.root, &bots, requested.as_str()) {
+                // Recreating a deleted template bot (`delete_home: false`) leaves its folder
+                // on disk while no active bot owns that slug; auto-disambiguate to `<slug>-2`
+                // instead of failing with `AlreadyExists` (`BOT-12`).
+                let template_orphan_folder = template.is_some_and(|t| {
+                    let tpl_name_slug = bot_slug_from_name(t.name);
+                    let req = requested.as_str();
+                    let matches_base = |base: &str| {
+                        req == base
+                            || req
+                                .strip_prefix(base)
+                                .and_then(|rest| rest.strip_prefix('-'))
+                                .is_some_and(|n| {
+                                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                                })
+                    };
+                    matches_base(t.id) || matches_base(tpl_name_slug.as_str())
+                }) && !bots.iter().any(|b| b.slug == requested);
+                if template_orphan_folder {
+                    allocate_unique_slug(&self.root, &bots, &requested)?
+                } else {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!("bot slug already exists: {}", requested.as_str()),
                     ));
                 }
+            } else {
                 requested
             }
-            None => allocate_unique_slug(&self.root, &bots, &bot_slug_from_name(&name))?,
+        } else {
+            let derived = bot_slug_from_name(&name);
+            let base_slug = if derived.as_str() == "bot"
+                && let Some(t) = template
+            {
+                let from_name = bot_slug_from_name(t.name);
+                if from_name.as_str() != "bot" {
+                    from_name
+                } else if let Ok(tpl_slug) = BotSlug::new(t.id) {
+                    tpl_slug
+                } else {
+                    derived
+                }
+            } else {
+                derived
+            };
+            allocate_unique_slug(&self.root, &bots, &base_slug)?
         };
         let id = allocate_unique_id(&bots, slug.as_str())?;
 
@@ -951,6 +987,7 @@ impl BotStore {
         let _guard = lock(&self.io_lock);
         self.apply_memory_with_history_locked(
             bot_id,
+            None,
             content,
             allow_deletions,
             actor,
@@ -959,9 +996,37 @@ impl BotStore {
         )
     }
 
+    /// Compare-and-swap variant of [`Self::apply_memory_with_history`]: rejects with
+    /// `io::ErrorKind::WouldBlock` if on-disk `MEMORY.md` diverged from `expected_old`
+    /// while the caller transformed it (`BOT-13`).
+    #[expect(clippy::too_many_arguments, reason = "CAS memory update inputs")]
+    pub(crate) fn apply_memory_with_history_cas(
+        &self,
+        bot_id: &BotId,
+        expected_old: &str,
+        content: &str,
+        allow_deletions: bool,
+        actor: &str,
+        action: &str,
+        now_ms: u64,
+    ) -> Result<Option<BotMemoryHistoryEntry>, MemoryUpdateError> {
+        let _guard = lock(&self.io_lock);
+        self.apply_memory_with_history_locked(
+            bot_id,
+            Some(expected_old),
+            content,
+            allow_deletions,
+            actor,
+            action,
+            now_ms,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "locked memory update inputs")]
     fn apply_memory_with_history_locked(
         &self,
         bot_id: &BotId,
+        expected_old: Option<&str>,
         content: &str,
         allow_deletions: bool,
         actor: &str,
@@ -988,6 +1053,14 @@ impl BotStore {
         } else {
             BOT_MEMORY_SEED.to_owned()
         };
+        if let Some(expected) = expected_old
+            && old != expected
+        {
+            return Err(MemoryUpdateError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "MEMORY.md changed concurrently",
+            )));
+        }
         if !allow_deletions {
             validate_memory_edit(&old, content).map_err(MemoryUpdateError::DeletionBlocked)?;
         }
@@ -1130,8 +1203,16 @@ impl BotStore {
             BOT_MEMORY_SEED.to_owned()
         };
         let rebuilt = memory_history::rewrite_single_fact(&current, old_fact, new_fact)?;
-        self.apply_memory_with_history_locked(bot_id, &rebuilt, true, actor, "edit_fact", now_ms)
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        self.apply_memory_with_history_locked(
+            bot_id,
+            None,
+            &rebuilt,
+            true,
+            actor,
+            "edit_fact",
+            now_ms,
+        )
+        .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(rebuilt)
     }
 
@@ -1166,6 +1247,7 @@ impl BotStore {
         let restored = entry.before_content.clone();
         self.apply_memory_with_history_locked(
             bot_id,
+            None,
             &restored,
             true,
             actor,
@@ -2164,13 +2246,16 @@ impl BotStore {
 
         let soul = read_external_soul(src_dir, &cand.name);
         let memory = read_external_memory(src_dir);
-        let requested_name = params
+        let explicit_name = params
             .as_ref()
             .map(|p| p.base.name.as_str())
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or(&cand.name);
-        let clean_name =
-            validate_bot_name(requested_name).unwrap_or_else(|_| "Imported Bot".to_owned());
+            .filter(|n| !n.trim().is_empty());
+        let clean_name = if let Some(requested_name) = explicit_name {
+            validate_bot_name(requested_name)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?
+        } else {
+            validate_bot_name(&cand.name).unwrap_or_else(|_| "Imported Bot".to_owned())
+        };
         let base_slug = manifest
             .slug
             .as_deref()
@@ -4015,6 +4100,108 @@ mod tests {
             !home.exists(),
             "read-only get_memory/get_soul must NOT recreate bot home via init_bot_home"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recreate_korean_template_bot_with_kept_folder_disambiguates_and_long_import_name_errors() {
+        let root = std::env::temp_dir().join(format!("krill-store-v040-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+
+        let tpl = &krill_proto::bots::BUILTIN_BOT_TEMPLATES[0];
+        let tpl_slug = bot_slug_from_name(tpl.name);
+
+        // 1. Create a Korean-named template bot with explicit ASCII template slug, then delete
+        //    with `delete_home: false` (orphan folder stays on disk).
+        let first = store
+            .create_bot_v2(
+                CreateBotV2Params {
+                    base: CreateBotParams {
+                        name: "버그 조사".to_owned(),
+                        description: String::new(),
+                        agent_id: "claude".to_owned(),
+                        emoji: None,
+                        avatar: None,
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: Some(tpl.id.to_owned()),
+                        initial_soul: None,
+                    },
+                    slug: Some(tpl_slug.clone()),
+                    avatar_color: None,
+                    skills: Vec::new(),
+                    events: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(first.slug, tpl_slug);
+        store.delete_bot(&first.id, false).unwrap();
+        assert!(store.bot_home(&first).is_dir());
+
+        // BOT-12: Recreating with the same template slug must disambiguate to `<slug>-2` instead of AlreadyExists.
+        let second = store
+            .create_bot_v2(
+                CreateBotV2Params {
+                    base: CreateBotParams {
+                        name: "버그 조사".to_owned(),
+                        description: String::new(),
+                        agent_id: "claude".to_owned(),
+                        emoji: None,
+                        avatar: None,
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: Some(tpl.id.to_owned()),
+                        initial_soul: None,
+                    },
+                    slug: Some(tpl_slug.clone()),
+                    avatar_color: None,
+                    skills: Vec::new(),
+                    events: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(second.slug.as_str(), format!("{}-2", tpl_slug.as_str()));
+
+        // BOT-24: import_external_bot_copy must return InvalidInput when explicit name > 64 bytes.
+        let src_dir = root.join("external-src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("SOUL.md"), "# Soul\n").unwrap();
+        let too_long = "a".repeat(80);
+        let err = store
+            .import_external_bot_copy(
+                Some(ExternalBotSourceApp::OpenClaw),
+                &src_dir.to_string_lossy(),
+                CreateBotV2Params {
+                    base: CreateBotParams {
+                        name: too_long,
+                        description: String::new(),
+                        agent_id: "claude".to_owned(),
+                        emoji: None,
+                        avatar: None,
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                    slug: None,
+                    avatar_color: None,
+                    skills: Vec::new(),
+                    events: Vec::new(),
+                },
+                3_000,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         fs::remove_dir_all(&root).ok();
     }

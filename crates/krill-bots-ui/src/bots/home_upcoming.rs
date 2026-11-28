@@ -527,7 +527,7 @@ impl View {
         });
     }
 
-    /// Starts the minute clock that keeps Home's automation times current.
+    /// Starts the minute clock that keeps Home's automation times and snooze expiries current.
     pub(super) fn ensure_upcoming_poll(&mut self, cx: &mut Context<Self>) {
         if self.items.upcoming_poll.is_some() {
             return;
@@ -537,7 +537,13 @@ impl View {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(60))
                     .await;
-                let Ok(Some((req_host, rpc, bot_id, req_gen))) = this.update(cx, |this, _| {
+                let tick = this.update(cx, |this, cx| {
+                    if this.group_panel.active {
+                        // Group panel has no single-bot `GetBotUpcoming`, but needs minute
+                        // ticks so expired snoozes leave `Group::Snoozed` (`BOT-37`).
+                        cx.notify();
+                        return None;
+                    }
                     (this.detail_tab == DetailTab::Items)
                         .then(|| {
                             this.selected_bot_id.clone().map(|id| {
@@ -545,7 +551,8 @@ impl View {
                             })
                         })
                         .flatten()
-                }) else {
+                });
+                let Ok(Some((req_host, rpc, bot_id, req_gen))) = tick else {
                     if this.upgrade().is_none() {
                         return;
                     }

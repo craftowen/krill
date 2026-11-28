@@ -303,13 +303,44 @@ impl View {
             _ => runtime_models(runtime_canon),
         };
         let current = bot.model.clone().filter(|m| !m.trim().is_empty());
+        let current_effort = bot
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(ToOwned::to_owned);
+        let is_agy = runtime_canon == "agy";
+        let matched_choice_id: Option<String> = current.as_deref().and_then(|id| {
+            if let Some(exact) = choices.iter().find(|m| m.id == id) {
+                return Some(exact.id.clone());
+            }
+            if is_agy {
+                // `krilld` folds `agy` launch models into `(family, effort)` while
+                // `ListAgentModels` returns flat `<family>-<effort>` level IDs (`BOT-23`).
+                if let Some(eff) = current_effort.as_deref()
+                    && let Some(by_pair) = choices.iter().find(|m| {
+                        let (fam, lvl) = krill_proto::agent::strip_agy_effort_suffix(&m.id);
+                        fam == id && lvl == Some(eff)
+                    })
+                {
+                    return Some(by_pair.id.clone());
+                }
+                if let Some(by_fam) = choices
+                    .iter()
+                    .find(|m| krill_proto::agent::strip_agy_effort_suffix(&m.id).0 == id)
+                {
+                    return Some(by_fam.id.clone());
+                }
+            }
+            None
+        });
         let has_model_override = current.is_some();
         let model_label = current.as_deref().map_or_else(
             || text::MODEL_DEFAULT.get().to_owned(),
             |id| {
-                choices
-                    .iter()
-                    .find(|m| m.id == id)
+                matched_choice_id
+                    .as_deref()
+                    .and_then(|mid| choices.iter().find(|m| m.id == mid))
                     .map_or_else(|| id.to_owned(), |m| m.label.clone())
             },
         );
@@ -368,15 +399,18 @@ impl View {
                         .on_click(pick(None)),
                 );
                 for choice in &choices {
+                    let is_checked = matched_choice_id.as_deref() == Some(choice.id.as_str())
+                        || current.as_deref() == Some(choice.id.as_str());
                     menu = menu.item(
                         PopupMenuItem::new(choice.label.clone())
-                            .checked(current.as_deref() == Some(choice.id.as_str()))
+                            .checked(is_checked)
                             .on_click(pick(Some(choice.id.clone()))),
                     );
                 }
                 menu
             });
         let effort_options = effort_options_for_runtime(runtime_canon);
+        let supports_effort = effort_options.len() > 1;
         let effort = bot.effort.clone().unwrap_or_default();
         let bot_id_effort = bot.id.clone();
         let ent = cx.entity();
@@ -455,7 +489,9 @@ impl View {
                     .gap_2()
                     .child(div().flex_1().min_w(px(120.)).child(runtime_button))
                     .child(div().flex_1().min_w(px(120.)).child(model_button))
-                    .child(div().flex_1().min_w(px(120.)).child(effort_select)),
+                    .when(supports_effort, |d| {
+                        d.child(div().flex_1().min_w(px(120.)).child(effort_select))
+                    }),
             )
             .child(if has_overrides {
                 div()

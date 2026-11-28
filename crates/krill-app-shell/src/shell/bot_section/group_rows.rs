@@ -36,22 +36,24 @@ pub(super) struct GroupFacts {
 }
 
 impl Shell {
-    /// Picks a host that has at least 2 bots (preferring `launch_host`), for creating a new group.
-    pub(super) fn default_group_host(&self) -> Option<HostId> {
+    /// All hosts with at least 2 bots, ordered with `default_group_host()` first (`BOT-39`).
+    pub(super) fn eligible_group_hosts(&self) -> Vec<HostId> {
         let count_on = |host: &HostId| self.sidebar_bots.iter().filter(|b| &b.host == host).count();
+        let mut hosts = Vec::new();
         if count_on(&self.launch_host) >= 2 {
-            return Some(self.launch_host.clone());
+            hosts.push(self.launch_host.clone());
         }
-        let mut seen = Vec::new();
         for b in &self.sidebar_bots {
-            if !seen.contains(&b.host) {
-                if count_on(&b.host) >= 2 {
-                    return Some(b.host.clone());
-                }
-                seen.push(b.host.clone());
+            if !hosts.contains(&b.host) && count_on(&b.host) >= 2 {
+                hosts.push(b.host.clone());
             }
         }
-        None
+        hosts
+    }
+
+    /// Picks a host that has at least 2 bots (preferring `launch_host`), for creating a new group.
+    pub(super) fn default_group_host(&self) -> Option<HostId> {
+        self.eligible_group_hosts().into_iter().next()
     }
 
     pub(super) fn bot_group_facts(&self, summary: &SidebarGroup, cx: &gpui::App) -> GroupFacts {
@@ -80,11 +82,20 @@ impl Shell {
         let all_paused = !member_bots.is_empty() && member_bots.iter().all(|b| b.paused);
         let mut needs_you = false;
         let mut working = !summary.active_turns.is_empty();
+        // Scope group status strictly to sessions bound to this group (`BOT-06`), never bleeding
+        // private Home Chat or other groups' `Waiting`/`Working` state into this row.
         for bot in &member_bots {
-            if bot.attention > 0 {
-                needs_you = true;
-            }
             for s in &bot.sessions {
+                let bound_to_group = summary
+                    .active_turns
+                    .iter()
+                    .any(|t| t.session_id == s.session_id)
+                    || crate::shell::bot_group_chat::session_belongs_to_group(
+                        &s.label, &group.id, None,
+                    );
+                if !bound_to_group {
+                    continue;
+                }
                 if s.working {
                     working = true;
                 }
@@ -197,7 +208,8 @@ impl Shell {
         let trailing_working = (!facts.all_paused && facts.status == RowStatus::Working)
             .then(|| self.render_row_working_mark(&host, &format!("group-{gid}"), cx));
 
-        let unread = facts.status == RowStatus::Permission;
+        let unread = facts.status == RowStatus::Permission
+            || (!facts.active && self.group_is_unread(&host, &gid, &summary.summary));
         let is_renaming = renaming.is_some();
         let remote_host_badge = (!is_renaming && !host.is_local()).then(|| {
             let label = self.host_display_label(&host, cx);
@@ -608,25 +620,48 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = self.default_group_host() else {
+        let eligible = self.eligible_group_hosts();
+        let Some(host) = eligible.first().cloned() else {
             return;
         };
         self.bot_ui.group_dialog = None;
         self.bot_ui.group_dialog_host = Some(host.clone());
-        let bots: Vec<SidebarBot> = self
-            .sidebar_bots
+        let host_choices: Vec<group_dialog::GroupDialogHost> = eligible
             .iter()
-            .filter(|b| b.host == host)
-            .cloned()
+            .map(|h| {
+                let bots = self
+                    .sidebar_bots
+                    .iter()
+                    .filter(|b| &b.host == h)
+                    .cloned()
+                    .collect();
+                let avatars = self
+                    .bot_ui
+                    .avatars
+                    .iter()
+                    .filter(|((ah, _), _)| ah == h)
+                    .map(|((_, k), (_, img))| (k.clone(), img.clone()))
+                    .collect();
+                group_dialog::GroupDialogHost {
+                    host: h.clone(),
+                    label: self.host_display_label(h, cx).to_string(),
+                    bots,
+                    avatars,
+                }
+            })
             .collect();
-        let avatars: std::collections::HashMap<_, _> = self
-            .bot_ui
-            .avatars
-            .iter()
-            .filter(|((h, _), _)| h == &host)
-            .map(|((_, k), (_, img))| (k.clone(), img.clone()))
-            .collect();
-        let dialog = cx.new(|cx| BotGroupMembersDialog::new_group(bots, avatars, window, cx));
+        let bots = host_choices
+            .first()
+            .map(|c| c.bots.clone())
+            .unwrap_or_default();
+        let avatars = host_choices
+            .first()
+            .map(|c| c.avatars.clone())
+            .unwrap_or_default();
+        let dialog = cx.new(|cx| {
+            BotGroupMembersDialog::new_group(bots, avatars, window, cx)
+                .with_hosts(host, host_choices)
+        });
         let sub = cx.subscribe(&dialog, Self::on_group_dialog_event);
         self.bot_ui.group_dialog = Some((dialog, sub));
         cx.notify();
@@ -655,25 +690,29 @@ impl Shell {
             .filter(|((h, _), _)| h == host)
             .map(|((_, k), (_, img))| (k.clone(), img.clone()))
             .collect();
+        let remote_label =
+            (!host.is_local()).then(|| self.host_display_label(host, cx).to_string());
+        let host_owned = host.clone();
         let dialog = cx.new(|cx| {
             BotGroupMembersDialog::manage_members(group, reply_audience, bots, avatars, window, cx)
+                .with_host_label(host_owned, remote_label)
         });
         let sub = cx.subscribe(&dialog, Self::on_group_dialog_event);
         self.bot_ui.group_dialog = Some((dialog, sub));
         cx.notify();
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "gpui cx.subscribe handler requires owned Entity<BotGroupMembersDialog>"
+    )]
     fn on_group_dialog_event(
         &mut self,
-        _: gpui::Entity<BotGroupMembersDialog>,
+        dialog: gpui::Entity<BotGroupMembersDialog>,
         ev: &group_dialog::Event,
         cx: &mut Context<Self>,
     ) {
-        let dialog_host = self
-            .bot_ui
-            .group_dialog_host
-            .clone()
-            .unwrap_or_else(|| self.launch_host.clone());
+        let dialog_host = dialog.read(cx).selected_host().clone();
         match ev {
             group_dialog::Event::Close => {
                 self.bot_ui.group_dialog = None;

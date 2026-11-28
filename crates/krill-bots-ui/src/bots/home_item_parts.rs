@@ -254,16 +254,60 @@ fn worker_title(s: Option<&BotSessionSummary>, id: &str) -> String {
         .unwrap_or_else(|| hm::WORKER_FALLBACK.format(&[("id", id.trim())]))
 }
 
+/// Resolves a `BotItemLink::File` target (raw path, relative path, or `file://` URI with
+/// optional `#L10` / `%20` / UTF-8 characters) against `base_dir`, blocking local open/reveal
+/// when `!is_local` (`BOT-36`).
+pub(super) fn resolve_bot_item_file_path(
+    raw: &str,
+    is_local: bool,
+    base_dir: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    if !is_local {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(krill_app_core::terminal::path_link::MarkdownLinkTarget::LocalPath {
+        path, ..
+    }) = krill_app_core::terminal::path_link::resolve_markdown_link(trimmed, base_dir)
+    {
+        return Some(path);
+    }
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        Some(candidate)
+    } else {
+        base_dir.map(|base| base.join(candidate))
+    }
+}
+
 /// Markdown as Orca's `BotItemMarkdown` shows it: selectable, links open external URLs or local files.
-pub(super) fn markdown(id: impl Into<SharedString>, src: &str) -> AnyElement {
+pub(super) fn markdown(
+    id: impl Into<SharedString>,
+    src: &str,
+    is_local: bool,
+    base_dir: Option<PathBuf>,
+) -> AnyElement {
     TextView::markdown(gpui::ElementId::Name(id.into()), src.to_owned())
         .scrollable(false)
         .selectable(true)
-        .on_link_click(|url, event, _, cx| {
+        .on_link_click(move |url, event, _, cx| {
             if !krill_app_core::terminal::path_link::should_open_link_click(event) {
                 return;
             }
-            krill_app_core::terminal::path_link::open_markdown_link_with_app(url, None, cx);
+            if !is_local {
+                if let Some(clean) = super::sanitize_http_url(url) {
+                    cx.open_url(&clean);
+                }
+                return;
+            }
+            krill_app_core::terminal::path_link::open_markdown_link_with_app(
+                url,
+                base_dir.as_deref(),
+                cx,
+            );
         })
         .into_any_element()
 }
@@ -759,6 +803,9 @@ impl View {
                 }
                 BotItemLink::File(v) => {
                     let path = v.trim().to_owned();
+                    let is_local = self.host.is_local();
+                    let base_dir = self.bot_home_folder(bot);
+                    let resolved = resolve_bot_item_file_path(&path, is_local, base_dir.as_deref());
                     card(format!("bot-item-link-{i}").into())
                         .child(
                             Icon::new(IconName::File)
@@ -773,10 +820,10 @@ impl View {
                                 .truncate()
                                 .child(path.rsplit(['/', '\\']).next().unwrap_or(&path).to_owned()),
                         )
-                        .on_click(move |_, _, cx| {
-                            if !path.is_empty() {
-                                cx.reveal_path(std::path::Path::new(&path));
-                            }
+                        .when_some(resolved, |d, resolved_path| {
+                            d.on_click(move |_, _, cx| {
+                                cx.reveal_path(&resolved_path);
+                            })
                         })
                         .into_any_element()
                 }
@@ -1238,8 +1285,10 @@ impl View {
                             .text_color(p.foreground)
                             .underline()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.items.skipped_asks.insert(k.clone());
-                                this.send_held_answers(
+                                // Send with `skip_remaining: true` so the daemon completes
+                                // remaining questions, transitions NeedsYou -> Working, and wakes
+                                // the bot; UI `skipped_asks` is marked only on RPC `Ok` (`BOT-16`).
+                                this.send_held_answers_with_options(
                                     uid.clone(),
                                     &k,
                                     &decisions,
@@ -1247,6 +1296,8 @@ impl View {
                                     None,
                                     None,
                                     None,
+                                    false,
+                                    true,
                                     cx,
                                 );
                             }))
@@ -1271,10 +1322,10 @@ impl View {
         answers: Vec<Option<String>>,
         typed: Option<(usize, String)>,
         extra_comment: Option<String>,
-        clear_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+        clear_input: Option<gpui::Entity<gpui_component::input::TextareaState>>,
         cx: &mut Context<Self>,
     ) {
-        self.send_held_answers_with_attachments(
+        self.send_held_answers_with_options(
             uid,
             key,
             decisions,
@@ -1282,6 +1333,7 @@ impl View {
             typed,
             extra_comment,
             clear_input,
+            false,
             false,
             cx,
         );
@@ -1296,11 +1348,42 @@ impl View {
         uid: String,
         key: &(String, u64),
         decisions: &[BotItemDecision],
+        answers: Vec<Option<String>>,
+        typed: Option<(usize, String)>,
+        extra_comment: Option<String>,
+        clear_input: Option<gpui::Entity<gpui_component::input::TextareaState>>,
+        clear_attachments: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_held_answers_with_options(
+            uid,
+            key,
+            decisions,
+            answers,
+            typed,
+            extra_comment,
+            clear_input,
+            clear_attachments,
+            false,
+            cx,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "posts held multi-question answers with optional skip_remaining and deferred cleanup"
+    )]
+    pub(super) fn send_held_answers_with_options(
+        &mut self,
+        uid: String,
+        key: &(String, u64),
+        decisions: &[BotItemDecision],
         mut answers: Vec<Option<String>>,
         typed: Option<(usize, String)>,
         extra_comment: Option<String>,
-        clear_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+        clear_input: Option<gpui::Entity<gpui_component::input::TextareaState>>,
         clear_attachments: bool,
+        skip_remaining: bool,
         cx: &mut Context<Self>,
     ) {
         if self.items.busy {
@@ -1326,14 +1409,16 @@ impl View {
         if body.is_empty() {
             return;
         }
-        self.answer_item_decision_with_cleanup(
+        self.answer_item_decision_with_options(
             uid,
             Some(body),
+            None,
             None,
             None,
             clear_input,
             clear_attachments,
             Some(key.clone()),
+            skip_remaining,
             cx,
         );
     }
@@ -1817,6 +1902,10 @@ mod tests {
             BotRpcRequest::AnswerBotItem {
                 answer_text: Some(text),
                 ..
+            }
+            | BotRpcRequest::AnswerBotItemWithOptions {
+                answer_text: Some(text),
+                ..
             } => {
                 let mut st = state_for_rpc.lock().unwrap();
                 st.answers.push(text.clone());
@@ -2000,6 +2089,10 @@ mod tests {
                 Ok(BotRpcResponse::Items(vec![it_rpc.lock().unwrap().clone()]))
             }
             BotRpcRequest::AnswerBotItem {
+                answer_text: Some(text),
+                ..
+            }
+            | BotRpcRequest::AnswerBotItemWithOptions {
                 answer_text: Some(text),
                 ..
             } => {
@@ -2237,6 +2330,8 @@ mod tests {
                     false,
                     None,
                     None,
+                    None,
+                    false,
                     cx,
                 );
                 cx.notify();

@@ -1400,7 +1400,9 @@ impl View {
                 Some(ui::icons::WRENCH_SVG),
                 text::SV_TOOLS.get(),
             )
-            .value(Some(count(bot.mcp_tools.len())))
+            .value(Some(count(
+                bot.mcp_tools.iter().filter(|t| t.enabled).count(),
+            )))
             .opens(Open::Page(SettingsPage::Tools)),
             Row::new(
                 "bot-settings-skills",

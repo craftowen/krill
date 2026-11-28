@@ -383,7 +383,14 @@ impl View {
                                 return;
                             }
                             this.items.snooze_pick = None;
-                            this.snooze_items(bot_id.clone(), &uids, Some(until), cx);
+                            // Recompute preset timestamp at click time so a dialog left open
+                            // past a preset boundary never sends a past timestamp (`BOT-47`).
+                            let fresh_now = super::now_unix_ms();
+                            let fresh_until = picker_presets_local(fresh_now)
+                                .get(i)
+                                .map_or(until, |(_, ts)| *ts)
+                                .max(fresh_now.saturating_add(60_000));
+                            this.snooze_items(bot_id.clone(), &uids, Some(fresh_until), cx);
                         })),
                 );
             }

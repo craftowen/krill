@@ -56,7 +56,7 @@ pub(super) enum ComposerFocus {
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "independent in-flight request flags for room poll, repoll, earlier pagination, and send"
+    reason = "independent in-flight request flags for room poll, repoll, earlier pagination, send, and stop"
 )]
 pub(super) struct RoomState {
     pub room: Option<BotGroupRoomView>,
@@ -66,10 +66,14 @@ pub(super) struct RoomState {
     pub repoll_needed: bool,
     pub loading_earlier: bool,
     pub sending: bool,
+    pub stopping_all: bool,
+    pub stopping_bots: HashSet<BotId>,
     pub error: Option<String>,
     pub action_error: Option<String>,
     pub composer: Option<(Entity<TextareaState>, Subscription)>,
     pub draft: String,
+    pub mention_selected: usize,
+    pub mention_dismissed_at: Option<usize>,
     pub expanded_turns: HashSet<String>,
     pub selected_approval_bot: Option<BotId>,
     pub member_items: BTreeMap<SessionId, Vec<ChatItem>>,
@@ -78,6 +82,7 @@ pub(super) struct RoomState {
     pub scroll: ScrollHandle,
     pub follow_paused: bool,
     pub last_tail_message_id: Option<String>,
+    pub last_tail_sig: Option<(String, usize, usize)>,
     pub initial_scrolled: std::cell::Cell<bool>,
 }
 
@@ -93,7 +98,155 @@ fn is_group_timeline_near_bottom(scroll: &ScrollHandle) -> bool {
 #[derive(Default)]
 pub(super) struct BotGroupUiState {
     pub rooms: HashMap<GroupRoomKey, RoomState>,
+    pub last_seen_ms: HashMap<(HostId, String), u64>,
     poll_timer: Option<Task<()>>,
+}
+
+/// Returns true when a bot session's label belongs to `group_id` (and `thread_id`, if specified),
+/// never matching private Home Chat or other groups (`BOT-06`).
+#[must_use]
+pub(in crate::shell) fn session_belongs_to_group(
+    label: &str,
+    group_id: &str,
+    thread_id: Option<&str>,
+) -> bool {
+    if let Some(tid) = thread_id {
+        let exact = format!("(group:{group_id}:{tid})");
+        if label.ends_with(&exact) {
+            return true;
+        }
+        let legacy = format!("(group:{group_id})");
+        return label.ends_with(&legacy);
+    }
+    let legacy = format!("(group:{group_id})");
+    let prefix = format!("(group:{group_id}:");
+    label.ends_with(&legacy) || (label.contains(&prefix) && label.ends_with(')'))
+}
+
+fn latest_unread_bot_message_ms(summary: &krill_proto::bots::BotGroupSummary) -> Option<u64> {
+    let msg = summary.latest_message.as_ref()?;
+    let body = msg.body.trim();
+    if msg.sender_id == "owner"
+        || msg.sender_id == "user"
+        || msg.in_progress
+        || body.is_empty()
+        || body == "[stopped]"
+    {
+        return None;
+    }
+    Some(msg.created_at_ms)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionCandidate {
+    handle: String,
+    bot_id: Option<BotId>,
+}
+
+fn mention_candidates(query: &str, members: &[SidebarBot]) -> Vec<MentionCandidate> {
+    let needle = query.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if needle.is_empty() || "everyone".starts_with(&needle) {
+        out.push(MentionCandidate {
+            handle: "everyone".to_owned(),
+            bot_id: None,
+        });
+    }
+    for b in members {
+        if needle.is_empty()
+            || b.name.to_ascii_lowercase().contains(&needle)
+            || b.slug.to_ascii_lowercase().contains(&needle)
+        {
+            out.push(MentionCandidate {
+                handle: b.slug.clone(),
+                bot_id: Some(b.id.clone()),
+            });
+        }
+    }
+    out
+}
+
+/// Cursor-aware `@mention` query detection supporting mid-draft edits and spaced display names
+/// like `@Bob Ops` (`BOT-08`, `CHAT-23`, `BOT-28`).
+///
+/// Returns `(at_byte_index, cursor_byte_index, query)` when the cursor is inside an active
+/// `@mention` token.
+#[must_use]
+pub fn mention_query_at_cursor(
+    text: &str,
+    cursor_byte: usize,
+    members: &[SidebarBot],
+) -> Option<(usize, usize, String)> {
+    let cursor = cursor_byte.min(text.len());
+    let before = text.get(..cursor)?;
+    let line_start = before.rfind('\n').map_or(0, |idx| idx + 1);
+    let line = before.get(line_start..)?;
+    for (rel_at, ch) in line.char_indices().rev() {
+        if ch != '@' {
+            continue;
+        }
+        let at_pos = line_start + rel_at;
+        if at_pos > 0 {
+            let prev = text.get(..at_pos)?.chars().next_back()?;
+            if prev.is_alphanumeric() || prev == '_' {
+                continue;
+            }
+        }
+        let token = text.get(at_pos.saturating_add(1)..cursor)?;
+        if token.chars().any(|c| c == '\n' || c == '\r' || c == '\t') {
+            return None;
+        }
+        if !token.contains(' ') {
+            return Some((at_pos, cursor, token.to_owned()));
+        }
+        // Allow spaces only while the query still matches a spaced member display name (`BOT-28`).
+        let needle = token.to_ascii_lowercase();
+        if members
+            .iter()
+            .any(|b| b.name.to_ascii_lowercase().starts_with(&needle))
+        {
+            return Some((at_pos, cursor, token.to_owned()));
+        }
+        return None;
+    }
+    None
+}
+
+/// Splices `@<handle> ` over `text[at_pos..cursor_byte]`, preserving any trailing suffix after
+/// `cursor_byte` (`BOT-08`). Returns `(new_text, new_cursor_byte)`.
+#[must_use]
+pub fn splice_mention_token(
+    text: &str,
+    at_pos: usize,
+    cursor_byte: usize,
+    handle: &str,
+) -> (String, usize) {
+    let clamped_at = at_pos.min(text.len());
+    let clamped_cursor = cursor_byte.clamp(clamped_at, text.len());
+    let prefix = text.get(..clamped_at).unwrap_or_default();
+    let suffix = text.get(clamped_cursor..).unwrap_or_default();
+    let sep = if suffix.starts_with(char::is_whitespace) {
+        ""
+    } else {
+        " "
+    };
+    let inserted = format!("@{handle}{sep}");
+    let new_cursor = prefix.len() + inserted.len() + usize::from(sep.is_empty());
+    let next = format!("{prefix}{inserted}{suffix}");
+    (
+        next,
+        new_cursor.min(prefix.len() + inserted.len() + suffix.len()),
+    )
+}
+
+fn byte_offset_to_position(text: &str, byte_offset: usize) -> gpui_component::input::Position {
+    let clamped = byte_offset.min(text.len());
+    let prefix = text.get(..clamped).unwrap_or(text);
+    let line = u32::try_from(prefix.bytes().filter(|&b| b == b'\n').count()).unwrap_or(0);
+    let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+    let col =
+        u32::try_from(prefix.get(line_start..).unwrap_or_default().chars().count()).unwrap_or(0);
+    gpui_component::input::Position::new(line, col)
 }
 
 /// Computes the concise label shown on `BotGroupReplyPicker` (`Replies: ...`), accounting for
@@ -142,6 +295,7 @@ pub fn extract_draft_mentions(text: &str, members: &[SidebarBot]) -> Vec<BotId> 
 }
 
 /// Returns `(at_byte_index, filter_query)` when the trailing `@mention` token is actively being typed.
+#[cfg(test)]
 #[must_use]
 pub fn trailing_mention_query(text: &str) -> Option<(usize, String)> {
     let at_pos = text.rfind('@')?;
@@ -159,6 +313,7 @@ pub fn trailing_mention_query(text: &str) -> Option<(usize, String)> {
 }
 
 /// Replaces `@<token>` starting at `at_pos` with `@<handle> `.
+#[cfg(test)]
 #[must_use]
 pub fn insert_mention_token(text: &str, at_pos: usize, handle: &str) -> String {
     let prefix = text.get(..at_pos).unwrap_or_default();
@@ -548,17 +703,92 @@ impl Shell {
         };
         let entry = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         entry.focus_composer = ComposerFocus::Focus;
+        let mut seen_ms = now_unix_ms();
         if let Some(summary) = self
             .sidebar_groups
             .iter()
             .find(|s| s.host == host && s.group.id == group_id)
         {
             entry.reply_audience = summary.reply_audience.clone();
+            if let Some(msg) = &summary.latest_message {
+                seen_ms = seen_ms.max(msg.created_at_ms);
+            }
         }
+        self.mark_group_seen(&host, group_id, seen_ms);
         let _ = pane;
         self.poll_group_room(key, cx);
         self.ensure_group_poll_timer(cx);
         cx.notify();
+    }
+
+    pub(in crate::shell) fn mark_group_seen(
+        &mut self,
+        host: &HostId,
+        group_id: &str,
+        seen_ms: u64,
+    ) {
+        let entry = self
+            .bot_ui
+            .group_chat
+            .last_seen_ms
+            .entry((host.clone(), group_id.to_owned()))
+            .or_insert(0);
+        if seen_ms > *entry {
+            *entry = seen_ms;
+        }
+    }
+
+    pub(in crate::shell) fn group_is_unread(
+        &self,
+        host: &HostId,
+        group_id: &str,
+        summary: &krill_proto::bots::BotGroupSummary,
+    ) -> bool {
+        let Some(latest_ms) = latest_unread_bot_message_ms(summary) else {
+            return false;
+        };
+        let seen_ms = self
+            .bot_ui
+            .group_chat
+            .last_seen_ms
+            .get(&(host.clone(), group_id.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        latest_ms > seen_ms
+    }
+
+    /// Immediately repolls any visible group chat rooms belonging to reconnected/invalidated
+    /// remote hosts (`BOT-42`).
+    pub(in crate::shell) fn repoll_visible_group_rooms_for_hosts(
+        &mut self,
+        hosts: &[HostId],
+        cx: &mut Context<Self>,
+    ) {
+        let visible: Vec<GroupRoomKey> = self
+            .layout
+            .visible()
+            .into_iter()
+            .filter_map(|p| {
+                let host = self.layout.host(p);
+                if !hosts.contains(host) {
+                    return None;
+                }
+                let g = self.layout.group_pane(p)?;
+                Some(GroupRoomKey {
+                    host: host.clone(),
+                    group_id: g.group_id.clone(),
+                    thread_id: g.thread_id.clone(),
+                })
+            })
+            .collect();
+        for key in visible {
+            if let Some(state) = self.bot_ui.group_chat.rooms.get_mut(&key) {
+                state.loading = false;
+                state.error = None;
+                state.poll_gen = state.poll_gen.wrapping_add(1);
+            }
+            self.poll_group_room(key, cx);
+        }
     }
 
     pub(in crate::shell) fn create_and_open_group_thread_on(
@@ -668,13 +898,19 @@ impl Shell {
         cx: &gpui::App,
     ) -> Vec<SessionId> {
         let mut sessions: Vec<SessionId> = Vec::new();
+        let active_tid = key
+            .thread_id
+            .as_deref()
+            .or_else(|| room.and_then(|r| r.active_thread_id.as_deref()));
         if let Some(summary) = self
             .sidebar_groups
             .iter()
             .find(|s| s.host == key.host && s.group.id == key.group_id)
         {
             for t in &summary.active_turns {
-                if !sessions.contains(&t.session_id) {
+                if active_tid.is_none_or(|tid| t.thread_id == tid)
+                    && !sessions.contains(&t.session_id)
+                {
                     sessions.push(t.session_id);
                 }
             }
@@ -686,6 +922,9 @@ impl Shell {
                     .find(|b| b.host == key.host && &b.id == bid)
                 {
                     for s in &bot.sessions {
+                        if !session_belongs_to_group(&s.label, &key.group_id, active_tid) {
+                            continue;
+                        }
                         let st = sidebar
                             .session_on(&key.host, s.session_id)
                             .map(|x| x.status.state);
@@ -754,7 +993,9 @@ impl Shell {
                         },
                     );
                     let mut map: BTreeMap<SessionId, Vec<ChatItem>> = BTreeMap::new();
-                    if !sessions_to_poll.is_empty()
+                    // Skip serial member ChatPoll calls when ReadGroupRoom already failed (`BOT-42`).
+                    if room_res.is_ok()
+                        && !sessions_to_poll.is_empty()
                         && !matches!(
                             target_for_sessions,
                             super::bot_section::ResolvedHostTarget::Offline
@@ -799,6 +1040,7 @@ impl Shell {
                         .and_then(|r| r.messages.last())
                         .map(|m| m.message_id.clone())
                 });
+                let prev_tail_sig = state.last_tail_sig.clone();
                 let mut applied_snapshot = false;
                 match room_res {
                     Ok(BotRpcResponse::GroupRoom(view)) => {
@@ -829,26 +1071,16 @@ impl Shell {
                     Err(err) => state.error = Some(err),
                 }
                 if applied_snapshot {
-                    let next_tail = state
-                        .room
-                        .as_ref()
-                        .and_then(|r| r.messages.last())
-                        .map(|m| m.message_id.clone());
-                    if !had_room {
-                        state.follow_paused = false;
-                        state.initial_scrolled.set(true);
-                        state.scroll.scroll_to_bottom();
-                    } else if next_tail != prev_tail && next_tail.is_some() {
-                        if is_group_timeline_near_bottom(&state.scroll) {
-                            state.follow_paused = false;
-                            state.scroll.scroll_to_bottom();
+                    if let Some(rv) = &state.room {
+                        if rv.active_turns.is_empty() {
+                            state.stopping_all = false;
+                            state.stopping_bots.clear();
                         } else {
-                            state.follow_paused = true;
+                            state
+                                .stopping_bots
+                                .retain(|bid| rv.active_turns.iter().any(|t| &t.bot_id == bid));
                         }
                     }
-                    state.last_tail_message_id = next_tail;
-                }
-                if applied_snapshot {
                     // Drop cached member items for sessions that are no longer active so the room
                     // returns to idle polling cadence (3s) and never surfaces stale prompts.
                     let active_sids: HashSet<SessionId> = this
@@ -863,6 +1095,14 @@ impl Shell {
                         )
                         .into_iter()
                         .collect();
+                    let is_focused = this.layout.focused().is_some_and(|p| {
+                        this.layout.host(p) == &key.host
+                            && this
+                                .layout
+                                .group_pane(p)
+                                .is_some_and(|g| g.group_id == key.group_id)
+                    });
+                    let mut focused_seen_ms = None;
                     if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
                         for (sid, items) in chat_items_map {
                             if active_sids.contains(&sid) {
@@ -872,6 +1112,42 @@ impl Shell {
                         state
                             .member_items
                             .retain(|sid, _| active_sids.contains(sid));
+                        let next_tail_msg = state.room.as_ref().and_then(|r| r.messages.last());
+                        let next_tail = next_tail_msg.map(|m| m.message_id.clone());
+                        let live_preview_len = state
+                            .room
+                            .as_ref()
+                            .and_then(|r| r.active_turns.last())
+                            .and_then(|t| state.member_items.get(&t.session_id))
+                            .and_then(|items| {
+                                items.iter().rev().find(|i| !i.text.trim().is_empty())
+                            })
+                            .map_or(0, |i| i.title.len() + i.text.len());
+                        let next_tail_sig = next_tail_msg
+                            .map(|m| (m.message_id.clone(), m.body.len(), live_preview_len));
+                        if is_focused && let Some(m) = next_tail_msg {
+                            focused_seen_ms = Some(m.created_at_ms);
+                        }
+                        if !had_room {
+                            state.follow_paused = false;
+                            state.initial_scrolled.set(true);
+                            state.scroll.scroll_to_bottom();
+                        } else if (next_tail != prev_tail || next_tail_sig != prev_tail_sig)
+                            && next_tail.is_some()
+                        {
+                            if !state.follow_paused || is_group_timeline_near_bottom(&state.scroll)
+                            {
+                                state.follow_paused = false;
+                                state.scroll.scroll_to_bottom();
+                            } else {
+                                state.follow_paused = true;
+                            }
+                        }
+                        state.last_tail_message_id = next_tail;
+                        state.last_tail_sig = next_tail_sig;
+                    }
+                    if let Some(seen_ms) = focused_seen_ms {
+                        this.mark_group_seen(&key.host, &key.group_id, seen_ms);
                     }
                 }
                 if repoll {
@@ -1002,8 +1278,16 @@ impl Shell {
             move |this, state, ev: &InputEvent, window, cx| match ev {
                 InputEvent::Change => {
                     let val = state.read(cx).value().to_string();
+                    let cursor = state.read(cx).cursor();
+                    let members = this.group_members_for_key(&sub_key);
+                    let active_at =
+                        mention_query_at_cursor(&val, cursor, &members).map(|(at, _, _)| at);
                     if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&sub_key) {
                         room.draft = val;
+                        if room.mention_dismissed_at != active_at {
+                            room.mention_dismissed_at = None;
+                        }
+                        room.mention_selected = 0;
                     }
                     cx.notify();
                 }
@@ -1012,6 +1296,9 @@ impl Shell {
                     shift: false,
                 } => {
                     if Self::chat_input_is_composing(state, window, cx) {
+                        return;
+                    }
+                    if this.accept_active_group_mention(&sub_key, state, window, cx) {
                         return;
                     }
                     this.send_group_composer_message(sub_key.clone(), window, cx);
@@ -1025,6 +1312,112 @@ impl Shell {
         }
         entry.composer = Some((input.clone(), sub));
         input
+    }
+
+    fn group_members_for_key(&self, key: &GroupRoomKey) -> Vec<SidebarBot> {
+        let group = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(key)
+            .and_then(|r| r.room.as_ref())
+            .map(|rv| &rv.group)
+            .or_else(|| {
+                self.sidebar_groups
+                    .iter()
+                    .find(|s| s.host == key.host && s.group.id == key.group_id)
+                    .map(|s| &s.group)
+            });
+        group
+            .map(|g| {
+                g.bot_ids
+                    .iter()
+                    .filter_map(|id| {
+                        self.sidebar_bots
+                            .iter()
+                            .find(|b| b.host == key.host && &b.id == id)
+                            .cloned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn active_group_mention(
+        &self,
+        key: &GroupRoomKey,
+        draft: &str,
+        cursor: usize,
+        members: &[SidebarBot],
+    ) -> Option<(usize, usize, Vec<MentionCandidate>)> {
+        let (at_pos, cursor_byte, query) = mention_query_at_cursor(draft, cursor, members)?;
+        if self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(key)
+            .and_then(|r| r.mention_dismissed_at)
+            == Some(at_pos)
+        {
+            return None;
+        }
+        let candidates = mention_candidates(&query, members);
+        if candidates.is_empty() {
+            return None;
+        }
+        Some((at_pos, cursor_byte, candidates))
+    }
+
+    fn apply_group_mention(
+        &mut self,
+        key: &GroupRoomKey,
+        input: &Entity<TextareaState>,
+        span: std::ops::Range<usize>,
+        handle: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = input.read(cx).value().to_string();
+        let (next, new_cursor_byte) = splice_mention_token(&draft, span.start, span.end, handle);
+        let pos = byte_offset_to_position(&next, new_cursor_byte);
+        input.update(cx, |s, cx| {
+            s.set_value(next.clone(), window, cx);
+            s.set_cursor_position(pos, window, cx);
+            s.focus(window, cx);
+        });
+        if let Some(r) = self.bot_ui.group_chat.rooms.get_mut(key) {
+            r.draft = next;
+            r.mention_selected = 0;
+            r.mention_dismissed_at = None;
+        }
+        cx.notify();
+    }
+
+    fn accept_active_group_mention(
+        &mut self,
+        key: &GroupRoomKey,
+        input: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let draft = input.read(cx).value().to_string();
+        let cursor = input.read(cx).cursor();
+        let members = self.group_members_for_key(key);
+        let Some((at_pos, cursor_byte, candidates)) =
+            self.active_group_mention(key, &draft, cursor, &members)
+        else {
+            return false;
+        };
+        let selected = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(key)
+            .map_or(0, |r| r.mention_selected)
+            .min(candidates.len().saturating_sub(1));
+        let handle = candidates[selected].handle.clone();
+        self.apply_group_mention(key, input, at_pos..cursor_byte, &handle, window, cx);
+        true
     }
 
     fn prepend_reply_mention(
@@ -1128,6 +1521,108 @@ impl Shell {
         state.action_error = None;
         let gid = key.group_id.clone();
         let tid = resolved_thread_id(&key, Some(state));
+
+        // Intercept `/clear` as a local group-thread reset (`BOT-05`) rather than posting literal
+        // `"/clear"` as an owner message to member bots.
+        if text_body.eq_ignore_ascii_case("/clear") {
+            cx.notify();
+            cx.spawn_in(window, async move |this, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        call_checked(
+                            &rpc,
+                            &BotRpcRequest::ClearGroupThread {
+                                group_id: gid,
+                                thread_id: tid,
+                            },
+                        )
+                    })
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    let mut clear_input = false;
+                    let mut new_thread_id: Option<String> = None;
+                    if let Some(room_state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                        room_state.sending = false;
+                        room_state.poll_gen = room_state.poll_gen.wrapping_add(1);
+                        match res {
+                            Ok(BotRpcResponse::GroupRoom(view)) => {
+                                if room_state.draft == sent_draft {
+                                    room_state.draft.clear();
+                                    clear_input = true;
+                                }
+                                new_thread_id.clone_from(&view.active_thread_id);
+                                room_state.reply_audience = view.reply_audience.clone();
+                                room_state.room = Some(view);
+                                room_state.expanded_turns.clear();
+                                room_state.member_items.clear();
+                                room_state.stopping_all = false;
+                                room_state.stopping_bots.clear();
+                                room_state.follow_paused = false;
+                                room_state.last_tail_message_id = None;
+                                room_state.last_tail_sig = None;
+                                room_state.initial_scrolled.set(false);
+                                room_state.error = None;
+                            }
+                            Ok(_) => {
+                                if room_state.draft == sent_draft {
+                                    room_state.draft.clear();
+                                    clear_input = true;
+                                }
+                            }
+                            Err(err) => {
+                                room_state.action_error =
+                                    Some(text::GRP_SEND_FAILED.format(&[("err", &err)]));
+                            }
+                        }
+                    }
+                    if clear_input && let Some(inp) = input {
+                        inp.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
+                    let host = key.host.clone();
+                    let next_key = if let Some(ref fresh_tid) = new_thread_id
+                        && key.thread_id.is_some()
+                        && key.thread_id.as_deref() != Some(fresh_tid.as_str())
+                    {
+                        let target_gid = key.group_id.clone();
+                        let fresh_tid_owned = fresh_tid.clone();
+                        this.change(true, cx, |l| {
+                            let panes: Vec<PaneId> =
+                                (0..l.tabs().len()).flat_map(|i| l.tab_panes(i)).collect();
+                            for p in panes {
+                                if l.host(p) == &key.host
+                                    && l.group_pane(p).is_some_and(|g| {
+                                        g.group_id == target_gid && g.thread_id == key.thread_id
+                                    })
+                                {
+                                    l.set_group_pane(
+                                        p,
+                                        Some(GroupPaneTarget {
+                                            group_id: target_gid.clone(),
+                                            thread_id: Some(fresh_tid_owned.clone()),
+                                        }),
+                                    );
+                                }
+                            }
+                        });
+                        GroupRoomKey {
+                            host: key.host.clone(),
+                            group_id: key.group_id.clone(),
+                            thread_id: Some(fresh_tid.clone()),
+                        }
+                    } else {
+                        key.clone()
+                    };
+                    this.poll_group_room(next_key, cx);
+                    this.refresh_bots_for_host(&host, true, cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
         let voice_text = text_body.clone();
         self.notify_voice_sent(
             &super::voice::VoiceComposerTarget::Group(key.clone()),
@@ -1216,10 +1711,23 @@ impl Shell {
         };
         let tid = resolved_thread_id(&key, self.bot_ui.group_chat.rooms.get(&key));
         if let Some(room) = self.bot_ui.group_chat.rooms.get_mut(&key) {
+            // Cooldown / deduplicate rapid clicks & Esc repeats while a stop RPC is in flight (`BOT-04`/`CHAT-09`).
+            if room.stopping_all {
+                return;
+            }
+            if let Some(ref bid) = bot_id {
+                if !room.stopping_bots.insert(bid.clone()) {
+                    return;
+                }
+            } else {
+                room.stopping_all = true;
+            }
             room.action_error = None;
             room.poll_gen = room.poll_gen.wrapping_add(1);
         }
         let gid = key.group_id.clone();
+        let stop_target = bot_id.clone();
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1236,6 +1744,11 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                    if let Some(ref bid) = stop_target {
+                        room.stopping_bots.remove(bid);
+                    } else {
+                        room.stopping_all = false;
+                    }
                     room.poll_gen = room.poll_gen.wrapping_add(1);
                     if let Err(err) = res {
                         room.action_error = Some(err);
@@ -1334,7 +1847,15 @@ impl Shell {
                 }
             }
             if waiting_sid.is_none() {
+                let active_tid = key.thread_id.as_deref().or_else(|| {
+                    room_state
+                        .and_then(|r| r.room.as_ref())
+                        .and_then(|rv| rv.active_thread_id.as_deref())
+                });
                 for s in &bot.sessions {
+                    if !session_belongs_to_group(&s.label, &key.group_id, active_tid) {
+                        continue;
+                    }
                     if let Some(sess) = sidebar.session_on(&key.host, s.session_id)
                         && matches!(sess.status.state, AgentState::Waiting | AgentState::Blocked)
                     {
@@ -1541,6 +2062,24 @@ impl Shell {
             cx,
         );
 
+        let offline_remote_host: Option<(String, String)> = key.host.remote_id().and_then(|rid| {
+            let offline = self.bot_rpc_on(&key.host).is_none()
+                || self.host_statuses.iter().any(|(spec, status)| {
+                    spec.id == rid
+                        && matches!(
+                            status,
+                            krill_app_core::hosts::HostStatus::Disconnected
+                                | krill_app_core::hosts::HostStatus::AuthFailed
+                        )
+                });
+            offline.then(|| {
+                (
+                    rid.to_owned(),
+                    self.host_display_label(&key.host, cx).to_string(),
+                )
+            })
+        });
+
         div()
             .id(SharedString::from(format!("bot-group-page-{}", pane.get())))
             .debug_selector(|| "bot-group-page".into())
@@ -1553,6 +2092,39 @@ impl Shell {
             .flex_col()
             .font_family(ui::FONT_UI)
             .child(header)
+            .children(offline_remote_host.map(|(remote_id, host_label)| {
+                div()
+                    .id("group-remote-offline-banner")
+                    .debug_selector(|| "group-remote-offline-banner".into())
+                    .mx_4()
+                    .mt_2()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.45))
+                    .bg(p.warning.opacity(0.1))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.foreground)
+                    .child(div().flex_1().min_w_0().truncate().child(format!(
+                        "{host_label} · {}",
+                        krill_app_core::i18n::catalog::sidebar::HOST_DISCONNECTED.get()
+                    )))
+                    .child(
+                        Button::new("group-remote-reconnect")
+                            .debug_selector(|| "group-remote-reconnect".into())
+                            .ghost()
+                            .xsmall()
+                            .label(krill_app_core::i18n::catalog::sidebar::HOST_RECONNECT.get())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.sync_hosts_after_reconnect(Some(remote_id.clone()), cx);
+                            })),
+                    )
+            }))
             .children(error_msg.map(|err| {
                 let dismiss_key = key.clone();
                 div()
@@ -1696,7 +2268,16 @@ impl Shell {
                                         text::GRP_PANEL_MEMBERS
                                             .format(&[("n", &members.len().to_string())]),
                                     ),
-                            ),
+                            )
+                            .when(!key.host.is_local(), |d| {
+                                let label = self.host_display_label(&key.host, cx);
+                                d.child(super::bot_section::render_remote_host_badge(
+                                    format!("group-page-host-{}", key.host.as_key()),
+                                    "group-page-host".to_owned(),
+                                    label,
+                                    p,
+                                ))
+                            }),
                     )
                     .child(thread_strip),
             )
@@ -1866,7 +2447,7 @@ impl Shell {
                             .w_full()
                             .text_center()
                             .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground.opacity(0.7))
+                            .text_color(p.muted_foreground)
                             .child(
                                 text::GRP_PEER_SAID_ONE
                                     .format(&[("from", from_name), ("to", to_name)]),
@@ -1921,6 +2502,7 @@ impl Shell {
         });
 
         let wheel_key = key.clone();
+        let dismiss_key = key.clone();
         let mut scroller = div()
             .id("bot-group-timeline")
             .debug_selector(|| "bot-group-timeline".into())
@@ -1929,6 +2511,30 @@ impl Shell {
             .overflow_y_scroll()
             .px_4()
             .py_4()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    let members = this.group_members_for_key(&dismiss_key);
+                    let active_at = this
+                        .bot_ui
+                        .group_chat
+                        .rooms
+                        .get(&dismiss_key)
+                        .and_then(|r| {
+                            let cursor = r
+                                .composer
+                                .as_ref()
+                                .map_or(r.draft.len(), |(inp, _)| inp.read(cx).cursor());
+                            mention_query_at_cursor(&r.draft, cursor, &members).map(|(at, _, _)| at)
+                        });
+                    if let Some(at_pos) = active_at
+                        && let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&dismiss_key)
+                    {
+                        state.mention_dismissed_at = Some(at_pos);
+                        cx.notify();
+                    }
+                }),
+            )
             .on_scroll_wheel(cx.listener(move |this, _, _, _| {
                 if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&wheel_key) {
                     state.follow_paused = !is_group_timeline_near_bottom(&state.scroll);
@@ -2038,8 +2644,20 @@ impl Shell {
         let key_toggle = key.clone();
         let stop_key = key.clone();
         let reply_key = key.clone();
-        let stop_bot_id = bot.map(|b| b.id.clone());
+        // Never pass `None` to per-turn stop when a member was removed (`BOT-26`): resolve
+        // the bot ID from the active turn, live member list, or sender_id.
+        let stop_bot_id = active_turn
+            .map(|t| t.bot_id.clone())
+            .or_else(|| bot.map(|b| b.id.clone()))
+            .or_else(|| BotId::new(&msg.sender_id).ok());
+        let turn_stopping = self.bot_ui.group_chat.rooms.get(key).is_some_and(|r| {
+            r.stopping_all
+                || stop_bot_id
+                    .as_ref()
+                    .is_some_and(|bid| r.stopping_bots.contains(bid))
+        });
         let reply_handle = bot.map_or_else(|| msg.sender_id.clone(), |b| b.slug.clone());
+        let bot_base_dir = bot.and_then(|b| self.bot_folder(b));
 
         let has_details =
             live_preview.is_some() || msg.body.lines().count() > TURN_COLLAPSE_LINE_LIMIT;
@@ -2130,7 +2748,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .when(is_working, |d| {
+                    .when(is_working && stop_bot_id.is_some(), |d| {
                         let bid = stop_bot_id.clone();
                         let label = text::GRP_TURN_STOP.format(&[("name", &bot_name)]);
                         d.child(
@@ -2141,11 +2759,14 @@ impl Shell {
                             .debug_selector(|| "grp-turn-stop".into())
                             .ghost()
                             .xsmall()
+                            .disabled(turn_stopping)
                             .icon(Icon::default().data(ui::icons::STOP_SQUARE_SVG))
                             .tooltip(label)
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    this.stop_group_turn(stop_key.clone(), bid.clone(), cx);
+                                    if bid.is_some() {
+                                        this.stop_group_turn(stop_key.clone(), bid.clone(), cx);
+                                    }
                                 },
                             )),
                         )
@@ -2187,6 +2808,7 @@ impl Shell {
                 if expanded {
                     let shell = cx.weak_entity();
                     let link_host = key.host.clone();
+                    let link_base = bot_base_dir.clone();
                     div()
                         .min_w_0()
                         .text_size(ui::TEXT_MD)
@@ -2204,7 +2826,7 @@ impl Shell {
                                         this.open_chat_markdown_link(
                                             None,
                                             link_host.clone(),
-                                            None,
+                                            link_base.as_deref(),
                                             url,
                                             event,
                                             cx,
@@ -2216,7 +2838,9 @@ impl Shell {
                                     )
                                 {
                                     krill_app_core::terminal::path_link::open_markdown_link_with_app(
-                                        url, None, cx,
+                                        url,
+                                        link_base.as_deref(),
+                                        cx,
                                     );
                                 }
                             }),
@@ -2234,6 +2858,7 @@ impl Shell {
                 let (content, _clamped) = group_turn_display_body(&msg.body, expanded);
                 let shell = cx.weak_entity();
                 let link_host = key.host.clone();
+                let link_base = bot_base_dir.clone();
                 div()
                     .min_w_0()
                     .text_size(ui::TEXT_MD)
@@ -2251,7 +2876,7 @@ impl Shell {
                                     this.open_chat_markdown_link(
                                         None,
                                         link_host.clone(),
-                                        None,
+                                        link_base.as_deref(),
                                         url,
                                         event,
                                         cx,
@@ -2263,7 +2888,9 @@ impl Shell {
                                 )
                             {
                                 krill_app_core::terminal::path_link::open_markdown_link_with_app(
-                                    url, None, cx,
+                                    url,
+                                    link_base.as_deref(),
+                                    cx,
                                 );
                             }
                         }),
@@ -2576,132 +3203,169 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let mention_menu = trailing_mention_query(draft).and_then(|(at_pos, query)| {
-            let needle = query.to_ascii_lowercase();
-            let show_everyone = needle.is_empty() || "everyone".starts_with(&needle);
-            let matched_bots: Vec<&SidebarBot> = members
-                .iter()
-                .filter(|b| {
-                    needle.is_empty()
-                        || b.name.to_ascii_lowercase().contains(&needle)
-                        || b.slug.to_ascii_lowercase().contains(&needle)
-                })
-                .collect();
-            if !show_everyone && matched_bots.is_empty() {
-                return None;
-            }
-            let mut list = div()
-                .id("group-mention-menu")
-                .debug_selector(|| "group-mention-menu".into())
-                .w_full()
-                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                .mx_auto()
-                .mb_1p5()
-                .p_1()
-                .rounded(ui::RADIUS_MD)
-                .border_1()
-                .border_color(p.border)
-                .bg(p.popover)
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .gap_0p5();
-            if show_everyone {
-                let k = key.clone();
-                let d = draft.to_owned();
-                let inp = input_state.clone();
-                list = list.child(
-                    Button::new("grp-mention-everyone")
-                        .ghost()
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let next = insert_mention_token(&d, at_pos, "everyone");
-                            inp.update(cx, |s, cx| {
-                                s.set_value(next.clone(), window, cx);
-                                s.focus(window, cx);
-                            });
-                            if let Some(r) = this.bot_ui.group_chat.rooms.get_mut(&k) {
-                                r.draft = next;
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
+        let cursor_byte = input_state.read(cx).cursor();
+        let active_mention = self.active_group_mention(key, draft, cursor_byte, members);
+        let mention_selected = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(key)
+            .map_or(0, |r| r.mention_selected);
+        let stopping_all = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(key)
+            .is_some_and(|r| r.stopping_all);
+
+        let mention_menu = active_mention
+            .as_ref()
+            .map(|(at_pos, cursor_end, candidates)| {
+                let at_pos = *at_pos;
+                let cursor_end = *cursor_end;
+                let selected_idx = mention_selected.min(candidates.len().saturating_sub(1));
+                let mut list = div()
+                    .id("group-mention-menu")
+                    .debug_selector(|| "group-mention-menu".into())
+                    .occlude()
+                    .w_full()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .mx_auto()
+                    .mb_1p5()
+                    .p_1()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.popover)
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5();
+                for (idx, cand) in candidates.iter().enumerate() {
+                    let is_selected = idx == selected_idx;
+                    let k = key.clone();
+                    let inp = input_state.clone();
+                    let handle = cand.handle.clone();
+                    if cand.bot_id.is_none() {
+                        list = list.child(
+                            Button::new("grp-mention-everyone")
+                                .debug_selector(|| "grp-mention-everyone".into())
+                                .ghost()
+                                .xsmall()
                                 .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .text_size(ui::TEXT_XS)
+                                .justify_start()
+                                .toggled(is_selected)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.apply_group_mention(
+                                        &k,
+                                        &inp,
+                                        at_pos..cursor_end,
+                                        &handle,
+                                        window,
+                                        cx,
+                                    );
+                                }))
                                 .child(
                                     div()
+                                        .w_full()
+                                        .min_w_0()
                                         .flex()
                                         .items_center()
+                                        .justify_between()
                                         .gap_2()
+                                        .text_size(ui::TEXT_XS)
                                         .child(
                                             div()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(text::GRP_EVERYONE_LABEL.get()),
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(text::GRP_EVERYONE_LABEL.get()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_color(p.muted_foreground)
+                                                        .child(text::GRP_EVERYONE_DESC.get()),
+                                                ),
                                         )
                                         .child(
                                             div()
+                                                .flex_none()
                                                 .text_color(p.muted_foreground)
-                                                .child(text::GRP_EVERYONE_DESC.get()),
+                                                .child(EVERYONE_HANDLE),
                                         ),
-                                )
-                                .child(div().text_color(p.muted_foreground).child(EVERYONE_HANDLE)),
-                        ),
-                );
-            }
-            for bot in matched_bots {
-                let k = key.clone();
-                let d = draft.to_owned();
-                let slug = bot.slug.clone();
-                let inp = input_state.clone();
-                let name = bot.name.clone();
-                let av = self.bot_avatar(bot, 18., px(5.), p);
-                let mention_handle = format!("@{slug}");
-                list = list.child(
-                    Button::new(SharedString::from(format!(
-                        "grp-mention-{}",
-                        bot.id.as_str()
-                    )))
-                    .ghost()
-                    .xsmall()
-                    .w_full()
-                    .justify_start()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let next = insert_mention_token(&d, at_pos, &slug);
-                        inp.update(cx, |s, cx| {
-                            s.set_value(next.clone(), window, cx);
-                            s.focus(window, cx);
-                        });
-                        if let Some(r) = this.bot_ui.group_chat.rooms.get_mut(&k) {
-                            r.draft = next;
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
+                                ),
+                        );
+                    } else if let Some(bot) = cand
+                        .bot_id
+                        .as_ref()
+                        .and_then(|bid| members.iter().find(|b| &b.id == bid))
+                    {
+                        let name = bot.name.clone();
+                        let av = self.bot_avatar(bot, 18., px(5.), p);
+                        let mention_handle = format!("@{handle}");
+                        list = list.child(
+                            Button::new(SharedString::from(format!(
+                                "grp-mention-{}",
+                                bot.id.as_str()
+                            )))
+                            .ghost()
+                            .xsmall()
                             .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(div().flex().items_center().gap_2().child(av).child(name))
+                            .justify_start()
+                            .toggled(is_selected)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.apply_group_mention(
+                                    &k,
+                                    &inp,
+                                    at_pos..cursor_end,
+                                    &handle,
+                                    window,
+                                    cx,
+                                );
+                            }))
                             .child(
                                 div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(mention_handle),
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(av)
+                                            .child(div().min_w_0().truncate().child(name)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .max_w(px(140.))
+                                            .truncate()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(mention_handle),
+                                    ),
                             ),
-                    ),
-                );
-            }
-            Some(list)
-        });
+                        );
+                    }
+                }
+                list
+            });
 
         let summary = reply_picker_summary(audience, draft, members);
         let prefix_label = format!("{}:", text::GRP_REPLIES_PREFIX.get());
@@ -2797,6 +3461,8 @@ impl Shell {
 
         let send_key = key.clone();
         let stop_key = key.clone();
+        let key_kbd = key.clone();
+        let inp_kbd = input_state.clone();
         let can_send = !draft.trim().is_empty() && !sending;
 
         let inner_card = div()
@@ -2822,8 +3488,63 @@ impl Shell {
                     }
                 }),
             )
-            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, _| {
-                let _ = ev;
+            .capture_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.modifiers.modified()
+                    || Self::chat_input_is_composing(&inp_kbd, window, cx)
+                {
+                    return;
+                }
+                let draft_now = inp_kbd.read(cx).value().to_string();
+                let cursor_now = inp_kbd.read(cx).cursor();
+                let members_now = this.group_members_for_key(&key_kbd);
+                if let Some((at_pos, _, candidates)) =
+                    this.active_group_mention(&key_kbd, &draft_now, cursor_now, &members_now)
+                {
+                    match ev.keystroke.key.as_str() {
+                        "up" => {
+                            if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key_kbd) {
+                                let len = candidates.len();
+                                room.mention_selected = if room.mention_selected == 0 {
+                                    len.saturating_sub(1)
+                                } else {
+                                    room.mention_selected.saturating_sub(1)
+                                };
+                            }
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            cx.notify();
+                        }
+                        "down" => {
+                            if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key_kbd) {
+                                let len = candidates.len().max(1);
+                                room.mention_selected = (room.mention_selected + 1) % len;
+                            }
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            cx.notify();
+                        }
+                        "tab" => {
+                            if this.accept_active_group_mention(&key_kbd, &inp_kbd, window, cx) {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                            }
+                        }
+                        "escape" => {
+                            if let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key_kbd) {
+                                room.mention_dismissed_at = Some(at_pos);
+                            }
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                } else if ev.keystroke.key == "escape" && active_run {
+                    // Esc stops active group turn when `@mention` popup is closed (`BOT-04`/`CHAT-09`).
+                    this.stop_group_turn(key_kbd.clone(), None, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
             }))
             .child(
                 Textarea::new(input_state)
@@ -2841,9 +3562,16 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(reply_picker)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(reply_picker),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_1p5()
@@ -2855,6 +3583,7 @@ impl Shell {
                                         .tooltip(text::GROUP_STOP_BTN.get())
                                         .secondary()
                                         .rounded(px(999.))
+                                        .disabled(stopping_all)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.stop_group_turn(stop_key.clone(), None, cx);
                                         })),
@@ -3197,5 +3926,55 @@ mod tests {
             fenced_collapsed.ends_with("\n```\n…"),
             "clamped code fence should be closed before ellipsis, got {fenced_collapsed:?}"
         );
+    }
+
+    #[test]
+    fn cursor_aware_mentions_preserve_suffix_match_spaced_names_and_group_session_scope() {
+        let members = vec![
+            sample_bot("b1", "alice", "Alice"),
+            sample_bot("b2", "bob-ops", "Bob Ops"),
+        ];
+
+        // BOT-08: mid-draft cursor-aware mention detection & splice preserving trailing text.
+        let draft = "hey @al please check";
+        let cursor = "hey @al".len();
+        assert_eq!(
+            mention_query_at_cursor(draft, cursor, &members),
+            Some((4, cursor, "al".to_owned()))
+        );
+        let (spliced, new_cursor) = splice_mention_token(draft, 4, cursor, "alice");
+        assert_eq!(spliced, "hey @alice please check");
+        assert_eq!(new_cursor, "hey @alice ".len());
+
+        // BOT-28: spaced display name prefix matches `@Bob Ops`.
+        let spaced = "ping @Bob O";
+        assert_eq!(
+            mention_query_at_cursor(spaced, spaced.len(), &members),
+            Some((5, spaced.len(), "Bob O".to_owned()))
+        );
+        assert_eq!(
+            mention_query_at_cursor("ping @Bob unknown", 17, &members),
+            None
+        );
+
+        // BOT-06: strict `(group:<gid>:<tid>)` and legacy `(group:<gid>)` session scoping.
+        assert!(session_belongs_to_group(
+            "Alice (group:g1:t1)",
+            "g1",
+            Some("t1")
+        ));
+        assert!(!session_belongs_to_group(
+            "Alice (group:g1:t2)",
+            "g1",
+            Some("t1")
+        ));
+        assert!(session_belongs_to_group("Alice (group:g1:t2)", "g1", None));
+        assert!(session_belongs_to_group(
+            "Alice (group:g1)",
+            "g1",
+            Some("t1")
+        ));
+        assert!(!session_belongs_to_group("Alice (group:g2:t1)", "g1", None));
+        assert!(!session_belongs_to_group("Alice", "g1", None));
     }
 }

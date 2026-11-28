@@ -3277,8 +3277,8 @@ fn multi_host_bots_show_host_badge_route_actions_isolate_same_id_and_prune_on_di
     });
     cx.run_until_parked();
 
-    // 4. Disconnecting the remote host prunes its bots, up_next, panel state, and delete dialog
-    //    while keeping local bots intact.
+    // 4. BOT-18: Transient disconnect preserves cached remote bots, up_next, and panel state;
+    //    only removing the remote host from config prunes them while keeping local bots intact.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let remote_bot = s
@@ -3295,7 +3295,7 @@ fn multi_host_bots_show_host_badge_route_actions_isolate_same_id_and_prune_on_di
             let _ = s.bot_panel_view_on(&remote_host, cx);
             assert!(s.bot_ui.panel.view.is_some());
 
-            // Simulate HostManager marking oci-yd-bot Disconnected (even before async sidebar sync).
+            // Transient disconnect while host remains configured: cache & panel MUST survive (`BOT-18`).
             s.host_statuses = vec![(remote_spec.clone(), HostStatus::Disconnected)];
             s.bot_rpc_overrides.remove(&remote_host);
             s.refresh_bots_badge(cx);
@@ -3305,32 +3305,56 @@ fn multi_host_bots_show_host_badge_route_actions_isolate_same_id_and_prune_on_di
 
     view.read_with(cx, |s, _| {
         assert!(
+            s.sidebar_bots.iter().any(|b| b.host == remote_host),
+            "transient disconnect must preserve cached remote bots (`BOT-18`)"
+        );
+        assert!(
+            s.bot_ui.panel.view.is_some(),
+            "transient disconnect must preserve active BotPanel view (`BOT-18`)"
+        );
+    });
+
+    // Removing the remote host from config prunes its bots, up_next, delete dialog, and panel.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_statuses.clear();
+            s.host_targets.remove(&remote_host);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.remove_remote_host_for_test("oci-yd-bot", cx);
+            });
+            s.refresh_bots_badge(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |s, _| {
+        assert!(
             !s.sidebar_bots.iter().any(|b| b.host == remote_host),
-            "disconnected remote host's bots must be pruned from sidebar"
+            "removed remote host's bots must be pruned from sidebar"
         );
         assert!(
             s.sidebar_bots
                 .iter()
                 .any(|b| b.host == HostId::Local && b.id == local_only_id),
-            "local bots must remain after remote disconnect"
+            "local bots must remain after remote host removal"
         );
         assert!(
             !s.bot_ui
                 .up_next_unseen
                 .contains_key(&(remote_host.clone(), shared_id.clone())),
-            "disconnected remote host's up_next_unseen must be pruned"
+            "removed remote host's up_next_unseen must be pruned"
         );
         assert!(
             s.bot_ui.delete.is_none(),
-            "pending delete dialog for disconnected remote host must be cleared"
+            "pending delete dialog for removed remote host must be cleared"
         );
         assert!(
             s.bot_ui.panel.shown.is_none(),
-            "panel.shown for disconnected remote host must be cleared"
+            "panel.shown for removed remote host must be cleared"
         );
         assert!(
             s.bot_ui.panel.view.is_none(),
-            "panel.view for disconnected remote host must be cleared"
+            "panel.view for removed remote host must be cleared"
         );
     });
 }

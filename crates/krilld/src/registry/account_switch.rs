@@ -1993,9 +1993,12 @@ impl Registry {
                     .and_then(|p| identity::CodexResume::new(p).ok())
             })
             .flatten();
+        let effective_permission = bot_launch
+            .as_ref()
+            .map_or(stored.permission, |bl| bl.permission_mode);
         let (mut launch, sid, applied) = crate::agent::resume_in_with_bot_mcp(
             &effective_profile,
-            stored.permission,
+            effective_permission,
             new,
             state_dir.as_deref(),
             Some(&session_id),
@@ -2021,7 +2024,7 @@ impl Registry {
                 new,
                 &AgentLaunch {
                     profile: canonical.into(),
-                    permission: stored.permission,
+                    permission: effective_permission,
                 },
                 sid,
                 cwd.clone(),

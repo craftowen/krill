@@ -14,8 +14,8 @@ use gpui_component::{Icon, IconName, Sizable as _};
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemStatus, BotRpcRequest, BotRpcResponse};
 
 use super::home::{
-    Group, ITEMS_LIST_OVERDRAW_PX, RowAnchor, activity_at, group_of, number_column_chars,
-    reconcile_list_state, status_name,
+    Group, ITEMS_LIST_OVERDRAW_PX, RowAnchor, activity_at, group_of, is_snoozed,
+    number_column_chars, reconcile_list_state, status_name,
 };
 use super::home_needs::Need;
 use super::rpc::call_checked;
@@ -253,11 +253,13 @@ impl View {
                 .count();
             by_bot.push((bid.clone(), count));
         }
+        let now = now_unix_ms();
         let needs_you = all
             .iter()
             .filter(|i| {
                 member_set.contains(&i.owner_bot_id)
                     && i.status == BotItemStatus::NeedsYou
+                    && !is_snoozed(i, now)
                     && (self.group_panel.filter.bot_ids.is_empty()
                         || self.group_panel.filter.bot_ids.contains(&i.owner_bot_id))
                     && item_matches_group_scope(
@@ -347,6 +349,7 @@ impl View {
             self.load_group_panel_items(key, cx);
         }
         self.sync_group_items_backing();
+        self.ensure_upcoming_poll(cx);
     }
 
     pub fn retry_group_panel_items(&mut self, cx: &mut Context<Self>) {
@@ -539,7 +542,9 @@ impl View {
             ) {
                 continue;
             }
-            if filter.needs_you_only && item.status != BotItemStatus::NeedsYou {
+            if filter.needs_you_only
+                && (item.status != BotItemStatus::NeedsYou || is_snoozed(item, now))
+            {
                 continue;
             }
             shown_count += 1;

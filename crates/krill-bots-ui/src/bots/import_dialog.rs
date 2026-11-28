@@ -524,6 +524,11 @@ impl View {
         if name.is_empty() {
             return;
         }
+        if let Err(err) = krill_proto::bots::validate_bot_name(&name) {
+            self.error = Some(SharedString::from(err.to_string()));
+            cx.notify();
+            return;
+        }
         let Some(setup) = &self.import_dialog.runs_on else {
             return;
         };

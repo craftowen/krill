@@ -181,230 +181,264 @@ fn run_memory_tidy_inner(
             format!("bot memory path is not a directory: {}", mem_dir.display()),
         ));
     }
-    let old = store.get_memory(bot_id)?;
-    let parsed = parse_memory_facts(&old);
-    if parsed.is_empty() {
-        return Ok(("MEMORY.md has no facts to tidy.".to_owned(), 0, None));
-    }
-
-    let raw_lines: Vec<&str> = old.lines().collect();
-    let mut fact_by_line: HashMap<usize, usize> = HashMap::with_capacity(parsed.len());
-    for (idx, fact) in parsed.iter().enumerate() {
-        fact_by_line.insert(fact.line, idx);
-    }
-
-    // Deduplicate facts globally by normalized text key, preferring the newest date and richer
-    // provenance, while tracking the winning parsed index so each surviving fact stays in its
-    // own section.
-    let mut deduped: BTreeMap<String, WinnerFact> = BTreeMap::new();
-    let mut duplicate_count: u32 = 0;
-
-    for (order, fact) in parsed.iter().enumerate() {
-        let key = normalize_key(&fact.text);
-        if key.is_empty() {
-            continue;
+    for attempt in 0..4 {
+        let old = store.get_memory(bot_id)?;
+        let parsed = parse_memory_facts(&old);
+        if parsed.is_empty() {
+            return Ok(("MEMORY.md has no facts to tidy.".to_owned(), 0, None));
         }
-        match deduped.get_mut(&key) {
-            Some(existing) => {
-                duplicate_count = duplicate_count.saturating_add(1);
-                let replace = match (existing.date.as_deref(), fact.date.as_deref()) {
-                    (Some(a), Some(b)) => b > a,
-                    (None, Some(_)) => true,
-                    _ => false,
-                };
-                if replace {
-                    existing.date.clone_from(&fact.date);
-                    existing.text = key;
-                    existing.order = order;
-                    existing.winning_idx = order;
-                }
-                if existing.source.is_none() && fact.source.is_some() {
-                    existing.source.clone_from(&fact.source);
-                }
-            }
-            None => {
-                deduped.insert(
-                    key.clone(),
-                    WinnerFact {
-                        date: fact.date.clone(),
-                        text: key,
-                        source: fact.source.clone(),
-                        order,
-                        winning_idx: order,
-                    },
-                );
-            }
+
+        let raw_lines: Vec<&str> = old.lines().collect();
+        let mut fact_by_line: HashMap<usize, usize> = HashMap::with_capacity(parsed.len());
+        for (idx, fact) in parsed.iter().enumerate() {
+            fact_by_line.insert(fact.line, idx);
         }
-    }
 
-    // Rank all surviving facts newest-date-first so overflow archival always archives the oldest.
-    let mut ranked: Vec<WinnerFact> = deduped.into_values().collect();
-    ranked.sort_by(|a, b| match (&b.date, &a.date) {
-        (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.order.cmp(&b.order),
-    });
+        // Deduplicate facts globally by normalized text key, preferring the newest date and richer
+        // provenance, while tracking the winning parsed index so each surviving fact stays in its
+        // own section.
+        let mut deduped: BTreeMap<String, WinnerFact> = BTreeMap::new();
+        let mut duplicate_count: u32 = 0;
 
-    // Partition raw lines into preserved non-fact segments (headings, subheadings, prose, blanks)
-    // and contiguous fact blocks so no `##` heading or prose after the first fact is dropped.
-    let mut segments: Vec<TidySegment> = Vec::new();
-    let has_leading_non_fact = raw_lines
-        .iter()
-        .enumerate()
-        .take_while(|(line_idx, _)| !fact_by_line.contains_key(line_idx))
-        .any(|(_, line)| !line.trim().is_empty());
-    if !has_leading_non_fact {
-        segments.push(TidySegment::Raw("# Memory".to_owned()));
-        segments.push(TidySegment::Raw(String::new()));
-    }
-    for (line_idx, line) in raw_lines.iter().enumerate() {
-        if let Some(&fact_idx) = fact_by_line.get(&line_idx) {
-            if let Some(TidySegment::Facts(group)) = segments.last_mut() {
-                group.push(fact_idx);
-            } else {
-                segments.push(TidySegment::Facts(vec![fact_idx]));
-            }
-        } else {
-            let trimmed = (*line).trim_end().to_owned();
-            // Collapse consecutive blank lines while preserving section spacing.
-            if trimmed.is_empty()
-                && matches!(segments.last(), Some(TidySegment::Raw(prev)) if prev.is_empty())
-            {
+        for (order, fact) in parsed.iter().enumerate() {
+            let key = normalize_key(&fact.text);
+            if key.is_empty() {
                 continue;
             }
-            segments.push(TidySegment::Raw(trimmed));
-        }
-    }
-    while matches!(segments.last(), Some(TidySegment::Raw(s)) if s.is_empty()) {
-        segments.pop();
-    }
-
-    let raw_line_count = segments
-        .iter()
-        .filter(|seg| matches!(seg, TidySegment::Raw(_)))
-        .count();
-    let max_facts = BOT_MEMORY_INDEX_LINE_CAP.saturating_sub(raw_line_count);
-
-    let mut archived_count: u32 = 0;
-    let mut archive_notice: Option<String> = None;
-    let mut archived_winners: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    if ranked.len() > max_facts && max_facts > 1 {
-        let keep_count = max_facts.saturating_sub(1);
-        let overflow = ranked.get(keep_count..).unwrap_or_default();
-        archived_count = u32::try_from(overflow.len()).unwrap_or(u32::MAX);
-
-        let ym = format_utc_ym(now_ms / 1_000);
-        let archive_name = format!("archive-{ym}.md");
-        let archive_path = mem_dir.join(&archive_name);
-        ensure_no_symlink_path(&archive_path)?;
-        let mut archive_body = std::fs::read_to_string(&archive_path)
-            .unwrap_or_else(|_| format!("# Archived Memory ({ym})\n\n"));
-        if !archive_body.is_empty() && !archive_body.ends_with('\n') {
-            archive_body.push('\n');
-        }
-        for fact in overflow {
-            archived_winners.insert(fact.winning_idx);
-            let line = format_fact(fact.date.as_deref(), &fact.text, fact.source.as_deref());
-            if !archive_body.lines().any(|existing| existing == line) {
-                archive_body.push_str(&line);
-                archive_body.push('\n');
+            match deduped.get_mut(&key) {
+                Some(existing) => {
+                    duplicate_count = duplicate_count.saturating_add(1);
+                    let replace = match (existing.date.as_deref(), fact.date.as_deref()) {
+                        (Some(a), Some(b)) => b > a,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if replace {
+                        existing.date.clone_from(&fact.date);
+                        existing.text = key;
+                        existing.order = order;
+                        existing.winning_idx = order;
+                    }
+                    if existing.source.is_none() && fact.source.is_some() {
+                        existing.source.clone_from(&fact.source);
+                    }
+                }
+                None => {
+                    deduped.insert(
+                        key.clone(),
+                        WinnerFact {
+                            date: fact.date.clone(),
+                            text: key,
+                            source: fact.source.clone(),
+                            order,
+                            winning_idx: order,
+                        },
+                    );
+                }
             }
         }
-        write_atomic_0600(&archive_path, archive_body.as_bytes())?;
 
-        let today = format_utc_ymd(now_ms / 1_000);
-        archive_notice = Some(format!(
-            "- {today} Archived {archived_count} older memory fact(s) in memory/{archive_name}"
-        ));
-    }
+        // Rank all surviving facts newest-date-first so overflow archival always archives the oldest.
+        let mut ranked: Vec<WinnerFact> = deduped.into_values().collect();
+        ranked.sort_by(|a, b| match (&b.date, &a.date) {
+            (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.order.cmp(&b.order),
+        });
 
-    let mut winner_by_idx: HashMap<usize, &WinnerFact> = HashMap::with_capacity(ranked.len());
-    for fact in &ranked {
-        if !archived_winners.contains(&fact.winning_idx) {
-            winner_by_idx.insert(fact.winning_idx, fact);
+        // Partition raw lines into preserved non-fact segments (headings, subheadings, prose, blanks)
+        // and contiguous fact blocks so no `##` heading or prose after the first fact is dropped.
+        let mut segments: Vec<TidySegment> = Vec::new();
+        let has_leading_non_fact = raw_lines
+            .iter()
+            .enumerate()
+            .take_while(|(line_idx, _)| !fact_by_line.contains_key(line_idx))
+            .any(|(_, line)| !line.trim().is_empty());
+        if !has_leading_non_fact {
+            segments.push(TidySegment::Raw("# Memory".to_owned()));
+            segments.push(TidySegment::Raw(String::new()));
         }
-    }
-
-    let mut rebuilt_lines: Vec<String> = Vec::new();
-    for seg in segments {
-        match seg {
-            TidySegment::Raw(line) => {
-                if line.is_empty() && rebuilt_lines.last().is_some_and(String::is_empty) {
+        for (line_idx, line) in raw_lines.iter().enumerate() {
+            if let Some(&fact_idx) = fact_by_line.get(&line_idx) {
+                if let Some(TidySegment::Facts(group)) = segments.last_mut() {
+                    group.push(fact_idx);
+                } else {
+                    segments.push(TidySegment::Facts(vec![fact_idx]));
+                }
+            } else {
+                let trimmed = (*line).trim_end().to_owned();
+                // Collapse consecutive blank lines while preserving section spacing.
+                if trimmed.is_empty()
+                    && matches!(segments.last(), Some(TidySegment::Raw(prev)) if prev.is_empty())
+                {
                     continue;
                 }
-                rebuilt_lines.push(line);
+                segments.push(TidySegment::Raw(trimmed));
             }
-            TidySegment::Facts(group) => {
-                let mut surviving: Vec<&WinnerFact> = group
-                    .into_iter()
-                    .filter_map(|idx| winner_by_idx.get(&idx).copied())
-                    .collect();
-                surviving.sort_by(|a, b| match (&b.date, &a.date) {
-                    (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a.order.cmp(&b.order),
-                });
-                for fact in surviving {
-                    rebuilt_lines.push(format_fact(
-                        fact.date.as_deref(),
-                        &fact.text,
-                        fact.source.as_deref(),
-                    ));
+        }
+        while matches!(segments.last(), Some(TidySegment::Raw(s)) if s.is_empty()) {
+            segments.pop();
+        }
+
+        let raw_line_count = segments
+            .iter()
+            .filter(|seg| matches!(seg, TidySegment::Raw(_)))
+            .count();
+        let max_facts = BOT_MEMORY_INDEX_LINE_CAP.saturating_sub(raw_line_count);
+
+        let mut archived_count: u32 = 0;
+        let mut archive_notice: Option<String> = None;
+        let mut archived_winners: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut pending_archive: Option<(std::path::PathBuf, Vec<String>, String)> = None;
+        if ranked.len() > max_facts && max_facts > 1 {
+            let keep_count = max_facts.saturating_sub(1);
+            let overflow = ranked.get(keep_count..).unwrap_or_default();
+            archived_count = u32::try_from(overflow.len()).unwrap_or(u32::MAX);
+
+            let ym = format_utc_ym(now_ms / 1_000);
+            let archive_name = format!("archive-{ym}.md");
+            let archive_path = mem_dir.join(&archive_name);
+            ensure_no_symlink_path(&archive_path)?;
+            let mut overflow_lines = Vec::with_capacity(overflow.len());
+            for fact in overflow {
+                archived_winners.insert(fact.winning_idx);
+                overflow_lines.push(format_fact(
+                    fact.date.as_deref(),
+                    &fact.text,
+                    fact.source.as_deref(),
+                ));
+            }
+            pending_archive = Some((archive_path, overflow_lines, ym));
+
+            let today = format_utc_ymd(now_ms / 1_000);
+            archive_notice = Some(format!(
+                "- {today} Archived {archived_count} older memory fact(s) in memory/{archive_name}"
+            ));
+        }
+
+        let mut winner_by_idx: HashMap<usize, &WinnerFact> = HashMap::with_capacity(ranked.len());
+        for fact in &ranked {
+            if !archived_winners.contains(&fact.winning_idx) {
+                winner_by_idx.insert(fact.winning_idx, fact);
+            }
+        }
+
+        let mut rebuilt_lines: Vec<String> = Vec::new();
+        for seg in segments {
+            match seg {
+                TidySegment::Raw(line) => {
+                    if line.is_empty() && rebuilt_lines.last().is_some_and(String::is_empty) {
+                        continue;
+                    }
+                    rebuilt_lines.push(line);
+                }
+                TidySegment::Facts(group) => {
+                    let mut surviving: Vec<&WinnerFact> = group
+                        .into_iter()
+                        .filter_map(|idx| winner_by_idx.get(&idx).copied())
+                        .collect();
+                    surviving.sort_by(|a, b| match (&b.date, &a.date) {
+                        (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.order.cmp(&b.order),
+                    });
+                    for fact in surviving {
+                        rebuilt_lines.push(format_fact(
+                            fact.date.as_deref(),
+                            &fact.text,
+                            fact.source.as_deref(),
+                        ));
+                    }
                 }
             }
         }
+        if let Some(notice) = archive_notice {
+            rebuilt_lines.push(notice);
+        }
+        while rebuilt_lines.last().is_some_and(String::is_empty) {
+            rebuilt_lines.pop();
+        }
+
+        let mut rebuilt = rebuilt_lines.join("\n");
+        rebuilt.push('\n');
+
+        let changed = rebuilt != old;
+        if !changed {
+            return Ok((
+                "MEMORY.md is already tidy (no changes needed).".to_owned(),
+                0,
+                None,
+            ));
+        }
+
+        if archived_count == 0 {
+            // Without archival, every single unique fact MUST pass `validate_memory_edit`.
+            validate_memory_edit(&old, &rebuilt).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("memory tidy refused to drop facts: {err}"),
+                )
+            })?;
+        }
+
+        // Write archive file before CAS commit (append-only deduplicated by line, so retries are safe).
+        if let Some((archive_path, overflow_lines, ym)) = pending_archive {
+            let mut archive_body = std::fs::read_to_string(&archive_path)
+                .unwrap_or_else(|_| format!("# Archived Memory ({ym})\n\n"));
+            if !archive_body.is_empty() && !archive_body.ends_with('\n') {
+                archive_body.push('\n');
+            }
+            for line in overflow_lines {
+                if !archive_body.lines().any(|existing| existing == line) {
+                    archive_body.push_str(&line);
+                    archive_body.push('\n');
+                }
+            }
+            write_atomic_0600(&archive_path, archive_body.as_bytes())?;
+        }
+
+        match store.apply_memory_with_history_cas(
+            bot_id,
+            &old,
+            &rebuilt,
+            true,
+            "system:tidy",
+            "tidy",
+            now_ms,
+        ) {
+            Ok(entry) => {
+                let changes = duplicate_count
+                    .saturating_add(archived_count)
+                    .max(u32::from(changed));
+                let summary = if archived_count > 0 {
+                    format!(
+                        "Tidied MEMORY.md: removed {duplicate_count} duplicate(s) and archived {archived_count} overflow fact(s)."
+                    )
+                } else if duplicate_count > 0 {
+                    format!(
+                        "Tidied MEMORY.md: removed {duplicate_count} duplicate fact(s) and normalized ordering."
+                    )
+                } else {
+                    "Tidied MEMORY.md: normalized formatting and date ordering.".to_owned()
+                };
+                return Ok((summary, changes, entry.map(|e| e.entry_id)));
+            }
+            Err(crate::bots::store::MemoryUpdateError::Io(ref err))
+                if err.kind() == io::ErrorKind::WouldBlock && attempt < 3 =>
+            {
+                // Concurrent write to MEMORY.md occurred between read and commit; retry with
+                // fresh content so newly added facts are never overwritten (`BOT-13`).
+            }
+            Err(err) => return Err(io::Error::other(err.to_string())),
+        }
     }
-    if let Some(notice) = archive_notice {
-        rebuilt_lines.push(notice);
-    }
-    while rebuilt_lines.last().is_some_and(String::is_empty) {
-        rebuilt_lines.pop();
-    }
-
-    let mut rebuilt = rebuilt_lines.join("\n");
-    rebuilt.push('\n');
-
-    let changed = rebuilt != old;
-    if !changed {
-        return Ok((
-            "MEMORY.md is already tidy (no changes needed).".to_owned(),
-            0,
-            None,
-        ));
-    }
-
-    if archived_count == 0 {
-        // Without archival, every single unique fact MUST pass `validate_memory_edit`.
-        validate_memory_edit(&old, &rebuilt).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("memory tidy refused to drop facts: {err}"),
-            )
-        })?;
-    }
-
-    let entry = store
-        .apply_memory_with_history(bot_id, &rebuilt, true, "system:tidy", "tidy", now_ms)
-        .map_err(|err| io::Error::other(err.to_string()))?;
-
-    let changes = duplicate_count
-        .saturating_add(archived_count)
-        .max(u32::from(changed));
-    let summary = if archived_count > 0 {
-        format!(
-            "Tidied MEMORY.md: removed {duplicate_count} duplicate(s) and archived {archived_count} overflow fact(s)."
-        )
-    } else if duplicate_count > 0 {
-        format!(
-            "Tidied MEMORY.md: removed {duplicate_count} duplicate fact(s) and normalized ordering."
-        )
-    } else {
-        "Tidied MEMORY.md: normalized formatting and date ordering.".to_owned()
-    };
-
-    Ok((summary, changes, entry.map(|e| e.entry_id)))
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "MEMORY.md changed concurrently during tidy; please retry",
+    ))
 }
 
 fn normalize_key(text: &str) -> String {
@@ -744,6 +778,65 @@ mod tests {
         assert!(
             lines.contains(&"- 2020-01-01 foo"),
             "substring match must not drop shorter distinct fact: {archived}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn memory_cas_detects_concurrent_append_without_overwriting() {
+        let root = std::env::temp_dir().join(format!("krill-tidy-cas-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let store = BotStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "CasBot".to_owned(),
+                    description: String::new(),
+                    agent_id: "claude".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let initial = "# Memory\n\n- 2026-11-01 Fact A\n";
+        store.update_memory(&bot.id, initial, false).unwrap();
+
+        // Simulate a concurrent writer appending Fact B after tidy read `initial` (`BOT-13`).
+        let concurrent = "# Memory\n\n- 2026-11-01 Fact A\n- 2026-11-28 Concurrent Fact B\n";
+        store.update_memory(&bot.id, concurrent, false).unwrap();
+
+        let err = store
+            .apply_memory_with_history_cas(
+                &bot.id,
+                initial,
+                "# Memory\n\n- 2026-11-01 Fact A (tidied)\n",
+                false,
+                "tidy",
+                "tidy",
+                2_000,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::bots::store::MemoryUpdateError::Io(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+            ),
+            "expected WouldBlock CAS error, got {err:?}"
+        );
+        let after = store.get_memory(&bot.id).unwrap();
+        assert!(
+            after.contains("Concurrent Fact B"),
+            "CAS mismatch must preserve concurrent MEMORY.md addition: {after}"
         );
 
         fs::remove_dir_all(&root).ok();

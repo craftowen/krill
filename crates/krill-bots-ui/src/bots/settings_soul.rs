@@ -383,9 +383,7 @@ impl View {
                     ) && !crate::jump::entity_input_is_composing(ent, window, cx)
                     {
                         let typed = ent.read(cx).value().trim().to_owned();
-                        if this.remember_fact(&typed, cx) {
-                            ent.update(cx, |s, cx| s.set_value("", window, cx));
-                        }
+                        let _ = this.remember_fact(&typed, cx);
                     }
                     if matches!(ev, InputEvent::Change) {
                         cx.notify();
@@ -396,6 +394,7 @@ impl View {
     }
 
     /// Quick-add: one new fact at the top of MEMORY.md, dated today.
+    /// Preserves `memory_add_input` until the async save returns `Ok` (`BOT-21`).
     fn remember_fact(&mut self, typed: &str, cx: &mut Context<Self>) -> bool {
         let Some(bot_id) = self.selected_bot_id.clone() else {
             return false;
@@ -413,8 +412,7 @@ impl View {
             today.as_deref(),
             None,
         );
-        self.save_memory(bot_id, next, cx);
-        true
+        self.save_memory_with_clear_quick_add(bot_id, next, cx)
     }
 
     pub(super) fn render_memory_page(
@@ -538,12 +536,8 @@ impl View {
                     ui::primary("bot-memory-add-save", text::SV_SAVE.get())
                         .xsmall()
                         .disabled(self.soul_memory.busy)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if this.remember_fact(&typed, cx)
-                                && let Some(i) = &this.settings.memory_add_input
-                            {
-                                i.update(cx, |s, cx| s.set_value("", window, cx));
-                            }
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ = this.remember_fact(&typed, cx);
                         })),
                 )
             });

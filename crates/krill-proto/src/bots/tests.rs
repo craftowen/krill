@@ -3299,3 +3299,41 @@ fn create_and_update_item_preserve_n_minus_1_wire_layout_and_roundtrip_waiting_r
         );
     }
 }
+
+#[test]
+fn v040_clear_group_thread_and_answer_with_options_wire_roundtrip() {
+    let clear_req = BotRpcRequest::ClearGroupThread {
+        group_id: "grp-1".to_owned(),
+        thread_id: Some("thr-1".to_owned()),
+    };
+    assert!(!clear_req.is_read_only());
+
+    let answer_opt_req = BotRpcRequest::AnswerBotItemWithOptions {
+        item_id: "item-1".to_owned(),
+        answer_text: Some("Q1? → Yes".to_owned()),
+        option_index: None,
+        decision_id: None,
+        request_id: Some("req-1".to_owned()),
+        skip_remaining: true,
+    };
+    assert!(!answer_opt_req.is_read_only());
+
+    for req in [
+        clear_req.clone(),
+        answer_opt_req.clone(),
+        BotRpcRequest::WithCapabilities {
+            capabilities: vec![DESKTOP_BOT_CAPABILITIES[0].to_owned()],
+            request: Box::new(clear_req),
+        },
+        BotRpcRequest::WithCapabilities {
+            capabilities: vec![DESKTOP_BOT_CAPABILITIES[0].to_owned()],
+            request: Box::new(answer_opt_req),
+        },
+    ] {
+        let frame = req.encode().unwrap();
+        let (kind, body) = crate::ipc::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(BotRpcRequest::decode(kind, &body).unwrap(), req);
+    }
+}
