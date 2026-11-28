@@ -1038,6 +1038,12 @@ enum Action {
         #[serde(default)]
         title: Option<String>,
     },
+    #[serde(rename = "bots.groups.clear")]
+    BotsGroupsClear {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+    },
     #[serde(rename = "bots.groups.stop")]
     BotsGroupsStop {
         group_id: String,
@@ -2860,6 +2866,9 @@ impl Backend {
                         "message": to_value(message)?,
                         "dispatched_bots": to_value(dispatched_bots)?,
                     })),
+                    krill_proto::bots::BotRpcResponse::GroupRoom(room) => {
+                        bound_group_view_payload(json!({"cleared": true, "group": to_value(room)?}))
+                    }
                     _ => Err(invalid()),
                 }
             }
@@ -2879,6 +2888,23 @@ impl Backend {
                         bound_group_view_payload(json!({"group": to_value(view)?}))
                     }
                     krill_proto::bots::BotRpcResponse::Ok => Ok(json!({"created": true})),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsGroupsClear {
+                group_id,
+                thread_id,
+            } => {
+                self.ensure_bots_active()?;
+                let group_id = validate_bot_token(&group_id, 128)?;
+                let thread_id = validate_opt_bot_token(thread_id.as_deref(), 128)?;
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ClearGroupThread {
+                    group_id,
+                    thread_id,
+                })? {
+                    krill_proto::bots::BotRpcResponse::GroupRoom(room) => {
+                        bound_group_view_payload(json!({"cleared": true, "group": to_value(room)?}))
+                    }
                     _ => Err(invalid()),
                 }
             }
@@ -7304,6 +7330,7 @@ mod revision_tests {
             r#"{"action":"bots.groups.create","name":"Team","bot_ids":["b1"]}"#,
             r#"{"action":"bots.groups.send","group_id":"grp-1","text":"hi"}"#,
             r#"{"action":"bots.groups.new_thread","group_id":"grp-1"}"#,
+            r#"{"action":"bots.groups.clear","group_id":"grp-1"}"#,
             r#"{"action":"bots.groups.stop","group_id":"grp-1"}"#,
             r#"{"action":"bots.look_around","bot_id":"b1"}"#,
             r#"{"action":"bots.suggestions.dismiss","bot_id":"b1","suggestion_id":"sug-1"}"#,
@@ -7880,6 +7907,38 @@ mod revision_tests {
         )
         .unwrap();
         assert_eq!(grp_stop["ok"], true, "{grp_stop}");
+        let grp_clear: Value = serde_json::from_str(
+            &backend.request(
+                &json!({"action": "bots.groups.clear", "group_id": grp_id, "thread_id": th_id})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(grp_clear["ok"], true, "{grp_clear}");
+        assert_eq!(grp_clear["data"]["cleared"], true, "{grp_clear}");
+        let cleared_tid = grp_clear["data"]["group"]["active_thread_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(cleared_tid, th_id);
+        let grp_send_clear: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.groups.send",
+                    "group_id": grp_id,
+                    "thread_id": cleared_tid,
+                    "text": "/clear"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(grp_send_clear["ok"], true, "{grp_send_clear}");
+        assert_eq!(grp_send_clear["data"]["cleared"], true, "{grp_send_clear}");
+        assert_ne!(
+            grp_send_clear["data"]["group"]["active_thread_id"].as_str(),
+            Some(cleared_tid.as_str())
+        );
 
         let sugs: Value = serde_json::from_str(
             &backend
@@ -8508,6 +8567,7 @@ mod revision_tests {
             r#"{"action":"bots.groups.read","group_id":"grp-1","thread_id":"thr-1","limit":20}"#,
             r#"{"action":"bots.groups.send","group_id":"grp-1","text":"@b1 hello","reply_mode":"mentions"}"#,
             r#"{"action":"bots.groups.new_thread","group_id":"grp-1","title":"Triage"}"#,
+            r#"{"action":"bots.groups.clear","group_id":"grp-1","thread_id":"thr-1"}"#,
             r#"{"action":"bots.groups.stop","group_id":"grp-1"}"#,
             r#"{"action":"bots.look_around","bot_id":"b1"}"#,
             r#"{"action":"bots.suggestions.list","bot_id":"b1","include_dismissed":false}"#,

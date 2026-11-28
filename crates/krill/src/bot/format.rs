@@ -8,8 +8,8 @@ use krill_proto::bots::catalog::{BotMcpAppCatalogEntry, BotTemplate, ComposioApp
 use krill_proto::bots::home::{count_memory_lines, parse_memory_facts};
 use krill_proto::bots::{
     BotAccessRequest, BotConfig, BotConnectorStatus, BotConnectorTestResult, BotGroupChat,
-    BotGroupMessage, BotGroupView, BotId, BotItem, BotItemActor, BotItemLink, BotItemsPage,
-    BotMcpOAuthState, BotMcpToolConfig, BotMemoryHistoryEntry, BotMemoryTidyStatus,
+    BotGroupMessage, BotGroupRoomView, BotGroupView, BotId, BotItem, BotItemActor, BotItemLink,
+    BotItemsPage, BotMcpOAuthState, BotMcpToolConfig, BotMemoryHistoryEntry, BotMemoryTidyStatus,
     BotMemoryTopicInfo, BotScheduleConfig, BotSessionSummary, BotSuggestion, BotToolRelayStatus,
     ComposioConnectionInfo, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
     ExternalSource,
@@ -1382,6 +1382,23 @@ pub(crate) fn format_group_message_posted(
         message.message_id,
         message.thread_id,
         dispatched.join(", ")
+    ))
+}
+
+pub(crate) fn format_group_cleared(
+    room: &BotGroupRoomView,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "cleared": true,
+            "group": room,
+        }));
+    }
+    let tid = room.active_thread_id.as_deref().unwrap_or("(none)");
+    Ok(format!(
+        "cleared group {} (new thread {})",
+        room.group.id, tid
     ))
 }
 

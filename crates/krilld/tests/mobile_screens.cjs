@@ -3766,10 +3766,20 @@ async function v040Pr1MobileRegressions(){
      active_run:activeRun,
     },
    });
-   if(req.action==='bots.groups.new_thread')return Promise.resolve({
+   if(req.action==='bots.groups.clear')return Promise.resolve({
+    cleared:true,
     group:{
      group:{id:'g1',name:'Team',bot_ids:['b1']},
      threads:[{thread_id:'t3',title:'New thread'},{thread_id:'t1',title:'Main thread'}],
+     active_thread_id:'t3',
+     messages:[],
+     active_turns:[],
+    },
+   });
+   if(req.action==='bots.groups.new_thread')return Promise.resolve({
+    group:{
+     group:{id:'g1',name:'Team',bot_ids:['b1']},
+     threads:[{thread_id:'t4',title:'New thread'},{thread_id:'t1',title:'Main thread'}],
      messages:[],
      active_run:false,
     },
@@ -3798,14 +3808,24 @@ async function v040Pr1MobileRegressions(){
   stopDeferred.resolve({ok:true});
   await pStop;
   await bf.flush();
-  // MPWA-12: typing /clear in group chat calls bots.groups.new_thread instead of posting literal /clear.
+  // MPWA-12: typing /clear in group chat calls bots.groups.clear (backed by ClearGroupThread) instead of posting literal /clear.
   const ta=bf.all().find(n=>n.tagName==='TEXTAREA');
   ta.value='/clear';
   const sendBtn=bf.byText(i18nBox.KrillMobile.i18n.t('Send'));
   await sendBtn.action();
   await bf.flush();
-  assert(calls.some(c=>c.action==='bots.groups.new_thread'),'MPWA-12: /clear routes to bots.groups.new_thread');
+  assert(calls.some(c=>c.action==='bots.groups.clear'&&c.group_id==='g1'),'MPWA-12: /clear routes to bots.groups.clear');
   assert(!calls.some(c=>c.action==='bots.groups.send'&&c.text==='/clear'),'MPWA-12: literal /clear is never posted as a group message');
+  // Legacy daemon fallback: when bots.groups.clear rejects as invalid/unknown action, falls back to bots.groups.new_thread.
+  const prevRpc=bf.ctx.rpcForHost;
+  bf.ctx.rpcForHost=(hid,req)=>{
+   if(req.action==='bots.groups.clear'){calls.push(req);return Promise.reject(new Error('invalid mobile action'));}
+   return prevRpc(hid,req);
+  };
+  ta.value='/clear';
+  await sendBtn.action();
+  await bf.flush();
+  assert(calls.some(c=>c.action==='bots.groups.new_thread'),'MPWA-12: legacy daemon falls back to bots.groups.new_thread');
   bf.abort.abort();
  }
 

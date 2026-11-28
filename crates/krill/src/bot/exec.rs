@@ -1136,14 +1136,14 @@ where
                 text,
                 reply_mode,
             })?;
-            let BotRpcResponse::GroupMessagePosted {
-                message,
-                dispatched_bots,
-            } = resp
-            else {
-                return Err(CliError::fail("unexpected reply for SendGroupMessage"));
-            };
-            format::format_group_message_posted(&message, &dispatched_bots, json)
+            match resp {
+                BotRpcResponse::GroupMessagePosted {
+                    message,
+                    dispatched_bots,
+                } => format::format_group_message_posted(&message, &dispatched_bots, json),
+                BotRpcResponse::GroupRoom(room) => format::format_group_cleared(&room, json),
+                _ => Err(CliError::fail("unexpected reply for SendGroupMessage")),
+            }
         }
         BotCommand::GroupsStop {
             group_id,

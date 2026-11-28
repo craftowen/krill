@@ -502,10 +502,11 @@ button.account-row:disabled{opacity:1}
 /* Stays visible while typing: the photo and model controls must remain reachable. Only the status text gives way. */
 .chat-status-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;min-height:38px;padding-inline:0;color:var(--muted-foreground);font-size:var(--font-meta)}
 .composer-leading{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
-.chat-status{flex:0 1 auto;display:flex;align-items:center;gap:var(--space-xs);min-width:0;overflow:hidden;white-space:nowrap}
-.chat-status>.badge{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.chat-status{flex:none;display:flex;align-items:center;gap:var(--space-xs);min-width:0;max-width:100%;padding:0 4px;overflow:hidden;white-space:nowrap;color:var(--muted-foreground);font-size:var(--font-meta)}
+.chat-status>.badge{flex:none}
 .chat-live-text{min-width:0;overflow:hidden;text-overflow:ellipsis}
 #mobile-app .composer-pill{position:relative;display:inline-flex;align-items:center;gap:6px;flex:0 1 auto;max-width:100%;min-width:0;height:38px;min-height:38px;padding:0 14px;border:0;border-radius:var(--radius-pill);background:var(--composer-control);color:var(--foreground);font-size:var(--font-meta);font-weight:500;text-align:start}
+@media(max-width:430px){.chat-status-row,.composer-leading{gap:6px}#mobile-app .composer-pill{padding:0 11px;gap:5px}}
 #mobile-app .composer-leading>.composer-icon{position:relative;display:grid;place-items:center;flex:none;width:38px;height:38px;min-width:38px;min-height:38px;padding:0;border:0;border-radius:50%;background:var(--composer-control);color:var(--foreground)}
 #mobile-app .composer-leading>.composer-icon svg{width:18px;height:18px}
 #mobile-app .composer-leading>:is(.composer-icon,.composer-pill):disabled{opacity:.45}
@@ -786,7 +787,7 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 
 .chat-question{border-left-color:var(--border)}.chat-question[data-live-question=true]{border-left-color:var(--status-waiting)}.chat-past-question>summary{min-height:var(--touch-target);padding:var(--space-sm) 0;color:var(--muted-foreground);font-size:var(--font-meta);cursor:pointer;overflow-wrap:anywhere}.chat-question[data-live-question=true] .chat-past-question>summary{color:var(--status-waiting);font-weight:600}.chat-past-question-body{display:flex;flex-direction:column;gap:var(--space-sm);padding-top:var(--space-sm)}.chat-past-question-body>[data-error=true]{color:var(--status-blocked)}
 
-.composer-model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.composer-model-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .composer-model-effort{flex:none;color:var(--muted-foreground);font-weight:500;white-space:nowrap}
 #mobile-app .composer-context{position:relative;display:grid;place-items:center;flex:none;width:32px;height:32px;min-width:32px;min-height:32px;padding:0;border-radius:50%;color:var(--muted-foreground);background:transparent}
 #mobile-app .composer-context>svg{width:16px;height:16px}

@@ -1876,6 +1876,14 @@ impl BotsManager {
                 text,
                 reply_mode,
             } => {
+                if caller_bot.is_none() && text.trim().eq_ignore_ascii_case("/clear") {
+                    return self.handle_clear_group_thread(
+                        registry,
+                        &group_id,
+                        thread_id.as_deref(),
+                        ts,
+                    );
+                }
                 let effective_sender = if sender.trim().is_empty() {
                     caller_bot.as_ref().map_or("", |(bid, _)| bid.as_str())
                 } else {
@@ -1959,6 +1967,14 @@ impl BotsManager {
                 text,
                 audience,
             } => {
+                if caller_bot.is_none() && text.trim().eq_ignore_ascii_case("/clear") {
+                    return self.handle_clear_group_thread(
+                        registry,
+                        &group_id,
+                        thread_id.as_deref(),
+                        ts,
+                    );
+                }
                 let effective_sender = if sender.trim().is_empty() {
                     caller_bot.as_ref().map_or("", |(bid, _)| bid.as_str())
                 } else {
@@ -2008,25 +2024,7 @@ impl BotsManager {
             BotRpcRequest::ClearGroupThread {
                 group_id,
                 thread_id,
-            } => match self.groups.clear_group_thread(
-                &self.store,
-                &group_id,
-                thread_id.as_deref(),
-                ts,
-            ) {
-                Ok((cleared_tid, room)) => {
-                    if let Some(tid) = cleared_tid {
-                        self.runtime.stop_sessions_for_group(
-                            registry,
-                            &self.tool_relay,
-                            &group_id,
-                            Some(&tid),
-                        );
-                    }
-                    BotRpcResponse::GroupRoom(room)
-                }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            } => self.handle_clear_group_thread(registry, &group_id, thread_id.as_deref(), ts),
             BotRpcRequest::SendBotMail {
                 from,
                 to_bot,
@@ -2608,6 +2606,32 @@ impl BotsManager {
         }
     }
 
+    fn handle_clear_group_thread(
+        &self,
+        registry: &Registry,
+        group_id: &str,
+        thread_id: Option<&str>,
+        ts: u64,
+    ) -> BotRpcResponse {
+        match self
+            .groups
+            .clear_group_thread(&self.store, group_id, thread_id, ts)
+        {
+            Ok((cleared_tid, room)) => {
+                if let Some(tid) = cleared_tid {
+                    self.runtime.stop_sessions_for_group(
+                        registry,
+                        &self.tool_relay,
+                        group_id,
+                        Some(&tid),
+                    );
+                }
+                BotRpcResponse::GroupRoom(room)
+            }
+            Err(err) => BotRpcResponse::Error(err.to_string()),
+        }
+    }
+
     fn execute_group_dispatch(
         &self,
         registry: &Registry,
@@ -3039,11 +3063,20 @@ fn authorize_bot_session_rpc(
         BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
         BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
         BotRpcRequest::SendGroupMessage {
-            group_id, sender, ..
+            group_id,
+            sender,
+            text,
+            ..
         }
         | BotRpcRequest::SendGroupMessageWithAudience {
-            group_id, sender, ..
+            group_id,
+            sender,
+            text,
+            ..
         } => {
+            if text.trim().eq_ignore_ascii_case("/clear") {
+                return deny("owner-only bot RPC");
+            }
             let group = store
                 .get_group(group_id)
                 .map_err(|e| e.to_string())?
@@ -6897,6 +6930,118 @@ mod tests {
             matches!(bad, BotRpcResponse::Error(_)),
             "opencode with effort=high must fail validation, got {bad:?}"
         );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn send_group_message_slash_clear_clears_thread_instead_of_posting_literal() {
+        let state = temp_state("group-send-clear");
+        let reg = Arc::new(Registry::new(None, Some(state.as_path())));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        let BotRpcResponse::Bot(bot) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Reviewer".to_owned(),
+                description: String::new(),
+                agent_id: "claude".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) else {
+            panic!("expected BotRpcResponse::Bot");
+        };
+        let BotRpcResponse::Group(group) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateGroup {
+                name: "Team".to_owned(),
+                bot_ids: vec![bot.id.clone()],
+                description: String::new(),
+            },
+        ) else {
+            panic!("expected BotRpcResponse::Group");
+        };
+
+        let posted = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::SendGroupMessage {
+                group_id: group.id.clone(),
+                thread_id: None,
+                sender: "owner".to_owned(),
+                text: "Hello before clear".to_owned(),
+                reply_mode: Some(krill_proto::bots::BotGroupReplyMode::Mentions),
+            },
+        );
+        let BotRpcResponse::GroupMessagePosted { message, .. } = posted else {
+            panic!("expected GroupMessagePosted, got {posted:?}");
+        };
+        let old_tid = message.thread_id;
+
+        // Owner sending `/clear` (case-insensitive, trimmed) via SendGroupMessage clears the thread.
+        let cleared = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::SendGroupMessage {
+                group_id: group.id.clone(),
+                thread_id: Some(old_tid.clone()),
+                sender: "owner".to_owned(),
+                text: "  /CLEAR  ".to_owned(),
+                reply_mode: None,
+            },
+        );
+        let BotRpcResponse::GroupRoom(room) = cleared else {
+            panic!("expected GroupRoom on /clear, got {cleared:?}");
+        };
+        assert_ne!(room.active_thread_id.as_deref(), Some(old_tid.as_str()));
+        assert!(room.messages.is_empty());
+
+        // Old thread must NOT contain a literal "/clear" message.
+        let old_view = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ReadGroup {
+                group_id: group.id.clone(),
+                thread_id: Some(old_tid),
+                limit: Some(20),
+            },
+        );
+        let BotRpcResponse::GroupView(view) = old_view else {
+            panic!("expected GroupView, got {old_view:?}");
+        };
+        assert!(
+            !view
+                .messages
+                .iter()
+                .any(|m| m.body.trim().eq_ignore_ascii_case("/clear")),
+            "literal /clear must not be posted: {:?}",
+            view.messages
+        );
+
+        // SendGroupMessageWithAudience also intercepts `/clear` for owner callers.
+        let prev_tid = room.active_thread_id.clone();
+        let cleared_aud = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::SendGroupMessageWithAudience {
+                group_id: group.id.clone(),
+                thread_id: prev_tid.clone(),
+                sender: "owner".to_owned(),
+                text: "/clear".to_owned(),
+                audience: krill_proto::bots::BotGroupReplyAudience::Mentions,
+            },
+        );
+        let BotRpcResponse::GroupRoom(room2) = cleared_aud else {
+            panic!(
+                "expected GroupRoom on SendGroupMessageWithAudience /clear, got {cleared_aud:?}"
+            );
+        };
+        assert_ne!(room2.active_thread_id, prev_tid);
+        assert!(room2.messages.is_empty());
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();
