@@ -126,7 +126,9 @@ fn tick(reg: &Registry, watch: Option<&ExitWatch>, tracked: &mut BTreeMap<Sessio
         };
         let idle_composer = matches!(
             status.state,
-            krill_proto::control::AgentState::Waiting | krill_proto::control::AgentState::Blocked
+            krill_proto::control::AgentState::Waiting
+                | krill_proto::control::AgentState::Blocked
+                | krill_proto::control::AgentState::Working
         ) && tap.is_idle_composer(&status.agent);
         let evidence = t.detector.observe_with_composer(
             title,

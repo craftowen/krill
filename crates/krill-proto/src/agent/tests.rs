@@ -160,6 +160,32 @@ fn profile_env_roundtrips_and_is_omitted_when_empty() {
 }
 
 #[test]
+fn interrupt_sequence_uses_esc_for_tui_agents_and_ctrl_c_for_shells() {
+    for agent in [
+        "agy",
+        "antigravity",
+        "Antigravity",
+        "claude",
+        "claude-code",
+        "openclaude",
+        "codex",
+        "opencode",
+        "opencode2",
+        "pi",
+        "omp",
+        "cursor",
+        "cursor-agent",
+        "gemini",
+        "Gemini",
+    ] {
+        assert_eq!(interrupt_sequence(agent), b"\x1b", "agent={agent}");
+    }
+    for shell in ["", "zsh", "bash", "fish", "sh", "unknown"] {
+        assert_eq!(interrupt_sequence(shell), b"\x03", "shell={shell}");
+    }
+}
+
+#[test]
 fn env_lines_parse_and_reject_bad_rows() {
     let env = parse_env_lines("A=1\n\n  B = two words \nC=").unwrap();
     assert_eq!(env["A"], "1");

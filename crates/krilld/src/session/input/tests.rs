@@ -226,8 +226,22 @@ fn lone_esc_expires_after_grace_and_does_not_block_interrupt_or_guarded_commands
     thread::sleep(Duration::from_millis(270));
 
     // Mobile Stop (write_interrupt) must succeed after lone Esc instead of staying wedged.
-    assert!(write_interrupt(&tap, || true).expect("write_interrupt after lone Esc"));
+    assert!(write_interrupt(&tap, b"\x03", || true).expect("write_interrupt after lone Esc"));
     assert_eq!(read_until(&mut user, 1), b"\x03");
+
+    // Standalone Esc interrupt clears PasteGuard matched immediately so rapid follow-up cancel
+    // or guarded_enter within 50ms is never dropped.
+    assert!(write_interrupt(&tap, b"\x1b", || true).expect("first Esc interrupt"));
+    assert_eq!(read_until(&mut user, 1), b"\x1b");
+    assert_eq!(lock(&tap.0.input).matched, 0);
+    assert!(lock(&tap.0.input).matched_at.is_none());
+    assert!(write_interrupt(&tap, b"\x1b", || true).expect("rapid second Esc interrupt"));
+    assert_eq!(read_until(&mut user, 1), b"\x1b");
+    assert!(
+        guarded_enter(&tap, |s| text(s).contains("EMPTY"))
+            .expect("guarded_enter after Esc interrupt")
+    );
+    assert_eq!(read_until(&mut user, 1), b"\r");
 
     // Another lone Esc followed by grace expiry must not block guarded_enter.
     write_input(&tap, b"\x1b", None).expect("write second lone Esc");

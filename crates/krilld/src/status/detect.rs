@@ -15,13 +15,16 @@ pub const QUIET: Duration = Duration::from_millis(300);
 /// 대화상자를 한 번도 못 본 Claude hook waiting을 떠도는 hook으로 보는 유예. 실제 대화상자는 이 안에 그려진다.
 pub const STRAY_WAITING: Duration = Duration::from_secs(5);
 
+/// hook `Working` 상태에서 스피너·진행 표시 없이 빈 컴포저로 정지해 있으면 누락된 `Stop` 훅(예: `agy` `Esc` 취소)으로 보는 유예.
+pub const STRAY_WORKING: Duration = Duration::from_secs(3);
+
 /// 제목·화면으로 얻은 상태. 프로세스 종료와 hook은 별도 경로다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Evidence {
     pub state: AgentState,
     pub source: Source,
     pub confidence: Confidence,
-    /// 같은 hook waiting 동안 실제 대화상자를 봤고, 그 뒤 프롬프트 복귀를 확인했다.
+    /// 같은 hook 상태 동안 화면 복귀(대화상자 소실 또는 `Esc` 중단·빈 컴포저 복귀)를 확인했다.
     pub(crate) dismissed_since: Option<u64>,
 }
 
@@ -42,6 +45,8 @@ pub struct Detector {
     dialog_waiting_since: Option<u64>,
     /// 대화상자 없이 관찰 중인 hook waiting(`since_unix_ns`)과 처음 본 시각.
     stray_waiting: Option<(u64, Instant)>,
+    /// hook `Working` 중 스피너·출력 변화 없이 빈 컴포저가 유지된 `(since_unix_ns, revision, first_seen)`.
+    idle_working: Option<(u64, u64, Instant)>,
     rules: ScreenRules,
 }
 
@@ -61,6 +66,7 @@ impl Detector {
             spinning_title: None,
             dialog_waiting_since: None,
             stray_waiting: None,
+            idle_working: None,
             rules,
         }
     }
@@ -183,6 +189,42 @@ impl Detector {
             self.dialog_waiting_since = None;
             self.stray_waiting = None;
         }
+        if status.state == AgentState::Working
+            && status.source == Some(Source::Hook)
+            && menu.is_none()
+            && title_state != Some(AgentState::Working)
+            && idle_composer
+            && !screen_shows_active_work(screen)
+        {
+            let is_agy = krill_proto::agent::canonical_id(&status.agent) == "agy";
+            if is_agy && quiet && has_agy_interrupted_marker(screen) {
+                self.idle_working = None;
+                return Some(Evidence {
+                    state: AgentState::Done,
+                    source: Source::Screen,
+                    confidence: Confidence::Low,
+                    dismissed_since: Some(status.since_unix_ns),
+                });
+            }
+            let first = match self.idle_working {
+                Some((since, rev, at)) if since == status.since_unix_ns && rev == revision => at,
+                _ => {
+                    self.idle_working = Some((status.since_unix_ns, revision, now));
+                    now
+                }
+            };
+            if quiet && now.saturating_duration_since(first) >= STRAY_WORKING {
+                self.idle_working = None;
+                return Some(Evidence {
+                    state: AgentState::Done,
+                    source: Source::Screen,
+                    confidence: Confidence::Low,
+                    dismissed_since: Some(status.since_unix_ns),
+                });
+            }
+        } else {
+            self.idle_working = None;
+        }
         if matches!(status.state, AgentState::Waiting | AgentState::Blocked)
             && status.source == Some(Source::Screen)
             && !quiet
@@ -285,6 +327,40 @@ fn title_indicates_agent_waiting(title: &str) -> bool {
     ]
     .iter()
     .any(|agent| lower.contains(agent))
+}
+
+fn has_agy_interrupted_marker(screen: &str) -> bool {
+    screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(12)
+        .any(|line| {
+            line.contains("What should Antigravity CLI do instead?")
+                || (line.contains("Interrupted") && line.contains('⎿'))
+        })
+}
+
+fn screen_shows_active_work(screen: &str) -> bool {
+    screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(12)
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("esc to interrupt")
+                || lower.contains("esc to cancel")
+                || line.contains("• Working")
+                || line.contains("Generating...")
+                || line.contains("Thinking...")
+                || line
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+        })
 }
 
 #[cfg(test)]

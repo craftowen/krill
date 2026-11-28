@@ -5003,14 +5003,14 @@ async function agyStartupAndModelApplyUx() {
   });
   await flush();
   assert(
-    suggestions
+    !suggestions
       .descendants()
       .some(
         (n) =>
           n.textContent ===
           "Antigravity also saves this as the default for new sessions.",
       ),
-    "provider note is surfaced in picker header",
+    "P0-3: static normal-state provider note is omitted when models are available",
   );
   const options = suggestions
     .descendants()
@@ -5038,9 +5038,21 @@ async function agyStartupAndModelApplyUx() {
     "Gemini 4 Carbon",
     "unconfirmed target model is never optimistically shown on composer pill",
   );
+  assert.equal(
+    suggestions.dataset.pending,
+    "true",
+    "in-flight model change marks sheet pending while preserving options list",
+  );
   assert(
-    suggestions.descendants().some((n) => n.textContent === "Applying…"),
-    "in-flight model change shows Applying… feedback",
+    suggestions
+      .descendants()
+      .some(
+        (n) =>
+          n.attrs?.role === "option" &&
+          n.dataset?.pending === "true" &&
+          n.descendants().some((c) => c.textContent === "Gemini 4 Argon"),
+      ),
+    "chosen model row shows optimistic pending/selected state while in flight",
   );
   setModelDeferred.resolve({
     applied: true,
@@ -5050,8 +5062,12 @@ async function agyStartupAndModelApplyUx() {
     effort: "high",
   });
   await flush();
-  assert.equal(suggestions.hidden, true);
-  assert.equal(suggestions.dataset.kind, undefined);
+  assert.equal(
+    suggestions.hidden,
+    false,
+    "P0-3: sheet stays open after model switch so effort can be adjusted immediately",
+  );
+  assert.equal(suggestions.dataset.kind, "models");
   assert.equal(modelName.textContent, "Gemini 4 Argon");
   assert.equal(
     effortLabel.hidden,
@@ -5061,6 +5077,10 @@ async function agyStartupAndModelApplyUx() {
   assert.equal(effortLabel.textContent, "High");
   assert.equal(effortLabel.dataset.effort, "high");
   assert.equal(pill.dataset.applied, "true");
+  // Closing sheet via Escape works cleanly after model apply.
+  key(f, "Escape");
+  assert.equal(suggestions.hidden, true);
+  assert.equal(suggestions.dataset.kind, undefined);
   f.dispose();
   // Jump-to-latest button stays hidden while following live items and reveals when scrolled up
   {
@@ -5874,7 +5894,8 @@ async function unboundEmptyAndVisibilityTransitions() {
     await flush();
     const qInput = p2b
       .find("chat-question-options")
-      .parentElement.children.find((n) => n.tag === "input");
+      .parentElement.descendants()
+      .find((n) => n.tag === "input");
     assert.equal(qInput.hidden, false);
     qInput.value = "Canary 10%";
     qInput.dispatchEvent(new Event("input"));
@@ -6128,18 +6149,24 @@ async function unboundEmptyAndVisibilityTransitions() {
     fx.update();
     await flush();
     assert.equal(
-      fx.find("chat-input").value,
+      fx.entry.queuedPrompts[0].text,
       "queued with photo",
-      "failed queued prompt restores text to composer draft when draft is empty",
+      "MPWA-14: failed queued prompt stays at head of queue (FIFO preserved)",
     );
-    assert.equal(fx.state.drafts.get(7), "queued with photo");
-    assert.equal(fx.entry.attachments.length, 1);
-    assert.equal(fx.entry.attachments[0].prepared.data, "q-shot.png");
+    assert.equal(fx.entry.queuedPrompts[1].text, "second queued");
+    assert.equal(fx.entry.queuePaused, true);
     assert.equal(
       fx.calls.filter((c) => c.action === "prompt").length,
       1,
       "second queued item must wait when first fails instead of jumping ahead",
     );
+    // Tapping Edit on failed head restores its text + photo into composer draft.
+    fx.button("Edit").action();
+    await flush();
+    assert.equal(fx.find("chat-input").value, "queued with photo");
+    assert.equal(fx.state.drafts.get(7), "queued with photo");
+    assert.equal(fx.entry.attachments.length, 1);
+    assert.equal(fx.entry.attachments[0].prepared.data, "q-shot.png");
 
     // Case 2: if user already typed a new draft, failed queued prompt returns to head of queue with Retry
     fx.button("Remove queued").action();
@@ -6147,7 +6174,7 @@ async function unboundEmptyAndVisibilityTransitions() {
     fx.state.sessions.set(7, { id: 7, state: "Working", state_since_unix_ns: "3", cwd: "/work" });
     fx.update();
     await flush();
-    // Composer still holds "queued with photo" + photo; clear photo and queue a text prompt, then type a new draft
+    // Clear photo and queue a text prompt, then type a new draft
     fx.entry.attachments = [];
     fx.entry.photo = null;
     fx.input("queued kept behind draft");
@@ -6864,6 +6891,255 @@ async function unboundEmptyAndVisibilityTransitions() {
       fMob.dispose();
       assert.equal(voiceCleaned, 1, "MOB-04: chat unmount cleans up voiceCtl");
       console.log("PASS MOB-02/MOB-04/MOB-07/MOB-16 chat voice insert, unmount cleanup, model blur & search IME guard");
+    }
+
+    // PR-1 v0.4.0 regressions: P0-1 Stop cooldown re-enable, P0-2 /clear 1st-Enter & queue purge,
+    // P0-3 Claude no-effort-in-set_model + error preserves list, MPWA-07 gapped push, MPWA-08 scroll,
+    // MPWA-10 TUI-only live_prompt & allows_other, MPWA-13 file:// chips, MPWA-14 FIFO queue, MPWA-15 att.error, MPWA-16 table \|.
+    {
+      // P0-1: Stop cooldown re-enables after 1.8s while still Working so stuck turns can be interrupted again.
+      let nowStop = 50000;
+      const p01 = fixture({
+        Date: { now: () => nowStop },
+        capabilities: { chat_interrupt: true },
+        handler: async (req) =>
+          req.action === "interrupt"
+            ? { interrupted: true }
+            : { generation: "g-p01", agent: "agy", bound: true, items: [], next_offset: req.offset || 0 },
+      });
+      await flush();
+      p01.state.sessions.set(7, { id: 7, state: "Working", state_since_unix_ns: "9001", cwd: "/work" });
+      p01.update();
+      await flush();
+      const sb = p01.find("primary composer-send");
+      assert.equal(sb.dataset.mode, "stop");
+      sb.dispatchEvent(new Event("click"));
+      await flush();
+      assert.equal(p01.calls.filter((c) => c.action === "interrupt").length, 1);
+      assert.equal(sb.disabled, true, "P0-1: Stop disabled during 1.8s cooldown");
+      nowStop += 1850;
+      const cdTimer = [...p01.timers.entries()].find(([, fn]) => fn.ms === 1800);
+      if (cdTimer) {
+        p01.timers.delete(cdTimer[0]);
+        cdTimer[1]();
+      } else {
+        p01.update();
+      }
+      await flush();
+      assert.equal(sb.disabled, false, "P0-1: Stop re-enables after cooldown expires while still Working");
+      sb.dispatchEvent(new Event("click"));
+      await flush();
+      assert.equal(p01.calls.filter((c) => c.action === "interrupt").length, 2, "P0-1: second Stop fires after cooldown");
+      p01.dispose();
+
+      // P0-2: /clear executes on 1st Enter even with suggestions open, empty No matches doesn't block submit, and cleared purges queue.
+      const p02 = fixture({
+        capabilities: { command_catalog: true, chat_tail: true },
+        handler: async (req) => {
+          if (req.action === "command_catalog")
+            return { items: [{ name: "clear", text: "/clear", kind: "Command", scope: "Built-in", description: "Clear the conversation and start fresh" }] };
+          if (req.action === "prompt")
+            return { sent: true, cleared: req.text.trim() === "/clear" };
+          return { generation: "g-p02", agent: "codex", bound: true, items: [{ id: "u1", kind: "user", text: "old" }], next_offset: 10 };
+        },
+      });
+      await flush();
+      p02.entry.queuedPrompts = [{ id: 1, text: "queued before clear", attachments: [] }];
+      p02.entry.queuePaused = true;
+      p02.entry.questionDraft = { identity: "q1", selected: [0] };
+      p02.input("/clear");
+      await flush();
+      key(p02, "Enter");
+      await flush();
+      assert(
+        p02.calls.some((c) => c.action === "prompt" && c.text === "/clear"),
+        "P0-2: 1st Enter on /clear submits immediately",
+      );
+      assert.equal(p02.entry.queuedPrompts.length, 0, "P0-2: cleared purges queuedPrompts");
+      assert.equal(p02.entry.queuePaused, false, "P0-2: cleared resets queuePaused");
+      assert.equal(p02.entry.questionDraft, null, "P0-2: cleared resets questionDraft");
+      // Empty No matches popover must not block normal slash submit.
+      p02.input("/unknowncmd");
+      await flush();
+      p02.submit();
+      await flush();
+      assert(
+        p02.calls.some((c) => c.action === "prompt" && c.text === "/unknowncmd"),
+        "P0-2: empty No matches popover never blocks form submit",
+      );
+      p02.dispose();
+
+      // P0-3: Claude set_model never includes effort; inline error preserves model list.
+      const p03 = fixture({
+        capabilities: { chat_composer: true, composer_models: true, model_set: true },
+        handler: async (req) => {
+          if (req.action === "chat_composer")
+            return { agent: "claude", model: "claude-opus-5-5", model_label: "Opus 5.5", effort: "high", effort_supported: true, efforts: ["low", "medium", "high", "max"], models: [] };
+          if (req.action === "composer_models")
+            return { supported: true, current: "opus", items: [{ id: "opus", label: "Opus 5.5" }, { id: "sonnet", label: "Sonnet 5.5" }] };
+          if (req.action === "set_model")
+            return { applied: false, reason: "Session busy" };
+          return { generation: "g-p03", agent: "claude", bound: true, items: [], next_offset: 0 };
+        },
+      });
+      await flush();
+      p03.find("composer-pill").action();
+      await flush();
+      const sonnetChip = p03.find("chat-composer-suggestions").descendants().find((n) => n.attrs?.role === "option" && n.descendants().some((c) => c.textContent === "Sonnet 5.5"));
+      assert(sonnetChip, "P0-3: Sonnet option rendered");
+      sonnetChip.click();
+      await flush();
+      const setModelCall = p03.calls.find((c) => c.action === "set_model");
+      assert.equal(setModelCall?.model, "sonnet");
+      assert.equal(Object.hasOwn(setModelCall || {}, "effort"), false, "P0-3: Claude set_model omits effort");
+      assert(
+        p03.find("chat-composer-suggestions").descendants().filter((n) => n.attrs?.role === "option").length >= 2,
+        "P0-3: inline error preserves model & effort list",
+      );
+      assert(
+        p03.find("chat-composer-suggestions").descendants().some((n) => n.textContent === "Session busy"),
+        "P0-3: inline error message shown",
+      );
+      p03.dispose();
+
+      // MPWA-07: gapped chat_delta (page_start > entry.offset) triggers pollNow instead of skipping.
+      let p07Polls = 0;
+      const p07 = fixture({
+        capabilities: { chat_tail: true, chat_push: true },
+        handler: async (req) => {
+          if (req.action === "chat_poll") {
+            p07Polls++;
+            return { generation: "g-p07", agent: "claude", bound: true, page_start: 0, next_offset: 100, items: [{ id: "m1", kind: "assistant", text: "first" }] };
+          }
+          return { subscribed: true };
+        },
+      });
+      await flush();
+      const beforePolls = p07Polls;
+      p07.M.chat.onPush({
+        push: "chat_delta",
+        session: 7,
+        data: {
+          generation: "g-p07",
+          agent: "claude",
+          bound: true,
+          page_start: 500,
+          next_offset: 600,
+          items: [{ id: "m3", kind: "assistant", text: "gapped" }],
+        },
+      });
+      await flush();
+      assert(p07Polls > beforePolls, "MPWA-07: gapped chat_delta triggers recovery poll");
+      assert(!p07.entry.items.some((it) => it.id === "m3"), "MPWA-07: gapped items are not blindly appended");
+      p07.dispose();
+
+      // MPWA-10: TUI-only live_prompt fallback card renders & replies even without a JSONL permission item.
+      const p10 = fixture({
+        capabilities: { chat_composer: true, live_prompt_reply: true },
+        handler: async (req) => {
+          if (req.action === "chat_composer")
+            return {
+              agent: "codex",
+              supported: true,
+              live_prompt: {
+                kind: "numbered_menu",
+                prompt: "Approve bash command?",
+                allows_other: true,
+                options: [{ label: "Allow once" }, { label: "Deny" }, { label: "Other" }],
+              },
+            };
+          if (req.action === "live_prompt_reply") return { ok: true };
+          return { generation: "g-p10", agent: "codex", bound: true, items: [{ id: "u1", kind: "user", text: "run" }], next_offset: 10 };
+        },
+      });
+      await flush();
+      const fallbackCard = p10.find("chat-feed").descendants().find((n) => n.dataset?.livePermission === "true");
+      assert(fallbackCard, "MPWA-10: TUI-only live_prompt renders fallback permission card");
+      const otherRow = fallbackCard.descendants().find((n) => n.className === "chat-other-row");
+      assert(otherRow, "MPWA-10: allows_other renders .chat-other-row on permission card");
+      const permIn = otherRow.descendants().find((n) => n.tag === "input");
+      const permSend = otherRow.descendants().find((n) => n.tag === "button");
+      permIn.value = "only ls";
+      permIn.dispatchEvent(new Event("input"));
+      permSend.click();
+      await flush();
+      const lpReply = p10.calls.find((c) => c.action === "live_prompt_reply");
+      assert.equal(lpReply?.custom_text, "only ls", "MPWA-10: permission allows_other sends custom_text");
+      p10.dispose();
+
+      // MPWA-13 & MPWA-16: file:// links render as safe chips; javascript:/data: stay inert; table cells respect \| and backticks.
+      const p13 = fixture({
+        capabilities: {},
+        handler: async () => ({
+          generation: "g-p13",
+          agent: "claude",
+          bound: true,
+          items: [
+            {
+              id: "m-file",
+              kind: "assistant",
+              text: "See [chat.js](file:///Users/me/chat.js#L10-L20) and [bad](javascript:alert(1)) and [d](data:text/html,x)\n\n| Col A | Col B |\n| --- | --- |\n| `a | b` | x \\| y |",
+            },
+          ],
+          next_offset: 100,
+        }),
+      });
+      await flush();
+      const feed13 = p13.find("chat-feed");
+      const fileChip = feed13.descendants().find((n) => n.className === "chat-file-chip");
+      assert(fileChip, "MPWA-13: file:// link renders .chat-file-chip");
+      assert.equal(fileChip.textContent, "chat.js#L10-L20");
+      assert(!feed13.descendants().some((n) => n.tag === "a"), "MPWA-13: javascript:/data: never render anchor tags");
+      const tds = feed13.descendants().filter((n) => n.tag === "td");
+      assert.equal(tds.length, 2, "MPWA-16: pipe inside backticks and escaped \\| keep 2 table cells");
+      p13.dispose();
+
+      // MPWA-14 & MPWA-15: failed queued head preserves FIFO order & att.error is surfaced.
+      let failFirst = true;
+      const p14 = fixture({
+        capabilities: { chat_interrupt: true },
+        photo: async () => { throw Error("Photo must be smaller than 20 MB"); },
+        handler: async (req) => {
+          if (req.action === "prompt") {
+            if (failFirst) { failFirst = false; throw Error("Temporary send error"); }
+            return { sent: true };
+          }
+          return { generation: "g-p14", agent: "claude", bound: true, items: [], next_offset: 0 };
+        },
+      });
+      await flush();
+      p14.state.sessions.set(7, { id: 7, state: "Working", state_since_unix_ns: "1", cwd: "/work" });
+      p14.update();
+      await flush();
+      p14.input("first queued");
+      p14.button("Queue").action();
+      p14.input("second queued");
+      p14.button("Queue").action();
+      assert.deepEqual([...p14.entry.queuedPrompts.map((q) => q.text)], ["first queued", "second queued"]);
+      p14.state.sessions.set(7, { id: 7, state: "Done", state_since_unix_ns: "2", cwd: "/work" });
+      p14.update();
+      await flush();
+      assert.equal(p14.entry.queuePaused, true, "MPWA-14: failed flush pauses queue");
+      assert.equal(p14.entry.queuedPrompts[0].text, "first queued", "MPWA-14: failed head stays at index 0 (FIFO preserved)");
+      assert.equal(p14.entry.queuedPrompts[1].text, "second queued");
+      // Removing second item while paused must NOT auto-flush first item.
+      const removeBtns = p14.find("chat-queued-strip").descendants().filter((n) => n.textContent === "Remove queued");
+      removeBtns[1].action();
+      await flush();
+      assert.equal(p14.entry.queuePaused, true, "MPWA-14: removing while paused keeps queuePaused true");
+      assert.equal(p14.entry.queuedPrompts.length, 1);
+      // MPWA-15: photo error displays specific att.error reason.
+      p14.prepare = async () => { throw Error("Photo must be smaller than 20 MB"); };
+      const fileIn = p14.root.descendants().find((n) => n.tag === "input" && n.type === "file");
+      fileIn.files = [{ name: "huge.png", size: 25 * 1024 * 1024 }];
+      fileIn.dispatchEvent(new Event("change"));
+      await flush();
+      assert(
+        p14.root.descendants().some((n) => String(n.textContent || "").includes("Photo must be smaller than 20 MB")),
+        "MPWA-15: specific att.error reason renders in attachment chip",
+      );
+      p14.dispose();
+      console.log("PASS PR-1 v0.4.0 mobile_chat regressions (P0-1, P0-2, P0-3, MPWA-07, MPWA-10, MPWA-13, MPWA-14, MPWA-15, MPWA-16)");
     }
   }
 }

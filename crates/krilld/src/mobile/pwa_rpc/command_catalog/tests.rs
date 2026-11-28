@@ -116,6 +116,17 @@ fn discovers_project_and_global_skills_commands_with_cli_invocation_and_preceden
             .any(|i| i["text"] == "/check" && i["scope"] == "Global")
     );
     assert_eq!(f.load("shell")["supported"], false);
+    for agent in ["claude", "codex", "agy", "cursor", "opencode", "pi"] {
+        let loaded = f.load(agent);
+        assert!(
+            loaded["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["text"] == "/clear" && i["scope"] == "Built-in"),
+            "/clear must be present for {agent}"
+        );
+    }
 }
 
 #[test]

@@ -716,3 +716,93 @@ fn dismissed_permission_dialog_with_placeholder_prompts_clears_waiting_for_claud
         .expect("Codex mid-turn with spinner must report Working, not Done");
     assert_eq!(mid_turn.state, AgentState::Working);
 }
+
+#[test]
+fn agy_esc_interrupted_and_quiet_idle_composer_recover_hook_working_without_regressing_spinner() {
+    let now = Instant::now();
+
+    // 1. Live agy 1.5.18 Esc interrupt prints `Interrupted · What should Antigravity CLI do instead?`
+    // and returns to idle `>` composer without emitting a Stop hook -> must transition Working -> Done.
+    let st = Statuses::open(None);
+    let mut detector = Detector::default();
+    let work = crate::status::tests::event(1, 100, "agy", r#"{"hook_event_name":"PreInvocation"}"#);
+    st.hook(&[(ID, &work)]).unwrap();
+    assert_eq!(
+        (st.get(ID).state, st.get(ID).source),
+        (AgentState::Working, Some(Source::Hook))
+    );
+
+    // While actively spinning (`⣷ Generating...` or Working title), stay Working even if idle_composer=true.
+    let spinning = "⣷ Generating...\n> ";
+    for at in [now, now + QUIET, now + STRAY_WORKING * 2] {
+        if let Some(e) = detector.observe_with_composer("", spinning, 1, &st.get(ID), at, true) {
+            st.inferred(ID, e, 110);
+        }
+        assert_eq!(st.get(ID).state, AgentState::Working);
+    }
+    let with_spinner_title = "  ⎿  Interrupted · What should Antigravity CLI do instead?\n> ";
+    for at in [now, now + QUIET, now + STRAY_WORKING * 2] {
+        if let Some(e) = detector.observe_with_composer(
+            "✦ Thinking (krill)",
+            with_spinner_title,
+            2,
+            &st.get(ID),
+            at,
+            true,
+        ) {
+            st.inferred(ID, e, 115);
+        }
+        assert_eq!(st.get(ID).state, AgentState::Working);
+    }
+
+    // Once Esc interrupts agy and screen settles for QUIET with idle composer, recover Hook Working -> Done.
+    let interrupted = "  ⎿  Interrupted · What should Antigravity CLI do instead?\n\
+                       ────────────────────────────────────────────────────────\n\
+                       > ";
+    assert!(
+        detector
+            .observe_with_composer("", interrupted, 3, &st.get(ID), now, true)
+            .is_none()
+    );
+    let recovered = detector
+        .observe_with_composer("", interrupted, 3, &st.get(ID), now + QUIET, true)
+        .expect("agy interrupted screen + idle composer must recover Hook Working");
+    assert_eq!(recovered.state, AgentState::Done);
+    assert_eq!(recovered.dismissed_since, Some(st.get(ID).since_unix_ns));
+    st.inferred(ID, recovered, 120);
+    assert_eq!(
+        (st.get(ID).state, st.get(ID).source),
+        (AgentState::Done, Some(Source::Screen))
+    );
+
+    // A newer Working hook must NOT be dismissed by stale evidence from an older turn.
+    let next_work =
+        crate::status::tests::event(2, 130, "agy", r#"{"hook_event_name":"PreInvocation"}"#);
+    st.hook(&[(ID, &next_work)]).unwrap();
+    assert_eq!(st.get(ID).state, AgentState::Working);
+    st.inferred(ID, recovered, 140);
+    assert_eq!(st.get(ID).state, AgentState::Working);
+
+    // 2. Missed Stop hook with plain idle composer and no spinner recovers after STRAY_WORKING grace.
+    let quiet_idle = "Answer finished.\n> ";
+    let base = now + Duration::from_secs(10);
+    assert!(
+        detector
+            .observe_with_composer("", quiet_idle, 4, &st.get(ID), base, true)
+            .is_none()
+    );
+    assert!(
+        detector
+            .observe_with_composer("", quiet_idle, 4, &st.get(ID), base + QUIET, true)
+            .is_none()
+    );
+    let after_grace = detector
+        .observe_with_composer("", quiet_idle, 4, &st.get(ID), base + STRAY_WORKING, true)
+        .expect(
+            "quiet idle composer without spinner must recover Hook Working after STRAY_WORKING",
+        );
+    assert_eq!(after_grace.state, AgentState::Done);
+    assert_eq!(after_grace.dismissed_since, Some(st.get(ID).since_unix_ns));
+    st.inferred(ID, after_grace, 150);
+    assert_eq!(st.get(ID).state, AgentState::Done);
+}

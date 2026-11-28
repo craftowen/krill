@@ -1017,6 +1017,8 @@ enum Action {
         #[serde(default)]
         thread_id: Option<String>,
         #[serde(default)]
+        before_message_id: Option<String>,
+        #[serde(default)]
         limit: Option<u32>,
     },
     #[serde(rename = "bots.groups.send")]
@@ -1041,6 +1043,14 @@ enum Action {
         group_id: String,
         #[serde(default)]
         thread_id: Option<String>,
+    },
+    #[serde(rename = "bots.groups.stop_member")]
+    BotsGroupsStopMember {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        #[serde(default)]
+        bot_id: Option<String>,
     },
     #[serde(rename = "bots.look_around")]
     BotsLookAround {
@@ -1697,34 +1707,40 @@ impl Backend {
                 } else {
                     None
                 };
-                let clear_cmd = if saved_paths.is_empty()
-                    && combined.trim().eq_ignore_ascii_case("/clear")
-                {
-                    let agent = self
-                        .registry
-                        .upgrade()
-                        .and_then(|reg| {
-                            let from_status = reg.mobile_session_status(SessionId(session))?.agent;
-                            if !from_status.is_empty() {
-                                return Some(from_status);
-                            }
-                            reg.session_agent_profile(SessionId(session))
-                        })
-                        .unwrap_or_default();
-                    let lower = agent.trim().to_ascii_lowercase();
-                    let cmd = if lower.contains("codex")
-                        || lower.contains("opencode")
-                        || lower.contains("omp")
-                        || lower == "pi"
-                    {
-                        "/new"
+                let clear_cmd = if saved_paths.is_empty() {
+                    let trimmed = combined.trim();
+                    let is_clear = trimmed.eq_ignore_ascii_case("/clear");
+                    let is_new = trimmed.eq_ignore_ascii_case("/new");
+                    if is_clear || is_new {
+                        let agent = self
+                            .registry
+                            .upgrade()
+                            .and_then(|reg| {
+                                let from_status =
+                                    reg.mobile_session_status(SessionId(session))?.agent;
+                                if !from_status.is_empty() {
+                                    return Some(from_status);
+                                }
+                                reg.session_agent_profile(SessionId(session))
+                            })
+                            .unwrap_or_default();
+                        let canon = krill_proto::agent::canonical_id(&agent);
+                        let lower = canon.to_ascii_lowercase();
+                        let uses_new =
+                            lower.contains("opencode") || lower == "omp" || lower == "pi";
+                        let is_codex = lower.contains("codex");
+                        if is_clear || uses_new || is_codex {
+                            // Live Codex 0.172.0 opens an interactive git worktree modal on `/new`
+                            // that swallows the next prompt, whereas `/clear` clears cleanly with
+                            // zero modal. Translate `/clear -> /new` ONLY for opencode/omp/pi.
+                            let cmd = if uses_new { "/new" } else { "/clear" };
+                            Some(cmd.to_owned())
+                        } else {
+                            None
+                        }
                     } else {
-                        "/clear"
-                    };
-                    if let Some(reg) = self.registry.upgrade() {
-                        reg.clear_chat_session(SessionId(session)).ok();
+                        None
                     }
-                    Some(cmd.to_owned())
                 } else {
                     None
                 };
@@ -1736,13 +1752,21 @@ impl Backend {
                     }
                 }
                 result?;
-                if let Some(baseline) = agy_steer_baseline {
-                    self.promote_agy_steer_if_queued(session, send_text, baseline);
-                }
-                if let Some(reg) = self.registry.upgrade()
-                    && let Some(bots) = reg.bots_if_initialized()
-                {
-                    bots.on_owner_prompt_submitted(SessionId(session), send_text);
+                if clear_cmd.is_some() {
+                    if let Some(reg) = self.registry.upgrade() {
+                        reg.clear_chat_session(SessionId(session)).ok();
+                    }
+                    feed::unsubscribe_chat(session);
+                    composer_status::invalidate_all();
+                } else {
+                    if let Some(baseline) = agy_steer_baseline {
+                        self.promote_agy_steer_if_queued(session, send_text, baseline);
+                    }
+                    if let Some(reg) = self.registry.upgrade()
+                        && let Some(bots) = reg.bots_if_initialized()
+                    {
+                        bots.on_owner_prompt_submitted(SessionId(session), send_text);
+                    }
                 }
                 if clear_cmd.is_some() {
                     Ok(json!({"sent":true,"cleared":true}))
@@ -1839,6 +1863,8 @@ impl Backend {
             Action::ChatClear { session } => {
                 let registry = self.registry.upgrade().ok_or_else(invalid)?;
                 registry.clear_chat_session(SessionId(session))?;
+                feed::unsubscribe_chat(session);
+                composer_status::invalidate_all();
                 Ok(json!({"cleared": true}))
             }
             Action::AnswerQuestion { .. } => Err(review_in_term()),
@@ -2765,25 +2791,41 @@ impl Backend {
             Action::BotsGroupsRead {
                 group_id,
                 thread_id,
+                before_message_id,
                 limit,
             } => {
                 let group_id = validate_bot_token(&group_id, 128)?;
                 let thread_id = validate_opt_bot_token(thread_id.as_deref(), 128)?;
+                let before_message_id = validate_opt_bot_token(before_message_id.as_deref(), 128)?;
                 let limit = match limit {
                     Some(0) => return Err(invalid()),
                     Some(n) => Some(n.min(200)),
                     None => None,
                 };
                 self.ensure_bots_active()?;
-                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ReadGroup {
-                    group_id,
-                    thread_id,
-                    limit,
-                })? {
-                    krill_proto::bots::BotRpcResponse::GroupView(view) => {
-                        bound_group_view_payload(json!({"group": to_value(view)?}))
+                if before_message_id.is_some() {
+                    match self.bot_rpc(krill_proto::bots::BotRpcRequest::ReadGroupRoom {
+                        group_id,
+                        thread_id,
+                        before_message_id,
+                        limit,
+                    })? {
+                        krill_proto::bots::BotRpcResponse::GroupRoom(room) => {
+                            bound_group_view_payload(json!({"group": to_value(room)?}))
+                        }
+                        _ => Err(invalid()),
                     }
-                    _ => Err(invalid()),
+                } else {
+                    match self.bot_rpc(krill_proto::bots::BotRpcRequest::ReadGroup {
+                        group_id,
+                        thread_id,
+                        limit,
+                    })? {
+                        krill_proto::bots::BotRpcResponse::GroupView(view) => {
+                            bound_group_view_payload(json!({"group": to_value(view)?}))
+                        }
+                        _ => Err(invalid()),
+                    }
                 }
             }
             Action::BotsGroupsSend {
@@ -2850,6 +2892,30 @@ impl Backend {
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::StopGroup {
                     group_id,
                     thread_id,
+                })? {
+                    krill_proto::bots::BotRpcResponse::Ok => Ok(json!({"stopped": true})),
+                    krill_proto::bots::BotRpcResponse::GroupView(view) => {
+                        bound_group_view_payload(json!({"stopped": true, "group": to_value(view)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsGroupsStopMember {
+                group_id,
+                thread_id,
+                bot_id,
+            } => {
+                self.ensure_bots_active()?;
+                let group_id = validate_bot_token(&group_id, 128)?;
+                let thread_id = validate_opt_bot_token(thread_id.as_deref(), 128)?;
+                let bot_id = match bot_id.as_deref() {
+                    Some(raw) => Some(krill_proto::bots::BotId::new(raw).map_err(|_| invalid())?),
+                    None => None,
+                };
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::StopGroupMember {
+                    group_id,
+                    thread_id,
+                    bot_id,
                 })? {
                     krill_proto::bots::BotRpcResponse::Ok => Ok(json!({"stopped": true})),
                     krill_proto::bots::BotRpcResponse::GroupView(view) => {
@@ -6520,7 +6586,8 @@ mod tests {
             json!({"ok": true, "data": {"interrupted": false}})
         );
 
-        // Working session receives exactly b"\x03" and returns {"interrupted": true}.
+        // Working TUI agent session (`claude`) receives single Esc (b"\x1b") and returns
+        // {"interrupted": true}, and a rapid follow-up Esc within 50ms is not blocked by PasteGuard.
         registry
             .record_test_hook(
                 SessionId(session_id),
@@ -6542,6 +6609,44 @@ mod tests {
         .unwrap();
         assert_eq!(
             working_reply,
+            json!({"ok": true, "data": {"interrupted": true}})
+        );
+        let n = pty.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b");
+
+        let rapid_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            rapid_reply,
+            json!({"ok": true, "data": {"interrupted": true}})
+        );
+        let n = pty.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b");
+
+        // Working non-agent / raw shell session receives Ctrl+C (b"\x03").
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 1_500,
+                    },
+                    agent: "zsh".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let shell_reply: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "interrupt", "session": session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            shell_reply,
             json!({"ok": true, "data": {"interrupted": true}})
         );
         let n = pty.read(&mut buf).unwrap();

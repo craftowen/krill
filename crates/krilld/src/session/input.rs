@@ -476,9 +476,13 @@ pub(super) fn write_input_if_untouched(
 }
 
 /// 모바일 정지 요청: 입력 잠금을 잡은 상태에서 열린 bracketed paste가 없고
-/// 세션이 여전히 작업 중일 때만 단일 Ctrl+C(`0x03`)를 쓴다.
-pub(super) fn write_interrupt(tap: &Tap, still_working: impl FnOnce() -> bool) -> io::Result<bool> {
-    if tap.pulse().closed {
+/// 세션이 여전히 작업 중일 때만 지정한 인터럽트 시퀀스(에이전트 `Esc` `\x1b` 또는 셸 `Ctrl+C` `\x03`)를 쓴다.
+pub(super) fn write_interrupt(
+    tap: &Tap,
+    bytes: &[u8],
+    still_working: impl FnOnce() -> bool,
+) -> io::Result<bool> {
+    if bytes.is_empty() || tap.pulse().closed {
         return Ok(false);
     }
     let mut state = match turn(tap, None) {
@@ -512,7 +516,13 @@ pub(super) fn write_interrupt(tap: &Tap, still_working: impl FnOnce() -> bool) -
     }
     state.owner = Some(owner);
     state.peer = None;
-    let result = write_all(tap, b"\x03", None, &mut state);
+    let result = write_all(tap, bytes, None, &mut state);
+    if bytes == b"\x1b" && !state.paste {
+        // Standalone Esc cancel is not a split bracketed-paste START prefix; clear matched
+        // immediately so rapid follow-up input or cancel within 50ms is never dropped.
+        state.matched = 0;
+        state.matched_at = None;
+    }
     state.owner = None;
     match result {
         Ok(()) => Ok(true),

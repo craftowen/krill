@@ -3734,5 +3734,131 @@ async function v0334MobileFixesRegressions(){
  }
  console.log('PASS v0.3.34 mobile fixes regressions: CSS/WCAG contracts, MOB-04/12/14/15/16, LIVE-02/04/06/07/08/09');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await projectInlineRemoteHost();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();await v0334MobileFixesRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function v040Pr1MobileRegressions(){
+ // 1) MPWA-11/12/23: Group chat /clear -> bots.groups.new_thread, owner -> You/나, Main/New thread i18n, Stop in-flight disable.
+ {
+  const calls=[];
+  let activeRun=true;
+  let stopDeferred=null;
+  const host={id:'h1',name:'Mac',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true},sessions:[],repositories:[]}};
+  const i18nBox={KrillMobile:{},document:{documentElement:{lang:'ko'},querySelectorAll:()=>[]},navigator:{language:'ko-KR',languages:['ko-KR']}};
+  vm.createContext(i18nBox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),i18nBox);
+  i18nBox.KrillMobile.i18n.configure('ko');
+  const bf=fixture('bots',{
+   t:(s,...v)=>i18nBox.KrillMobile.i18n.t(s,...v),
+   state:{connection:{phase:'ready'},snapshot:host.snapshot},
+  });
+  bf.ctx.connections=[host];
+  bf.ctx.filteredConnections=()=>[host];
+  bf.ctx.rpcForHost=(_hid,req)=>{
+   calls.push(req);
+   if(req.action==='bots.list')return Promise.resolve({bots:[{id:'b1',slug:'alpha',name:'Alpha',agent_id:'claude'}]});
+   if(req.action==='bots.groups.list')return Promise.resolve({groups:[{id:'g1',name:'Team',bot_ids:['b1']}]});
+   if(req.action==='bots.groups.read')return Promise.resolve({
+    group:{
+     group:{id:'g1',name:'Team',bot_ids:['b1']},
+     threads:[{thread_id:'t1',title:'Main thread'},{thread_id:'t2',title:'New thread'}],
+     messages:[
+      {sender_id:'owner',sender_name:'owner',body:'안녕'},
+      {sender_id:'b1',sender_name:'Alpha',body:'작업 중',in_progress:activeRun},
+     ],
+     active_run:activeRun,
+    },
+   });
+   if(req.action==='bots.groups.new_thread')return Promise.resolve({
+    group:{
+     group:{id:'g1',name:'Team',bot_ids:['b1']},
+     threads:[{thread_id:'t3',title:'New thread'},{thread_id:'t1',title:'Main thread'}],
+     messages:[],
+     active_run:false,
+    },
+   });
+   if(req.action==='bots.groups.stop'){
+    stopDeferred=deferred();
+    return stopDeferred.promise;
+   }
+   return Promise.resolve({items:[],requests:[],statuses:[],sessions:[]});
+  };
+  bf.view.update();
+  await bf.flush();
+  const grpBtn=bf.all().find(n=>n.dataset?.groupRailId==='g1');
+  await grpBtn.action();
+  await bf.flush();
+  // MPWA-23: Korean labels for Main thread, New thread, and owner -> 나
+  assert(bf.root.textContent.includes('기본 스레드'),'MPWA-23: Main thread localized in Korean');
+  assert(bf.root.textContent.includes('새 스레드'),'MPWA-23: New thread localized in Korean');
+  assert(!bf.root.textContent.includes('owner'),'MPWA-23: raw owner never leaks in Korean group chat');
+  // MPWA-11: Stop disables while bots.groups.stop is in flight.
+  const stopBtn=bf.byText('정지');
+  assert(stopBtn,'Stop button visible during active_run');
+  const pStop=stopBtn.action();
+  assert(bf.root.textContent.includes('중지하는 중…'),'MPWA-11: Stop shows Stopping… while in flight');
+  activeRun=false;
+  stopDeferred.resolve({ok:true});
+  await pStop;
+  await bf.flush();
+  // MPWA-12: typing /clear in group chat calls bots.groups.new_thread instead of posting literal /clear.
+  const ta=bf.all().find(n=>n.tagName==='TEXTAREA');
+  ta.value='/clear';
+  const sendBtn=bf.byText(i18nBox.KrillMobile.i18n.t('Send'));
+  await sendBtn.action();
+  await bf.flush();
+  assert(calls.some(c=>c.action==='bots.groups.new_thread'),'MPWA-12: /clear routes to bots.groups.new_thread');
+  assert(!calls.some(c=>c.action==='bots.groups.send'&&c.text==='/clear'),'MPWA-12: literal /clear is never posted as a group message');
+  bf.abort.abort();
+ }
+
+ // 2) MPWA-24: async sheet close guarded by sheetSignal?.aborted so a dismissed sheet cannot close a newer sheet.
+ {
+  const host={id:'h1',name:'Mac',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true,bots_bundle:true},sessions:[],repositories:[]}};
+  let createDeferred=null;
+  let closes=0;
+  const f=fixture('bots',{
+   route:{botId:'b1'},
+   state:{connection:{phase:'ready'},snapshot:host.snapshot},
+   rpc:async req=>{
+    if(req.action==='bots.workspace')return {bot:{id:'b1',name:'Alpha',agent_id:'claude'},bots:[{id:'b1',name:'Alpha',agent_id:'claude'}],items:[],statuses:[{source:'email',state:'connected',account_label:'me@example.com'}],suggestions:[],requests:[],sessions:[],etag:'e1'};
+    if(req.action==='bots.item.create'){createDeferred=deferred();return createDeferred.promise;}
+    return {};
+   },
+  });
+  f.ctx.closeSheet=()=>{closes++;};
+  await f.flush();
+  await f.find('.bot-panel-btn').action();
+  const panelBody=f.ctx.el('div');
+  f.sheets.at(-1)[3](panelBody);
+  await panelBody.descendants().find(n=>n.tagName==='BUTTON'&&n.textContent==='+ New Item').action();
+  const body=f.ctx.el('div');
+  const ac=new AbortController();
+  f.sheets.at(-1)[3](body,ac.signal);
+  const titleIn=body.descendants().find(n=>n.tagName==='INPUT');
+  titleIn.value='Async item';
+  const createBtn=body.descendants().find(n=>n.tagName==='BUTTON'&&n.textContent==='Create Item');
+  const pendingCreate=createBtn.action();
+  ac.abort(); // Simulate sheet dismissed and replaced before RPC finishes
+  createDeferred.resolve({ok:true});
+  await pendingCreate;
+  assert.equal(closes,0,'MPWA-24: aborted sheet must not close a newly opened sheet');
+  f.abort.abort();
+ }
+
+ // 3) MPWA-27: Usage SWR cache avoids spinner on remount + Settings voice SWR avoids Not connected flash.
+ {
+  const sharedCache=new Map();
+  const state={_usageCache:sharedCache,connection:{phase:'ready'},snapshot:{host:{display_name:'Mac'},capabilities:{}}};
+  const a1=fixture('accounts',{
+   state,
+   rpc:async req=>req.action==='accounts'?{accounts:[{id:'acc1',provider:'Claude',email:'a@b.com',active:true,host_default:true}],statuses:[]}:{},
+  });
+  await a1.flush();
+  a1.abort.abort();
+  assert(sharedCache.size>=1,'MPWA-27: Usage caches snapshot in state._usageCache');
+  const a2=fixture('accounts',{state,rpc:async()=>new Promise(()=>{})});
+  assert(a2.root.textContent.includes('a@b.com'),'MPWA-27: remounted Usage renders cached data immediately without spinner');
+  a2.abort.abort();
+ }
+ console.log('PASS v0.4.0 PR-1 mobile_screens regressions: MPWA-11/12/23/24/27');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await projectInlineRemoteHost();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();await botInstantLoadingRegressions();await v0334MobileFixesRegressions();await v040Pr1MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

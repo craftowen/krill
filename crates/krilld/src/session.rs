@@ -667,12 +667,11 @@ impl Tap {
     }
 
     /// Cell-aware idle composer check (dimmed placeholder prompts on Claude/Codex/Agy).
-    /// Only invoked by the status monitor while a session is currently `Waiting` or `Blocked`.
     pub(crate) fn is_idle_composer(&self, agent: &str) -> bool {
-        let canonical = match agent {
-            "claude" | "codex" | "agy" => agent,
-            _ => return false,
-        };
+        let canonical = krill_proto::agent::canonical_id(agent);
+        if !matches!(canonical, "claude" | "codex" | "agy") {
+            return false;
+        }
         let screen = self.0.live().engine.screen();
         matches!(
             crate::registry::prompt_delivery::composer_state(canonical, &screen),
@@ -947,8 +946,12 @@ impl Tap {
         input::write_input_if_untouched(self, bytes, expected_last_input_ns)
     }
 
-    pub(crate) fn write_interrupt(&self, still_working: impl FnOnce() -> bool) -> io::Result<bool> {
-        input::write_interrupt(self, still_working)
+    pub(crate) fn write_interrupt(
+        &self,
+        bytes: &[u8],
+        still_working: impl FnOnce() -> bool,
+    ) -> io::Result<bool> {
+        input::write_interrupt(self, bytes, still_working)
     }
 
     pub(crate) fn guarded_command(

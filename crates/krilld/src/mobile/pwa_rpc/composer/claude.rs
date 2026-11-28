@@ -611,7 +611,7 @@ fn models(context: &Context, tap: &Tap) -> io::Result<Value> {
     }
     let current = observe_screen(&screen).map(|(id, _, _)| id);
     Ok(
-        json!({"agent":"claude","supported":true,"current":current,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":VERSIONS.iter().find(|(alias,_)|alias==id).map_or(*label,|(_,name)|*name)})).collect::<Vec<_>>(),"truncated":false,"reason":"Changes the model in this running Claude chat. Claude also saves its default for new sessions.","note":"Claude also saves this as the default for new sessions."}),
+        json!({"agent":"claude","supported":true,"current":current,"items":choices(context).iter().map(|(id,label)|json!({"id":id,"label":VERSIONS.iter().find(|(alias,_)|alias==id).map_or(*label,|(_,name)|*name)})).collect::<Vec<_>>(),"truncated":false}),
     )
 }
 
@@ -709,11 +709,13 @@ fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Resul
     let before_model = observe_footer(&before).map(|(m, _, _)| m);
     let before_manual = needs_manual_confirm(&before);
     let command = format!("/model {id}");
-    super::command(
+    let (revision, seq) = super::command_waiting(
         tap,
         working,
         revision.0,
+        seq.0,
         command.as_bytes(),
+        |screen| verified(screen) && composer(screen, None),
         |screen, pasted| verified(screen) && composer(screen, pasted.then_some(command.as_str())),
     )?;
     let mut dialog_confirmed = false;
@@ -721,7 +723,7 @@ fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Resul
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
         let (screen, after, _) = tap.capture();
-        if after.0 <= revision.0 {
+        if after.0 <= revision {
             continue;
         }
         if !dialog_confirmed
@@ -732,7 +734,7 @@ fn set_model(context: &Context, tap: &Tap, working: bool, id: &str) -> io::Resul
             deadline = Instant::now() + CONFIRM;
             continue;
         }
-        let fresh = native::fresh_text(tap, seq.0);
+        let fresh = native::fresh_text(tap, seq);
         if composer(&screen, None)
             && (confirmed(&fresh, id, label)
                 || (id != "default"
@@ -777,11 +779,13 @@ fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
     let before_effort = observe_footer(&before).and_then(|(_, _, e)| e);
     let before_manual = needs_manual_confirm(&before);
     let command = format!("/effort {effort}");
-    super::command(
+    let (revision, seq) = super::command_waiting(
         tap,
         working,
         revision.0,
+        seq.0,
         command.as_bytes(),
+        effort_available,
         |screen, pasted| {
             effort_version(screen) && composer(screen, pasted.then_some(command.as_str()))
         },
@@ -791,7 +795,7 @@ fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
         let (screen, after, _) = tap.capture();
-        if after.0 <= revision.0 {
+        if after.0 <= revision {
             continue;
         }
         if !dialog_confirmed
@@ -802,7 +806,7 @@ fn set_effort(tap: &Tap, working: bool, effort: &str) -> io::Result<Value> {
             deadline = Instant::now() + CONFIRM;
             continue;
         }
-        let fresh = native::fresh_text(tap, seq.0);
+        let fresh = native::fresh_text(tap, seq);
         if composer(&screen, None) {
             if let Some(applied_effort) = effort_confirmed(&fresh, effort) {
                 return Ok(json!({"applied":true,"supported":true,"effort":applied_effort}));
