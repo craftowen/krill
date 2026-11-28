@@ -364,11 +364,11 @@ impl Feed {
                         s.watcher = new_watcher.take();
                     }
                     if let Some(delta) = res.delta
-                        && let Some(frame) = chat_push(session, &delta)
+                        && let Some((frame, stale)) = chat_push(session, &delta)
                     {
                         match (self.sink)(&frame) {
                             Ok(()) => {
-                                if let Some(s) = state.chat_sub.as_mut() {
+                                if !stale && let Some(s) = state.chat_sub.as_mut() {
                                     s.offset = res.next_offset;
                                 }
                             }
@@ -478,15 +478,20 @@ fn push(mut value: Value, rev: u64) -> Option<(Vec<u8>, String)> {
     Some((MobileReply::Workflow(text).encode().ok()?, etag))
 }
 
-fn chat_push(session: u64, data: &Value) -> Option<Vec<u8>> {
-    let mut text = format!(
+fn chat_push(session: u64, data: &Value) -> Option<(Vec<u8>, bool)> {
+    let text = format!(
         "{{\"push\":\"chat_delta\",\"session\":{session},\"data\":{}}}",
         serde_json::to_string(data).ok()?
     );
-    if text.len() >= ipc::MAX_FRAME.saturating_sub(32) {
-        text = format!("{{\"push\":\"chat_stale\",\"session\":{session}}}");
-    }
-    MobileReply::Workflow(text).encode().ok()
+    let (frame_text, stale) = if text.len() >= ipc::MAX_FRAME.saturating_sub(32) {
+        (
+            format!("{{\"push\":\"chat_stale\",\"session\":{session}}}"),
+            true,
+        )
+    } else {
+        (text, false)
+    };
+    Some((MobileReply::Workflow(frame_text).encode().ok()?, stale))
 }
 
 #[cfg(test)]
@@ -594,7 +599,9 @@ mod tests {
 
     #[test]
     fn chat_push_encodes_delta_and_downgrades_oversized_payload_to_chat_stale() {
-        let small = chat_push(9, &serde_json::json!({"items": [], "next_offset": 12})).unwrap();
+        let (small, small_stale) =
+            chat_push(9, &serde_json::json!({"items": [], "next_offset": 12})).unwrap();
+        assert!(!small_stale);
         let (kind, body) = ipc::read_frame(&mut &small[..]).unwrap().unwrap();
         let MobileReply::Workflow(text) = MobileReply::decode(kind, &body).unwrap() else {
             panic!("expected workflow frame");
@@ -605,8 +612,9 @@ mod tests {
             "items": [{"text": "x".repeat(ipc::MAX_FRAME)}],
             "next_offset": 99
         });
-        let stale = chat_push(9, &oversized).unwrap();
-        let (kind, body) = ipc::read_frame(&mut &stale[..]).unwrap().unwrap();
+        let (stale_frame, is_stale) = chat_push(9, &oversized).unwrap();
+        assert!(is_stale);
+        let (kind, body) = ipc::read_frame(&mut &stale_frame[..]).unwrap().unwrap();
         let MobileReply::Workflow(text) = MobileReply::decode(kind, &body).unwrap() else {
             panic!("expected workflow frame");
         };

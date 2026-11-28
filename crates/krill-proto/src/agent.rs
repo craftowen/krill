@@ -419,6 +419,31 @@ pub fn is_known_agent_process(name: &str) -> bool {
         || preset_profiles().contains_key(lower.as_str())
 }
 
+/// Interactive TUI coding agents cancel an active turn with single `Esc` (`\x1b`).
+/// Sending `Ctrl-C` (`\x03`) kills idle Codex/OpenCode on 1x and exits Agy/Claude on 2x;
+/// reserve `\x03` for raw shells and unknown sessions only.
+#[must_use]
+pub fn interrupt_sequence(agent: &str) -> &'static [u8] {
+    let canon = canonical_id(agent);
+    if matches!(
+        canon,
+        "agy"
+            | "claude"
+            | "openclaude"
+            | "codex"
+            | "opencode"
+            | "opencode2"
+            | "pi"
+            | "omp"
+            | "cursor"
+    ) || canon.eq_ignore_ascii_case("gemini")
+    {
+        b"\x1b"
+    } else {
+        b"\x03"
+    }
+}
+
 /// 사용자 프로필 파일 이름. 상태 디렉터리([`crate::daemon::state_dir`]) 아래에 둔다.
 pub const FILE_NAME: &str = "agents.toml";
 

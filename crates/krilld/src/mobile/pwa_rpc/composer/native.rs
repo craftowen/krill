@@ -111,11 +111,8 @@ impl Adapter for Codex {
                 let (screen, _, _) = tap.capture();
                 if idle(&screen) {
                     set(models, "supported", true.into());
-                    set(
-                        models,
-                        "reason",
-                        "Changes the model in this running Codex chat session only.".into(),
-                    );
+                    super::remove(models, "reason");
+                    super::remove(models, "note");
                     if let Some(current) = observed_model(models, &screen)
                         .or_else(|| banner_model(models, &screen).map(|(id, _)| id))
                     {
@@ -162,11 +159,13 @@ impl Adapter for Codex {
             |effort| format!("/model {model} --reasoning={effort}"),
         );
         let working = live.working();
-        super::command(
+        let (revision, seq) = super::command_waiting(
             &tap,
             working,
             revision.0,
+            seq.0,
             command.as_bytes(),
+            idle,
             |screen, pasted| {
                 verified(screen) && composer(screen, pasted.then_some(command.as_str()))
             },
@@ -178,11 +177,11 @@ impl Adapter for Codex {
             let settled = composer(&screen, None)
                 && observed_model(&catalog, &screen).as_deref() == Some(model)
                 && latest_confirmation(&screen, model)
-                && fresh_confirmation(&tap, seq.0, model)
+                && fresh_confirmation(&tap, seq, model)
                 && effort.is_none_or(|effort| self::effort(&screen).as_deref() == Some(effort));
             // Codex hides its cursor while it streams, so only fresh output can confirm mid-turn.
-            if observed.0 > revision.0
-                && (settled || working && streamed_confirmation(&tap, seq.0, model, effort))
+            if observed.0 > revision
+                && (settled || working && streamed_confirmation(&tap, seq, model, effort))
             {
                 return Ok(json!({"applied":true,"supported":true,"model":model,"effort":effort}));
             }
@@ -210,12 +209,35 @@ impl Adapter for Codex {
         _snapshot: &ChatPollSnapshot,
         status: &mut Value,
     ) {
-        let supported = status.get("supported").cloned().unwrap_or(false.into());
-        set(status, "effort_supported", supported);
-        let Some(screen) = live.screen() else {
-            return;
-        };
-        observe_screen_into(catalog, &screen, status);
+        if let Some(screen) = live.screen() {
+            observe_screen_into(catalog, &screen, status);
+        }
+        let supported = status
+            .get("supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let active_model = status.get("model").and_then(Value::as_str);
+        let active_model_has_efforts = active_model.is_none_or(|model_id| {
+            catalog
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == Some(model_id))
+                })
+                .is_none_or(|item| {
+                    item.get("efforts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|levels| !levels.is_empty())
+                        || item.get("default_effort").and_then(Value::as_str).is_some()
+                })
+        });
+        set(
+            status,
+            "effort_supported",
+            (supported && active_model_has_efforts).into(),
+        );
     }
 }
 

@@ -3672,7 +3672,8 @@ impl Registry {
     }
 
     /// 모바일 정지 요청: 살아 있는 세션이 현재 `AgentState::Working`이고 열린 붙여넣기가 없을 때만
-    /// 단일 `Ctrl+C`(`\x03`)를 기록한다(OWE-1349). 이미 턴이 끝났으면 PTY에 아무것도 쓰지 않는다.
+    /// 에이전트별 인터럽트 시퀀스(TUI 코딩 에이전트는 단일 `Esc` `\x1b`, 일반 셸은 `Ctrl+C` `\x03`)를
+    /// 기록한다(OWE-1349). 이미 턴이 끝났으면 PTY에 아무것도 쓰지 않는다.
     pub(crate) fn mobile_interrupt(&self, id: SessionId) -> io::Result<bool> {
         let (tap, root, wrapped) = {
             let st = lock(&self.state);
@@ -3691,14 +3692,17 @@ impl Registry {
             }
             (tap, entry.pid, entry.wrapped)
         };
-        if self
-            .resolve_session_status(id, root, false, &tap, wrapped)
-            .state
-            != control::AgentState::Working
-        {
+        let status = self.resolve_session_status(id, root, false, &tap, wrapped);
+        if status.state != control::AgentState::Working {
             return Ok(false);
         }
-        tap.write_interrupt(|| {
+        let agent = if status.agent.trim().is_empty() {
+            self.session_agent_profile(id).unwrap_or_default()
+        } else {
+            status.agent
+        };
+        let bytes = krill_proto::agent::interrupt_sequence(&agent);
+        tap.write_interrupt(bytes, || {
             !tap.pulse().closed
                 && !self.agents.account_binding_retiring(id)
                 && self.status.get(id).state == control::AgentState::Working

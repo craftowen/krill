@@ -1289,6 +1289,7 @@
             "bots.memory.get",
             "voice.status",
             "voice.config_get",
+            "voice.warm",
           ].includes(request?.action),
         LONG_RPC_ACTIONS = new Set([
           "handoff",
@@ -1296,6 +1297,8 @@
           "voice.transcribe",
           "composer_models",
           "set_model",
+          "set_effort",
+          "bots.models",
           "bots.look_around",
         ]),
         rpcDeadline = (request, probe) =>

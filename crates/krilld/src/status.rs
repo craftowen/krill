@@ -222,7 +222,8 @@ impl Statuses {
         self.save_best_effort(&map);
     }
 
-    /// 제목·화면의 보조 근거. hook이 이기며, 대화상자 소실을 확인한 waiting 해제만 예외다.
+    /// 제목·화면의 보조 근거. hook이 이기며, 대화상자 소실 또는 `Esc` 인터럽트·정적 빈 컴포저로
+    /// 확인한 해제(`dismissed_since`)만 예외다.
     /// 보조 근거 시각으로 hook 중복 제거 시각을 밀지 않는다(늦게 전달된 새 hook도 반영한다).
     pub fn inferred(&self, session: SessionId, evidence: detect::Evidence, ns: u64) {
         let _commit = lock(&self.commit);
@@ -231,8 +232,10 @@ impl Statuses {
             if let Some(r) = map.get(&session) {
                 if r.status.source == Some(Source::Process)
                     || (r.status.source == Some(Source::Hook)
-                        && !(matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
-                            && evidence.dismissed_since == Some(r.status.since_unix_ns))
+                        && !(matches!(
+                            r.status.state,
+                            AgentState::Waiting | AgentState::Blocked | AgentState::Working
+                        ) && evidence.dismissed_since == Some(r.status.since_unix_ns))
                         && !(!matches!(r.status.state, AgentState::Waiting | AgentState::Blocked)
                             && evidence.source == Source::Screen
                             && matches!(evidence.state, AgentState::Waiting | AgentState::Blocked)))

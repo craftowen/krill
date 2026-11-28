@@ -49,6 +49,16 @@ pub(super) fn load(
         remaining: MAX_VISITS,
         truncated: false,
     };
+    scan.items.insert(
+        "/clear".into(),
+        Item {
+            name: "clear".into(),
+            text: "/clear".into(),
+            description: "Clear the conversation and start fresh".into(),
+            kind: "Command",
+            scope: "Built-in",
+        },
+    );
     // Codex 0.164's native empty-session welcome screen lists these local commands.
     // /model is consumed by the mobile composer chooser, which verifies the running CLI.
     if agent == "codex" {

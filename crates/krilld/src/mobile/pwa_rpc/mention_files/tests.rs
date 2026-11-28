@@ -102,3 +102,25 @@ fn git_ignore_is_honored_and_cwd_is_search_boundary() {
     let value = load(&f.0.join("sub"), "").unwrap();
     assert_eq!(value["items"], json!([{"path":"visible.rs"}]));
 }
+
+#[test]
+fn git_query_filters_before_consuming_max_visits() {
+    let f = Fixture::new();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&f.0)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bulk_dir = f.0.join("a");
+    fs::create_dir_all(&bulk_dir).unwrap();
+    for i in 0..=MAX_VISITS {
+        fs::write(bulk_dir.join(format!("f{i:04}.txt")), "").unwrap();
+    }
+    f.file("src/zzz_target.rs");
+    let value = load(&f.0, "zzz_target").unwrap();
+    assert_eq!(value["items"], json!([{"path":"src/zzz_target.rs"}]));
+    assert_eq!(value["truncated"], false);
+}
