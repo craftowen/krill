@@ -600,7 +600,8 @@ fn parse_file_url_path_only(raw_url: &str, allow_posix_fallback: bool) -> Option
         Err(()) if allow_posix_fallback => {
             // Remote POSIX paths (e.g. `file://localhost/srv/app/main.rs`) cannot be converted
             // via `Url::to_file_path()` on a Windows desktop host, so decode `parsed.path()`.
-            let decoded = percent_decode_path(parsed.path())?;
+            let raw_path = parsed.path();
+            let decoded = percent_decode_path(raw_path).unwrap_or_else(|| raw_path.to_owned());
             if !decoded.starts_with('/') {
                 return None;
             }
