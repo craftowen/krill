@@ -10651,35 +10651,43 @@ fn install_tab_renders_tools_runs_inline_install_and_saves_shell_aliases(cx: &mu
     // Verify shell profile alias block and quick_commands sync
     let rc_path = install::shell_rc_path(&d.join("test-home"));
     let content = fs::read_to_string(&rc_path).expect("shell rc file written");
-    // 처음 값은 기본 실행이다. 권한을 건너뛰는 옵션은 사용자가 직접 켠다.
-    assert!(content.contains("alias cc='claude'"));
-    assert!(content.contains("alias cx='codex'"));
-    assert!(content.contains("alias ag='agy'"));
-    assert!(!content.contains("--dangerously"));
+    // 처음 값은 YOLO(자동 승인 포함)이다.
+    assert!(content.contains("alias cc='claude --dangerously-skip-permissions'"));
+    assert!(content.contains("alias cx='codex --dangerously-bypass-approvals-and-sandbox'"));
+    assert!(content.contains("alias ag='agy --dangerously-skip-permissions'"));
 
     vcx.update(|_, cx| {
         let qc = &current(cx).quick_commands;
-        assert!(qc.iter().any(|q| q.name == "cc"));
-        assert!(qc.iter().any(|q| q.name == "cx"));
-        assert!(qc.iter().any(|q| q.name == "ag"));
+        assert!(
+            qc.iter()
+                .any(|q| q.name == "cc" && q.text == "claude --dangerously-skip-permissions")
+        );
+        assert!(qc.iter().any(|q| {
+            q.name == "cx" && q.text == "codex --dangerously-bypass-approvals-and-sandbox"
+        }));
+        assert!(
+            qc.iter()
+                .any(|q| q.name == "ag" && q.text == "agy --dangerously-skip-permissions")
+        );
     });
 
     fs::remove_dir_all(d).ok();
 }
 
-/// 이미 셸 설정에 저장한 별칭 모드는 처음 값 변경과 상관없이 그대로 둔다.
+/// 이미 셸 설정에 저장한 별칭 모드는 처음 값(YOLO)과 상관없이 그대로 둔다.
 #[gpui::test]
 fn install_alias_keeps_saved_yolo_mode(cx: &mut TestAppContext) {
     let d = dir("install-alias-saved");
     init(cx, &d);
     let rc_path = install::shell_rc_path(&d.join("test-home"));
     fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
+    // 1) 저장된 일반 실행(use_yolo: false)은 유지되고, 미저장 프리셋(cx, ag)은 기본 YOLO로 저장된다.
     let saved = install::upsert_alias_block(
         "",
         &[install::AliasEntry {
             agent_id: "claude",
             alias_name: "cc".into(),
-            use_yolo: true,
+            use_yolo: false,
         }],
         false,
     );
@@ -10693,8 +10701,52 @@ fn install_alias_keeps_saved_yolo_mode(cx: &mut TestAppContext) {
     vcx.update(|_, cx| view.update(cx, SettingsView::save_shell_aliases));
     vcx.run_until_parked();
     let content = fs::read_to_string(&rc_path).unwrap();
-    assert!(content.contains("alias cc='claude --dangerously-skip-permissions'"));
-    assert!(content.contains("alias cx='codex'"), "{content}");
+    assert!(content.contains("alias cc='claude'"), "{content}");
+    assert!(
+        content.contains("alias cx='codex --dangerously-bypass-approvals-and-sandbox'"),
+        "{content}"
+    );
+    assert!(
+        content.contains("alias ag='agy --dangerously-skip-permissions'"),
+        "{content}"
+    );
+
+    // 2) 저장된 YOLO(use_yolo: true)도 그대로 보존된다.
+    let saved_yolo = install::upsert_alias_block(
+        "",
+        &[
+            install::AliasEntry {
+                agent_id: "claude",
+                alias_name: "cc".into(),
+                use_yolo: true,
+            },
+            install::AliasEntry {
+                agent_id: "codex",
+                alias_name: "cx".into(),
+                use_yolo: false,
+            },
+        ],
+        false,
+    );
+    fs::write(&rc_path, saved_yolo).unwrap();
+    let (view2, vcx2) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx2.update(|window, cx| {
+        view2.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx2.run_until_parked();
+    vcx2.update(|_, cx| view2.update(cx, SettingsView::save_shell_aliases));
+    vcx2.run_until_parked();
+    let content2 = fs::read_to_string(&rc_path).unwrap();
+    assert!(
+        content2.contains("alias cc='claude --dangerously-skip-permissions'"),
+        "{content2}"
+    );
+    assert!(content2.contains("alias cx='codex'"), "{content2}");
+    assert!(
+        content2.contains("alias ag='agy --dangerously-skip-permissions'"),
+        "{content2}"
+    );
     fs::remove_dir_all(d).ok();
 }
 
@@ -10809,7 +10861,7 @@ fn install_alias_search_hit_names_the_alias_section() {
     }
 }
 
-/// 저장한 YOLO 별칭이 있으면 경고를 보이고, 기본 실행만 있으면 보이지 않는다.
+/// YOLO 별칭이 하나라도 있으면 경고를 보이고, 모두 기본 실행이면 보이지 않는다.
 #[gpui::test]
 fn install_alias_warns_only_for_yolo_rows(cx: &mut TestAppContext) {
     let d = dir("install-alias-warning");
@@ -10818,6 +10870,13 @@ fn install_alias_warns_only_for_yolo_rows(cx: &mut TestAppContext) {
     vcx.simulate_resize(size(px(1400.), px(5000.)));
     vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Install, cx)));
     vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("admin-install-alias-yolo-warning")
+            .is_some()
+    );
+    click_install_control(vcx, "admin-install-alias-normal-claude");
+    click_install_control(vcx, "admin-install-alias-normal-codex");
+    click_install_control(vcx, "admin-install-alias-normal-agy");
     assert!(
         vcx.debug_bounds("admin-install-alias-yolo-warning")
             .is_none()
