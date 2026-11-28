@@ -344,9 +344,17 @@ pub fn format_short_time_ago(ts_ms: u64, now_ms: u64) -> String {
     format_short_time_ago_secs(ts_ms / 1000, now_ms / 1000)
 }
 
-/// 초 단위 타임스탬프용 콤팩트 상대 시각(`방금`/`now`, `13분`/`13m`, `1시간`/`1h`, `1일`/`1d`, `2주`/`2w`, `3개월`/`3mo`, `1년`/`1y`).
+/// 초 단위 타임스탬프용 Orca 콤팩트 상대 시각(`now`, `13m`, `1h`, `1d`, `2w`, `3mo`, `1y`).
+/// 로케일 인식 포맷은 [`format_short_time_ago_secs_localized`] 또는
+/// [`format_short_time_ago_secs_in`]을 사용한다.
 #[must_use]
 pub fn format_short_time_ago_secs(ts_secs: u64, now_secs: u64) -> String {
+    format_short_time_ago_secs_in(ts_secs, now_secs, crate::i18n::Language::En)
+}
+
+/// 현재 앱 언어로 초 단위 상대 시각(`방금`/`now`, `13분`/`13m`, `1시간`/`1h` 등)을 포맷한다.
+#[must_use]
+pub fn format_short_time_ago_secs_localized(ts_secs: u64, now_secs: u64) -> String {
     format_short_time_ago_secs_in(ts_secs, now_secs, crate::i18n::language())
 }
 
@@ -1351,6 +1359,10 @@ mod tests {
         );
         assert_eq!(
             super::format_short_time_ago((now - 120) * 1000, now * 1000),
+            "2m"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_localized(now - 120, now),
             super::format_short_time_ago_secs_in(now - 120, now, crate::i18n::language())
         );
     }

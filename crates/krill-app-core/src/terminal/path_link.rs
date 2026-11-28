@@ -577,7 +577,7 @@ fn split_trailing_line_col(raw: &str) -> (&str, Option<u32>, Option<u32>) {
     (before_last, Some(last_num), None)
 }
 
-fn parse_file_url_path_only(raw_url: &str) -> Option<PathBuf> {
+fn parse_file_url_path_only(raw_url: &str, allow_posix_fallback: bool) -> Option<PathBuf> {
     // Agents sometimes emit raw spaces inside `file:///Users/.../Application Support/...`.
     let encoded = if raw_url.contains(' ') {
         raw_url.replace(' ', "%20")
@@ -595,7 +595,19 @@ fn parse_file_url_path_only(raw_url: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let path = parsed.to_file_path().ok()?;
+    let path = match parsed.to_file_path() {
+        Ok(p) => p,
+        Err(()) if allow_posix_fallback => {
+            // Remote POSIX paths (e.g. `file://localhost/srv/app/main.rs`) cannot be converted
+            // via `Url::to_file_path()` on a Windows desktop host, so decode `parsed.path()`.
+            let decoded = percent_decode_path(parsed.path())?;
+            if !decoded.starts_with('/') {
+                return None;
+            }
+            PathBuf::from(decoded)
+        }
+        Err(()) => return None,
+    };
     if path
         .to_string_lossy()
         .chars()
@@ -624,6 +636,7 @@ pub fn decode_file_url(
     {
         return None;
     }
+    let allow_posix_fallback = !check_local_exists;
     let (before_hash, fragment) = match trimmed.split_once('#') {
         Some((head, frag)) => (head, Some(frag)),
         None => (trimmed, None),
@@ -636,9 +649,9 @@ pub fn decode_file_url(
             .split_once('?')
             .map_or(trimmed, |(h, _)| h)
             .replace('#', "%23");
-        let literal_path = parse_file_url_path_only(&literal_encoded);
+        let literal_path = parse_file_url_path_only(&literal_encoded, allow_posix_fallback);
         let head_without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
-        let head_path = parse_file_url_path_only(head_without_query);
+        let head_path = parse_file_url_path_only(head_without_query, allow_posix_fallback);
         match (literal_path, head_path) {
             (Some(lit), Some(head)) if check_local_exists => {
                 if lit.exists() || !head.exists() {
@@ -654,7 +667,7 @@ pub fn decode_file_url(
         }
     } else {
         let without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
-        parse_file_url_path_only(without_query)?
+        parse_file_url_path_only(without_query, allow_posix_fallback)?
     };
     if line.is_none()
         && let Some(path_str) = path.to_str()
@@ -1408,7 +1421,7 @@ mod windows_path_tests {
         assert_eq!(
             remote,
             Some(MarkdownLinkTarget::LocalPath {
-                path: PathBuf::from("/remote/repo/src/lib.rs"),
+                path: Path::new("/remote/repo").join("src/lib.rs"),
                 line: Some(10),
                 column: Some(3),
                 dangerous_executable: false,
