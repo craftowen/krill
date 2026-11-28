@@ -1903,14 +1903,14 @@ impl BotsManager {
             {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
-                        if let Err(err) =
-                            self.runtime
-                                .interrupt_group_turn(registry, &self.store, &bid, sid)
+                        if self
+                            .runtime
+                            .interrupt_group_turn(registry, &self.store, &bid, sid)
+                            .is_err()
                         {
                             tracing::warn!(
                                 bot_id = %bid,
                                 session = sid.0,
-                                error = %err,
                                 "failed to interrupt group turn"
                             );
                         }
@@ -1989,14 +1989,14 @@ impl BotsManager {
             ) {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
-                        if let Err(err) =
-                            self.runtime
-                                .interrupt_group_turn(registry, &self.store, &bid, sid)
+                        if self
+                            .runtime
+                            .interrupt_group_turn(registry, &self.store, &bid, sid)
+                            .is_err()
                         {
                             tracing::warn!(
                                 bot_id = %bid,
                                 session = sid.0,
-                                error = %err,
                                 "failed to interrupt group member turn"
                             );
                         }
@@ -2940,44 +2940,42 @@ impl BotsManager {
                         && registry.is_session_live(origin_sid)
                         && self.runtime.session_belongs_to_bot(origin_sid, &bot.id)
                     {
-                        match self.runtime.deliver_turn(
-                            registry,
-                            &self.store,
-                            origin_sid,
-                            &bot.id,
-                            &wake_prompt,
-                        ) {
-                            Ok(()) => true,
-                            Err(err) => {
-                                tracing::warn!(
-                                    bot_id = %bot.id,
-                                    item_uid = %outcome.item.uid,
-                                    session = origin_sid.0,
-                                    error = %err,
-                                    "failed to deliver item answer wake prompt to originating session; falling back"
-                                );
-                                false
-                            }
+                        if self
+                            .runtime
+                            .deliver_turn(registry, &self.store, origin_sid, &bot.id, &wake_prompt)
+                            .is_ok()
+                        {
+                            true
+                        } else {
+                            tracing::warn!(
+                                bot_id = %bot.id,
+                                item_uid = %outcome.item.uid,
+                                session = origin_sid.0,
+                                "failed to deliver item answer wake prompt to originating session; falling back"
+                            );
+                            false
                         }
                     } else {
                         false
                     };
                     if !delivered_origin
-                        && let Err(err) = self.runtime.deliver_or_wake_bot(
-                            registry,
-                            &self.store,
-                            &self.secrets,
-                            &self.tool_relay,
-                            &self.composio_base_url,
-                            &bot.id,
-                            &wake_prompt,
-                            ts,
-                        )
+                        && self
+                            .runtime
+                            .deliver_or_wake_bot(
+                                registry,
+                                &self.store,
+                                &self.secrets,
+                                &self.tool_relay,
+                                &self.composio_base_url,
+                                &bot.id,
+                                &wake_prompt,
+                                ts,
+                            )
+                            .is_err()
                     {
                         tracing::warn!(
                             bot_id = %bot.id,
                             item_uid = %outcome.item.uid,
-                            error = %err,
                             "failed to deliver item answer wake prompt"
                         );
                     }
