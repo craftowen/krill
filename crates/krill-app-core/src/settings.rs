@@ -4441,6 +4441,7 @@ impl SettingsView {
         self.visible = visible;
         if !visible {
             self.stop_voice_shortcut_capture();
+            self.abandon_antigravity_sign_in(cx);
         }
         if let Some(view) = &self.remote_krill {
             view.update(cx, |view, cx| {
@@ -4589,6 +4590,7 @@ impl SettingsView {
         let app: &mut gpui::App = cx;
         for input in [
             self.opencode_api_key_input.as_ref(),
+            self.antigravity.code_input.as_ref().map(|(input, _)| input),
             self.rename.as_ref().map(|(_, input)| input),
             self.search.as_ref().map(|(input, _)| input),
             self.shortcuts.search.as_ref().map(|(input, _)| input),
@@ -4763,6 +4765,7 @@ impl SettingsView {
             self.accounts_offline = false;
             self.terminal_login_provider = None;
             self.terminal_login_account = None;
+            self.abandon_antigravity_sign_in(cx);
             self.antigravity.reset_for_host_switch();
             self.removing = None;
             self.rename = None;
@@ -9205,10 +9208,9 @@ impl SettingsView {
                     continue;
                 }
             }
-            // Antigravity (`agy`) uses Orca's native single-login account section 1:1
-            // (Save current / Select / Remove / Refresh usage — no isolated profile guide).
+            // Antigravity (`agy`) uses Orca's native single-login + in-app sign-in account section 1:1.
             if provider == ProviderKind::Antigravity {
-                let section = self.render_antigravity_section(provider_installed, cx);
+                let section = self.render_antigravity_section(provider_installed, window, cx);
                 if provider_installed {
                     root = root.child(section);
                 } else {
@@ -13560,6 +13562,12 @@ impl Render for SettingsView {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.antigravity.has_own_running_sign_in() || this.antigravity.sign_in_busy {
+                        this.cancel_antigravity_sign_in(cx);
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.removing.take().is_some() {
                         cx.stop_propagation();
                         cx.notify();
@@ -13611,6 +13619,12 @@ impl Render for SettingsView {
                     return;
                 }
                 if ev.keystroke.key == "escape" {
+                    if this.antigravity.has_own_running_sign_in() || this.antigravity.sign_in_busy {
+                        this.cancel_antigravity_sign_in(cx);
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.rename.take().is_some() {
                         if let Some(focus) = this.rename_return_focus.take() {
                             window.focus(&focus, cx);

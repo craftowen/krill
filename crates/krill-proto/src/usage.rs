@@ -22,8 +22,11 @@ pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 pub const FEAT_ACCOUNT_SWITCH_CONTROL: u64 = 1 << 43;
 mod antigravity;
 pub use antigravity::{
-    AntigravityAccountOp, AntigravityAccountState, AntigravityAccountSummary,
-    AntigravityCurrentAccount, AntigravityStoredUsage,
+    ANTIGRAVITY_ACCESS_DENIED, ANTIGRAVITY_ACCOUNT_INELIGIBLE, ANTIGRAVITY_INVALID_GRANT,
+    ANTIGRAVITY_SIGN_IN_FAILED, ANTIGRAVITY_SUBSCRIPTION_REQUIRED, AntigravityAccountOp,
+    AntigravityAccountState, AntigravityAccountSummary, AntigravityCurrentAccount,
+    AntigravitySignInIntent, AntigravitySignInPhase, AntigravitySignInState,
+    AntigravityStoredUsage, agy_login_answer, agy_login_failure, agy_login_link,
 };
 mod switch_plan;
 pub use switch_plan::{
@@ -868,7 +871,9 @@ impl UsageRequest {
                 | Self::ListOrphanProfiles
                 | Self::GetProvisioning
                 | Self::ImportOrcaAntigravity { dry_run: true, .. }
-                | Self::AntigravityAccounts(AntigravityAccountOp::List)
+                | Self::AntigravityAccounts(
+                    AntigravityAccountOp::List | AntigravityAccountOp::SignInStatus { .. },
+                )
         )
     }
 
@@ -970,6 +975,8 @@ impl UsageRequest {
     pub const fn ipc_timeout(&self, default: std::time::Duration) -> std::time::Duration {
         if matches!(self, Self::ConsumeResetCredit { .. }) {
             RESET_CONSUME_IPC_TIMEOUT
+        } else if matches!(self, Self::AntigravityAccounts(_)) {
+            std::time::Duration::from_secs(20)
         } else {
             default
         }
@@ -1275,8 +1282,8 @@ impl Msg for UsageReply {
         } else if let Self::AntigravityAccounts(result) = self {
             match result {
                 Ok(state) => {
-                    // Keep the N-1 4-field prefix unchanged; append `vault_locked` only when true
-                    // so older decoders reading normal unlocked states receive identical bytes.
+                    // Keep the N-1 4-field prefix unchanged; append trailing optional fields only
+                    // when non-default so older decoders reading normal states receive identical bytes.
                     let mut body = postcard::to_stdvec(&(
                         7_u8,
                         0_u8,
@@ -1286,8 +1293,31 @@ impl Msg for UsageReply {
                         &state.selected_account_id,
                     ))
                     .map_err(Error::Codec)?;
-                    if state.vault_locked {
-                        body.extend(postcard::to_stdvec(&true).map_err(Error::Codec)?);
+                    if state.vault_locked
+                        || state.restores_selection_at_launch
+                        || state.sign_in_supported
+                        || state.sign_in.is_some()
+                    {
+                        body.extend(
+                            postcard::to_stdvec(&state.vault_locked).map_err(Error::Codec)?,
+                        );
+                    }
+                    if state.restores_selection_at_launch
+                        || state.sign_in_supported
+                        || state.sign_in.is_some()
+                    {
+                        body.extend(
+                            postcard::to_stdvec(&state.restores_selection_at_launch)
+                                .map_err(Error::Codec)?,
+                        );
+                    }
+                    if state.sign_in_supported || state.sign_in.is_some() {
+                        body.extend(
+                            postcard::to_stdvec(&state.sign_in_supported).map_err(Error::Codec)?,
+                        );
+                    }
+                    if state.sign_in.is_some() {
+                        body.extend(postcard::to_stdvec(&state.sign_in).map_err(Error::Codec)?);
                     }
                     ipc::encode_frame(Self::KIND, &body)
                 }
@@ -1357,10 +1387,25 @@ impl Msg for UsageReply {
                     (_, _, accounts, active_account_id, current_account, selected_account_id),
                     tail,
                 ) = postcard::take_from_bytes::<LegacyAntigravityOk>(body).map_err(Error::Codec)?;
-                let vault_locked = if tail.is_empty() {
-                    false
+                let (vault_locked, tail) = if tail.is_empty() {
+                    (false, tail)
                 } else {
-                    postcard::take_from_bytes::<bool>(tail)
+                    postcard::take_from_bytes::<bool>(tail).map_err(Error::Codec)?
+                };
+                let (restores_selection_at_launch, tail) = if tail.is_empty() {
+                    (false, tail)
+                } else {
+                    postcard::take_from_bytes::<bool>(tail).map_err(Error::Codec)?
+                };
+                let (sign_in_supported, tail) = if tail.is_empty() {
+                    (false, tail)
+                } else {
+                    postcard::take_from_bytes::<bool>(tail).map_err(Error::Codec)?
+                };
+                let sign_in = if tail.is_empty() {
+                    None
+                } else {
+                    postcard::take_from_bytes::<Option<AntigravitySignInState>>(tail)
                         .map_err(Error::Codec)?
                         .0
                 };
@@ -1370,6 +1415,9 @@ impl Msg for UsageReply {
                     current_account,
                     selected_account_id,
                     vault_locked,
+                    restores_selection_at_launch,
+                    sign_in_supported,
+                    sign_in,
                 })))
             } else {
                 let ((_, _, err), _) =

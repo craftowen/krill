@@ -9479,15 +9479,33 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
     });
     vcx.run_until_parked();
 
-    // Orca parity: no `+ Add account` button or intermediate terminal login guide modal.
+    // Orca parity: no header `+ Add account` button or legacy terminal guide modal.
+    // On an N-1 daemon (`sign_in_supported == false`, default in non-daemon test dir),
+    // signed-out row hides `Sign in with Google` and keeps the sign-in help link.
     assert!(vcx.debug_bounds("admin-add-account-agy").is_none());
     assert!(vcx.debug_bounds("admin-agy-login-guide").is_none());
     assert!(vcx.debug_bounds("admin-agy-refresh-accounts").is_some());
     assert!(vcx.debug_bounds("admin-agy-row-signed-out").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-google").is_none());
     assert!(vcx.debug_bounds("admin-agy-sign-in-help").is_some());
     assert!(vcx.debug_bounds("admin-agy-add-account-help").is_none());
 
-    // Current unsaved login shows active badge + Refresh usage + Save button.
+    // Current daemon (`sign_in_supported == true`) renders in-app `Sign in with Google` when signed out.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.state = Some(AntigravityAccountState {
+                sign_in_supported: true,
+                restores_selection_at_launch: true,
+                ..Default::default()
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-sign-in-google").is_some());
+
+    // Current unsaved login shows active badge + Refresh usage + Save button + in-card Add account.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.antigravity.state = Some(AntigravityAccountState {
@@ -9501,6 +9519,9 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     identity_known: true,
                 }),
                 vault_locked: false,
+                restores_selection_at_launch: true,
+                sign_in_supported: true,
+                sign_in: None,
             });
             cx.notify();
         });
@@ -9510,11 +9531,13 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
     assert!(vcx.debug_bounds("admin-agy-row-current").is_some());
     assert!(vcx.debug_bounds("admin-agy-save-current").is_some());
     assert!(vcx.debug_bounds("admin-agy-current-usage").is_some());
+    assert!(vcx.debug_bounds("admin-agy-add-account").is_some());
     assert!(vcx.debug_bounds("admin-agy-row-signed-out").is_none());
     assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
     assert!(vcx.debug_bounds("admin-agy-row-vault-locked").is_none());
 
-    // Locked legacy vault keeps current host login + usage refresh visible, hides normal Save, and renders recovery row + button.
+    // Locked legacy vault keeps current host login + usage refresh visible, hides Save, Add account,
+    // and manual `/logout` footer help, and renders recovery row + button.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.antigravity.state = Some(AntigravityAccountState {
@@ -9528,6 +9551,9 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     identity_known: true,
                 }),
                 vault_locked: true,
+                restores_selection_at_launch: true,
+                sign_in_supported: true,
+                sign_in: None,
             });
             cx.notify();
         });
@@ -9539,9 +9565,11 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
     assert!(vcx.debug_bounds("admin-agy-row-current").is_some());
     assert!(vcx.debug_bounds("admin-agy-current-usage").is_some());
     assert!(vcx.debug_bounds("admin-agy-save-current").is_none());
+    assert!(vcx.debug_bounds("admin-agy-add-account").is_none());
+    assert!(vcx.debug_bounds("admin-agy-add-account-help").is_none());
     assert!(vcx.debug_bounds("admin-agy-row-error").is_none());
 
-    // Saved accounts show Select rows, Active badge + usage refresh on active, Remove on inactive, and footer help.
+    // Saved accounts show Select rows, Active badge + usage refresh on active, Remove on inactive, and in-card Add account button.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
             v.antigravity.state = Some(AntigravityAccountState {
@@ -9584,6 +9612,9 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     identity_known: true,
                 }),
                 vault_locked: false,
+                restores_selection_at_launch: true,
+                sign_in_supported: true,
+                sign_in: None,
             });
             cx.notify();
         });
@@ -9599,7 +9630,83 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
     assert!(vcx.debug_bounds("admin-agy-remove-acc-1").is_none());
     assert!(vcx.debug_bounds("admin-agy-remove-acc-2").is_some());
     assert!(vcx.debug_bounds("admin-agy-add-account-help").is_some());
+    assert!(vcx.debug_bounds("admin-agy-add-account").is_some());
     assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
+
+    // Active in-app sign-in flow (Waiting) renders inline paste form, Continue, Copy link, Cancel, and hides footer add row.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.sign_in_flow_id = Some("flow-ui-1".into());
+            if let Some(state) = v.antigravity.state.as_mut() {
+                state.sign_in = Some(krill_proto::usage::AntigravitySignInState {
+                    flow_id: Some("flow-ui-1".into()),
+                    phase: krill_proto::usage::AntigravitySignInPhase::Waiting,
+                    intent: krill_proto::usage::AntigravitySignInIntent::AddAccount,
+                    url: Some("https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=ui-state".into()),
+                    error: None,
+                });
+            }
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-row-signing-in").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-continue").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-copy-link").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-cancel").is_some());
+    assert!(vcx.debug_bounds("admin-agy-add-account").is_none());
+
+    // Invalid pasted answer surfaces inline refusal while keeping Copy link visible.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some((input, _)) = v.antigravity.code_input.as_ref() {
+                input.update(cx, |inp, cx| inp.set_value("not a valid code", window, cx));
+            }
+            v.submit_antigravity_sign_in_code(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-sign-in-refusal").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-copy-link").is_some());
+
+    // Pressing Escape while `code_input` is focused cancels the sign-in flow instead of closing Settings.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-row-signing-in").is_none());
+    assert!(vcx.debug_bounds("admin-agy-add-account").is_some());
+
+    // Saved account refreshed over native slot shows launches-use indicator when launch-restore is enabled,
+    // and surfaces changed warning when launch-restore is disabled (Windows / N-1 daemon).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(state) = v.antigravity.state.as_mut() {
+                state.sign_in = None;
+                state.selected_account_id = Some("acc-1".into());
+                state.active_account_id = Some("acc-2".into());
+                state.restores_selection_at_launch = true;
+            }
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-launches-use-acc-1").is_some());
+    assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(state) = v.antigravity.state.as_mut() {
+                state.restores_selection_at_launch = false;
+            }
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-launches-use-acc-1").is_none());
+    assert!(vcx.debug_bounds("admin-agy-changed-warning").is_some());
 
     // Changed externally (selected != active) renders warning + unsaved current row.
     vcx.update(|window, cx| {
@@ -9623,6 +9730,9 @@ fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext)
                     identity_known: true,
                 }),
                 vault_locked: false,
+                restores_selection_at_launch: true,
+                sign_in_supported: true,
+                sign_in: None,
             });
             cx.notify();
         });

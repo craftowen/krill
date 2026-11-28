@@ -1652,11 +1652,15 @@ fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
         }),
         selected_account_id: Some("acct-1".into()),
         vault_locked: false,
+        restores_selection_at_launch: false,
+        sign_in_supported: false,
+        sign_in: None,
     };
     assert!(!state.native_account_changed());
     let mut changed = state.clone();
     changed.active_account_id = None;
     assert!(changed.native_account_changed());
+    assert_eq!(state.launches_use_account(), None);
 
     let reply = UsageReply::AntigravityAccounts(Ok(state.clone()));
     let frame = reply.encode().unwrap();
@@ -1665,7 +1669,7 @@ fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
     assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
 
     // Locked vault appends trailing `true` flag and roundtrips cleanly.
-    let mut locked_state = state;
+    let mut locked_state = state.clone();
     locked_state.vault_locked = true;
     let locked_reply = UsageReply::AntigravityAccounts(Ok(locked_state));
     let locked_frame = locked_reply.encode().unwrap();
@@ -1675,19 +1679,142 @@ fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
     assert_eq!(lbody.len(), body.len() + 1, "only appends trailing bool");
     assert_eq!(UsageReply::decode(lkind, &lbody).unwrap(), locked_reply);
 
-    // Err variant and ResetLockedVault op roundtrip cleanly.
+    // N-2 (4-field) and N-1 (5-field vault_locked) raw-byte wire fixtures decode cleanly
+    // with `sign_in_supported == false` and `restores_selection_at_launch == false`.
+    let n2_body = postcard::to_stdvec(&(
+        7_u8,
+        0_u8,
+        &state.accounts,
+        &state.active_account_id,
+        &state.current_account,
+        &state.selected_account_id,
+    ))
+    .unwrap();
+    assert_eq!(
+        n2_body, body,
+        "default state preserves exact N-2 wire bytes"
+    );
+    assert_eq!(
+        UsageReply::decode(UsageReply::KIND, &n2_body).unwrap(),
+        UsageReply::AntigravityAccounts(Ok(state.clone()))
+    );
+    let mut n1_body = n2_body.clone();
+    n1_body.extend(postcard::to_stdvec(&true).unwrap());
+    assert_eq!(
+        n1_body, lbody,
+        "vault_locked-only preserves exact N-1 bytes"
+    );
+    let UsageReply::AntigravityAccounts(Ok(decoded_n1)) =
+        UsageReply::decode(UsageReply::KIND, &n1_body).unwrap()
+    else {
+        panic!("expected Ok AntigravityAccounts");
+    };
+    assert!(decoded_n1.vault_locked);
+    assert!(!decoded_n1.restores_selection_at_launch);
+    assert!(!decoded_n1.sign_in_supported);
+    assert!(decoded_n1.sign_in.is_none());
+
+    // Launch-restore + sign-in flow state roundtrips cleanly AND remains decodable by N-2/N-1 peers.
+    let mut sign_in_state = state;
+    sign_in_state.restores_selection_at_launch = true;
+    sign_in_state.sign_in_supported = true;
+    sign_in_state.sign_in = Some(AntigravitySignInState {
+        flow_id: Some("flow-123".into()),
+        phase: AntigravitySignInPhase::Waiting,
+        intent: AntigravitySignInIntent::AddAccount,
+        url: Some("https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=abc".into()),
+        error: None,
+    });
+    let sign_in_reply = UsageReply::AntigravityAccounts(Ok(sign_in_state.clone()));
+    let sign_in_frame = sign_in_reply.encode().unwrap();
+    let (skind, sbody) = ipc::read_frame(&mut sign_in_frame.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(UsageReply::decode(skind, &sbody).unwrap(), sign_in_reply);
+
+    // Simulate N-1 decoder reading the new frame (ignores trailing fields after vault_locked).
+    let ((tag, ok, accounts, active, current, selected), tail) = postcard::take_from_bytes::<(
+        u8,
+        u8,
+        Vec<AntigravityAccountSummary>,
+        Option<String>,
+        Option<AntigravityCurrentAccount>,
+        Option<String>,
+    )>(&sbody)
+    .unwrap();
+    assert_eq!((tag, ok), (7, 0));
+    assert_eq!(accounts, sign_in_state.accounts);
+    assert_eq!(active, sign_in_state.active_account_id);
+    assert_eq!(current, sign_in_state.current_account);
+    assert_eq!(selected, sign_in_state.selected_account_id);
+    let (n1_locked, _) = postcard::take_from_bytes::<bool>(tail).unwrap();
+    assert!(!n1_locked);
+
+    // Debug impls redact capability tokens, OAuth links, and authorization codes.
+    let debug_state = format!("{:?}", sign_in_state.sign_in.as_ref().unwrap());
+    assert!(!debug_state.contains("flow-123"));
+    assert!(!debug_state.contains("state=abc"));
+    assert!(debug_state.contains("[REDACTED]"));
+    let debug_op = format!(
+        "{:?}",
+        AntigravityAccountOp::SignInComplete {
+            flow_id: "secret-flow-id".into(),
+            answer: "4/0AY0e-secret-code".into(),
+        }
+    );
+    assert!(!debug_op.contains("secret-flow-id"));
+    assert!(!debug_op.contains("secret-code"));
+    assert!(debug_op.contains("[REDACTED]"));
+
+    // Antigravity account RPCs get an extended IPC timeout so Keychain/userinfo never false-timeout.
+    assert!(
+        UsageRequest::AntigravityAccounts(AntigravityAccountOp::SignInStart {
+            intent: AntigravitySignInIntent::AddAccount,
+        })
+        .ipc_timeout(std::time::Duration::from_secs(5))
+            >= std::time::Duration::from_secs(20)
+    );
+
+    // Err variant and sign-in/recovery ops roundtrip cleanly.
     let err_reply = UsageReply::AntigravityAccounts(Err("vault error".into()));
     let err_frame = err_reply.encode().unwrap();
     let (ekind, ebody) = ipc::read_frame(&mut err_frame.as_slice()).unwrap().unwrap();
     assert_eq!(UsageReply::decode(ekind, &ebody).unwrap(), err_reply);
 
-    let reset_req = UsageRequest::AntigravityAccounts(AntigravityAccountOp::ResetLockedVault);
-    assert!(!reset_req.is_read());
-    let reset_frame = reset_req.encode().unwrap();
-    let (rkind, rbody) = ipc::read_frame(&mut reset_frame.as_slice())
-        .unwrap()
-        .unwrap();
-    assert_eq!(UsageRequest::decode(rkind, &rbody).unwrap(), reset_req);
+    for (op, expected_read) in [
+        (AntigravityAccountOp::ResetLockedVault, false),
+        (
+            AntigravityAccountOp::SignInStart {
+                intent: AntigravitySignInIntent::AddAccount,
+            },
+            false,
+        ),
+        (
+            AntigravityAccountOp::SignInComplete {
+                flow_id: "flow-123".into(),
+                answer: "4/0AY0e-g7example".into(),
+            },
+            false,
+        ),
+        (
+            AntigravityAccountOp::SignInCancel {
+                flow_id: "flow-123".into(),
+            },
+            false,
+        ),
+        (
+            AntigravityAccountOp::SignInStatus {
+                flow_id: Some("flow-123".into()),
+            },
+            true,
+        ),
+    ] {
+        let req = UsageRequest::AntigravityAccounts(op);
+        assert_eq!(req.is_read(), expected_read);
+        let frame = req.encode().unwrap();
+        let (okind, obody) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(UsageRequest::decode(okind, &obody).unwrap(), req);
+    }
 
     assert_eq!(
         reply
@@ -1706,6 +1833,81 @@ fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
             FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL
         ),
         reply
+    );
+}
+
+#[test]
+fn antigravity_sign_in_url_answer_and_failure_validators_match_contract() {
+    let real_line = "  https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com&prompt=consent&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=1D-c07whJqid-5TAMH7ZIQ  ";
+    assert_eq!(agy_login_link(real_line), Some(real_line.trim()));
+
+    let v2 = "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=ok-state";
+    assert_eq!(agy_login_link(v2), Some(v2));
+
+    // Reject untrusted hosts, fragments, duplicate params, wrong redirect, missing/blank state.
+    for bad in [
+        "Open this link in a browser:",
+        "http://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=s",
+        "https://accounts.google.com.evil.test/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=s",
+        "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fevil.test%2Fcb&state=s",
+        "https://accounts.google.com/o/oauth2/auth?response_type=code&response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=s",
+        "https://accounts.google.com/o/oauth2/auth?response_type=token&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=s",
+        "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=s#frag",
+        "https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=",
+    ] {
+        assert_eq!(agy_login_link(bad), None, "expected None for {bad}");
+    }
+
+    // Valid answers: bare code (with optional outer whitespace/newline) and exact callback URL with non-empty code.
+    assert_eq!(
+        agy_login_answer("  4/0AY0e-g7example_code\r\n").as_deref(),
+        Some("4/0AY0e-g7example_code")
+    );
+    let cb = "https://antigravity.google/oauth-callback?state=abc&code=4%2F0AY0e-g7&scope=openid";
+    assert_eq!(agy_login_answer(cb).as_deref(), Some(cb));
+    let cb_upper = "HTTPS://ANTIGRAVITY.GOOGLE:443/oauth-callback?code=4%2F0AY0e-g7";
+    assert_eq!(agy_login_answer(cb_upper).as_deref(), Some(cb_upper));
+
+    // Reject control chars (including Unicode C1), embedded newlines, spaces, wrong callback host, or missing/blank code param.
+    for bad in [
+        "",
+        "   ",
+        "code with spaces",
+        "code\nsecond-line",
+        "code\rsecond-line",
+        "code\x00tail",
+        "code\u{009b}31m",
+        "https://antigravity.google/oauth-callback?state=abc",
+        "https://antigravity.google/oauth-callback?code=",
+        "https://antigravity.google/oauth-callback?code=%20",
+        "https://antigravity.google/oauth-callback?code=+",
+        "https://antigravity.google/oauth-callback?code=%0a",
+        "https://evil.example/oauth-callback?code=abc",
+        "https://antigravity.google/other?code=abc",
+        "https://antigravity.google:8443/oauth-callback?code=abc",
+    ] {
+        assert_eq!(agy_login_answer(bad), None, "expected None for {bad:?}");
+    }
+
+    assert_eq!(
+        agy_login_failure("error: SUBSCRIPTION_REQUIRED"),
+        ANTIGRAVITY_SUBSCRIPTION_REQUIRED
+    );
+    assert_eq!(
+        agy_login_failure("Onboarding failed for workspace"),
+        ANTIGRAVITY_ACCOUNT_INELIGIBLE
+    );
+    assert_eq!(
+        agy_login_failure("token exchange failed: oauth2: \"invalid_grant\""),
+        ANTIGRAVITY_INVALID_GRANT
+    );
+    assert_eq!(
+        agy_login_failure("login cancelled: no authorization code was entered"),
+        ANTIGRAVITY_ACCESS_DENIED
+    );
+    assert_eq!(
+        agy_login_failure("unexpected exit"),
+        ANTIGRAVITY_SIGN_IN_FAILED
     );
 }
 
