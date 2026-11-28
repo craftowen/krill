@@ -309,6 +309,438 @@ pub fn sanitize_http_url(raw: &str) -> Option<String> {
     Some(clean)
 }
 
+/// Safe target resolved from a rendered Markdown/chat link (`http(s)://`, `mailto:`,
+/// `cursor://`, `vscode://`, local `file://`, or local filesystem path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownLinkTarget {
+    /// Sanitized external URL ready for `cx.open_url`.
+    ExternalUrl(String),
+    /// Resolved local filesystem path with optional 1-based `#L<line>`/`#L<line>C<col>` location.
+    LocalPath {
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+        /// True when OS `open` / `ShellExecute` could execute the target rather than viewing it.
+        dangerous_executable: bool,
+        /// True when the executable extension is plain-text source (safe to open in Krill's editor).
+        text_script: bool,
+    },
+}
+
+/// Returns true when a GPUI link click event should trigger link opening (ignores right-clicks
+/// and touch long-presses).
+#[must_use]
+pub fn should_open_link_click(event: &gpui::ClickEvent) -> bool {
+    match event {
+        gpui::ClickEvent::Mouse(click) => matches!(
+            click.up.button,
+            gpui::MouseButton::Left | gpui::MouseButton::Middle
+        ),
+        gpui::ClickEvent::Keyboard(_) => true,
+        gpui::ClickEvent::Touch(click) => !click.long_press,
+    }
+}
+
+/// Returns true when a local path should be opened by the OS default handler (browser for HTML,
+/// Preview/image viewer for images, Finder/Explorer for directories, PDF/media/office viewers)
+/// rather than a code editor tab.
+#[must_use]
+pub fn prefers_system_open(path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "html"
+            | "htm"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "ico"
+            | "tiff"
+            | "tif"
+            | "avif"
+            | "heic"
+            | "heif"
+            | "svg"
+            | "pdf"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "aac"
+            | "ogg"
+            | "flac"
+            | "opus"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "webm"
+            | "mkv"
+            | "avi"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "pages"
+            | "numbers"
+            | "key"
+            | "rtf"
+            | "epub"
+    )
+}
+
+fn classify_local_executable(path: &Path) -> (bool, bool) {
+    if path.is_dir() {
+        // macOS `.app` / `.workflow` / `.action` / `.scptd` bundles are directories on disk
+        // that `open` executes.
+        let is_exec_bundle = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "app" | "workflow" | "action" | "scptd" | "mpkg" | "pkg"
+                )
+            });
+        return (is_exec_bundle, false);
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return (false, false);
+    };
+    match ext.as_str() {
+        "sh" | "bash" | "zsh" | "fish" | "csh" | "ksh" | "ps1" | "psm1" | "psd1" | "bat"
+        | "cmd" | "vbs" | "vbe" | "js" | "jse" | "wsf" | "wsh" | "py" | "rb" | "pl"
+        | "applescript" => (true, true),
+        "command" | "app" | "pkg" | "dmg" | "mpkg" | "action" | "workflow" | "scpt" | "scptd"
+        | "osax" | "terminal" | "inetloc" | "webloc" | "exe" | "com" | "msc" | "msi" | "msp"
+        | "scr" | "pif" | "lnk" | "hta" | "cpl" | "reg" | "inf" | "jar" | "jnlp" | "appimage"
+        | "desktop" | "run" => (true, false),
+        _ => (false, false),
+    }
+}
+
+/// Parses GitHub/editor line anchors such as `L10`, `L10-L20`, `L10C5`, `L10C5-L20C8`, `L10:5`,
+/// or bare positive integer `10`. Ignores general HTML anchors like `section-1` or `01c`.
+fn parse_line_fragment(fragment: &str) -> (Option<u32>, Option<u32>) {
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    let first = trimmed.split('-').next().unwrap_or(trimmed);
+    let body = first
+        .strip_prefix('L')
+        .or_else(|| first.strip_prefix('l'))
+        .unwrap_or(first);
+    if body.is_empty() || !body.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+        return (None, None);
+    }
+    if let Some((line_part, col_part)) = body
+        .split_once('C')
+        .or_else(|| body.split_once('c'))
+        .or_else(|| body.split_once(':'))
+    {
+        let Ok(line) = line_part.parse::<u32>() else {
+            return (None, None);
+        };
+        let Ok(col) = col_part.parse::<u32>() else {
+            return (None, None);
+        };
+        if line == 0 {
+            return (None, None);
+        }
+        return (Some(line), (col > 0).then_some(col));
+    }
+    let Ok(line) = body.parse::<u32>() else {
+        return (None, None);
+    };
+    if line == 0 {
+        return (None, None);
+    }
+    (Some(line), None)
+}
+
+fn has_non_drive_uri_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.split_once(':') else {
+        return false;
+    };
+    // Single ASCII letter followed by `:` is a Windows drive path (`C:\...`, `C:/...`), not a URI scheme.
+    if scheme.len() <= 1 {
+        return false;
+    }
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn percent_decode_path(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut decoded_any = false;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            decoded_any = true;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if !decoded_any {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+const fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_windows_drive_absolute(s: &str) -> bool {
+    matches!(
+        s.as_bytes(),
+        [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()
+    )
+}
+
+fn expand_tilde_path(s: &str) -> Option<PathBuf> {
+    let rest = s.strip_prefix("~/")?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(rest))
+}
+
+fn split_trailing_line_col(raw: &str) -> (&str, Option<u32>, Option<u32>) {
+    // Preserve Windows drive prefixes like `C:\foo.rs:12:3` by never splitting at index 1.
+    let min_colon = if is_windows_drive_absolute(raw) { 2 } else { 0 };
+    let Some((before_last, last_part)) = raw.rsplit_once(':') else {
+        return (raw, None, None);
+    };
+    if before_last.len() <= min_colon {
+        return (raw, None, None);
+    }
+    let Ok(last_num) = last_part.parse::<u32>() else {
+        return (raw, None, None);
+    };
+    if last_num == 0 {
+        return (raw, None, None);
+    }
+    if let Some((before_line, line_part)) = before_last.rsplit_once(':')
+        && before_line.len() > min_colon
+        && let Ok(line_num) = line_part.parse::<u32>()
+        && line_num > 0
+    {
+        return (before_line, Some(line_num), Some(last_num));
+    }
+    (before_last, Some(last_num), None)
+}
+
+/// Resolves a Markdown/chat link URL into either a sanitized external URL or a validated local
+/// filesystem path (supporting `file://` with percent-encoded spaces/UTF-8, `#L10-L20` line
+/// anchors, unencoded spaces, absolute paths, and `base_dir`-relative paths).
+#[must_use]
+pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<MarkdownLinkTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || is_bidi_control(c))
+    {
+        return None;
+    }
+
+    if let Some(clean) = sanitize_external_url(trimmed) {
+        return Some(MarkdownLinkTarget::ExternalUrl(clean));
+    }
+
+    if trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+    {
+        let (before_hash, fragment) = match trimmed.split_once('#') {
+            Some((head, frag)) => (head, Some(frag)),
+            None => (trimmed, None),
+        };
+        let (line, column) = fragment.map_or((None, None), parse_line_fragment);
+        let without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
+        // Agents sometimes emit raw spaces inside `file:///Users/.../Application Support/...`.
+        let encoded = if without_query.contains(' ') {
+            without_query.replace(' ', "%20")
+        } else {
+            without_query.to_owned()
+        };
+        let parsed = gpui::http_client::Url::parse(&encoded).ok()?;
+        if parsed.scheme() != "file" {
+            return None;
+        }
+        // Reject remote UNC/SMB hosts (`file://evil.example/...`); allow only local files.
+        if parsed
+            .host_str()
+            .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
+        {
+            return None;
+        }
+        let path = parsed.to_file_path().ok()?;
+        if path
+            .to_string_lossy()
+            .chars()
+            .any(|c| c.is_control() || is_bidi_control(c))
+        {
+            return None;
+        }
+        let (dangerous_executable, text_script) = classify_local_executable(&path);
+        return Some(MarkdownLinkTarget::LocalPath {
+            path,
+            line,
+            column,
+            dangerous_executable,
+            text_script,
+        });
+    }
+
+    if has_non_drive_uri_scheme(trimmed) {
+        return None;
+    }
+
+    let (before_hash, fragment) = match trimmed.split_once('#') {
+        Some((head, frag)) => (head, Some(frag)),
+        None => (trimmed, None),
+    };
+    let (mut line, mut column) = fragment.map_or((None, None), parse_line_fragment);
+    let mut path_str = before_hash;
+    if line.is_none() {
+        let (stripped, l, c) = split_trailing_line_col(path_str);
+        if l.is_some() {
+            path_str = stripped;
+            line = l;
+            column = c;
+        }
+    }
+    if path_str.is_empty() {
+        return None;
+    }
+
+    let candidate_path = if let Some(expanded) = expand_tilde_path(path_str) {
+        expanded
+    } else if path_str.starts_with('/') || is_windows_drive_absolute(path_str) {
+        let raw_pb = PathBuf::from(path_str);
+        if !raw_pb.exists()
+            && let Some(decoded) = percent_decode_path(path_str)
+            && !decoded
+                .chars()
+                .any(|c| c.is_control() || is_bidi_control(c))
+        {
+            let decoded_pb = PathBuf::from(&decoded);
+            if decoded_pb.exists() {
+                decoded_pb
+            } else {
+                raw_pb
+            }
+        } else {
+            raw_pb
+        }
+    } else {
+        let base = base_dir?;
+        let raw_joined = base.join(path_str);
+        if raw_joined.exists() {
+            raw_joined
+        } else if let Some(decoded) = percent_decode_path(path_str)
+            && !decoded
+                .chars()
+                .any(|c| c.is_control() || is_bidi_control(c))
+        {
+            let decoded_joined = base.join(&decoded);
+            if decoded_joined.exists() {
+                decoded_joined
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    };
+
+    if candidate_path
+        .to_string_lossy()
+        .chars()
+        .any(|c| c.is_control() || is_bidi_control(c))
+    {
+        return None;
+    }
+    let (dangerous_executable, text_script) = classify_local_executable(&candidate_path);
+    Some(MarkdownLinkTarget::LocalPath {
+        path: candidate_path,
+        line,
+        column,
+        dangerous_executable,
+        text_script,
+    })
+}
+
+/// Opens a Markdown/chat link using `App`-level OS handlers (`cx.open_url`, `cx.open_with_system`,
+/// or `cx.reveal_path` for dangerous executables). Used by non-Shell views such as Markdown file
+/// previews and Bot Item cards.
+pub fn open_markdown_link_with_app(raw: &str, base_dir: Option<&Path>, cx: &mut gpui::App) -> bool {
+    let Some(target) = resolve_markdown_link(raw, base_dir) else {
+        tracing::warn!(url = raw, "ignoring invalid or disallowed markdown link");
+        return false;
+    };
+    match target {
+        MarkdownLinkTarget::ExternalUrl(clean) => {
+            cx.open_url(&clean);
+            true
+        }
+        MarkdownLinkTarget::LocalPath {
+            path,
+            dangerous_executable,
+            ..
+        } => {
+            if !path.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "markdown link target does not exist"
+                );
+                return false;
+            }
+            if dangerous_executable {
+                cx.reveal_path(&path);
+            } else {
+                cx.open_with_system(&path);
+            }
+            true
+        }
+    }
+}
+
 /// 포인터 칸을 덮는 후보 글자열(디스크를 보지 않는다). 글자마다 시작 칸, 마지막 글자 다음 칸을 함께 둔다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {

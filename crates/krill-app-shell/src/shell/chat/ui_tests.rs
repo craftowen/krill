@@ -6634,3 +6634,207 @@ fn removing_attached_image_leaves_send_disabled_and_hides_queue_steer(cx: &mut T
         "UI-12: Steer must be hidden when only a removed-image token remains"
     );
 }
+
+#[gpui::test]
+fn chat_markdown_file_links_after_korean_text_and_inline_code_click_and_open(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::agent_history::{ChatItem, ChatItemKind};
+
+    struct LinkClickHarness {
+        source: SharedString,
+        clicked: Arc<Mutex<Vec<String>>>,
+    }
+    impl gpui::Render for LinkClickHarness {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let clicked = self.clicked.clone();
+            gpui::div()
+                .w(gpui::px(760.))
+                .h(gpui::px(420.))
+                .child(gpui_component::TextSelectionLayer)
+                .child(
+                    gpui_component::text::TextView::markdown(
+                        "korean-file-links",
+                        self.source.clone(),
+                    )
+                    .scrollable(false)
+                    .selectable(true)
+                    .on_link_click(move |url, _, _, _| {
+                        clicked.lock().unwrap().push(url.to_string());
+                    }),
+                )
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "krill-chat-md-links-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let outputs = dir
+        .join("Application Support")
+        .join("dev.krill.app")
+        .join("bots")
+        .join("bot-7")
+        .join("outputs");
+    std::fs::create_dir_all(&outputs).unwrap();
+    let gallery = outputs.join("yunjadong-profile-gallery.html");
+    let png1 = outputs.join("01c-balanced-lowkey-depth.png");
+    let png2 = outputs.join("verify-before-after.png");
+    let png3 = outputs.join("verify-html-final.png");
+    let rs_file = outputs.join("view.rs");
+    std::fs::write(&gallery, b"<html><body>gallery</body></html>").unwrap();
+    std::fs::write(&png1, b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(&png2, b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(&png3, b"\x89PNG\r\n\x1a\n").unwrap();
+    std::fs::write(
+        &rs_file,
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
+    )
+    .unwrap();
+
+    let enc = |p: &std::path::Path| {
+        gpui::http_client::Url::from_file_path(p)
+            .expect("temp path converts to file:// URL")
+            .to_string()
+    };
+    let gallery_url = enc(&gallery);
+    let png1_url = enc(&png1);
+    let png2_url = enc(&png2);
+    let png3_url = enc(&png3);
+    let rs_url = format!("{}#L12-L20", enc(&rs_file));
+
+    // Exact structure from the owner's bug report screenshot: Korean text + inline code + multiple file:// links.
+    let markdown = format!(
+        "## 결과 파일 및 검증\n\n\
+         - 최종 사용 PNG (`1122x1402`, 1.5MB): [01c-balanced-lowkey-depth.png]({png1_url})\n\
+         - 업데이트된 갤러리: [yunjadong-profile-gallery.html]({gallery_url}) (새로고침하면 바로 보정된 `#01c`가 4번째 카드에 배치됩니다)\n\
+         - 전후 비교 및 최종 렌더링 캡처 검증 완료: [verify-before-after.png]({png2_url}), [verify-html-final.png]({png3_url})\n\
+         - 소스 확인: [view.rs]({rs_url})\n"
+    );
+
+    // 1. Verify GPUI TextView::markdown hit-testing fires on_link_click for links preceded by Korean text & inline code.
+    let clicked_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = clicked_urls.clone();
+    let (_harness, vcx) = cx.add_window_view({
+        let markdown = markdown.clone();
+        move |_, cx| {
+            gpui_component::init(cx);
+            LinkClickHarness {
+                source: SharedString::from(markdown),
+                clicked: captured,
+            }
+        }
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    // Scan across the rendered list rows to click every link (including after Korean text, after inline code, and second link on line).
+    for y in (20_u16..260).step_by(8) {
+        for x in (40_u16..720).step_by(28) {
+            let pos = gpui::point(gpui::px(f32::from(x)), gpui::px(f32::from(y)));
+            vcx.simulate_mouse_down(pos, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(pos, gpui::MouseButton::Left, gpui::Modifiers::default());
+        }
+    }
+    let fired = clicked_urls.lock().unwrap().clone();
+    for expected in [&png1_url, &gallery_url, &png2_url, &png3_url, &rs_url] {
+        assert!(
+            fired.iter().any(|u| u == expected),
+            "expected link {expected} to fire on_link_click after Korean/inline-code text, fired={fired:?}"
+        );
+    }
+
+    // 2. Verify real clicks inside Shell's rendered desktop-chat-feed open .html/.png via system
+    //    opener, .rs#L12-L20 in Krill editor tab, and reject dangerous/disallowed links.
+    let (shell, cx) = fixture(
+        cx,
+        "chat-md-links-shell",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: markdown.clone(),
+            ..Default::default()
+        }],
+    );
+    // Click across the actual rendered assistant message body inside Shell's gpui::list chat feed!
+    let body_bounds = cx
+        .debug_bounds("chat-message-body")
+        .expect("assistant chat-message-body must render");
+    let mut y = f32::from(body_bounds.top()) + 8.0;
+    while y < f32::from(body_bounds.bottom()) {
+        let mut x = f32::from(body_bounds.left()) + 20.0;
+        while x < f32::from(body_bounds.right()) {
+            let pos = gpui::point(gpui::px(x), gpui::px(y));
+            cx.simulate_mouse_down(pos, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(pos, gpui::MouseButton::Left, gpui::Modifiers::default());
+            x += 36.0;
+        }
+        y += 10.0;
+    }
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert!(
+            shell.chat.opened_system_paths.contains(&gallery),
+            "clicking gallery .html link in Shell chat feed must invoke system opener, got: {:?}",
+            shell.chat.opened_system_paths
+        );
+        assert!(
+            shell.chat.opened_system_paths.contains(&png1),
+            "clicking png1 link in Shell chat feed must invoke system opener, got: {:?}",
+            shell.chat.opened_system_paths
+        );
+        assert!(
+            shell.chat.opened_system_paths.contains(&png2),
+            "clicking png2 link in Shell chat feed must invoke system opener, got: {:?}",
+            shell.chat.opened_system_paths
+        );
+        assert!(
+            shell.chat.opened_system_paths.contains(&png3),
+            "clicking second link on same line (png3) in Shell chat feed must invoke system opener, got: {:?}",
+            shell.chat.opened_system_paths
+        );
+        assert_eq!(
+            shell.layout.focused().and_then(|p| shell.layout.file(p)),
+            Some(rs_file.as_path()),
+            "clicking Rust file://#L12-L20 link in Shell chat feed must focus the opened editor tab"
+        );
+    });
+    // Also verify dangerous executable (.command) reveals rather than executing, and javascript: is blocked.
+    let evil_cmd = outputs.join("evil.command");
+    std::fs::write(&evil_cmd, b"#!/bin/sh\n").unwrap();
+    let evil_url = enc(&evil_cmd);
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            let left_click = gpui::ClickEvent::Keyboard(gpui::KeyboardClickEvent::default());
+            assert!(shell.open_chat_markdown_link(
+                Some(pane),
+                krill_app_core::hosts::HostId::Local,
+                Some(&outputs),
+                &evil_url,
+                &left_click,
+                cx,
+            ));
+            assert!(shell.chat.revealed_paths.contains(&evil_cmd));
+            assert!(!shell.chat.opened_system_paths.contains(&evil_cmd));
+            assert!(!shell.open_chat_markdown_link(
+                Some(pane),
+                krill_app_core::hosts::HostId::Local,
+                Some(&outputs),
+                "javascript:alert(1)",
+                &left_click,
+                cx,
+            ));
+        });
+    });
+
+    std::fs::remove_dir_all(&dir).ok();
+}

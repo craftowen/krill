@@ -623,6 +623,25 @@ impl Registry {
         fg_pid: Option<u32>,
         exact: bool,
     ) -> std::io::Result<Option<identity::Identity>> {
+        self.discover_live_identity_excluding(
+            provider,
+            home,
+            stored,
+            (root_pid, fg_pid),
+            exact,
+            &[],
+        )
+    }
+
+    pub(super) fn discover_live_identity_excluding(
+        &self,
+        provider: ProviderKind,
+        home: &Path,
+        stored: Option<&crate::agent::control::StoredLaunch>,
+        (root_pid, fg_pid): (u32, Option<u32>),
+        exact: bool,
+        excluded_ids: &[String],
+    ) -> std::io::Result<Option<identity::Identity>> {
         let expected = stored
             .and_then(|s| s.session_id.as_deref())
             .filter(|id| crate::agent::control::valid_session_id(id));
@@ -633,7 +652,7 @@ impl Registry {
             (Some(expected_id), false) => {
                 identity::discover_preferring(provider, root_pid, fg_pid, expected_id)?
             }
-            (None, _) => identity::discover(provider, root_pid, fg_pid)?,
+            (None, _) => identity::discover_excluding(provider, root_pid, fg_pid, excluded_ids)?,
         };
         if observed.is_none() && provider == ProviderKind::Claude {
             let state_dir = self.state_dir();

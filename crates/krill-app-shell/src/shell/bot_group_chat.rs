@@ -2185,6 +2185,8 @@ impl Shell {
             let body_el = if is_working {
                 let content = live_preview.unwrap_or(msg.body.trim()).to_owned();
                 if expanded {
+                    let shell = cx.weak_entity();
+                    let link_host = key.host.clone();
                     div()
                         .min_w_0()
                         .text_size(ui::TEXT_MD)
@@ -2196,9 +2198,26 @@ impl Shell {
                             )
                             .scrollable(false)
                             .selectable(true)
-                            .on_link_click(|url, _, _, cx| {
-                                if let Some(clean) = krill_bots_ui::bots::sanitize_http_url(url) {
-                                    cx.open_url(&clean);
+                            .on_link_click(move |url, event, _, cx| {
+                                if shell
+                                    .update(cx, |this, cx| {
+                                        this.open_chat_markdown_link(
+                                            None,
+                                            link_host.clone(),
+                                            None,
+                                            url,
+                                            event,
+                                            cx,
+                                        );
+                                    })
+                                    .is_err()
+                                    && krill_app_core::terminal::path_link::should_open_link_click(
+                                        event,
+                                    )
+                                {
+                                    krill_app_core::terminal::path_link::open_markdown_link_with_app(
+                                        url, None, cx,
+                                    );
                                 }
                             }),
                         )
@@ -2213,6 +2232,8 @@ impl Shell {
                 }
             } else {
                 let (content, _clamped) = group_turn_display_body(&msg.body, expanded);
+                let shell = cx.weak_entity();
+                let link_host = key.host.clone();
                 div()
                     .min_w_0()
                     .text_size(ui::TEXT_MD)
@@ -2224,9 +2245,26 @@ impl Shell {
                         )
                         .scrollable(false)
                         .selectable(true)
-                        .on_link_click(|url, _, _, cx| {
-                            if let Some(clean) = krill_bots_ui::bots::sanitize_http_url(url) {
-                                cx.open_url(&clean);
+                        .on_link_click(move |url, event, _, cx| {
+                            if shell
+                                .update(cx, |this, cx| {
+                                    this.open_chat_markdown_link(
+                                        None,
+                                        link_host.clone(),
+                                        None,
+                                        url,
+                                        event,
+                                        cx,
+                                    );
+                                })
+                                .is_err()
+                                && krill_app_core::terminal::path_link::should_open_link_click(
+                                    event,
+                                )
+                            {
+                                krill_app_core::terminal::path_link::open_markdown_link_with_app(
+                                    url, None, cx,
+                                );
                             }
                         }),
                     )

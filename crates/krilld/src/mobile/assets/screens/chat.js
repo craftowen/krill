@@ -3070,8 +3070,18 @@ t(
 }
 }
 voiceCtl?.onSend?.(text);
-await ctx.rpc(rpcPayload);
-if (entry.progress === progress) entry.progress.phase = "accepted";
+const rpcRes = await ctx.rpc(rpcPayload);
+if (rpcRes?.cleared) {
+clearTranscript(true);
+entry.offset = 0;
+entry.generation = null;
+entry.initialized = false;
+entry.latestRecovery = false;
+entry.progress = null;
+renderItems();
+} else if (entry.progress === progress) {
+entry.progress.phase = "accepted";
+}
 entry.notifyComposer?.();
 if (fromDraft) {
 if (
