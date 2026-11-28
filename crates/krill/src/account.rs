@@ -12,7 +12,7 @@ use krill_proto::usage::{
     AccountsSnapshot, FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | save agy [--json] | recover agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
+const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | add agy [--json] | save agy [--json] | recover agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -36,6 +36,13 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     if strs.first() == Some(&"provisioning") {
         return run_provisioning(&strs);
+    }
+    if matches!(
+        strs.as_slice(),
+        ["add", "agy" | "antigravity"] | ["add", "agy" | "antigravity", "--json"]
+    ) {
+        let json = strs.len() == 3;
+        return run_add_antigravity(json);
     }
     if matches!(
         strs.as_slice(),
@@ -81,6 +88,9 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(2);
             };
+            if provider == ProviderKind::Antigravity {
+                return run_switch_antigravity(id);
+            }
             (
                 UsageRequest::SwitchAccount {
                     provider,
@@ -98,7 +108,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             };
             if provider == ProviderKind::Antigravity {
                 eprintln!(
-                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                    "account: Antigravity uses your native agy login. Run `krill account add agy [--json]` to sign in and save another Google account."
                 );
                 return ExitCode::from(2);
             }
@@ -121,7 +131,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
             };
             if provider == ProviderKind::Antigravity {
                 eprintln!(
-                    "account: Antigravity uses your native agy login. Sign in with `agy` in a terminal, then run `krill account save agy`."
+                    "account: Antigravity uses your native agy login. Run `krill account add agy` to sign in and save another Google account."
                 );
                 return ExitCode::from(2);
             }
@@ -184,6 +194,13 @@ pub fn run(raw: &[OsString]) -> ExitCode {
 /// 현재 터미널에서 등록 계정의 CLI 로그인을 실행한다. 활성 계정은 바꾸지 않는다.
 fn login(provider: &str, id: &str) -> Result<(), String> {
     let provider = ProviderKind::parse(provider).ok_or("unknown provider")?;
+    if provider == ProviderKind::Antigravity {
+        // Antigravity uses a single native `agy` login backed by the encrypted vault; isolated
+        // `--gemini_dir` profiles are obsolete and would write to a nested `.gemini/.gemini` store.
+        let _ = id;
+        add_antigravity_account()?;
+        return Ok(());
+    }
     let snap = request(&UsageRequest::ListAccounts)?;
     let id = resolve_account(&snap, provider, id)?;
     let account = snap
@@ -204,32 +221,9 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
     }
     let exe = krill_proto::agent::which(provider.as_str(), &path)
         .ok_or("provider executable not found")?;
-    let auth = if provider == ProviderKind::Antigravity && account.host_default {
-        std::fs::write(
-            std::path::Path::new(&account.profile_dir).join(".krill-login-completed"),
-            b"",
-        )
-        .ok();
-        let deadline = std::time::Instant::now() + Duration::from_secs(6);
-        loop {
-            if request(&UsageRequest::ListAccounts).is_ok_and(|s| {
-                s.connection_for(&account.id) == krill_proto::usage::ConnectionStatus::Connected
-            }) {
-                break Some(krill_proto::account_login::AuthStatus {
-                    logged_in: true,
-                    identity: None,
-                });
-            }
-            if std::time::Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    } else {
-        krill_proto::account_login::probe(&exe, provider, dir)
-    }
-    .filter(|s| s.logged_in)
-    .ok_or("login could not be verified")?;
+    let auth = krill_proto::account_login::probe(&exe, provider, dir)
+        .filter(|s| s.logged_in)
+        .ok_or("login could not be verified")?;
     if let Some(dir) = dir {
         std::fs::write(dir.join(".krill-login-completed"), b"").ok();
     }
@@ -332,12 +326,120 @@ fn run_provisioning(args: &[&str]) -> ExitCode {
     }
 }
 
-fn run_remove_antigravity(account_id: &str) -> ExitCode {
-    let req = UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::Remove {
-        account_id: account_id.to_owned(),
-    });
-    match exchange(&req) {
-        Ok(UsageReply::AntigravityAccounts(Ok(_))) => match request(&UsageRequest::ListAccounts) {
+const AGY_VAULT_LOCKED_CLI_ERR: &str = "saved Antigravity vault is locked by macOS Keychain ACL; run `krill account recover agy` first.";
+
+fn add_antigravity_account() -> Result<krill_proto::usage::AntigravityAccountState, String> {
+    let before = exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::List)?;
+    if before.vault_locked {
+        return Err(AGY_VAULT_LOCKED_CLI_ERR.to_owned());
+    }
+    if before
+        .sign_in
+        .as_ref()
+        .is_some_and(|s| s.phase.is_running())
+    {
+        return Err("Antigravity sign-in is already in progress in another window.".to_owned());
+    }
+    // Preserve the currently signed-in account in the vault before `agy acp --login` replaces it.
+    if before.current_account.is_some() && before.active_account_id.is_none() {
+        exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::AddCurrent).map_err(
+            |e| format!("could not save current agy login before adding another account: {e}"),
+        )?;
+    }
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    let path = krill_proto::os::augment_windows_path(Some(&path)).unwrap_or(path);
+    let exe = krill_proto::agent::which("agy", &path)
+        .ok_or_else(|| "agy executable not found on PATH".to_owned())?;
+    let mut cmd = krill_proto::account_login::agy_acp_login_command(&exe);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("could not start `agy acp --login`: {e}"))?;
+    if !status.success() {
+        return Err("Google sign-in for Antigravity failed or was cancelled".to_owned());
+    }
+
+    let saved = exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::AddCurrent)
+        .map_err(|e| format!("signed in, but could not save the new account: {e}"))?;
+    let active_id = saved.active_account_id.clone().ok_or_else(|| {
+        "sign-in finished, but krilld did not observe an active Antigravity login in its credential store (if running over SSH, check whether krilld uses the desktop Keychain)".to_owned()
+    })?;
+    exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::Select {
+        account_id: active_id,
+    })
+    .map_err(|e| format!("account was saved, but selecting it failed: {e}"))
+}
+
+fn run_add_antigravity(json: bool) -> ExitCode {
+    match add_antigravity_account() {
+        Ok(final_state) => print_antigravity_state(&final_state, json),
+        Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_switch_antigravity(query: &str) -> ExitCode {
+    let state = match exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::List) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("account: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if state.vault_locked {
+        eprintln!("account: {AGY_VAULT_LOCKED_CLI_ERR}");
+        return ExitCode::FAILURE;
+    }
+    let account_id = match resolve_antigravity_account(&state, query) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("account: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::Select {
+        account_id,
+    }) {
+        Ok(updated) => match request(&UsageRequest::ListAccounts) {
+            Ok(snap) => {
+                print_snapshot(&snap);
+                ExitCode::SUCCESS
+            }
+            Err(_) => print_antigravity_state(&updated, false),
+        },
+        Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_remove_antigravity(query: &str) -> ExitCode {
+    let state = match exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::List) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("account: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if state.vault_locked {
+        eprintln!("account: {AGY_VAULT_LOCKED_CLI_ERR}");
+        return ExitCode::FAILURE;
+    }
+    let account_id = match resolve_antigravity_account(&state, query) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("account: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match exchange_antigravity_state(krill_proto::usage::AntigravityAccountOp::Remove {
+        account_id,
+    }) {
+        Ok(_) => match request(&UsageRequest::ListAccounts) {
             Ok(snap) => {
                 print_snapshot(&snap);
                 ExitCode::SUCCESS
@@ -347,64 +449,86 @@ fn run_remove_antigravity(account_id: &str) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+        Err(e) => {
             eprintln!("account: {e}");
-            ExitCode::FAILURE
-        }
-        Ok(UsageReply::Failed(e)) => {
-            eprintln!("account: {e}");
-            ExitCode::FAILURE
-        }
-        Ok(_) => {
-            eprintln!("account: unexpected Antigravity account reply");
             ExitCode::FAILURE
         }
     }
 }
 
+fn resolve_antigravity_account(
+    state: &krill_proto::usage::AntigravityAccountState,
+    value: &str,
+) -> Result<String, String> {
+    if let Some(acc) = state.accounts.iter().find(|a| a.id == value) {
+        return Ok(acc.id.clone());
+    }
+    let mut matching = state.accounts.iter().filter(|a| {
+        a.email
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case(value))
+    });
+    let acc = matching
+        .next()
+        .ok_or_else(|| format!("Antigravity account not found: {value}"))?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "ambiguous Antigravity account email: {value}; use an account id"
+        ));
+    }
+    Ok(acc.id.clone())
+}
+
+fn exchange_antigravity_state(
+    op: krill_proto::usage::AntigravityAccountOp,
+) -> Result<krill_proto::usage::AntigravityAccountState, String> {
+    match exchange(&UsageRequest::AntigravityAccounts(op))? {
+        UsageReply::AntigravityAccounts(Ok(state)) => Ok(state),
+        UsageReply::AntigravityAccounts(Err(e)) => Err(e),
+        UsageReply::Failed(e) => Err(e.to_string()),
+        _ => Err("unexpected Antigravity account reply".to_owned()),
+    }
+}
+
 fn run_antigravity_op(op: krill_proto::usage::AntigravityAccountOp, json: bool) -> ExitCode {
-    let req = UsageRequest::AntigravityAccounts(op);
-    match exchange(&req) {
-        Ok(UsageReply::AntigravityAccounts(Ok(state))) => {
-            if json {
-                match serde_json::to_string_pretty(&state) {
-                    Ok(rendered) => println!("{rendered}"),
-                    Err(e) => {
-                        eprintln!("account: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                println!("Managed Antigravity accounts ({}):", state.accounts.len());
-                for acc in &state.accounts {
-                    let active = if state.active_account_id.as_deref() == Some(acc.id.as_str()) {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                    let name = acc
-                        .email
-                        .as_deref()
-                        .or(acc.subject.as_deref())
-                        .unwrap_or(&acc.id);
-                    println!("  {}  {}{active}", acc.id, name);
-                }
-            }
-            ExitCode::SUCCESS
-        }
-        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+    match exchange_antigravity_state(op) {
+        Ok(state) => print_antigravity_state(&state, json),
+        Err(e) => {
             eprintln!("account: {e}");
-            ExitCode::FAILURE
-        }
-        Ok(UsageReply::Failed(e)) => {
-            eprintln!("account: {e}");
-            ExitCode::FAILURE
-        }
-        Ok(_) => {
-            eprintln!("account: unexpected Antigravity account reply");
             ExitCode::FAILURE
         }
     }
+}
+
+fn print_antigravity_state(
+    state: &krill_proto::usage::AntigravityAccountState,
+    json: bool,
+) -> ExitCode {
+    if json {
+        match serde_json::to_string_pretty(state) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(e) => {
+                eprintln!("account: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("Managed Antigravity accounts ({}):", state.accounts.len());
+        for acc in &state.accounts {
+            let active = if state.active_account_id.as_deref() == Some(acc.id.as_str()) {
+                " (active)"
+            } else {
+                ""
+            };
+            let name = acc
+                .email
+                .as_deref()
+                .or(acc.subject.as_deref())
+                .unwrap_or(&acc.id);
+            println!("  {}  {}{active}", acc.id, name);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
@@ -696,11 +820,88 @@ mod tests {
     }
 
     #[test]
-    fn recover_subcommand_is_documented_and_rejects_other_providers() {
-        assert!(USAGE.contains("recover agy [--json]"));
+    fn recover_and_add_agy_cli_validation_match_contract() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
         assert_eq!(
             run(&[OsString::from("recover"), OsString::from("claude")]),
             ExitCode::from(2)
+        );
+        assert_eq!(
+            run(&[
+                OsString::from("add"),
+                OsString::from("agy"),
+                OsString::from("--unknown"),
+            ]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            run(&[
+                OsString::from("add"),
+                OsString::from("agy"),
+                OsString::from("extra-label"),
+            ]),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_account_matches_id_or_unique_email_case_insensitively() {
+        let state = krill_proto::usage::AntigravityAccountState {
+            accounts: vec![
+                krill_proto::usage::AntigravityAccountSummary {
+                    id: "uuid-1".into(),
+                    email: Some("First@example.com".into()),
+                    subject: Some("sub-1".into()),
+                    auth_method: "consumer".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    usage: None,
+                },
+                krill_proto::usage::AntigravityAccountSummary {
+                    id: "uuid-2".into(),
+                    email: Some("second@example.com".into()),
+                    subject: Some("sub-2".into()),
+                    auth_method: "consumer".into(),
+                    created_at: 2,
+                    updated_at: 2,
+                    usage: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_antigravity_account(&state, "uuid-1").unwrap(),
+            "uuid-1"
+        );
+        assert_eq!(
+            resolve_antigravity_account(&state, "first@example.com").unwrap(),
+            "uuid-1"
+        );
+        assert_eq!(
+            resolve_antigravity_account(&state, "SECOND@EXAMPLE.COM").unwrap(),
+            "uuid-2"
+        );
+        assert!(resolve_antigravity_account(&state, "missing@example.com").is_err());
+
+        let dup_state = krill_proto::usage::AntigravityAccountState {
+            accounts: vec![
+                state.accounts[0].clone(),
+                krill_proto::usage::AntigravityAccountSummary {
+                    id: "uuid-dup".into(),
+                    email: Some("first@example.com".into()),
+                    subject: Some("sub-dup".into()),
+                    auth_method: "enterprise".into(),
+                    created_at: 3,
+                    updated_at: 3,
+                    usage: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            resolve_antigravity_account(&dup_state, "first@example.com")
+                .unwrap_err()
+                .contains("ambiguous")
         );
     }
 }

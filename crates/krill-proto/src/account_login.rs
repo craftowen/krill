@@ -56,6 +56,17 @@ pub fn login_command(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> 
     Some(command)
 }
 
+/// Interactive `agy acp --login` command for CLI sign-in / adding another Google account.
+/// Preserves the caller's native credential store (keyring on desktop, file store on SSH/WSL).
+#[must_use]
+pub fn agy_acp_login_command(exe: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .args(["acp", "--login"])
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    command
+}
+
 fn configure_account(command: &mut Command, provider: ProviderKind, dir: Option<&Path>) {
     for key in provider.credential_overrides() {
         command.env_remove(key);

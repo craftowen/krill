@@ -1414,3 +1414,403 @@ fn prepare_for_launch_handles_legacy_acl_locked_silently_after_first_warn() {
     assert!(svc.prepare_for_launch().is_ok());
     assert!(svc.prepare_for_launch().is_ok());
 }
+
+#[test]
+fn launch_restore_restores_selected_saved_account_and_defers_to_active_sign_in() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cred_a = agy_credential_json("sub-a", "alice@example.test", "acc-a1", "ref-a", true);
+    let cred_b = agy_credential_json("sub-b", "bob@example.test", "acc-b1", "ref-b", true);
+    let cred_b_refreshed =
+        agy_credential_json("sub-b", "bob@example.test", "acc-b2", "ref-b", false);
+    let cred_external = agy_credential_json("sub-c", "ext@example.test", "acc-c1", "ref-c", true);
+
+    let vault_mem = Arc::new(Mutex::new(AntigravityAccountVault::default()));
+    let native = Arc::new(Mutex::new(Some(cred_a.clone())));
+    let sign_in_active = Arc::new(AtomicBool::new(false));
+    let guard_flag = Arc::clone(&sign_in_active);
+
+    let svc = AntigravityAccountService::new_with_launch_restore(
+        Box::new(MemoryStore {
+            vault: vault_mem.clone(),
+        }),
+        Box::new(MemoryBackend {
+            raw: native.clone(),
+        }),
+        Box::new(|| 1_700_000_000_000),
+        Box::new(|_| Err("offline".to_owned())),
+        Some(Box::new(move || guard_flag.load(Ordering::Acquire))),
+    );
+
+    let s1 = svc.add_current_account().unwrap();
+    assert!(s1.restores_selection_at_launch);
+    let id_a = s1.accounts[0].id.clone();
+
+    *native.lock().unwrap() = Some(cred_b);
+    let s2 = svc.add_current_account().unwrap();
+    let id_b = s2.accounts[1].id.clone();
+
+    svc.select_account(&id_a).unwrap();
+
+    // Simulate a still-running agy on saved account B refreshing its token over the native slot.
+    *native.lock().unwrap() = Some(cred_b_refreshed.clone());
+    let moved = svc.list_accounts().unwrap();
+    assert_eq!(moved.active_account_id.as_deref(), Some(id_b.as_str()));
+    assert_eq!(moved.selected_account_id.as_deref(), Some(id_a.as_str()));
+    assert_eq!(moved.launches_use_account(), Some(id_a.as_str()));
+
+    // While an in-app sign-in holds the native slot, launch must refuse rather than overwrite it.
+    sign_in_active.store(true, Ordering::Release);
+    let err = svc.prepare_for_launch().unwrap_err();
+    assert!(err.contains("sign-in is in progress"), "{err}");
+    sign_in_active.store(false, Ordering::Release);
+
+    // Once idle, launch preflight preserves B's refreshed token in the vault and restores A natively.
+    svc.prepare_for_launch().unwrap();
+    let after = svc.list_accounts().unwrap();
+    assert_eq!(after.active_account_id.as_deref(), Some(id_a.as_str()));
+    assert_eq!(after.launches_use_account(), None);
+    let stored_b = vault_mem
+        .lock()
+        .unwrap()
+        .accounts
+        .iter()
+        .find(|a| a.id == id_b)
+        .unwrap()
+        .credentials
+        .as_str()
+        .to_owned();
+    assert_eq!(stored_b, cred_b_refreshed);
+
+    // Unsaved external login still refuses launch so the unsaved credential is never overwritten.
+    *native.lock().unwrap() = Some(cred_external);
+    let ext_err = svc.prepare_for_launch().unwrap_err();
+    assert!(
+        ext_err.contains("native Antigravity account changed"),
+        "{ext_err}"
+    );
+    // Even if the native slot is cleared or replaced by an unsaved credential during sign-in,
+    // `holds_login` takes precedence and reports sign-in-in-progress.
+    *native.lock().unwrap() = None;
+    sign_in_active.store(true, Ordering::Release);
+    let active_err = svc.prepare_for_launch().unwrap_err();
+    assert!(
+        active_err.contains("sign-in is in progress"),
+        "{active_err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_app_sign_in_add_account_saves_existing_completes_oauth_and_selects_new_account() {
+    use krill_proto::usage::{AntigravitySignInIntent, AntigravitySignInPhase};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("krill-agy-signin-e2e-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // Seed existing unsaved host login (Account A).
+    let cred_a = agy_credential_json("sub-a", "first@example.test", "acc-a", "ref-a", true);
+    let cred_b = agy_credential_json("sub-b", "second@example.test", "acc-b", "ref-b", true);
+    let token_path = antigravity_token_file_path(&home);
+    write_atomic_0600(&token_path, cred_a.as_bytes()).unwrap();
+
+    let fake_agy = root.join("fake-agy");
+    let cred_b_path = root.join("cred-b.json");
+    std::fs::write(&cred_b_path, &cred_b).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" != "acp" ] || [ "$2" != "--login" ]; then
+  echo "unexpected args: $@" >&2
+  exit 9
+fi
+echo "Open this link in a browser to log in with Google:"
+echo "  https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=test-state-1"
+echo "Then paste the authorization code:"
+read -r line
+if [ "$line" != "https://antigravity.google/oauth-callback?code=good-code&state=test-state-1" ]; then
+  echo 'token exchange failed: oauth2: "invalid_grant"' >&2
+  exit 1
+fi
+cp "{}" "{}"
+chmod 600 "{}"
+exit 0
+"#,
+        cred_b_path.display(),
+        token_path.display(),
+        token_path.display(),
+    );
+    std::fs::write(&fake_agy, script).unwrap();
+    std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Start AddAccount: must save existing Account A into vault BEFORE replacing it.
+    let flow_id = sign_in::start_with_exe(
+        &home,
+        Some(&state),
+        AntigravitySignInIntent::AddAccount,
+        &fake_agy,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    // Wait for Google OAuth URL.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let waiting = loop {
+        let status = sign_in::status_for(&home, Some(&state), Some(&flow_id)).unwrap();
+        if status.phase == AntigravitySignInPhase::Waiting {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for URL: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        waiting
+            .url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://accounts.google.com/o/oauth2/auth?"))
+    );
+
+    // Another caller without the capability flow_id must NOT see flow_id or url, and cannot act.
+    let redacted = sign_in::status_for(&home, Some(&state), None).unwrap();
+    assert_eq!(redacted.flow_id, None);
+    assert_eq!(redacted.url, None);
+    assert_eq!(redacted.phase, AntigravitySignInPhase::Waiting);
+    assert!(sign_in::complete(&home, Some(&state), "wrong-id", "good-code").is_err());
+    assert!(sign_in::cancel(&home, Some(&state), "wrong-id").is_err());
+    assert!(
+        sign_in::start_with_exe(
+            &home,
+            Some(&state),
+            AntigravitySignInIntent::SignIn,
+            &fake_agy,
+            Duration::from_secs(10),
+        )
+        .is_err()
+    );
+
+    // Invalid answer is rejected cleanly while keeping the flow waiting.
+    assert!(sign_in::complete(&home, Some(&state), &flow_id, "not a valid answer").is_err());
+    assert_eq!(
+        sign_in::status_for(&home, Some(&state), Some(&flow_id))
+            .unwrap()
+            .phase,
+        AntigravitySignInPhase::Waiting
+    );
+
+    // Account mutations are fenced while sign-in owns the native credential slot.
+    let fenced_err = handle_op(
+        &home,
+        Some(&state),
+        &AntigravityAccountOp::Select {
+            account_id: "any".into(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        fenced_err.contains("sign-in is in progress"),
+        "{fenced_err}"
+    );
+
+    // Deliver the callback URL; flow verifies, saves & selects Account B.
+    sign_in::complete(
+        &home,
+        Some(&state),
+        &flow_id,
+        "https://antigravity.google/oauth-callback?code=good-code&state=test-state-1",
+    )
+    .unwrap();
+
+    // Polling via `handle_op(SignInStatus)` observes `SignedIn` paired with the freshly saved
+    // 2-account list (no stale pre-save snapshot).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let final_state = loop {
+        let st = handle_op(
+            &home,
+            Some(&state),
+            &AntigravityAccountOp::SignInStatus {
+                flow_id: Some(flow_id.clone()),
+            },
+        )
+        .unwrap();
+        if st.sign_in.as_ref().map(|s| s.phase) == Some(AntigravitySignInPhase::SignedIn) {
+            break st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "did not reach SignedIn: {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!sign_in::holds_native_login(&home, Some(&state)));
+    assert!(final_state.sign_in_supported);
+    assert_eq!(final_state.accounts.len(), 2);
+    let emails: Vec<_> = final_state
+        .accounts
+        .iter()
+        .filter_map(|a| a.email.as_deref())
+        .collect();
+    assert!(emails.contains(&"first@example.test"), "{emails:?}");
+    assert!(emails.contains(&"second@example.test"), "{emails:?}");
+    let id_b = final_state
+        .accounts
+        .iter()
+        .find(|a| a.email.as_deref() == Some("second@example.test"))
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        final_state.active_account_id.as_deref(),
+        Some(id_b.as_str())
+    );
+    assert_eq!(
+        final_state.selected_account_id.as_deref(),
+        Some(id_b.as_str())
+    );
+    assert!(!final_state.native_account_changed());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn in_app_sign_in_cancel_and_failure_classification_work_cleanly() {
+    use krill_proto::usage::{
+        ANTIGRAVITY_INVALID_GRANT, AntigravitySignInIntent, AntigravitySignInPhase,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!(
+        "krill-agy-signin-cancel-fail-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 1. Cancel kills waiting process and releases host lock.
+    let fake_wait = root.join("fake-wait");
+    std::fs::write(
+        &fake_wait,
+        "#!/bin/sh\necho 'https://accounts.google.com/o/oauth2/v2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=cancel-me'\nread -r _\nsleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_wait, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let flow_id = sign_in::start_with_exe(
+        &home,
+        Some(&state),
+        AntigravitySignInIntent::SignIn,
+        &fake_wait,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sign_in::status_for(&home, Some(&state), Some(&flow_id))
+        .unwrap()
+        .phase
+        != AntigravitySignInPhase::Waiting
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    sign_in::cancel(&home, Some(&state), &flow_id).unwrap();
+    let cancelled = sign_in::status_for(&home, Some(&state), Some(&flow_id)).unwrap();
+    assert_eq!(cancelled.phase, AntigravitySignInPhase::Cancelled);
+    assert!(!sign_in::holds_native_login(&home, Some(&state)));
+
+    // 2. Rejected code surfaces friendly invalid_grant failure.
+    let fake_fail = root.join("fake-fail");
+    std::fs::write(
+        &fake_fail,
+        r#"#!/bin/sh
+echo 'https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=fail-me'
+read -r _
+printf '%s\n' 'could not log in: token exchange failed: oauth2: "invalid_grant"' >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_fail, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let flow_id = sign_in::start_with_exe(
+        &home,
+        Some(&state),
+        AntigravitySignInIntent::SignIn,
+        &fake_fail,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sign_in::status_for(&home, Some(&state), Some(&flow_id))
+        .unwrap()
+        .phase
+        != AntigravitySignInPhase::Waiting
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    sign_in::complete(&home, Some(&state), &flow_id, "bad-code").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let failed = loop {
+        let st = sign_in::status_for(&home, Some(&state), Some(&flow_id)).unwrap();
+        if st.phase == AntigravitySignInPhase::Failed {
+            break st;
+        }
+        assert!(std::time::Instant::now() < deadline, "{st:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(failed.error.as_deref(), Some(ANTIGRAVITY_INVALID_GRANT));
+
+    // 3. Exit 0 without writing native credentials reports Failed rather than masking as SignedIn.
+    let fake_noop = root.join("fake-noop");
+    std::fs::write(
+        &fake_noop,
+        r"#!/bin/sh
+echo 'https://accounts.google.com/o/oauth2/auth?response_type=code&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=noop-me'
+read -r _
+exit 0
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_noop, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let flow_id = sign_in::start_with_exe(
+        &home,
+        Some(&state),
+        AntigravitySignInIntent::SignIn,
+        &fake_noop,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sign_in::status_for(&home, Some(&state), Some(&flow_id))
+        .unwrap()
+        .phase
+        != AntigravitySignInPhase::Waiting
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    sign_in::complete(&home, Some(&state), &flow_id, "good-looking-code").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let failed_save = loop {
+        let st = sign_in::status_for(&home, Some(&state), Some(&flow_id)).unwrap();
+        if st.phase == AntigravitySignInPhase::Failed {
+            break st;
+        }
+        assert!(std::time::Instant::now() < deadline, "{st:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(failed_save.error.is_some());
+
+    std::fs::remove_dir_all(root).ok();
+}

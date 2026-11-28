@@ -199,50 +199,101 @@ impl From<String> for ReconcileError {
     }
 }
 
+/// True while an in-app `agy` sign-in flow may hold an unsaved native login.
+pub(crate) type LaunchRestoreGuardFn = Box<dyn Fn() -> bool + Send + Sync>;
+
+pub(crate) fn canonical_host_key(
+    home: &Path,
+    state_dir: Option<&Path>,
+) -> (PathBuf, Option<PathBuf>) {
+    let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let canon_state =
+        state_dir.map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+    (canon_home, canon_state)
+}
+
 /// Mirrors Orca's `AntigravityAccountService` 1:1.
 pub(crate) struct AntigravityAccountService {
     store: Box<dyn AntigravityAccountStore>,
     backend: Box<dyn AntigravityCredentialBackend>,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
     lookup_identity: IdentityLookupFn,
+    launch_restore: Option<LaunchRestoreGuardFn>,
     op_lock: Mutex<()>,
     rewritten_cache: Mutex<Option<RewrittenLoginCache>>,
+    last_state: Mutex<Option<AntigravityAccountState>>,
 }
 
 impl AntigravityAccountService {
+    #[cfg(test)]
     pub(crate) fn new(
         store: Box<dyn AntigravityAccountStore>,
         backend: Box<dyn AntigravityCredentialBackend>,
         now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
         lookup_identity: IdentityLookupFn,
     ) -> Self {
+        Self::new_with_launch_restore(store, backend, now_ms, lookup_identity, None)
+    }
+
+    pub(crate) fn new_with_launch_restore(
+        store: Box<dyn AntigravityAccountStore>,
+        backend: Box<dyn AntigravityCredentialBackend>,
+        now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
+        lookup_identity: IdentityLookupFn,
+        launch_restore: Option<LaunchRestoreGuardFn>,
+    ) -> Self {
         Self {
             store,
             backend,
             now_ms,
             lookup_identity,
+            launch_restore,
             op_lock: Mutex::new(()),
             rewritten_cache: Mutex::new(None),
+            last_state: Mutex::new(None),
         }
+    }
+
+    /// Blocks until any in-flight serialized account operation completes.
+    pub(crate) fn settled(&self) {
+        let _guard = lock(&self.op_lock);
+    }
+
+    /// Returns the most recently built account state without spawning OS keyring reads or
+    /// contending on `op_lock` (used by `SignInStatus` while `agy acp --login` is active).
+    pub(crate) fn cached_state_or_list(&self) -> Result<AntigravityAccountState, String> {
+        if let Some(cached) = lock(&self.last_state).clone() {
+            return Ok(cached);
+        }
+        self.list_accounts()
     }
 
     pub(crate) fn for_host(home: &Path, state_dir: Option<&Path>) -> Arc<Self> {
         type HostServiceMap = BTreeMap<(PathBuf, Option<PathBuf>), Arc<AntigravityAccountService>>;
         static HOST_SERVICES: Mutex<HostServiceMap> = Mutex::new(BTreeMap::new());
-        let canon_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-        let canon_state =
-            state_dir.map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
-        let key = (canon_home, canon_state);
+        let key = canonical_host_key(home, state_dir);
         let mut cache = lock(&HOST_SERVICES);
         if let Some(existing) = cache.get(&key) {
             return Arc::clone(existing);
         }
         let path = vault_path(home, state_dir);
-        let service = Arc::new(Self::new(
+        // Windows launches aren't gated (native-account-launch.ts), so nothing restores there.
+        #[cfg(target_os = "windows")]
+        let launch_restore: Option<LaunchRestoreGuardFn> = None;
+        #[cfg(not(target_os = "windows"))]
+        let launch_restore: Option<LaunchRestoreGuardFn> = {
+            let guard_home = key.0.clone();
+            let guard_state = key.1.clone();
+            Some(Box::new(move || {
+                super::sign_in::holds_native_login(&guard_home, guard_state.as_deref())
+            }))
+        };
+        let service = Arc::new(Self::new_with_launch_restore(
             Box::new(EncryptedAntigravityAccountStore::new(path)),
             Box::new(HostCredentialBackend::new(home)),
             Box::new(default_now_ms),
             Box::new(fetch_google_identity),
+            launch_restore,
         ));
         cache.insert(key, Arc::clone(&service));
         service
@@ -253,7 +304,7 @@ impl AntigravityAccountService {
         match self.reconcile(None) {
             Ok((vault, current)) => {
                 clear_vault_locked_warnings();
-                Ok(Self::build_state(&vault, current.as_ref(), false))
+                Ok(self.build_state(&vault, current.as_ref(), false))
             }
             Err(ReconcileError::LegacyVaultLocked { status }) => {
                 warn_vault_locked_once(
@@ -262,11 +313,7 @@ impl AntigravityAccountService {
                     "Antigravity vault is locked by a previous macOS ad-hoc Keychain ACL; returning host login with vault_locked=true",
                 );
                 let current = self.backend.read()?;
-                Ok(Self::build_state(
-                    &AntigravityAccountVault::default(),
-                    current.as_ref(),
-                    true,
-                ))
+                Ok(self.build_state(&AntigravityAccountVault::default(), current.as_ref(), true))
             }
             Err(ReconcileError::Other(msg)) => Err(msg),
         }
@@ -278,14 +325,14 @@ impl AntigravityAccountService {
         if self.store.read().is_ok() {
             let (vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
             clear_vault_locked_warnings();
-            return Ok(Self::build_state(&vault, current.as_ref(), false));
+            return Ok(self.build_state(&vault, current.as_ref(), false));
         }
         self.store.reset_locked_vault()?;
         clear_vault_locked_warnings();
         let current = self.backend.read()?;
         let mut vault = self.store.read().map_err(VaultError::into_message)?;
         let Some(current) = current else {
-            return Ok(Self::build_state(&vault, None, false));
+            return Ok(self.build_state(&vault, None, false));
         };
         let identity = if let Some(id) = current.identity.clone() {
             Some(id)
@@ -317,26 +364,43 @@ impl AntigravityAccountService {
                 usage: None,
             });
             self.store.write(&vault)?;
-            return Ok(Self::build_state(&vault, Some(&identified), false));
+            return Ok(self.build_state(&vault, Some(&identified), false));
         }
-        Ok(Self::build_state(&vault, Some(&current), false))
+        Ok(self.build_state(&vault, Some(&current), false))
     }
 
     pub(crate) fn add_current_account(&self) -> Result<AntigravityAccountState, String> {
+        self.save_current_account_inner(false)
+    }
+
+    /// Saves the currently signed-in `agy` account into the vault (if not already present)
+    /// and updates `selected_account_id` to point to it. Used after an explicit in-app or CLI
+    /// `agy acp --login` flow completes so new launches immediately use the newly added account.
+    pub(crate) fn save_and_select_current_account(
+        &self,
+    ) -> Result<AntigravityAccountState, String> {
+        self.save_current_account_inner(true)
+    }
+
+    fn save_current_account_inner(&self, select: bool) -> Result<AntigravityAccountState, String> {
         let _guard = lock(&self.op_lock);
-        let (vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
+        let (mut vault, current) = self.reconcile(None).map_err(ReconcileError::into_message)?;
         let Some(current) = current else {
             return Err(
                 "Sign in with agy on this execution host, then save the current account."
                     .to_owned(),
             );
         };
-        if vault
+        if let Some(existing) = vault
             .accounts
             .iter()
-            .any(|entry| account_matches(entry, &current))
+            .find(|entry| account_matches(entry, &current))
         {
-            return Ok(Self::build_state(&vault, Some(&current), false));
+            if select && vault.selected_account_id.as_deref() != Some(existing.id.as_str()) {
+                vault.selected_account_id = Some(existing.id.clone());
+                self.store.write(&vault)?;
+            }
+            return Ok(self.build_state(&vault, Some(&current), false));
         }
         let identity = if let Some(id) = current.identity.clone() {
             id
@@ -354,14 +418,17 @@ impl AntigravityAccountService {
         let mut identified = current;
         identified.identity = Some(identity.clone());
         let mut latest = self.store.read().map_err(VaultError::into_message)?;
-        if !latest
+        let matched_id = if let Some(existing) = latest
             .accounts
             .iter()
-            .any(|entry| account_matches(entry, &identified))
+            .find(|entry| account_matches(entry, &identified))
         {
+            existing.id.clone()
+        } else {
+            let id = generate_uuid_v4();
             let timestamp = (self.now_ms)();
             latest.accounts.push(StoredAntigravityAccount {
-                id: generate_uuid_v4(),
+                id: id.clone(),
                 email: identity.email.or_else(|| identified.email_hint.clone()),
                 subject: Some(identity.subject),
                 auth_method: identified.auth_method.clone(),
@@ -370,10 +437,14 @@ impl AntigravityAccountService {
                 credentials: identified.contents.clone(),
                 usage: None,
             });
+            id
+        };
+        if select {
+            latest.selected_account_id = Some(matched_id);
         }
         self.update_snapshot(&mut latest, &identified);
         self.store.write(&latest)?;
-        Ok(Self::build_state(&latest, Some(&identified), false))
+        Ok(self.build_state(&latest, Some(&identified), false))
     }
 
     pub(crate) fn select_account(&self, id: &str) -> Result<AntigravityAccountState, String> {
@@ -417,7 +488,7 @@ impl AntigravityAccountService {
             latest.selected_account_id = Some(id.to_owned());
             self.update_snapshot(&mut latest, &readback);
             self.store.write(&latest)?;
-            Ok(Self::build_state(&latest, Some(&readback), false))
+            Ok(self.build_state(&latest, Some(&readback), false))
         })
     }
 
@@ -443,7 +514,7 @@ impl AntigravityAccountService {
             vault.selected_account_id = None;
         }
         self.store.write(&vault)?;
-        Ok(Self::build_state(&vault, current.as_ref(), false))
+        Ok(self.build_state(&vault, current.as_ref(), false))
     }
 
     #[cfg(test)]
@@ -461,17 +532,70 @@ impl AntigravityAccountService {
             }
             Err(ReconcileError::Other(msg)) => return Err(msg),
         };
+        self.verify_or_restore_selected_for_launch(&vault, current.as_ref())
+            .map(|_| ())
+    }
+
+    #[cfg(any(test, not(target_os = "windows")))]
+    fn verify_or_restore_selected_for_launch(
+        &self,
+        vault: &AntigravityAccountVault,
+        current: Option<&AntigravityNativeCredential>,
+    ) -> Result<bool, String> {
         let Some(selected_id) = vault.selected_account_id.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
         let selected = vault.accounts.iter().find(|a| a.id == selected_id);
         let matches = selected
-            .zip(current.as_ref())
+            .zip(current)
             .is_some_and(|(sel, curr)| account_matches(sel, curr));
-        if !matches {
-            return Err("The native Antigravity account changed. Select the account again in Accounts before launching agy.".to_owned());
+        if matches {
+            return Ok(false);
         }
-        Ok(())
+        // Check an active sign-in flow BEFORE checking `holders != 1` so an unsaved or cleared
+        // slot mid-sign-in surfaces the sign-in-in-progress guidance rather than a generic mismatch.
+        if self.launch_restore.as_ref().is_some_and(|holds| holds()) {
+            return Err(
+                "Antigravity sign-in is in progress. Finish it, then launch agy again.".to_owned(),
+            );
+        }
+        // Orca #50206: each running `agy` writes its own login back to the native slot on token
+        // refresh. If exactly one saved account holds the slot (and `reconcile` just saved it),
+        // restore `selected` before launching.
+        let holders = current.map_or(0, |curr| {
+            vault
+                .accounts
+                .iter()
+                .filter(|entry| account_matches(entry, curr))
+                .count()
+        });
+        let Some(selected) = selected.filter(|_| self.launch_restore.is_some() && holders == 1)
+        else {
+            return Err("The native Antigravity account changed. Select the account again in Accounts before launching agy.".to_owned());
+        };
+        self.backend
+            .write(&selected.credentials, current.map(|c| c.contents.as_str()))?;
+        let readback = self.backend.read()?;
+        if !readback.is_some_and(|rb| account_matches(selected, &rb)) {
+            return Err(
+                "Antigravity account switching could not be verified; refresh before retrying."
+                    .to_owned(),
+            );
+        }
+        if self
+            .store
+            .read()
+            .map_err(VaultError::into_message)?
+            .selected_account_id
+            .as_deref()
+            != Some(selected.id.as_str())
+        {
+            return Err(
+                "Antigravity snapshots changed during selection; refresh before retrying."
+                    .to_owned(),
+            );
+        }
+        Ok(true)
     }
 
     pub(crate) fn begin_usage_read(&self) -> Result<Option<AntigravityUsageReadStart>, String> {
@@ -563,7 +687,7 @@ impl AntigravityAccountService {
         }
         self.store.write(&vault)?;
         let current = self.backend.read().ok().flatten();
-        Ok(Self::build_state(&vault, current.as_ref(), false))
+        Ok(self.build_state(&vault, current.as_ref(), false))
     }
 
     fn identify_rewritten_login(
@@ -644,59 +768,83 @@ impl AntigravityAccountService {
         home: &Path,
         launch_env: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        let _guard = lock(&self.op_lock);
-        let initial_vault = match self.store.read() {
-            Ok(v) => v,
-            Err(VaultError::LegacyAclLocked { status }) => {
-                warn_vault_locked_once(
-                    "prepare_antigravity_account_for_launch",
-                    status,
-                    "skipping Antigravity launch preflight because legacy vault is ACL-locked",
-                );
+        let needs_restore = {
+            let _guard = lock(&self.op_lock);
+            let initial_vault = match self.store.read() {
+                Ok(v) => v,
+                Err(VaultError::LegacyAclLocked { status }) => {
+                    warn_vault_locked_once(
+                        "prepare_antigravity_account_for_launch",
+                        status,
+                        "skipping Antigravity launch preflight because legacy vault is ACL-locked",
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into_message()),
+            };
+            if initial_vault.selected_account_id.is_none() {
                 return Ok(());
             }
-            Err(err) => return Err(err.into_message()),
-        };
-        if initial_vault.selected_account_id.is_none() {
-            return Ok(());
-        }
-        let env_home = launch_env
-            .get("HOME")
-            .or_else(|| launch_env.get("USERPROFILE"))
-            .map(PathBuf::from);
-        let host_env = current_process_env();
-        let home_mismatch = env_home.is_some_and(|eh| {
-            let ca = std::fs::canonicalize(&eh).unwrap_or(eh);
-            let cb = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-            ca != cb
-        });
-        if home_mismatch
-            || is_antigravity_file_storage_host(launch_env)
-                != is_antigravity_file_storage_host(&host_env)
-        {
-            return Err("This agy launch uses a different credential authority from the selected Antigravity account.".to_owned());
-        }
-        let (vault, current) = match self.reconcile_with_vault(None, initial_vault) {
-            Ok(pair) => pair,
-            Err(ReconcileError::LegacyVaultLocked { status }) => {
-                warn_vault_locked_once(
-                    "prepare_antigravity_account_for_launch",
-                    status,
-                    "skipping Antigravity launch preflight because legacy vault is ACL-locked",
-                );
-                return Ok(());
+            let env_home = launch_env
+                .get("HOME")
+                .or_else(|| launch_env.get("USERPROFILE"))
+                .map(PathBuf::from);
+            let host_env = current_process_env();
+            let home_mismatch = env_home.is_some_and(|eh| {
+                let ca = std::fs::canonicalize(&eh).unwrap_or(eh);
+                let cb = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+                ca != cb
+            });
+            if home_mismatch
+                || is_antigravity_file_storage_host(launch_env)
+                    != is_antigravity_file_storage_host(&host_env)
+            {
+                return Err("This agy launch uses a different credential authority from the selected Antigravity account.".to_owned());
             }
-            Err(ReconcileError::Other(msg)) => return Err(msg),
+            let (vault, current) = match self.reconcile_with_vault(None, initial_vault) {
+                Ok(pair) => pair,
+                Err(ReconcileError::LegacyVaultLocked { status }) => {
+                    warn_vault_locked_once(
+                        "prepare_antigravity_account_for_launch",
+                        status,
+                        "skipping Antigravity launch preflight because legacy vault is ACL-locked",
+                    );
+                    return Ok(());
+                }
+                Err(ReconcileError::Other(msg)) => return Err(msg),
+            };
+            let selected = vault
+                .selected_account_id
+                .as_deref()
+                .and_then(|id| vault.accounts.iter().find(|a| a.id == id));
+            !selected
+                .zip(current.as_ref())
+                .is_some_and(|(sel, curr)| account_matches(sel, curr))
         };
-        let Some(selected_id) = vault.selected_account_id.as_deref() else {
+        if !needs_restore {
             return Ok(());
-        };
-        let selected = vault.accounts.iter().find(|a| a.id == selected_id);
-        let matches = selected
-            .zip(current.as_ref())
-            .is_some_and(|(sel, curr)| account_matches(sel, curr));
-        if !matches {
-            return Err("The native Antigravity account changed. Select the account again in Accounts before launching agy.".to_owned());
+        }
+        // Match `select_account` lock order: fence in-flight `agy` model listings OUTSIDE `op_lock`
+        // before rewriting the native slot, then evict host/model caches on successful restore.
+        let restored = crate::usage::direct::agy::run_account_op(|| {
+            let _guard = lock(&self.op_lock);
+            let (vault, current) = match self.reconcile(None) {
+                Ok(pair) => pair,
+                Err(ReconcileError::LegacyVaultLocked { status }) => {
+                    warn_vault_locked_once(
+                        "prepare_antigravity_account_for_launch",
+                        status,
+                        "skipping Antigravity launch preflight because legacy vault is ACL-locked",
+                    );
+                    return Ok(false);
+                }
+                Err(ReconcileError::Other(msg)) => return Err(msg),
+            };
+            self.verify_or_restore_selected_for_launch(&vault, current.as_ref())
+        })?;
+        if restored {
+            super::evict_host_agy_caches(home);
+            crate::mobile::evict_agy_models_cache();
         }
         Ok(())
     }
@@ -735,6 +883,7 @@ impl AntigravityAccountService {
     }
 
     fn build_state(
+        &self,
         vault: &AntigravityAccountVault,
         current: Option<&AntigravityNativeCredential>,
         vault_locked: bool,
@@ -744,7 +893,7 @@ impl AntigravityAccountService {
         let subject = current
             .and_then(|c| c.identity.as_ref().map(|i| i.subject.clone()))
             .or_else(|| active.and_then(|a| a.subject.clone()));
-        AntigravityAccountState {
+        let state = AntigravityAccountState {
             accounts: vault
                 .accounts
                 .iter()
@@ -768,7 +917,12 @@ impl AntigravityAccountService {
                 }
             }),
             vault_locked,
-        }
+            restores_selection_at_launch: self.launch_restore.is_some(),
+            sign_in_supported: true,
+            sign_in: None,
+        };
+        *lock(&self.last_state) = Some(state.clone());
+        state
     }
 }
 
@@ -946,6 +1100,15 @@ pub(crate) fn default_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Fail-closed CSPRNG `UUIDv4` for capability tokens (never falls back to predictable timestamps).
+pub(crate) fn generate_capability_uuid_v4() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "Could not generate a secure sign-in session identifier.".to_owned())?;
+    Ok(format_uuid_v4(bytes))
+}
+
 fn generate_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     if SystemRandom::new().fill(&mut bytes).is_err() {
@@ -954,6 +1117,10 @@ fn generate_uuid_v4() -> String {
             .map_or(0_u128, |d| d.as_nanos());
         bytes.copy_from_slice(&nanos.to_le_bytes());
     }
+    format_uuid_v4(bytes)
+}
+
+fn format_uuid_v4(mut bytes: [u8; 16]) -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(

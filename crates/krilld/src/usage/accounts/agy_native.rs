@@ -12,6 +12,7 @@
 pub(crate) mod backend;
 pub(crate) mod codec;
 pub(crate) mod service;
+pub(crate) mod sign_in;
 pub(crate) mod store;
 
 #[cfg(unix)]
@@ -47,6 +48,9 @@ pub(crate) const MAX_SECURITY_INTERACTIVE_LINE: usize = 4095;
 pub(crate) const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
+const SIGN_IN_MUTATION_FENCE_ERR: &str =
+    "Antigravity sign-in is in progress. Finish or cancel it before changing accounts.";
+
 /// Dispatch one `UsageRequest::AntigravityAccounts(op)` against the host's native Antigravity service.
 pub(crate) fn handle_op(
     home: &Path,
@@ -55,17 +59,55 @@ pub(crate) fn handle_op(
 ) -> Result<AntigravityAccountState, String> {
     migrate_legacy_agy_profiles_once(home, state_dir);
     let svc = AntigravityAccountService::for_host(home, state_dir);
-    match op {
-        AntigravityAccountOp::List => svc.list_accounts(),
-        AntigravityAccountOp::AddCurrent => svc.add_current_account(),
+    if matches!(
+        op,
+        AntigravityAccountOp::AddCurrent
+            | AntigravityAccountOp::Select { .. }
+            | AntigravityAccountOp::Remove { .. }
+            | AntigravityAccountOp::ResetLockedVault
+    ) && sign_in::holds_native_login(home, state_dir)
+    {
+        return Err(SIGN_IN_MUTATION_FENCE_ERR.to_owned());
+    }
+    if let AntigravityAccountOp::SignInStatus { flow_id } = op {
+        // Read sign-in status BEFORE listing accounts so terminal `SignedIn` establishes a
+        // happens-before edge with `save_and_select_current_account()`, while active polling
+        // avoids spawning Keychain reads or contending on `op_lock` 3x/sec.
+        let sign_in = sign_in::status_for(home, state_dir, flow_id.as_deref());
+        let mut state = if sign_in.as_ref().is_some_and(|s| s.phase.is_running()) {
+            svc.cached_state_or_list()?
+        } else {
+            svc.list_accounts()?
+        };
+        state.sign_in = sign_in;
+        return Ok(state);
+    }
+    let (mut state, caller_flow_id) = match op {
+        AntigravityAccountOp::List => (svc.list_accounts()?, None),
+        AntigravityAccountOp::AddCurrent => (svc.add_current_account()?, None),
         AntigravityAccountOp::Select { account_id } => {
             let state = svc.select_account(account_id)?;
             evict_host_agy_caches(home);
-            Ok(state)
+            (state, None)
         }
-        AntigravityAccountOp::Remove { account_id } => svc.remove_account(account_id),
-        AntigravityAccountOp::ResetLockedVault => svc.reset_locked_vault(),
-    }
+        AntigravityAccountOp::Remove { account_id } => (svc.remove_account(account_id)?, None),
+        AntigravityAccountOp::ResetLockedVault => (svc.reset_locked_vault()?, None),
+        AntigravityAccountOp::SignInStart { intent } => {
+            let flow_id = sign_in::start(home, state_dir, *intent)?;
+            (svc.cached_state_or_list()?, Some(flow_id))
+        }
+        AntigravityAccountOp::SignInComplete { flow_id, answer } => {
+            sign_in::complete(home, state_dir, flow_id, answer)?;
+            (svc.cached_state_or_list()?, Some(flow_id.clone()))
+        }
+        AntigravityAccountOp::SignInCancel { flow_id } => {
+            sign_in::cancel(home, state_dir, flow_id)?;
+            (svc.list_accounts()?, Some(flow_id.clone()))
+        }
+        AntigravityAccountOp::SignInStatus { .. } => unreachable!("handled above"),
+    };
+    state.sign_in = sign_in::status_for(home, state_dir, caller_flow_id.as_deref());
+    Ok(state)
 }
 
 /// Read-only projection of native Antigravity vault + host login state for `AccountsSnapshot`.
@@ -121,7 +163,7 @@ pub(crate) fn vault_has_account(home: &Path, state_dir: Option<&Path>, id: &str)
         .is_ok_and(|v| v.accounts.iter().any(|a| a.id == id))
 }
 
-fn evict_host_agy_caches(home: &Path) {
+pub(crate) fn evict_host_agy_caches(home: &Path) {
     let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
     crate::usage::direct::evict_profile(home, ProviderKind::Antigravity, &host_dir);
     super::login::evict_profile(ProviderKind::Antigravity, &host_dir);
