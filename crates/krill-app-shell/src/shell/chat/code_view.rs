@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gpui::{
     App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, GlobalElementId, HighlightStyle,
     Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    Point, SharedString, StyledText, TextLayout, Window, transparent_black,
+    Point, SharedString, StyledText, TextLayout, Window,
 };
 use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use gpui_component::{
@@ -59,7 +59,7 @@ impl SelectableHighlightedText {
                 background: color.into(),
                 corner_radii: Corners::default(),
                 border_widths: Edges::default(),
-                border_color: transparent_black(),
+                border_color: krill_app_core::ui::transparent(),
                 border_style: BorderStyle::default(),
             });
         }
@@ -266,7 +266,8 @@ pub(super) fn highlight_code_runs_cached(
         return Arc::from([]);
     }
     if code.len() > MAX_HIGHLIGHT_CACHE_CODE_BYTES {
-        return Arc::from(compute_highlight_runs(&key_lang, code, highlight_theme));
+        // Avoid synchronous per-frame tree-sitter reparsing on oversized (>64 KiB) code fences.
+        return Arc::from([]);
     }
 
     let mut code_hasher = std::collections::hash_map::DefaultHasher::new();

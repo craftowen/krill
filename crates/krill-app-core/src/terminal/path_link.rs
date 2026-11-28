@@ -401,6 +401,18 @@ pub fn prefers_system_open(path: &Path) -> bool {
     )
 }
 
+#[cfg(unix)]
+fn has_unix_execute_bit(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+}
+
+#[cfg(not(unix))]
+fn has_unix_execute_bit(_path: &Path) -> bool {
+    false
+}
+
 fn classify_local_executable(path: &Path) -> (bool, bool) {
     if path.is_dir() {
         // macOS `.app` / `.workflow` / `.action` / `.scptd` bundles are directories on disk
@@ -421,7 +433,7 @@ fn classify_local_executable(path: &Path) -> (bool, bool) {
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
     else {
-        return (false, false);
+        return (has_unix_execute_bit(path), false);
     };
     match ext.as_str() {
         "sh" | "bash" | "zsh" | "fish" | "csh" | "ksh" | "ps1" | "psm1" | "psd1" | "bat"
@@ -430,7 +442,8 @@ fn classify_local_executable(path: &Path) -> (bool, bool) {
         "command" | "app" | "pkg" | "dmg" | "mpkg" | "action" | "workflow" | "scpt" | "scptd"
         | "osax" | "terminal" | "inetloc" | "webloc" | "exe" | "com" | "msc" | "msi" | "msp"
         | "scr" | "pif" | "lnk" | "hta" | "cpl" | "reg" | "inf" | "jar" | "jnlp" | "appimage"
-        | "desktop" | "run" => (true, false),
+        | "desktop" | "run" | "out" | "bin" | "elf" | "macho" | "dylib" | "so" => (true, false),
+        _ if !prefers_system_open(path) && has_unix_execute_bit(path) => (true, false),
         _ => (false, false),
     }
 }
@@ -564,11 +577,121 @@ fn split_trailing_line_col(raw: &str) -> (&str, Option<u32>, Option<u32>) {
     (before_last, Some(last_num), None)
 }
 
+fn parse_file_url_path_only(raw_url: &str) -> Option<PathBuf> {
+    // Agents sometimes emit raw spaces inside `file:///Users/.../Application Support/...`.
+    let encoded = if raw_url.contains(' ') {
+        raw_url.replace(' ', "%20")
+    } else {
+        raw_url.to_owned()
+    };
+    let parsed = gpui::http_client::Url::parse(&encoded).ok()?;
+    if parsed.scheme() != "file" {
+        return None;
+    }
+    // Reject remote UNC/SMB hosts (`file://evil.example/...`); allow only local files.
+    if parsed
+        .host_str()
+        .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
+    {
+        return None;
+    }
+    let path = parsed.to_file_path().ok()?;
+    if path
+        .to_string_lossy()
+        .chars()
+        .any(|c| c.is_control() || is_bidi_control(c))
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// Decodes a `file://` URL (supporting `file://localhost/`, `%20` / UTF-8 percent-encoding,
+/// unencoded spaces, `#L10-L20` anchors, and trailing `:line[:col]`).
+#[must_use]
+pub fn decode_file_url(
+    raw: &str,
+    check_local_exists: bool,
+) -> Option<(PathBuf, Option<u32>, Option<u32>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || is_bidi_control(c))
+        || !trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+    {
+        return None;
+    }
+    let (before_hash, fragment) = match trimmed.split_once('#') {
+        Some((head, frag)) => (head, Some(frag)),
+        None => (trimmed, None),
+    };
+    let (mut line, mut column) = fragment.map_or((None, None), parse_line_fragment);
+    let mut path = if line.is_none() && fragment.is_some() {
+        // When `#` is not a line anchor (e.g. `file:///Users/a/C#notes.md`), preserve literal `#`
+        // if that path exists locally or if `before_hash` does not exist.
+        let literal_encoded = trimmed
+            .split_once('?')
+            .map_or(trimmed, |(h, _)| h)
+            .replace('#', "%23");
+        let literal_path = parse_file_url_path_only(&literal_encoded);
+        let head_without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
+        let head_path = parse_file_url_path_only(head_without_query);
+        match (literal_path, head_path) {
+            (Some(lit), Some(head)) if check_local_exists => {
+                if lit.exists() || !head.exists() {
+                    lit
+                } else {
+                    head
+                }
+            }
+            (Some(lit), _) if !check_local_exists => lit,
+            (_, Some(head)) => head,
+            (Some(lit), None) => lit,
+            (None, None) => return None,
+        }
+    } else {
+        let without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
+        parse_file_url_path_only(without_query)?
+    };
+    if line.is_none()
+        && let Some(path_str) = path.to_str()
+    {
+        let (stripped, l, c) = split_trailing_line_col(path_str);
+        if l.is_some() && !stripped.is_empty() && (!check_local_exists || !path.exists()) {
+            path = PathBuf::from(stripped);
+            line = l;
+            column = c;
+        }
+    }
+    Some((path, line, column))
+}
+
 /// Resolves a Markdown/chat link URL into either a sanitized external URL or a validated local
 /// filesystem path (supporting `file://` with percent-encoded spaces/UTF-8, `#L10-L20` line
 /// anchors, unencoded spaces, absolute paths, and `base_dir`-relative paths).
 #[must_use]
 pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<MarkdownLinkTarget> {
+    resolve_markdown_link_inner(raw, base_dir, false)
+}
+
+/// Resolves a Markdown/chat link URL for a remote session without touching the local filesystem
+/// or expanding the local `$HOME` environment variable.
+#[must_use]
+pub fn resolve_markdown_link_remote(
+    raw: &str,
+    base_dir: Option<&Path>,
+) -> Option<MarkdownLinkTarget> {
+    resolve_markdown_link_inner(raw, base_dir, true)
+}
+
+fn resolve_markdown_link_inner(
+    raw: &str,
+    base_dir: Option<&Path>,
+    remote: bool,
+) -> Option<MarkdownLinkTarget> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
         || trimmed
@@ -586,38 +709,12 @@ pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<Markd
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
     {
-        let (before_hash, fragment) = match trimmed.split_once('#') {
-            Some((head, frag)) => (head, Some(frag)),
-            None => (trimmed, None),
-        };
-        let (line, column) = fragment.map_or((None, None), parse_line_fragment);
-        let without_query = before_hash.split_once('?').map_or(before_hash, |(h, _)| h);
-        // Agents sometimes emit raw spaces inside `file:///Users/.../Application Support/...`.
-        let encoded = if without_query.contains(' ') {
-            without_query.replace(' ', "%20")
+        let (path, line, column) = decode_file_url(trimmed, !remote)?;
+        let (dangerous_executable, text_script) = if remote {
+            (false, false)
         } else {
-            without_query.to_owned()
+            classify_local_executable(&path)
         };
-        let parsed = gpui::http_client::Url::parse(&encoded).ok()?;
-        if parsed.scheme() != "file" {
-            return None;
-        }
-        // Reject remote UNC/SMB hosts (`file://evil.example/...`); allow only local files.
-        if parsed
-            .host_str()
-            .is_some_and(|h| !h.is_empty() && !h.eq_ignore_ascii_case("localhost"))
-        {
-            return None;
-        }
-        let path = parsed.to_file_path().ok()?;
-        if path
-            .to_string_lossy()
-            .chars()
-            .any(|c| c.is_control() || is_bidi_control(c))
-        {
-            return None;
-        }
-        let (dangerous_executable, text_script) = classify_local_executable(&path);
         return Some(MarkdownLinkTarget::LocalPath {
             path,
             line,
@@ -649,11 +746,25 @@ pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<Markd
         return None;
     }
 
-    let candidate_path = if let Some(expanded) = expand_tilde_path(path_str) {
-        expanded
+    let candidate_path = if path_str.starts_with("~/") {
+        if remote {
+            // Never expand the local machine's $HOME for a remote session.
+            return None;
+        }
+        expand_tilde_path(path_str)?
     } else if path_str.starts_with('/') || is_windows_drive_absolute(path_str) {
         let raw_pb = PathBuf::from(path_str);
-        if !raw_pb.exists()
+        if remote {
+            if let Some(decoded) = percent_decode_path(path_str)
+                && !decoded
+                    .chars()
+                    .any(|c| c.is_control() || is_bidi_control(c))
+            {
+                PathBuf::from(&decoded)
+            } else {
+                raw_pb
+            }
+        } else if !raw_pb.exists()
             && let Some(decoded) = percent_decode_path(path_str)
             && !decoded
                 .chars()
@@ -670,22 +781,29 @@ pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<Markd
         }
     } else {
         let base = base_dir?;
-        let raw_joined = base.join(path_str);
-        if raw_joined.exists() {
-            raw_joined
-        } else if let Some(decoded) = percent_decode_path(path_str)
-            && !decoded
-                .chars()
-                .any(|c| c.is_control() || is_bidi_control(c))
-        {
-            let decoded_joined = base.join(&decoded);
-            if decoded_joined.exists() {
-                decoded_joined
+        if remote {
+            let rel = percent_decode_path(path_str)
+                .filter(|d| !d.chars().any(|c| c.is_control() || is_bidi_control(c)))
+                .unwrap_or_else(|| path_str.to_owned());
+            base.join(rel)
+        } else {
+            let raw_joined = base.join(path_str);
+            if raw_joined.exists() {
+                raw_joined
+            } else if let Some(decoded) = percent_decode_path(path_str)
+                && !decoded
+                    .chars()
+                    .any(|c| c.is_control() || is_bidi_control(c))
+            {
+                let decoded_joined = base.join(&decoded);
+                if decoded_joined.exists() {
+                    decoded_joined
+                } else {
+                    return None;
+                }
             } else {
                 return None;
             }
-        } else {
-            return None;
         }
     };
 
@@ -696,7 +814,11 @@ pub fn resolve_markdown_link(raw: &str, base_dir: Option<&Path>) -> Option<Markd
     {
         return None;
     }
-    let (dangerous_executable, text_script) = classify_local_executable(&candidate_path);
+    let (dangerous_executable, text_script) = if remote {
+        (false, false)
+    } else {
+        classify_local_executable(&candidate_path)
+    };
     Some(MarkdownLinkTarget::LocalPath {
         path: candidate_path,
         line,
@@ -1269,5 +1391,61 @@ mod windows_path_tests {
             }),
             "Windows drive path should be prioritized first: {cands:?}"
         );
+    }
+
+    #[test]
+    fn chat_18_32_unix_exec_bit_and_remote_link_and_file_url_line_col() {
+        // file://localhost + :line:col decoding
+        let (path, line, col) =
+            decode_file_url("file://localhost/srv/app/src/main.rs:42:7", false).unwrap();
+        assert_eq!(path, PathBuf::from("/srv/app/src/main.rs"));
+        assert_eq!(line, Some(42));
+        assert_eq!(col, Some(7));
+
+        // Remote resolution skips local filesystem existence checks and local $HOME expansion.
+        let remote =
+            resolve_markdown_link_remote("src/lib.rs:10:3", Some(Path::new("/remote/repo")));
+        assert_eq!(
+            remote,
+            Some(MarkdownLinkTarget::LocalPath {
+                path: PathBuf::from("/remote/repo/src/lib.rs"),
+                line: Some(10),
+                column: Some(3),
+                dangerous_executable: false,
+                text_script: false,
+            })
+        );
+        // Remote tilde path returns None (never leaks local $HOME).
+        let remote_tilde =
+            resolve_markdown_link_remote("~/notes.md", Some(Path::new("/remote/repo")));
+        assert_eq!(remote_tilde, None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("krill-exec-bit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("payload_bin");
+            std::fs::write(&bin, b"\x7fELF\x02\x01\x01\x00").unwrap();
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+            let url = format!("file://{}", bin.display());
+            let resolved = resolve_markdown_link(&url, None).unwrap();
+            match resolved {
+                MarkdownLinkTarget::LocalPath {
+                    dangerous_executable,
+                    text_script,
+                    ..
+                } => {
+                    assert!(
+                        dangerous_executable && !text_script,
+                        "Unix +x binary must be classified as dangerous non-script executable"
+                    );
+                }
+                MarkdownLinkTarget::ExternalUrl(_) => panic!("expected LocalPath"),
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

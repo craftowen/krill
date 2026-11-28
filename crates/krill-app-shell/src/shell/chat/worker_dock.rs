@@ -48,6 +48,7 @@ pub(super) struct SessionObservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkerDockState {
     Working,
+    Starting,
     NeedsYou,
     Idle,
     Stopped,
@@ -70,6 +71,7 @@ impl WorkerDockState {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Working => ctext::WORKER_STATE_RUNNING.get(),
+            Self::Starting => ctext::WORKER_STARTING.get(),
             Self::NeedsYou => ctext::WORKER_DOCK_STATE_NEEDS_YOU.get(),
             Self::Idle => ctext::WORKER_DOCK_STATE_IDLE.get(),
             Self::Stopped => ctext::WORKER_STATE_STOPPED.get(),
@@ -82,7 +84,8 @@ impl WorkerDockState {
             Self::NeedsYou => 0,
             Self::Stopped | Self::Failed => 1,
             Self::Working => 2,
-            Self::Idle => 3,
+            Self::Starting => 3,
+            Self::Idle => 4,
         }
     }
 }
@@ -283,8 +286,13 @@ pub(super) fn build_worker_dock_snapshot(
                                 WorkerDockState::NeedsYou
                             }
                             Some(AgentState::Done) => WorkerDockState::Idle,
-                            Some(AgentState::Working | AgentState::Unknown) | None => {
-                                WorkerDockState::Working
+                            Some(AgentState::Working) => WorkerDockState::Working,
+                            Some(AgentState::Unknown) | None => {
+                                if now_ms.saturating_sub(dispatch.started_at_ms) < 15_000 {
+                                    WorkerDockState::Starting
+                                } else {
+                                    WorkerDockState::Idle
+                                }
                             }
                             Some(AgentState::Exited) => WorkerDockState::Stopped,
                         };
@@ -545,30 +553,50 @@ impl Shell {
                 }
             }
         }
+        let cleared: BTreeSet<String> = self
+            .chat
+            .worker_dock_cleared
+            .iter()
+            .filter(|(h, _)| h == &key.0)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let owner_stopped: BTreeSet<String> = self
+            .chat
+            .worker_dock_owner_stopped
+            .iter()
+            .filter(|(h, _)| h == &key.0)
+            .map(|(_, id)| id.clone())
+            .collect();
         build_worker_dock_snapshot(
             store,
             key.1,
             &sessions,
-            &self.chat.worker_dock_cleared,
-            &self.chat.worker_dock_owner_stopped,
+            &cleared,
+            &owner_stopped,
             self.chat_now_epoch_ms(),
         )
     }
 
-    pub(super) fn clear_worker_dock_row(&mut self, dispatch_id: String, cx: &mut Context<Self>) {
-        if self.chat.worker_dock_cleared.insert(dispatch_id) {
+    pub(super) fn clear_worker_dock_row(
+        &mut self,
+        host: HostId,
+        dispatch_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.worker_dock_cleared.insert((host, dispatch_id)) {
             cx.notify();
         }
     }
 
     pub(super) fn clear_all_worker_dock_rows(
         &mut self,
+        host: &HostId,
         dispatch_ids: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
         for id in dispatch_ids {
-            changed |= self.chat.worker_dock_cleared.insert(id);
+            changed |= self.chat.worker_dock_cleared.insert((host.clone(), id));
         }
         if changed {
             cx.notify();
@@ -584,8 +612,10 @@ impl Shell {
         dispatch_id: String,
         cx: &mut Context<Self>,
     ) {
-        self.chat.worker_keep_open.insert(session);
-        self.chat.worker_banner_kept.insert(dispatch_id.clone());
+        self.chat.worker_keep_open.insert((host.clone(), session));
+        self.chat
+            .worker_banner_kept
+            .insert((host.clone(), dispatch_id.clone()));
         if host.is_local() {
             // Update in-memory snapshot immediately so sibling surfaces stay consistent.
             let mut next = (*self.orch_snapshot).clone();
@@ -632,13 +662,21 @@ impl Shell {
                         let any_countdown =
                             this.visible_chat_panes(cx).into_iter().any(|(pane, sid)| {
                                 let host = this.layout.host(pane);
-                                !this.chat.worker_keep_open.contains(&sid)
+                                let chat_key = (host.clone(), sid);
+                                let kept: BTreeSet<String> = this
+                                    .chat
+                                    .worker_banner_kept
+                                    .iter()
+                                    .filter(|(h, _)| h == host)
+                                    .map(|(_, id)| id.clone())
+                                    .collect();
+                                !this.chat.worker_keep_open.contains(&chat_key)
                                     && this.orch_snapshot_for(host).is_some_and(|store| {
                                         matches!(
                                             temporary_worker_banner_for_session(
                                                 store,
                                                 sid,
-                                                &this.chat.worker_banner_kept,
+                                                &kept,
                                                 now_ms,
                                             ),
                                             Some(TemporaryWorkerBanner {
@@ -676,16 +714,19 @@ impl Shell {
         key: &ChatKey,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.chat.worker_keep_open.contains(&key.1) {
+        if self.chat.worker_keep_open.contains(key) {
             return None;
         }
         let store = self.orch_snapshot_for(&key.0)?;
-        let banner = temporary_worker_banner_for_session(
-            store,
-            key.1,
-            &self.chat.worker_banner_kept,
-            self.chat_now_epoch_ms(),
-        )?;
+        let kept: BTreeSet<String> = self
+            .chat
+            .worker_banner_kept
+            .iter()
+            .filter(|(h, _)| h == &key.0)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let banner =
+            temporary_worker_banner_for_session(store, key.1, &kept, self.chat_now_epoch_ms())?;
         let palette = ui::palette(cx);
         let dispatch_id = banner.dispatch_id.clone();
         let host = key.0.clone();
@@ -910,6 +951,7 @@ impl Shell {
                     ),
             )
             .when(show_clear_all, |d| {
+                let clear_host = host.clone();
                 d.child(
                     Button::new(SharedString::from(format!(
                         "chat-worker-dock-clear-{}",
@@ -922,7 +964,7 @@ impl Shell {
                     .text_color(palette.muted_foreground)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.clear_all_worker_dock_rows(clearable_ids.clone(), cx);
+                        this.clear_all_worker_dock_rows(&clear_host, clearable_ids.clone(), cx);
                     })),
                 )
             });
@@ -956,6 +998,13 @@ impl Shell {
                             cx,
                         )
                         .into_any_element(),
+                        WorkerDockState::Starting => ui::status::status_glyph(
+                            AgentState::Unknown,
+                            false,
+                            ui::status::Size::Sm,
+                            cx,
+                        )
+                        .into_any_element(),
                         WorkerDockState::NeedsYou => ui::status::status_glyph(
                             AgentState::Waiting,
                             false,
@@ -980,9 +1029,9 @@ impl Shell {
                     let state_color = match row.state {
                         WorkerDockState::Working => palette.agent_working(),
                         WorkerDockState::NeedsYou => palette.agent_question,
-                        WorkerDockState::Idle | WorkerDockState::Stopped => {
-                            palette.muted_foreground
-                        }
+                        WorkerDockState::Starting
+                        | WorkerDockState::Idle
+                        | WorkerDockState::Stopped => palette.muted_foreground,
                         WorkerDockState::Failed => palette.destructive,
                     };
                     let primary_label = if row.worker_name.trim().is_empty() {
@@ -1079,6 +1128,7 @@ impl Shell {
                         )
                         .when(row.clearable, |d| {
                             let clear_sel = format!("chat-worker-dock-clear-{clear_id}");
+                            let clear_host = host.clone();
                             d.child(
                                 Button::new(SharedString::from(format!(
                                     "chat-worker-dock-clear-{}-{clear_id}",
@@ -1096,7 +1146,11 @@ impl Shell {
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.clear_worker_dock_row(clear_id.clone(), cx);
+                                        this.clear_worker_dock_row(
+                                            clear_host.clone(),
+                                            clear_id.clone(),
+                                            cx,
+                                        );
                                     },
                                 )),
                             )
