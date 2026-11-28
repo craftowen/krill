@@ -6958,6 +6958,15 @@ async function unboundEmptyAndVisibilityTransitions() {
       assert.equal(p02.entry.queuedPrompts.length, 0, "P0-2: cleared purges queuedPrompts");
       assert.equal(p02.entry.queuePaused, false, "P0-2: cleared resets queuePaused");
       assert.equal(p02.entry.questionDraft, null, "P0-2: cleared resets questionDraft");
+      // Defect #3: status strip lives outside composer-leading so it cannot crush the model pill on narrow viewports.
+      const statusNode = p02.find("chat-status"),
+        leadingNode = p02.find("composer-leading"),
+        boxNode = p02.find("chat-composer-box");
+      assert(statusNode && leadingNode && boxNode, "composer layout nodes exist");
+      assert(
+        !leadingNode.children.includes(statusNode) && boxNode.children.includes(statusNode),
+        "chat-status is separated from composer-leading inside chat-composer-box",
+      );
       // Empty No matches popover must not block normal slash submit.
       p02.input("/unknowncmd");
       await flush();
@@ -6968,6 +6977,85 @@ async function unboundEmptyAndVisibilityTransitions() {
         "P0-2: empty No matches popover never blocks form submit",
       );
       p02.dispose();
+
+      // Blocker #2: in-flight chat_poll returning bound:false across /clear must never show "Transcript changed" or "Back to latest".
+      let clearPollSeq = 0;
+      const stalePoll = deferred();
+      const clearPrompt = deferred();
+      let isCleared = false;
+      const race = fixture({
+        capabilities: { chat_tail: true, chat_composer: true, composer_models: true },
+        handler: async (req) => {
+          if (req.action === "chat_composer")
+            return { agent: "agy", model: "gemini-4-neon", model_label: "Gemini 4 Neon", effort: "medium", effort_supported: true, supported: true };
+          if (req.action === "prompt") {
+            isCleared = true;
+            return clearPrompt.promise;
+          }
+          if (req.action === "chat_poll") {
+            clearPollSeq++;
+            if (clearPollSeq === 1)
+              return { generation: "g-before", agent: "agy", bound: true, items: [{ id: "u1", kind: "user", text: "hi" }], next_offset: 10, page_start: 0 };
+            if (clearPollSeq === 2) return stalePoll.promise;
+            return { generation: "", agent: "agy", bound: false, items: [], next_offset: 0, page_start: 0 };
+          }
+          return { ok: true };
+        },
+      });
+      await flush();
+      assert.equal(race.entry.items.length, 1);
+      // Start an in-flight chat_poll BEFORE /clear resolves.
+      for (const fn of [...race.timers.values()]) fn();
+      await flush();
+      assert.equal(clearPollSeq, 2, "in-flight poll started before /clear");
+      // Submit /clear while poll #2 is in flight.
+      race.input("/clear");
+      race.submit();
+      await flush();
+      // Case A: stale poll resolves with bound:false while /clear is still in flight, then /clear resolves.
+      stalePoll.resolve({ generation: "", agent: "agy", bound: false, items: [], next_offset: 0, page_start: 0 });
+      await flush();
+      clearPrompt.resolve({ sent: true, cleared: true });
+      await flush();
+      assert.equal(race.entry.items.length, 0, "cleared transcript is empty");
+      assert.equal(race.entry.latestRecovery, false, "latestRecovery stays false after /clear");
+      assert.equal(race.button("Back to latest").hidden, true, "Back to latest hidden after /clear");
+      const pollBanner = race.root.descendants().find((n) => n.className === "chat-actions" && n.attrs?.role === "status");
+      assert.equal(pollBanner.hidden, true, "poll error banner stays hidden after /clear race");
+      assert(!race.root.textContent.includes("Transcript changed"), "no Transcript changed banner after /clear");
+      race.dispose();
+
+      // Case B: stale poll from BEFORE /clear resolves AFTER rpcRes.cleared (epoch fence must discard it).
+      let raceBSeq = 0;
+      const raceBStale = deferred();
+      const raceB = fixture({
+        capabilities: { chat_tail: true, chat_composer: true },
+        handler: async (req) => {
+          if (req.action === "chat_composer") return { agent: "agy", supported: true };
+          if (req.action === "prompt") return { sent: true, cleared: true };
+          if (req.action === "chat_poll") {
+            raceBSeq++;
+            if (raceBSeq === 1)
+              return { generation: "g-b1", agent: "agy", bound: true, items: [{ id: "u1", kind: "user", text: "old" }], next_offset: 10, page_start: 0 };
+            if (raceBSeq === 2) return raceBStale.promise;
+            return { generation: "", agent: "agy", bound: false, items: [], next_offset: 0, page_start: 0 };
+          }
+          return { ok: true };
+        },
+      });
+      await flush();
+      for (const fn of [...raceB.timers.values()]) fn();
+      await flush();
+      raceB.input("/clear");
+      raceB.submit();
+      await flush();
+      // Stale poll resolves AFTER /clear with old items — epoch fence must ignore it and run fresh poll!
+      raceBStale.resolve({ generation: "g-b1", agent: "agy", bound: true, items: [{ id: "u2", kind: "assistant", text: "stale resurrection" }], next_offset: 20, page_start: 10 });
+      await flush();
+      assert.equal(raceB.entry.items.length, 0, "epoch fence prevents stale pre-clear poll from resurrecting items");
+      assert.equal(raceB.button("Back to latest").hidden, true, "Back to latest stays hidden after epoch-fenced poll");
+      assert(!raceB.root.textContent.includes("Transcript changed"), "no Transcript changed error on epoch-fenced poll");
+      raceB.dispose();
 
       // P0-3: Claude set_model never includes effort; inline error preserves model list.
       const p03 = fixture({

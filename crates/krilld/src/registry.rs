@@ -4463,8 +4463,10 @@ impl Registry {
             }
             BotRpcRequest::SendGroupMessage { group_id, text, .. }
             | BotRpcRequest::SendGroupMessageWithAudience { group_id, text, .. } => {
-                self.voice()
-                    .observe_prompt(VoiceTargetKind::GroupChat, group_id, text, None);
+                if !text.trim().eq_ignore_ascii_case("/clear") {
+                    self.voice()
+                        .observe_prompt(VoiceTargetKind::GroupChat, group_id, text, None);
+                }
             }
             BotRpcRequest::PostBotReply { bot_id, text, .. } => {
                 self.voice()

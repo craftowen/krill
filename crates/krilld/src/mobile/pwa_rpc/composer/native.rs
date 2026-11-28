@@ -354,9 +354,8 @@ fn banner_model(models: &Value, screen: &Screen) -> Option<(String, Option<Strin
             let before_slash = after.split('/').next().unwrap_or("");
             let effort = before_slash
                 .split_whitespace()
-                .next()
                 .map(str::to_ascii_lowercase)
-                .filter(|word| super::valid_effort(word));
+                .find(|word| super::valid_effort(word));
             return Some((id, effort));
         }
     }
@@ -387,11 +386,12 @@ fn verified(screen: &Screen) -> bool {
 fn effort(screen: &Screen) -> Option<String> {
     let footer = wrapped_row(screen, usize::from(screen.cursor.line) + 2);
     let (model, _) = footer.split_once(" · ")?;
-    model
-        .split_whitespace()
-        .last()
+    let mut words = model.split_whitespace();
+    words.next()?;
+    words
+        .rev()
         .map(str::to_ascii_lowercase)
-        .filter(|effort| super::valid_effort(effort))
+        .find(|effort| super::valid_effort(effort))
 }
 
 fn composer(screen: &Screen, command: Option<&str>) -> bool {
@@ -868,5 +868,52 @@ mod tests {
         observe_screen_into(&catalog, &prompt_screen, &mut existing);
         assert_eq!(existing["model"], "gpt-5.4-mini");
         assert_eq!(existing["effort"], "low");
+    }
+    #[test]
+    fn fast_mode_badge_in_footer_does_not_mask_model_or_effort() {
+        let catalog = serde_json::json!({
+            "items": [
+                {"id": "gpt-6.2-sol", "label": "GPT-6.2-Sol"}
+            ]
+        });
+        let make = |footer: &str| {
+            let mut s = screen("");
+            s.rows[4] = footer
+                .chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect();
+            s
+        };
+        let medium_fast = make("  GPT-6.2-Sol medium fast · main · Context 0% used");
+        assert_eq!(
+            observed_model(&catalog, &medium_fast).as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        assert_eq!(effort(&medium_fast).as_deref(), Some("medium"));
+
+        let high_fast =
+            make("  GPT-6.2-Sol high fast · main · Context 0% used · 5h 0% left · weekly 22% left");
+        assert_eq!(
+            observed_model(&catalog, &high_fast).as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        assert_eq!(effort(&high_fast).as_deref(), Some("high"));
+
+        let plain_xhigh = make("  GPT-6.2-Sol xhigh · main");
+        assert_eq!(
+            observed_model(&catalog, &plain_xhigh).as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        assert_eq!(effort(&plain_xhigh).as_deref(), Some("xhigh"));
+
+        let fast_only = make("  GPT-6.2-Sol fast · main · Context 0% used");
+        assert_eq!(
+            observed_model(&catalog, &fast_only).as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        assert!(effort(&fast_only).is_none());
     }
 }

@@ -2380,7 +2380,13 @@ const hid = activeGroupHost;
 const dk = currentGroupDraftKey();
 if (text.toLowerCase() === "/clear") {
 const prevIds = new Set((groupView?.threads || []).map((th) => th.thread_id));
-const res = await rpcHost(ctx, hid, { action: "bots.groups.new_thread", group_id: gid });
+let res;
+try {
+res = await rpcHost(ctx, hid, { action: "bots.groups.clear", group_id: gid, ...(tid ? { thread_id: tid } : {}) });
+} catch (e) {
+if (!/invalid|unknown|unsupported/i.test(String(e?.message || e))) throw e;
+res = await rpcHost(ctx, hid, { action: "bots.groups.new_thread", group_id: gid });
+}
 if (ctx.signal.aborted) return;
 if (dk) ctx.state.drafts?.delete?.(dk);
 if (gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
@@ -2388,8 +2394,9 @@ groupTextarea.value = "";
 if (res?.group) {
 groupView = res.group;
 const created = (groupView.threads || []).find((th) => !prevIds.has(th.thread_id));
-activeThreadId = created?.thread_id || groupView.threads?.[0]?.thread_id || null;
+activeThreadId = groupView.active_thread_id || created?.thread_id || groupView.threads?.[0]?.thread_id || null;
 draw();
+syncGroupPolling();
 groupMsgBox.scrollTop = groupMsgBox.scrollHeight;
 } else {
 await loadGroup(gid, null, hid);

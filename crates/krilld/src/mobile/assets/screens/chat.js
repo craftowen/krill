@@ -1750,7 +1750,7 @@ else M.app?.navigate?.("/accounts");
 "secondary small",
 ),
 );
-leading.append(attachBtn, modelBtn, searchToggleBtn, statusLine);
+leading.append(attachBtn, modelBtn, searchToggleBtn);
 statusRow.append(leading, contextMeter, queueBtn, steerBtn, sendBtn);
 const voiceCtl = M.voice?.attach?.(input, statusRow, {
 ctx,
@@ -1759,7 +1759,7 @@ targetId: () => String(sessionId),
 beforeNode: sendBtn,
 onInsert: () => sizeInput(true),
 });
-box.append(suggestions, queuedStrip, attachment, input, statusRow);
+box.append(suggestions, statusLine, queuedStrip, attachment, input, statusRow);
 composer.append(box, photoPicker);
 // Like Orca, the send tap takes focus so the IME commits the last syllable first.
 for (const row of [attachment, leading, contextMeter])
@@ -3230,8 +3230,20 @@ t(
 }
 }
 voiceCtl?.onSend?.(text);
+const maybeClear = /^\/(clear|new)$/i.test(text.trim());
+if (maybeClear) entry.clearing = true;
 const rpcRes = await ctx.rpc(rpcPayload);
 if (rpcRes?.cleared) {
+entry.clearEpoch = (entry.clearEpoch || 0) + 1;
+earlierEpoch++;
+earlierQueued = false;
+failedEarlier = false;
+autoBlocked = null;
+resetHistory = false;
+refreshLatest = false;
+failures = 0;
+pollStatus.hidden = true;
+following = true;
 clearTranscript(true);
 entry.offset = 0;
 entry.generation = "";
@@ -3244,6 +3256,7 @@ entry.questionDraft = null;
 subscribed = false;
 subscribedOffset = null;
 subscribedConn = null;
+if (inFlight) refreshPollQueued = true;
 renderItems();
 } else if (entry.progress === progress) {
 entry.progress.phase = "accepted";
@@ -3284,6 +3297,7 @@ entry.queuedPrompts.unshift(queuedItem);
 }
 throw Error(message);
 } finally {
+entry.clearing = false;
 entry.sending = false;
 entry.notifyComposer?.();
 }
@@ -5693,6 +5707,7 @@ p.session !== sessionId ||
 !active() ||
 !isVisible() ||
 state.cached ||
+entry.clearing ||
 earlierPending ||
 entry.live ||
 state.connection?.phase !== "ready"
@@ -5744,12 +5759,14 @@ state.connection?.phase !== "ready"
 )
 return;
 const epoch = earlierEpoch,
+clearEpoch = entry.clearEpoch || 0,
 prefetch = !visible,
 owner = ctx.transport,
 linkEpoch = state.connection?.generation;
 const current = () =>
 active() &&
 epoch === earlierEpoch &&
+clearEpoch === (entry.clearEpoch || 0) &&
 owner === ctx.transport &&
 linkEpoch === state.connection?.generation &&
 !state.cached &&
@@ -5775,6 +5792,7 @@ if (!current() || earlierPending || (entry.live && !resetHistory))
 return;
 if (!res)
 throw new Error(t("Transcript changed. Return to latest and retry."));
+if (!res.bound && entry.clearing) return;
 let changed =
 entry.generation &&
 res.generation &&
@@ -5799,6 +5817,7 @@ if (!res)
 throw new Error(
 t("Transcript changed. Return to latest and retry."),
 );
+if (!res.bound && entry.clearing) return;
 latest = true;
 changed = true;
 }
