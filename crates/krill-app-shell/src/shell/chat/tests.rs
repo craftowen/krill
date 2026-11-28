@@ -864,7 +864,7 @@ fn user_prompt_fold_threshold_and_chat_log_wrap_state() {
 }
 
 #[test]
-fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
+fn composer_primary_action_respects_sending_working_cooldown_and_draft_state() {
     use krill_proto::control::AgentState;
 
     assert_eq!(
@@ -872,7 +872,7 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::InFlight,
             draft_empty: true,
-            interrupt_latched: false,
+            stop_cooling_down: false,
         }),
         ComposerPrimaryAction::Sending,
     );
@@ -881,7 +881,7 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::InFlight,
             draft_empty: false,
-            interrupt_latched: false,
+            stop_cooling_down: false,
         }),
         ComposerPrimaryAction::Sending,
     );
@@ -891,9 +891,11 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::ReviewRequired,
             draft_empty: false,
-            interrupt_latched: false,
+            stop_cooling_down: false,
         }),
-        ComposerPrimaryAction::Stop { latched: false },
+        ComposerPrimaryAction::Stop {
+            cooling_down: false,
+        },
     );
 
     // Option A: Working + ready shows Stop even when draft text or attachments exist.
@@ -902,29 +904,33 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::Ready,
             draft_empty: true,
-            interrupt_latched: false,
+            stop_cooling_down: false,
         }),
-        ComposerPrimaryAction::Stop { latched: false },
+        ComposerPrimaryAction::Stop {
+            cooling_down: false,
+        },
     );
     assert_eq!(
         composer_primary_action(ComposerPrimaryInput {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::Ready,
             draft_empty: false,
-            interrupt_latched: false,
+            stop_cooling_down: false,
         }),
-        ComposerPrimaryAction::Stop { latched: false },
+        ComposerPrimaryAction::Stop {
+            cooling_down: false,
+        },
     );
 
-    // Latched Working keeps Stop disabled even when text is typed afterward.
+    // Cooling-down Working keeps Stop disabled briefly even when text is typed afterward.
     assert_eq!(
         composer_primary_action(ComposerPrimaryInput {
             agent_state: AgentState::Working,
             submission: ComposerSubmissionState::Ready,
             draft_empty: false,
-            interrupt_latched: true,
+            stop_cooling_down: true,
         }),
-        ComposerPrimaryAction::Stop { latched: true },
+        ComposerPrimaryAction::Stop { cooling_down: true },
     );
 
     for state in [
@@ -939,7 +945,7 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
                 agent_state: state,
                 submission: ComposerSubmissionState::Ready,
                 draft_empty: true,
-                interrupt_latched: false,
+                stop_cooling_down: false,
             }),
             ComposerPrimaryAction::Send { enabled: false },
         );
@@ -948,7 +954,7 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
                 agent_state: state,
                 submission: ComposerSubmissionState::Ready,
                 draft_empty: false,
-                interrupt_latched: false,
+                stop_cooling_down: false,
             }),
             ComposerPrimaryAction::Send { enabled: true },
         );
@@ -957,7 +963,7 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
                 agent_state: state,
                 submission: ComposerSubmissionState::ReviewRequired,
                 draft_empty: false,
-                interrupt_latched: false,
+                stop_cooling_down: false,
             }),
             ComposerPrimaryAction::Send { enabled: false },
         );
@@ -1616,9 +1622,9 @@ fn bot_chat_folds_settled_turns_behind_their_answer() {
             "bar:1:true:false"
         ]
     );
-    assert_eq!(work_run::format_turn_duration(16), "16s");
-    assert_eq!(work_run::format_turn_duration(125), "2m 5s");
-    assert_eq!(work_run::format_turn_duration(3_725), "1h 2m 5s");
+    assert_eq!(work_run::format_turn_duration(16), "16초");
+    assert_eq!(work_run::format_turn_duration(125), "2분 5초");
+    assert_eq!(work_run::format_turn_duration(3_725), "1시간 2분");
 }
 
 /// Orca's memory note summary: counts while one or two kinds changed, a total past that.
@@ -2787,4 +2793,292 @@ fn noop_chat_poll_reports_no_change(cx: &mut TestAppContext) {
             "unchanged idle poll with empty items must not trigger redundant cx.notify()"
         );
     });
+}
+
+#[test]
+fn p0_1_chat_interrupt_sequence_uses_esc_for_tui_agents_and_ctrl_c_only_for_shells() {
+    for agent in [
+        "agy",
+        "antigravity",
+        "claude",
+        "openclaude",
+        "codex",
+        "opencode",
+        "pi",
+        "omp",
+        "cursor",
+        "gemini",
+        "CLAUDE",
+        " Codex ",
+    ] {
+        assert_eq!(
+            chat_interrupt_sequence(agent),
+            b"\x1b",
+            "interactive TUI agent {agent} must always receive Esc (never Ctrl-C)"
+        );
+    }
+    for shell_name in ["", "zsh", "bash", "fish", "unknown-cli"] {
+        assert_eq!(
+            chat_interrupt_sequence(shell_name),
+            b"\x03",
+            "raw shell/unknown session {shell_name:?} should receive Ctrl-C"
+        );
+    }
+}
+
+#[test]
+fn p0_3_localize_composer_notice_maps_backend_reasons_without_english_leaks() {
+    let cases = [
+        (
+            "Wait for Claude to finish the current turn.",
+            true,
+            ctext::PICKER_WAIT.get(),
+        ),
+        (
+            "Still loading models...",
+            false,
+            ctext::PICKER_LOADING.get(),
+        ),
+        (
+            "claude CLI not found in PATH",
+            false,
+            ctext::PICKER_CLI_NOT_FOUND.get(),
+        ),
+        (
+            "Requires codex >= 0.164.0",
+            false,
+            ctext::PICKER_CLI_TOO_OLD.get(),
+        ),
+        (
+            "Agent did not return its model list",
+            false,
+            ctext::PICKER_LIST_FAILED.get(),
+        ),
+        (
+            "Model switching is unavailable on Windows",
+            false,
+            ctext::PICKER_WINDOWS_UNAVAILABLE.get(),
+        ),
+        (
+            "Confirm in Term to finish switching",
+            true,
+            ctext::PICKER_CONFIRM_IN_TERM.get(),
+        ),
+        (
+            "Model change was not confirmed",
+            true,
+            ctext::PICKER_NOT_CONFIRMED.get(),
+        ),
+        (
+            "This session does not expose model switching",
+            false,
+            ctext::PICKER_SESSION_UNAVAILABLE.get(),
+        ),
+        (
+            "Some unexpected daemon failure string",
+            false,
+            ctext::PICKER_UNAVAILABLE.get(),
+        ),
+    ];
+    for (raw, supported, expected) in cases {
+        let got = composer::localize_composer_notice(Some(raw), supported)
+            .expect("error/unavailable must produce localized notice");
+        assert_eq!(got.as_ref(), expected, "raw={raw}");
+    }
+    assert!(composer::localize_composer_notice(None, true).is_none());
+    assert_eq!(
+        composer::localize_composer_notice(None, false).as_deref(),
+        Some(ctext::PICKER_UNAVAILABLE.get())
+    );
+}
+
+#[test]
+fn p0_3_resolved_efforts_and_effort_text_cover_per_model_and_extended_variants() {
+    assert_eq!(composer::effort_text(" Auto "), ctext::EFFORT_AUTO.get());
+    assert_eq!(
+        composer::effort_text("DEFAULT"),
+        ctext::EFFORT_DEFAULT.get()
+    );
+    assert_eq!(composer::effort_text("x-high"), ctext::EFFORT_XHIGH.get());
+    assert_eq!(
+        composer::effort_text("extra-high"),
+        ctext::EFFORT_XHIGH.get()
+    );
+
+    // Standalone agy model with empty efforts must return empty (no effort chip).
+    let agy_meta = ComposerMeta {
+        supported: true,
+        effort_supported: true,
+        current_model_id: Some("gemini-2.5-flash".into()),
+        models: vec![
+            ComposerModelItem {
+                id: "gemini-2.5-flash".into(),
+                label: "Gemini 2.5 Flash".into(),
+                efforts: vec![],
+                default_effort: None,
+            },
+            ComposerModelItem {
+                id: "gemini-4-carbon".into(),
+                label: "Gemini 4 Carbon".into(),
+                efforts: vec!["high".into(), "low".into()],
+                default_effort: Some("high".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(
+        composer::resolved_efforts_for_model("agy", Some(&agy_meta), Some("gemini-2.5-flash"))
+            .is_empty()
+    );
+    assert_eq!(
+        composer::resolved_efforts_for_model("agy", Some(&agy_meta), Some("gemini-4-carbon")),
+        vec!["low", "high"]
+    );
+
+    // Unsupported effort clears choices even if model has efforts.
+    let no_effort_meta = ComposerMeta {
+        effort_supported: false,
+        ..agy_meta
+    };
+    assert!(
+        composer::resolved_efforts_for_model("agy", Some(&no_effort_meta), Some("gemini-4-carbon"))
+            .is_empty()
+    );
+    // Unknown empty agent must NOT default to Claude's choices.
+    assert!(composer::resolved_efforts_for_model("", None, None).is_empty());
+}
+
+#[test]
+fn chat_35_oversized_fence_skips_highlight_and_uses_segment_cache() {
+    let huge = "let x = 1;\n".repeat(7_000); // > 64 KiB
+    assert!(huge.len() > 64 * 1024);
+    let theme = gpui_component::highlighter::HighlightTheme::default_dark();
+    let highlights = super::code_view::highlight_code_runs_cached("rust", &huge, &theme);
+    assert!(
+        highlights.is_empty(),
+        "oversized code block must fall back to plain monospace without running syntax highlight"
+    );
+    let fenced = format!("intro\n```rust\n{huge}```\noutro");
+    let first = super::body::parse_chat_segments_cached(&fenced);
+    let second = super::body::parse_chat_segments_cached(&fenced);
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn bot_31_markdown_local_image_paths_handles_spaces_angle_brackets_and_file_urls() {
+    let dir = std::env::temp_dir().join(format!("krill-img-paths-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img1 = dir.join("my photo.png");
+    let img2 = dir.join("shot 2.png");
+    std::fs::write(&img1, b"png").unwrap();
+    std::fs::write(&img2, b"png").unwrap();
+    let encoded_url = format!("file://{}", img1.to_string_lossy().replace(' ', "%20"));
+    let md = format!(
+        "![one]({encoded_url})\n![two](<{}> \"cap\")\n![three]({} \"title\")",
+        img1.display(),
+        img2.display()
+    );
+    let found = super::images::markdown_local_image_paths(&md);
+    assert!(found.contains(&img1), "expected {img1:?} in {found:?}");
+    assert!(found.contains(&img2), "expected {img2:?} in {found:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn chat_08_worker_dock_unknown_state_is_starting_then_idle_never_working() {
+    use krill_proto::orchestration::{
+        Dispatch, DispatchReleaseState, DispatchSessionOrigin, DispatchStatus, OrchestrationStore,
+        Run, RunStatus,
+    };
+    let mut store = OrchestrationStore::default();
+    let now_ms: u64 = 1_000_000;
+    store.runs.push(Run {
+        id: "run-1".into(),
+        title: "Test".into(),
+        coordinator_session_id: Some(1),
+        status: RunStatus::Active,
+        created_at_ms: now_ms - 60_000,
+        updated_at_ms: now_ms,
+    });
+    store.dispatches.push(Dispatch {
+        id: "disp-start".into(),
+        run_id: "run-1".into(),
+        task_id: None,
+        worker_name: "starter".into(),
+        agent: "claude".into(),
+        session_id: Some(9),
+        depth: 1,
+        cwd: "/tmp".into(),
+        prompt: "booting".into(),
+        status: DispatchStatus::Active,
+        summary: None,
+        archived_output: None,
+        started_at_ms: now_ms - 5_000,
+        ended_at_ms: None,
+        release_state: DispatchReleaseState::Active,
+        session_origin: DispatchSessionOrigin::Created,
+        model: None,
+        effort: None,
+        retry_of: None,
+        request_id: None,
+    });
+    store.dispatches.push(Dispatch {
+        id: "disp-stale".into(),
+        run_id: "run-1".into(),
+        task_id: None,
+        worker_name: "unbound".into(),
+        agent: "codex".into(),
+        session_id: None,
+        depth: 1,
+        cwd: "/tmp".into(),
+        prompt: "unbound".into(),
+        status: DispatchStatus::Active,
+        summary: None,
+        archived_output: None,
+        started_at_ms: now_ms - 30_000,
+        ended_at_ms: None,
+        release_state: DispatchReleaseState::Active,
+        session_origin: DispatchSessionOrigin::Created,
+        model: None,
+        effort: None,
+        retry_of: None,
+        request_id: None,
+    });
+    let mut sessions = std::collections::HashMap::new();
+    sessions.insert(
+        SessionId(9),
+        super::worker_dock::SessionObservation {
+            state: krill_proto::control::AgentState::Unknown,
+            since_ms: now_ms - 5_000,
+            exited: false,
+        },
+    );
+    let empty_set = std::collections::BTreeSet::new();
+    let snap = super::worker_dock::build_worker_dock_snapshot(
+        &store,
+        SessionId(1),
+        &sessions,
+        &empty_set,
+        &empty_set,
+        now_ms,
+    );
+    assert_eq!(
+        snap.active_count, 0,
+        "Unknown/unbound must not inflate Working count"
+    );
+    let start_row = snap
+        .rows
+        .iter()
+        .find(|r| r.dispatch_id == "disp-start")
+        .unwrap();
+    let stale_row = snap
+        .rows
+        .iter()
+        .find(|r| r.dispatch_id == "disp-stale")
+        .unwrap();
+    assert_eq!(
+        start_row.state,
+        super::worker_dock::WorkerDockState::Starting
+    );
+    assert_eq!(stale_row.state, super::worker_dock::WorkerDockState::Idle);
 }

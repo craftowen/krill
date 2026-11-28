@@ -21,11 +21,11 @@ fn render_diff_block(palette: &ui::Palette, text: &str) -> AnyElement {
     let total_lines = text.lines().count();
     for line in text.lines().take(MAX_RENDERED_DIFF_LINES) {
         let (bg, fg) = if line.starts_with('+') && !line.starts_with("+++") {
-            (palette.success.opacity(0.14), palette.success)
+            (palette.success.opacity(0.14), palette.foreground)
         } else if line.starts_with('-') && !line.starts_with("---") {
-            (palette.destructive.opacity(0.14), palette.destructive)
+            (palette.destructive.opacity(0.14), palette.foreground)
         } else if line.starts_with("@@") {
-            (palette.accent.opacity(0.25), palette.ring)
+            (palette.accent.opacity(0.25), palette.foreground)
         } else if line.starts_with("+++") || line.starts_with("---") || line.starts_with("***") {
             (ui::transparent(), palette.foreground)
         } else {
@@ -97,12 +97,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> bool {
         use krill_app_core::terminal::path_link::{
-            MarkdownLinkTarget, prefers_system_open, resolve_markdown_link, should_open_link_click,
+            MarkdownLinkTarget, prefers_system_open, resolve_markdown_link,
+            resolve_markdown_link_remote, should_open_link_click,
         };
         if !should_open_link_click(event) {
             return false;
         }
-        let Some(target) = resolve_markdown_link(url, base_dir) else {
+        let target = if host.is_remote() {
+            resolve_markdown_link_remote(url, base_dir)
+        } else {
+            resolve_markdown_link(url, base_dir)
+        };
+        let Some(target) = target else {
             tracing::warn!(url, "ignoring invalid or disallowed chat markdown link");
             return false;
         };
@@ -197,14 +203,10 @@ impl Shell {
         let muted_fg = style.palette.muted_foreground;
         let mut next_code_idx = 0usize;
         let link_host = style.key.0.clone();
-        let link_base_dir = if link_host.is_local() {
-            self.pane_cwd(pane, cx).or_else(|| {
-                self.chat_bot(style.key)
-                    .and_then(|bot| self.bot_folder(bot))
-            })
-        } else {
-            None
-        };
+        let link_base_dir = self.pane_cwd(pane, cx).or_else(|| {
+            self.chat_bot(style.key)
+                .and_then(|bot| Self::bot_folder_on(&link_host, bot))
+        });
         let segments = parse_chat_segments_cached(text);
         for (seg_idx, segment) in segments.iter().enumerate() {
             container = match segment {
@@ -2185,7 +2187,9 @@ impl Shell {
                     .cloned()
             {
                 let req_other = request.clone();
+                let req_other_enter = request.clone();
                 let send_input = other_input.clone();
+                let enter_input = other_input.clone();
                 scroll_body = scroll_body.child(
                     div()
                         .w_full()
@@ -2197,6 +2201,35 @@ impl Shell {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .on_action(cx.listener(
+                                    move |this,
+                                          action: &gpui_component::input::Enter,
+                                          window,
+                                          cx| {
+                                        if disabled
+                                            || action.secondary
+                                            || action.shift
+                                            || krill_app_core::jump::entity_input_is_composing(
+                                                &enter_input,
+                                                window,
+                                                cx,
+                                            )
+                                        {
+                                            return;
+                                        }
+                                        let text = enter_input.read(cx).value().to_string();
+                                        if text.trim().is_empty() {
+                                            return;
+                                        }
+                                        cx.stop_propagation();
+                                        this.answer_chat_question_other(
+                                            req_other_enter.clone(),
+                                            other_idx,
+                                            &text,
+                                            cx,
+                                        );
+                                    },
+                                ))
                                 .child(gpui_component::input::Input::new(&other_input)),
                         )
                         .child(
@@ -3235,7 +3268,7 @@ impl Shell {
             .chat
             .pane_widths
             .get(&pane)
-            .is_some_and(|w| *w <= gpui::px(264.))
+            .is_some_and(|w| *w <= gpui::px(360.))
         {
             return None;
         }
@@ -3250,6 +3283,7 @@ impl Shell {
                 .top_2()
                 .left_0()
                 .right_0()
+                .px(gpui::px(116.))
                 .flex()
                 .justify_center()
                 .child(
@@ -4008,6 +4042,7 @@ impl Shell {
             .children(text_block);
 
         let retry_key = key.clone();
+        let dismiss_key = key.clone();
         let copy_key = key;
         let copy_text = pending.display_text.clone();
         let status_row = if is_review {
@@ -4053,6 +4088,21 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
                         this.mark_chat_pending_copied(copy_key.clone(), pending_id, cx);
+                    })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "chat-pending-dismiss-{pending_id}-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-pending-dismiss".into())
+                    .icon(IconName::Close)
+                    .tooltip(ctext::PENDING_DISMISS.get())
+                    .accessibility_label(ctext::PENDING_DISMISS.get())
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_pending_chat_prompt(&dismiss_key, pending_id, cx);
                     })),
                 )
         } else {
@@ -4644,7 +4694,7 @@ impl Shell {
         self.ensure_agy_version(cx);
         let composer = match self.render_bot_outage_card(&key, cx) {
             Some(card) => card,
-            None => self.render_chat_composer(pane, key.clone(), &input_state, cx),
+            None => self.render_chat_composer(pane, key.clone(), &input_state, window, cx),
         };
         let paused_banner = self.render_bot_paused_banner(&key, cx);
         let worker_auto_close_banner = self.render_worker_auto_close_banner(pane, &key, cx);
@@ -4840,6 +4890,8 @@ impl Shell {
                     Button::new(SharedString::from(format!("chat-find-prev-{}", pane.get())))
                         .debug_selector(|| "chat-find-prev".into())
                         .icon(IconName::ChevronUp)
+                        .tooltip(ctext::FIND_PREV.get())
+                        .accessibility_label(ctext::FIND_PREV.get())
                         .ghost()
                         .xsmall()
                         .disabled(!has_matches)
@@ -4855,6 +4907,8 @@ impl Shell {
                     Button::new(SharedString::from(format!("chat-find-next-{}", pane.get())))
                         .debug_selector(|| "chat-find-next".into())
                         .icon(IconName::ChevronDown)
+                        .tooltip(ctext::FIND_NEXT.get())
+                        .accessibility_label(ctext::FIND_NEXT.get())
                         .ghost()
                         .xsmall()
                         .disabled(!has_matches)
@@ -4873,6 +4927,8 @@ impl Shell {
                     )))
                     .debug_selector(|| "chat-find-close".into())
                     .icon(IconName::Close)
+                    .tooltip(ctext::FIND_CLOSE.get())
+                    .accessibility_label(ctext::FIND_CLOSE.get())
                     .ghost()
                     .xsmall()
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -4891,7 +4947,7 @@ impl Shell {
                     weak.update(cx, |this, cx| {
                         let prev = this.chat.pane_widths.get(&pane).copied();
                         let crossed =
-                            prev.is_none_or(|p| (p <= gpui::px(264.)) != (w <= gpui::px(264.)));
+                            prev.is_none_or(|p| (p <= gpui::px(360.)) != (w <= gpui::px(360.)));
                         if prev != Some(w) {
                             this.chat.pane_widths.insert(pane, w);
                             if crossed {
@@ -4938,11 +4994,19 @@ impl Shell {
             .on_key_down(cx.listener({
                 let esc_key = key.clone();
                 move |this, e: &gpui::KeyDownEvent, window, cx| {
-                    if e.keystroke.key == "escape"
-                        && !e.keystroke.modifiers.modified()
-                        && this.dismiss_chat_selection_quote(&esc_key, window, cx)
-                    {
-                        cx.stop_propagation();
+                    if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                        if this.dismiss_chat_selection_quote(&esc_key, window, cx) {
+                            cx.stop_propagation();
+                        } else if this.dismiss_open_composer_popover(&esc_key) {
+                            cx.stop_propagation();
+                            cx.notify();
+                        } else if !this.chat.finds.contains_key(&esc_key)
+                            && this.session_agent_state(&esc_key.0, esc_key.1, cx)
+                                == krill_proto::control::AgentState::Working
+                            && this.interrupt_chat_turn(&esc_key, cx)
+                        {
+                            cx.stop_propagation();
+                        }
                     }
                 }
             }))
@@ -4962,13 +5026,13 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .child(feed)
+                    .children(home_banner)
+                    .child(top_controls)
+                    .children(find_bar)
                     .children(self.render_chat_prompt_notices(&key, cx))
                     .children(resume_toast)
                     .children(turn_status_line)
-                    .child(composer)
-                    .children(home_banner)
-                    .child(top_controls)
-                    .children(find_bar),
+                    .child(composer),
             );
 
         Some(
@@ -5170,6 +5234,9 @@ impl Shell {
                                 .id("chat-resume-toast-btn")
                                 .debug_selector(|| "chat-resume-toast-btn".into())
                                 .role(gpui::Role::Button)
+                                .aria_label(ctext::RESUME_TOAST_BTN.get())
+                                .tab_index(0)
+                                .focus_visible(|d| d.border_1().border_color(palette.ring))
                                 .cursor_pointer()
                                 .rounded(ui::RADIUS_SM)
                                 .bg(accent)
@@ -5188,6 +5255,8 @@ impl Shell {
                         .child(
                             Button::new("chat-resume-toast-dismiss")
                                 .icon(IconName::Close)
+                                .tooltip(ctext::DISMISS_ERROR.get())
+                                .accessibility_label(ctext::DISMISS_ERROR.get())
                                 .ghost()
                                 .xsmall()
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -6047,6 +6116,9 @@ impl Shell {
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
+                                    if this.layout.focused() != Some(pane) {
+                                        this.change(false, cx, |l| l.focus(pane));
+                                    }
                                     if this.panel_collapsed {
                                         this.toggle_panel(cx);
                                     }
@@ -6124,6 +6196,9 @@ impl Shell {
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
+                                    if this.layout.focused() != Some(pane) {
+                                        this.change(false, cx, |l| l.focus(pane));
+                                    }
                                     if this.panel_collapsed {
                                         this.toggle_panel(cx);
                                     }
@@ -6284,6 +6359,9 @@ impl Shell {
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
+                                    if this.layout.focused() != Some(pane) {
+                                        this.change(false, cx, |l| l.focus(pane));
+                                    }
                                     this.open_bots_screen(
                                         super::super::bot_section::BotsScreen::Import,
                                         Some(window),

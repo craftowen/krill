@@ -225,9 +225,38 @@ pub(super) fn step_image_index(current: usize, count: usize, by: isize) -> Optio
     current.checked_add_signed(by).filter(|&to| to < count)
 }
 
+fn extract_markdown_image_target(raw_inner: &str) -> &str {
+    let trimmed = raw_inner.trim();
+    if let Some(after_lt) = trimmed.strip_prefix('<')
+        && let Some((inside, _)) = after_lt.split_once('>')
+    {
+        return inside.trim();
+    }
+    // Strip optional trailing Markdown image title (`"title"` or `'title'`) while preserving
+    // unencoded spaces inside local/file:// paths.
+    for quote in ['"', '\''] {
+        if let Some((before_close, after_close)) = trimmed.rsplit_once(quote)
+            && !before_close.is_empty()
+            && after_close.trim().is_empty()
+            && let Some((before_open, _)) = before_close.rsplit_once(quote)
+            && !before_open.is_empty()
+            && before_open
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return before_open.trim();
+        }
+    }
+    trimmed.trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''))
+}
+
 /// Extracts local previewable Markdown image paths (`![alt](path)`), excluding remote URLs and
 /// GitHub user-attachment links (Orca #47457).
 pub(super) fn markdown_local_image_paths(text: &str) -> Vec<PathBuf> {
+    use krill_app_core::terminal::path_link::{
+        MarkdownLinkTarget, decode_file_url, resolve_markdown_link,
+    };
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(bang) = rest.find("![") {
@@ -240,35 +269,23 @@ pub(super) fn markdown_local_image_paths(text: &str) -> Vec<PathBuf> {
         let Some(close_paren) = after_paren.find(')') else {
             break;
         };
-        let target = after_paren
-            .get(..close_paren)
-            .unwrap_or("")
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''));
+        let target = extract_markdown_image_target(after_paren.get(..close_paren).unwrap_or(""));
         let lower = target.to_ascii_lowercase();
         let is_remote_url = lower.starts_with("http://")
             || lower.starts_with("https://")
             || lower.starts_with("data:")
             || lower.contains("github.com/user-attachments/");
         if !target.is_empty() && !is_remote_url {
-            let local_str = match target.strip_prefix("file://") {
-                Some(rest)
-                    if cfg!(windows)
-                        && rest.starts_with('/')
-                        && rest
-                            .as_bytes()
-                            .get(1..3)
-                            .is_some_and(|b| b[0].is_ascii_alphabetic() && b[1] == b':') =>
-                {
-                    rest.strip_prefix('/').unwrap_or(rest)
+            let resolved_path = if lower.starts_with("file://") {
+                decode_file_url(target, false).map(|(p, _, _)| p)
+            } else {
+                match resolve_markdown_link(target, None) {
+                    Some(MarkdownLinkTarget::LocalPath { path, .. }) => Some(path),
+                    _ => Some(PathBuf::from(target)),
                 }
-                Some(rest) => rest,
-                None => target,
             };
-            let path = PathBuf::from(local_str);
-            if path.is_absolute()
+            if let Some(path) = resolved_path
+                && path.is_absolute()
                 && !path
                     .as_os_str()
                     .to_string_lossy()
@@ -992,6 +1009,18 @@ impl Shell {
         if let Loaded::Ready(image) = viewer.image {
             cx.drop_image(image, Some(window));
         }
+        // Restore keyboard focus to the active chat composer or shell after lightbox closes (CHAT-36).
+        let restored = self
+            .layout
+            .focused()
+            .filter(|&pane| self.is_pane_chat_view(pane, cx))
+            .and_then(|pane| self.chat_key(pane))
+            .and_then(|key| self.chat.inputs.get(&key).map(|(input, _)| input.clone()));
+        if let Some(input) = restored {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
     }
 
@@ -1077,21 +1106,45 @@ impl Shell {
                     .h(px(dh))
                     .into_any_element()
             }
-            Loaded::Loading => Icon::default()
-                .data(ui::icons::IMAGE_SVG)
-                .size(px(ui::ICON_LG))
-                .text_color(p.muted_foreground)
+            Loaded::Loading => div()
+                .id("chat-image-viewer-loading")
+                .debug_selector(|| "chat-image-viewer-status-card".into())
+                .bg(p.popover)
+                .border_1()
+                .border_color(p.border)
+                .rounded(ui::RADIUS_MD)
+                .px_3()
+                .py_2()
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    Icon::default()
+                        .data(ui::icons::IMAGE_SVG)
+                        .size(px(ui::ICON_LG))
+                        .text_color(p.popover_foreground),
+                )
                 .into_any_element(),
             Loaded::Failed => div()
+                .id("chat-image-viewer-failed")
+                .debug_selector(|| "chat-image-viewer-status-card".into())
+                .bg(p.popover)
+                .border_1()
+                .border_color(p.border)
+                .rounded(ui::RADIUS_MD)
+                .px_3()
+                .py_2()
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .flex()
                 .items_center()
                 .gap_2()
                 .text_size(ui::TEXT_SM)
-                .text_color(p.muted_foreground)
+                .text_color(p.popover_foreground)
                 .child(
                     Icon::default()
                         .data(ui::icons::IMAGE_SVG)
-                        .size(px(ui::ICON_MD)),
+                        .size(px(ui::ICON_MD))
+                        .text_color(p.muted_foreground),
                 )
                 .child(failed_label)
                 .into_any_element(),

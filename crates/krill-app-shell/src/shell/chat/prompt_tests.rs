@@ -1705,8 +1705,8 @@ fn clear_command_translates_to_new_for_codex_and_runs_from_autocomplete_and_quic
     let payloads = sent.lock().unwrap();
     assert_eq!(payloads.len(), 2);
     assert_eq!(
-        payloads[0], b"\x1b[200~/new\x1b[201~",
-        "codex must receive /new when user runs /clear"
+        payloads[0], b"\x1b[200~/clear\x1b[201~",
+        "codex must receive /clear directly (live codex /new opens a worktree modal)"
     );
     assert_eq!(payloads[1], b"\r");
 }

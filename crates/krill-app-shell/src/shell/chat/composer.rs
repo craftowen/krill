@@ -9,6 +9,9 @@ use gpui_component::{Icon, IconName, Selectable as _, progress::ProgressCircle, 
 struct DismissedComposerPopovers {
     quick_menu: Option<ChatKey>,
     model_picker: Option<ChatKey>,
+    effort_picker: Option<ChatKey>,
+    permission_picker: Option<ChatKey>,
+    agy_picker: Option<ChatKey>,
 }
 
 impl gpui::Global for DismissedComposerPopovers {}
@@ -90,22 +93,73 @@ fn effort_bars(effort: &str) -> Option<usize> {
 }
 
 pub(super) fn effort_text(effort: &str) -> String {
-    match effort {
+    match effort.trim().to_ascii_lowercase().as_str() {
         "minimal" => ctext::EFFORT_MINIMAL.get().to_owned(),
         "low" => ctext::EFFORT_LOW.get().to_owned(),
         "medium" => ctext::EFFORT_MEDIUM.get().to_owned(),
         "high" => ctext::EFFORT_HIGH.get().to_owned(),
-        "xhigh" | "very_high" | "very-high" => ctext::EFFORT_XHIGH.get().to_owned(),
+        "xhigh" | "x-high" | "extra-high" | "very_high" | "very-high" => {
+            ctext::EFFORT_XHIGH.get().to_owned()
+        }
         "max" => ctext::EFFORT_MAX.get().to_owned(),
         "ultra" => ctext::EFFORT_ULTRA.get().to_owned(),
         "none" => ctext::EFFORT_NONE.get().to_owned(),
         "off" => ctext::EFFORT_OFF.get().to_owned(),
-        other => other.to_owned(),
+        "auto" => ctext::EFFORT_AUTO.get().to_owned(),
+        "default" => ctext::EFFORT_DEFAULT.get().to_owned(),
+        _ => effort.trim().to_owned(),
     }
 }
 
-fn model_is_selected(active: Option<&str>, id: &str) -> bool {
+pub(super) fn model_is_selected(active: Option<&str>, id: &str) -> bool {
     active.is_some_and(|active| active == id || active.starts_with(&format!("claude-{id}-")))
+}
+
+/// Maps backend English composer status reasons and apply errors to concise localized 1-line
+/// Korean/English copy (`CHAT-10`, `CHAT-11`). Never leaks raw English strings into the popover.
+pub(super) fn localize_composer_notice(raw: Option<&str>, supported: bool) -> Option<SharedString> {
+    if let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) {
+        let lower = text.to_ascii_lowercase();
+        let localized = if lower.starts_with("wait for") {
+            ctext::PICKER_WAIT.get()
+        } else if lower.contains("still loading") || lower.contains("starting") {
+            ctext::PICKER_LOADING.get()
+        } else if lower.contains("not found") || lower.contains("no such file") {
+            ctext::PICKER_CLI_NOT_FOUND.get()
+        } else if lower.contains("1.4.12")
+            || lower.contains("0.164.0")
+            || lower.contains("2.1.311")
+            || lower.contains("too old")
+            || lower.contains("upgrade")
+            || lower.contains("requires")
+        {
+            ctext::PICKER_CLI_TOO_OLD.get()
+        } else if lower.contains("did not return its model list") || lower.contains("model list") {
+            ctext::PICKER_LIST_FAILED.get()
+        } else if lower.contains("windows") {
+            ctext::PICKER_WINDOWS_UNAVAILABLE.get()
+        } else if lower.contains("confirm in term") || lower.contains("asked for confirmation") {
+            ctext::PICKER_CONFIRM_IN_TERM.get()
+        } else if lower.contains("not recognized")
+            || lower.contains("not confirmed")
+            || lower.contains("reject")
+            || lower.contains("failed")
+        {
+            ctext::PICKER_NOT_CONFIRMED.get()
+        } else if lower.contains("does not expose")
+            || lower.contains("not in this session")
+            || lower.contains("cannot switch")
+            || lower.contains("unsupported")
+        {
+            ctext::PICKER_SESSION_UNAVAILABLE.get()
+        } else if !supported {
+            ctext::PICKER_UNAVAILABLE.get()
+        } else {
+            ctext::PICKER_NOT_CONFIRMED.get()
+        };
+        return Some(SharedString::from(localized));
+    }
+    (!supported).then(|| SharedString::from(ctext::PICKER_UNAVAILABLE.get()))
 }
 
 fn composer_popup(palette: &ui::Palette) -> gpui::Div {
@@ -115,6 +169,7 @@ fn composer_popup(palette: &ui::Palette) -> gpui::Div {
 /// Above the composer, under the control that opened it (Orca's model picker sits at the right).
 fn composer_popup_at(palette: &ui::Palette, right: bool) -> gpui::Div {
     div()
+        .occlude()
         .absolute()
         .when(right, gpui::Styled::right_0)
         .when(!right, gpui::Styled::left_0)
@@ -126,6 +181,7 @@ fn composer_popup_at(palette: &ui::Palette, right: bool) -> gpui::Div {
         .border_1()
         .border_color(palette.border)
         .bg(palette.popover)
+        .shadow_lg()
         .p_1p5()
         .flex()
         .flex_col()
@@ -185,27 +241,79 @@ pub(super) fn sort_effort_choices(mut efforts: Vec<String>) -> Vec<String> {
     efforts
 }
 
+pub(super) fn resolved_efforts_for_model(
+    agent: &str,
+    meta: Option<&ComposerMeta>,
+    selected_model_id: Option<&str>,
+) -> Vec<String> {
+    if meta.is_some_and(|m| m.supported && !m.effort_supported) {
+        return Vec::new();
+    }
+    let trimmed_agent = agent.trim();
+    let (_, fallback_efforts) = if trimmed_agent.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        fallback_choices_for_agent(trimmed_agent)
+    };
+    let claude = trimmed_agent.eq_ignore_ascii_case("claude");
+    if let Some(m) = meta {
+        let matched = selected_model_id.and_then(|id| {
+            m.models.iter().find(|item| item.id == id).or_else(|| {
+                m.models
+                    .iter()
+                    .find(|item| model_is_selected(Some(id), &item.id))
+            })
+        });
+        if let Some(item) = matched {
+            if !item.efforts.is_empty() {
+                return sort_effort_choices(item.efforts.clone());
+            }
+            if claude {
+                if !m.efforts.is_empty() {
+                    return sort_effort_choices(m.efforts.clone());
+                }
+                if !m.supported {
+                    return sort_effort_choices(fallback_efforts);
+                }
+                return Vec::new();
+            }
+            if m.supported {
+                // Codex/Agy per-model effort lists are authoritative (standalone models have `[]`).
+                return Vec::new();
+            }
+            if !m.efforts.is_empty() {
+                return sort_effort_choices(m.efforts.clone());
+            }
+            return sort_effort_choices(fallback_efforts);
+        }
+        if !m.efforts.is_empty() {
+            return sort_effort_choices(m.efforts.clone());
+        }
+        if m.supported {
+            return Vec::new();
+        }
+    }
+    sort_effort_choices(fallback_efforts)
+}
+
 pub(super) fn resolved_composer_choices(
     agent: &str,
     meta: Option<&ComposerMeta>,
 ) -> (Vec<ComposerModelItem>, Vec<String>) {
-    let (fallback_models, fallback_efforts) = fallback_choices_for_agent(agent);
+    let trimmed_agent = agent.trim();
+    let (fallback_models, _) = if trimmed_agent.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        fallback_choices_for_agent(trimmed_agent)
+    };
     // A busy Claude session only reports its configured model, so keep every native alias listed.
-    let claude = agent.eq_ignore_ascii_case("claude");
+    let claude = trimmed_agent.eq_ignore_ascii_case("claude");
     let models = meta
         .filter(|m| !m.models.is_empty() && (m.supported || !claude))
         .map_or(fallback_models, |m| m.models.clone());
     let active_id = meta.and_then(|m| m.current_model_id.as_deref().or(m.model.as_deref()));
-    let efforts = meta
-        .and_then(|m| {
-            active_id
-                .and_then(|id| m.models.iter().find(|item| item.id == id))
-                .filter(|item| !item.efforts.is_empty() || m.efforts.is_empty())
-                .map(|item| item.efforts.clone())
-                .or_else(|| (!m.efforts.is_empty()).then(|| m.efforts.clone()))
-        })
-        .unwrap_or(fallback_efforts);
-    (models, sort_effort_choices(efforts))
+    let efforts = resolved_efforts_for_model(trimmed_agent, meta, active_id);
+    (models, efforts)
 }
 
 impl Shell {
@@ -214,46 +322,53 @@ impl Shell {
         pane: super::super::PaneId,
         key: ChatKey,
         input_state: &gpui::Entity<TextareaState>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let _ = window;
         let submit_key = key.clone();
         let palette = ui::palette(cx);
         let muted_fg = palette.muted_foreground;
         let log = self.chat.logs.get(&key);
         let meta = log.map(|l| &l.meta);
-        let agent_id = self.chat_agent_id(&key);
-        let (model_choices, effort_choices) = resolved_composer_choices(agent_id, meta);
-        let current_model = meta.and_then(|m| m.current_model_id.as_deref().or(m.model.as_deref()));
-        let current_effort = meta.and_then(|m| m.effort.as_deref());
-        let is_pending = meta.is_some_and(|m| m.pending);
+        let agent_id = self.chat_agent_id(&key, cx);
+        let (model_choices, _) = resolved_composer_choices(&agent_id, meta);
+        let apply = self.chat.composer_applies.get(&key);
+        let optimistic_model = apply.and_then(|a| a.optimistic_model.as_deref());
+        let optimistic_label = apply.and_then(|a| a.optimistic_label.as_deref());
+        let optimistic_effort = apply.and_then(|a| a.optimistic_effort.as_deref());
+        let effective_model = optimistic_model
+            .or_else(|| meta.and_then(|m| m.current_model_id.as_deref().or(m.model.as_deref())));
+        let effective_effort = optimistic_effort.or_else(|| meta.and_then(|m| m.effort.as_deref()));
+        let effort_choices = resolved_efforts_for_model(&agent_id, meta, effective_model);
+        let is_pending =
+            meta.is_some_and(|m| m.pending) || apply.is_some_and(|a| a.in_flight.is_some());
 
         let supported = meta.is_some_and(|m| m.supported);
         let effort_supported = meta.is_some_and(|m| m.supported && m.effort_supported);
-        let show_effort =
-            !effort_choices.is_empty() && meta.is_none_or(|m| !m.supported || m.effort_supported);
-        let model_label = if let Some(label) = meta.and_then(|m| m.model_label.as_deref()) {
+        let show_effort = effort_choices.len() > 1 && meta.is_some_and(|m| m.effort_supported);
+        let model_label = if let Some(label) = optimistic_label {
             short_model_name(label)
-        } else if let Some(m) = current_model {
+        } else if let Some(m) = optimistic_model {
             model_choices
                 .iter()
-                .find(|item| item.id == m)
+                .find(|item| model_is_selected(Some(m), &item.id))
                 .map_or_else(|| short_model_name(m), |item| item.label.clone())
-        } else if let Some(agent) = log
-            .map(|l| l.agent.as_str())
-            .filter(|a| !a.is_empty())
-            .or_else(|| {
-                self.chat_bot(&key)
-                    .map(|b| krill_proto::agent::canonical_id(&b.agent_id))
-                    .filter(|a| !a.is_empty())
-            })
-        {
-            agent_display_name(agent)
+        } else if let Some(label) = meta.and_then(|m| m.model_label.as_deref()) {
+            short_model_name(label)
+        } else if let Some(m) = effective_model {
+            model_choices
+                .iter()
+                .find(|item| model_is_selected(Some(m), &item.id))
+                .map_or_else(|| short_model_name(m), |item| item.label.clone())
+        } else if !agent_id.is_empty() {
+            agent_display_name(&agent_id)
         } else {
             ctext::AGENT_FALLBACK.get().to_string()
         };
-        let effort_label = current_effort
+        let effort_label = effective_effort
             .filter(|e| !e.trim().is_empty())
-            .map(effort_text);
+            .map_or_else(|| ctext::PICKER_EFFORT.get().to_owned(), effort_text);
 
         let context_ring = meta.and_then(|m| m.context_percent).map(|pct| {
             let color = if pct >= 85 {
@@ -290,7 +405,8 @@ impl Shell {
         });
 
         let quick_menu_open = self.chat.quick_menu.contains(&key);
-        let model_picker_open = self.chat.model_picker.contains(&key);
+        let model_picker_open = self.is_model_picker_open(&key);
+        let effort_picker_open = self.is_effort_picker_open(&key);
 
         let quick_menu = quick_menu_open.then(|| {
             let close_key = key.clone();
@@ -300,6 +416,7 @@ impl Shell {
                     "chat-quick-menu-{}",
                     pane.get()
                 )))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                     this.chat.quick_menu.remove(&close_key);
                     cx.notify();
@@ -344,16 +461,7 @@ impl Shell {
                                 move |this, _, window, cx| {
                                     this.chat.quick_menu.remove(&key);
                                     if cmd_str == "/model" {
-                                        this.toggle_chat_model_picker(&key, cx);
-                                        if this.chat.model_picker.contains(&key)
-                                            && !input_state
-                                                .read(cx)
-                                                .focus_handle(cx)
-                                                .is_focused(window)
-                                        {
-                                            input_state
-                                                .update(cx, |state, cx| state.focus(window, cx));
-                                        }
+                                        this.toggle_chat_model_picker(&key, Some(window), cx);
                                         return;
                                     }
                                     if let Some(ac) = this.chat.autocomplete.get_mut(&key) {
@@ -364,8 +472,14 @@ impl Shell {
                                         ));
                                         ac.close();
                                     }
-                                    let run_clear_now = cmd_str == "/clear"
-                                        && input_state.read(cx).value().trim().is_empty();
+                                    if cmd_str == "/clear" {
+                                        input_state.update(cx, |state, cx| {
+                                            state.set_value("/clear".to_owned(), window, cx);
+                                            state.focus(window, cx);
+                                        });
+                                        this.submit_chat_prompt(&key, window, cx);
+                                        return;
+                                    }
                                     input_state.update(cx, |state, cx| {
                                         let val = state.value();
                                         let new_val = if val.trim().is_empty() {
@@ -376,107 +490,203 @@ impl Shell {
                                         state.set_value(new_val, window, cx);
                                         state.focus(window, cx);
                                     });
-                                    if run_clear_now {
-                                        this.submit_chat_prompt(&key, window, cx);
-                                    } else {
-                                        cx.notify();
-                                    }
+                                    cx.notify();
                                 },
                             ))
                         }),
                 )
         });
 
-        let kbd_selected_idx = self.chat.model_picker_selected.get(&key).copied();
         let model_picker = model_picker_open.then(|| {
-            let active_model = current_model.map(str::to_owned);
-            let active_effort = current_effort.map(str::to_owned);
-            let reason = meta.and_then(|m| m.reason.as_deref());
-            let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
-            let notice = if waiting {
-                Some(SharedString::from(ctext::PICKER_WAIT.get()))
+            let filtered_models = self.filtered_model_choices(&key, cx);
+            let (kbd_selected_idx, search_input, list_scroll) =
+                self.chat.composer_popover.get(&key).map_or_else(
+                    || (0, None, gpui::ScrollHandle::new()),
+                    |p| {
+                        (
+                            p.selected_idx,
+                            p.search_input.clone(),
+                            p.list_scroll.clone(),
+                        )
+                    },
+                );
+            let active_model = effective_model.map(str::to_owned);
+            let active_effort = effective_effort.map(str::to_owned);
+            let has_apply_error = meta.is_some_and(|m| m.apply_error.is_some());
+            // Plan A Pillar 1: render `chat-model-picker-reason` ONLY on apply error or unsupported.
+            let notice = if let Some(err) = meta.and_then(|m| m.apply_error.as_deref()) {
+                localize_composer_notice(Some(err), true)
+            } else if !supported {
+                localize_composer_notice(meta.and_then(|m| m.unavailable_reason.as_deref()), false)
             } else {
-                reason.map(|text| SharedString::from(text.to_owned()))
+                None
             };
             let close_key = key.clone();
-            composer_popup_at(palette, true)
+            let up_key = key.clone();
+            let down_key = key.clone();
+            let enter_key = key.clone();
+            let esc_key = key.clone();
+            let esc_focus = input_state.clone();
+            let enter_search = search_input.clone();
+            let esc_search = search_input.clone();
+            let effort_items = effort_choices.clone();
+            let mut popup = composer_popup_at(palette, true)
+                .w(px(300.))
                 .id(SharedString::from(format!(
                     "chat-model-picker-{}",
                     pane.get()
                 )))
                 .debug_selector(|| "chat-model-picker".into())
+                .capture_action(cx.listener(
+                    move |this, _: &gpui_component::input::MoveUp, window, cx| {
+                        if this.step_chat_model_picker(&up_key, -1, cx) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                ))
+                .capture_action(cx.listener(
+                    move |this, _: &gpui_component::input::MoveDown, window, cx| {
+                        if this.step_chat_model_picker(&down_key, 1, cx) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                ))
+                .capture_action(cx.listener(
+                    move |this, action: &gpui_component::input::Enter, window, cx| {
+                        if action.secondary || action.shift {
+                            return;
+                        }
+                        if enter_search.as_ref().is_some_and(|si| {
+                            krill_app_core::jump::entity_input_is_composing(si, window, cx)
+                        }) {
+                            return;
+                        }
+                        if this.accept_chat_model_picker(&enter_key, cx) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
+                .capture_action(cx.listener(
+                    move |this, _: &gpui_component::input::Escape, window, cx| {
+                        if esc_search.as_ref().is_some_and(|si| {
+                            krill_app_core::jump::entity_input_is_composing(si, window, cx)
+                        }) {
+                            return;
+                        }
+                        if this.chat.composer_popover.remove(&esc_key).is_some() {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            esc_focus.update(cx, |state, cx| state.focus(window, cx));
+                            cx.notify();
+                        }
+                    },
+                ))
                 // Orca `#47587`: clicking or dragging the picker's scrollbar must not close it.
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                    this.chat.model_picker.remove(&close_key);
-                    this.chat.model_picker_selected.remove(&close_key);
+                    this.chat.composer_popover.remove(&close_key);
                     cx.notify();
-                }))
-                .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
-                .child(
+                }));
+            if let Some(search_input) = search_input {
+                popup = popup.child(
                     div()
                         .id(SharedString::from(format!(
-                            "chat-model-list-{}",
+                            "chat-model-search-{}",
                             pane.get()
                         )))
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .max_h(px(220.))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .children(model_choices.into_iter().enumerate().map(|(idx, item)| {
-                            let id = item.id;
-                            let is_selected = model_is_selected(active_model.as_deref(), &id);
-                            let is_kbd = kbd_selected_idx == Some(idx);
-                            let key = key.clone();
-                            let option_id = id.clone();
-                            let selector_id = id.clone();
-                            let enabled = supported && !is_pending;
-                            popup_row(
-                                palette,
-                                SharedString::from(format!(
-                                    "chat-model-option-{id}-{}",
-                                    pane.get()
-                                )),
-                                enabled,
-                            )
-                            .debug_selector(move || format!("chat-model-option-{selector_id}"))
-                            .when(is_kbd, |row| row.bg(palette.muted))
-                            .child(item.label)
-                            .when(is_selected, |row| {
-                                row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
-                            })
-                            .when(enabled, |row| {
-                                row.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_chat_model(&key, &option_id, cx);
-                                }))
-                            })
-                        })),
+                        .debug_selector(|| "chat-model-search".into())
+                        .pb_1()
+                        .child(gpui_component::input::Input::new(&search_input).small()),
+                );
+            } else {
+                popup = popup.child(popup_heading(palette, ctext::PICKER_MODEL.get()));
+            }
+            let list_el = div()
+                .id(SharedString::from(format!(
+                    "chat-model-list-{}",
+                    pane.get()
+                )))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .track_scroll(&list_scroll)
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_0p5();
+            let list_el = if filtered_models.is_empty() {
+                list_el.child(
+                    div()
+                        .px_2()
+                        .py_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(ctext::PICKER_MODEL_NO_MATCH.get()),
                 )
+            } else {
+                list_el.children(filtered_models.into_iter().enumerate().map(|(idx, item)| {
+                    let id = item.id;
+                    let is_selected = model_is_selected(active_model.as_deref(), &id);
+                    let is_kbd = kbd_selected_idx == idx;
+                    let key = key.clone();
+                    let option_id = id.clone();
+                    let selector_id = id.clone();
+                    let enabled = supported;
+                    popup_row(
+                        palette,
+                        SharedString::from(format!("chat-model-option-{id}-{}", pane.get())),
+                        enabled,
+                    )
+                    .debug_selector(move || format!("chat-model-option-{selector_id}"))
+                    .when(is_kbd, |row| row.bg(palette.muted))
+                    .child(div().min_w_0().truncate().child(item.label))
+                    .when(is_selected, |row| {
+                        row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                    })
+                    .when(enabled, |row| {
+                        row.on_click(cx.listener(move |this, _, _, cx| {
+                            // Plan A Pillar 4: clicking a model applies optimistically and
+                            // KEEPS POPOVER OPEN so effort can be adjusted right below.
+                            this.select_chat_model(&key, &option_id, cx);
+                        }))
+                    })
+                }))
+            };
+            popup
+                .child(list_el)
                 .when(show_effort, |popup| {
                     popup
+                        .child(div().h_px().w_full().my_1().bg(palette.border))
                         .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
-                        .child(div().flex().flex_wrap().gap_0p5().children(
-                            effort_choices.into_iter().map(|effort| {
-                                let is_selected = active_effort.as_deref() == Some(effort.as_str());
+                        .child(ui::segmented_control(
+                            palette,
+                            effort_items.into_iter().map(|effort| {
+                                let is_selected = active_effort
+                                    .as_deref()
+                                    .is_some_and(|cur| cur.eq_ignore_ascii_case(&effort));
                                 let key = key.clone();
                                 let option_effort = effort.clone();
                                 let selector_effort = effort.clone();
-                                Button::new(SharedString::from(format!(
-                                    "chat-effort-option-{effort}-{}",
-                                    pane.get()
-                                )))
+                                let focus_input = input_state.clone();
+                                ui::segment(
+                                    palette,
+                                    SharedString::from(format!(
+                                        "chat-effort-option-{effort}-{}",
+                                        pane.get()
+                                    )),
+                                    effort_text(&effort),
+                                    is_selected,
+                                )
                                 .debug_selector(move || {
                                     format!("chat-effort-option-{selector_effort}")
                                 })
-                                .label(effort_text(&effort))
-                                .selected(is_selected)
-                                .disabled(is_pending || !effort_supported)
-                                .ghost()
                                 .xsmall()
-                                .on_click(cx.listener({
-                                    let focus_input = input_state.clone();
+                                .disabled(!effort_supported)
+                                .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         this.select_chat_effort(&key, &option_effort, cx);
                                         if !focus_input.read(cx).focus_handle(cx).is_focused(window)
@@ -484,8 +694,8 @@ impl Shell {
                                             focus_input
                                                 .update(cx, |state, cx| state.focus(window, cx));
                                         }
-                                    }
-                                }))
+                                    },
+                                ))
                             }),
                         ))
                 })
@@ -499,9 +709,64 @@ impl Shell {
                         .px_2()
                         .pt_1()
                         .text_size(ui::TEXT_XS)
-                        .text_color(muted_fg)
+                        .text_color(if has_apply_error {
+                            palette.destructive
+                        } else {
+                            muted_fg
+                        })
                         .child(notice)
                 }))
+        });
+
+        // Plan A Pillar 3: standalone 1-row effort mini segmented popover.
+        let effort_picker = (effort_picker_open && show_effort).then(|| {
+            let active_effort = effective_effort.map(str::to_owned);
+            let close_key = key.clone();
+            let effort_items = effort_choices.clone();
+            composer_popup_at(palette, true)
+                .w_auto()
+                .id(SharedString::from(format!(
+                    "chat-effort-picker-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-effort-picker".into())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.composer_popover.remove(&close_key);
+                    cx.notify();
+                }))
+                .child(ui::segmented_control(
+                    palette,
+                    effort_items.into_iter().map(|effort| {
+                        let is_selected = active_effort
+                            .as_deref()
+                            .is_some_and(|cur| cur.eq_ignore_ascii_case(&effort));
+                        let key = key.clone();
+                        let option_effort = effort.clone();
+                        let selector_effort = effort.clone();
+                        let focus_input = input_state.clone();
+                        ui::segment(
+                            palette,
+                            SharedString::from(format!(
+                                "chat-effort-option-{effort}-{}",
+                                pane.get()
+                            )),
+                            effort_text(&effort),
+                            is_selected,
+                        )
+                        .debug_selector(move || format!("chat-effort-option-{selector_effort}"))
+                        .xsmall()
+                        .disabled(!effort_supported)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.select_chat_effort(&key, &option_effort, cx);
+                                if !focus_input.read(cx).focus_handle(cx).is_focused(window) {
+                                    focus_input.update(cx, |state, cx| state.focus(window, cx));
+                                }
+                            },
+                        ))
+                    }),
+                ))
         });
 
         let attachments = self
@@ -865,8 +1130,7 @@ impl Shell {
             super::ComposerSubmissionState::Ready
         };
         let agent_state = self.session_agent_state(&key.0, key.1, cx);
-        let interrupt_latched =
-            self.is_chat_interrupt_latched(&key, cx) || self.is_chat_stop_cooldown(&key, cx);
+        let stop_cooling_down = self.is_chat_stop_cooldown(&key, cx);
         let draft_empty = {
             let state = input_state.read(cx);
             super::strip_image_token_spans(state.value().as_ref(), state.tokens())
@@ -878,7 +1142,7 @@ impl Shell {
             agent_state,
             submission,
             draft_empty,
-            interrupt_latched,
+            stop_cooling_down,
         });
         let queued_prompts: Vec<_> = self
             .chat
@@ -1258,6 +1522,7 @@ impl Shell {
             };
             let tip = format!("{label} · {desc}");
             let perm_key = key.clone();
+            let perm_down_key = key.clone();
             let icon_color = if full { palette.warning } else { muted_fg };
             div()
                 .id(SharedString::from(format!(
@@ -1275,10 +1540,27 @@ impl Shell {
                 .items_center()
                 .gap_0p5()
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.chat.quick_menu.remove(&perm_key);
-                    this.chat.model_picker.remove(&perm_key);
-                    if !this.chat.permission_picker.remove(&perm_key) {
+                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.default_global::<DismissedComposerPopovers>()
+                        .permission_picker = permission_picker_open.then(|| perm_down_key.clone());
+                })
+                .on_click(cx.listener(move |this, event, _, cx| {
+                    let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
+                        && cx
+                            .default_global::<DismissedComposerPopovers>()
+                            .permission_picker
+                            .take()
+                            .as_ref()
+                            == Some(&perm_key);
+                    if dismissed {
+                        this.chat.permission_picker.remove(&perm_key);
+                        cx.notify();
+                        return;
+                    }
+                    let was_open = this.chat.permission_picker.contains(&perm_key);
+                    this.close_all_composer_popovers(&perm_key);
+                    if !was_open {
                         this.chat.permission_picker.insert(perm_key.clone());
                     }
                     cx.notify();
@@ -1296,12 +1578,14 @@ impl Shell {
                 )
         });
 
+        let agy_auth_open = self.chat.agy_auth_picker.contains(&key);
         let agy_chip = self.chat_is_agy(&key, cx).then(|| {
             let agy_label = match &self.chat.agy_version {
                 Some(ver) => ctext::AGY_PROGRAM_YOUR_VER.format(&[("version", ver.as_str())]),
                 None => ctext::AGY_PROGRAM_YOUR.get().to_owned(),
             };
             let agy_key = key.clone();
+            let agy_down_key = key.clone();
             Button::new(SharedString::from(format!(
                 "chat-composer-agy-auth-{}",
                 pane.get()
@@ -1317,11 +1601,27 @@ impl Shell {
             .ghost()
             .xsmall()
             .text_color(muted_fg)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.chat.quick_menu.remove(&agy_key);
-                this.chat.model_picker.remove(&agy_key);
-                this.chat.permission_picker.remove(&agy_key);
-                if !this.chat.agy_auth_picker.remove(&agy_key) {
+            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                cx.default_global::<DismissedComposerPopovers>().agy_picker =
+                    agy_auth_open.then(|| agy_down_key.clone());
+            })
+            .on_click(cx.listener(move |this, event, _, cx| {
+                let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
+                    && cx
+                        .default_global::<DismissedComposerPopovers>()
+                        .agy_picker
+                        .take()
+                        .as_ref()
+                        == Some(&agy_key);
+                if dismissed {
+                    this.chat.agy_auth_picker.remove(&agy_key);
+                    cx.notify();
+                    return;
+                }
+                let was_open = this.chat.agy_auth_picker.contains(&agy_key);
+                this.close_all_composer_popovers(&agy_key);
+                if !was_open {
                     this.chat.agy_auth_picker.insert(agy_key.clone());
                 }
                 cx.notify();
@@ -1582,7 +1882,15 @@ impl Shell {
                         )
                         .child(div().truncate().child(host_label)),
                 )
-                .children(folder_el)
+                .children(folder_el.map(|el| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .child(el)
+                }))
                 .children(agy_chip.map(|chip| {
                     div()
                         .ml_auto()
@@ -1628,7 +1936,14 @@ impl Shell {
                         ac.step_selection(-1);
                         cx.stop_propagation();
                         cx.notify();
-                    } else if this.step_chat_model_picker(&up_key, -1) {
+                    } else if this
+                        .chat
+                        .autocomplete
+                        .get(&up_key)
+                        .is_some_and(super::catalog::AutocompleteState::should_render_popover)
+                    {
+                        cx.stop_propagation();
+                    } else if this.step_chat_model_picker(&up_key, -1, cx) {
                         cx.stop_propagation();
                         cx.notify();
                     } else if up_input.read(cx).focus_handle(cx).is_focused(window)
@@ -1650,7 +1965,14 @@ impl Shell {
                         ac.step_selection(1);
                         cx.stop_propagation();
                         cx.notify();
-                    } else if this.step_chat_model_picker(&down_key, 1) {
+                    } else if this
+                        .chat
+                        .autocomplete
+                        .get(&down_key)
+                        .is_some_and(super::catalog::AutocompleteState::should_render_popover)
+                    {
+                        cx.stop_propagation();
+                    } else if this.step_chat_model_picker(&down_key, 1, cx) {
                         cx.stop_propagation();
                         cx.notify();
                     } else if down_input.read(cx).focus_handle(cx).is_focused(window)
@@ -1722,6 +2044,14 @@ impl Shell {
                         window.prevent_default();
                         cx.stop_propagation();
                         cx.notify();
+                    } else if !this.chat.finds.contains_key(&escape_key)
+                        && !this.dismiss_chat_selection_quote(&escape_key, window, cx)
+                        && this.session_agent_state(&escape_key.0, escape_key.1, cx)
+                            == krill_proto::control::AgentState::Working
+                        && this.interrupt_chat_turn(&escape_key, cx)
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
                 }
             }))
@@ -1741,6 +2071,13 @@ impl Shell {
                     if this.dismiss_open_composer_popover(&escape_key) {
                         cx.stop_propagation();
                         cx.notify();
+                    } else if !this.chat.finds.contains_key(&escape_key)
+                        && !this.dismiss_chat_selection_quote(&escape_key, window, cx)
+                        && this.session_agent_state(&escape_key.0, escape_key.1, cx)
+                            == krill_proto::control::AgentState::Working
+                        && this.interrupt_chat_turn(&escape_key, cx)
+                    {
+                        cx.stop_propagation();
                     }
                 }
             }))
@@ -1794,7 +2131,11 @@ impl Shell {
                 gpui::MouseButton::Left,
                 cx.listener({
                     let focus_input = input_state.clone();
+                    let card_key = key.clone();
                     move |this, _, window, cx| {
+                        if this.close_all_composer_popovers(&card_key) {
+                            cx.notify();
+                        }
                         if this.layout.focused() != Some(pane) {
                             this.change(false, cx, |l| l.focus(pane));
                             this.files.refocus = false;
@@ -1819,6 +2160,7 @@ impl Shell {
             .gap_1()
             .children(quick_menu)
             .children(model_picker)
+            .children(effort_picker)
             .children(permission_popover)
             .children(agy_auth_popover)
             .children(resume_search_popover)
@@ -1880,6 +2222,7 @@ impl Shell {
                                 .on_mouse_down(gpui::MouseButton::Left, {
                                     let down_key = key.clone();
                                     move |_, _, cx| {
+                                        cx.stop_propagation();
                                         cx.default_global::<DismissedComposerPopovers>()
                                             .quick_menu = quick_menu_open.then(|| down_key.clone());
                                     }
@@ -1896,15 +2239,16 @@ impl Shell {
                                                 .as_ref()
                                                 == Some(&key);
                                         if dismissed {
+                                            this.chat.quick_menu.remove(&key);
+                                            cx.notify();
                                             return;
                                         }
-                                        this.chat.model_picker.remove(&key);
+                                        let was_open = this.chat.quick_menu.contains(&key);
+                                        this.close_all_composer_popovers(&key);
                                         if let Some(ac) = this.chat.autocomplete.get_mut(&key) {
                                             ac.dismiss_current();
                                         }
-                                        if this.chat.quick_menu.contains(&key) {
-                                            this.chat.quick_menu.remove(&key);
-                                        } else {
+                                        if !was_open {
                                             this.chat.quick_menu.insert(key.clone());
                                             if matches!(event, gpui::ClickEvent::Mouse(_))
                                                 && !input_state
@@ -1927,10 +2271,11 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .min_w_0()
+                            .flex_shrink(1.)
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .child(
                                 div()
                                     .id(SharedString::from(format!(
@@ -1938,76 +2283,115 @@ impl Shell {
                                         pane.get()
                                     )))
                                     .debug_selector(|| "chat-composer-model".into())
+                                    .min_w_0()
+                                    .flex_shrink(1.)
                                     .h(px(24.))
                                     .px_1p5()
                                     .rounded(ui::RADIUS_SM)
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .when(!is_pending, |d| {
-                                        d.cursor_pointer().hover(|s| s.bg(palette.secondary))
-                                    })
-                                    .when(is_pending, |d| d.opacity(0.5))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(palette.secondary))
+                                    .when(is_pending, |d| d.opacity(0.65))
                                     .on_mouse_down(gpui::MouseButton::Left, {
                                         let down_key = key.clone();
                                         move |_, _, cx| {
+                                            cx.stop_propagation();
                                             cx.default_global::<DismissedComposerPopovers>()
                                                 .model_picker =
                                                 model_picker_open.then(|| down_key.clone());
                                         }
                                     })
-                                    .when(!is_pending, |d| {
-                                        d.on_click(cx.listener({
-                                            let key = key.clone();
-                                            let input_state = input_state.clone();
-                                            move |this, event, window, cx| {
-                                                let dismissed = matches!(
-                                                    event,
-                                                    gpui::ClickEvent::Mouse(_)
-                                                ) && cx
-                                                    .default_global::<DismissedComposerPopovers>()
-                                                    .model_picker
-                                                    .take()
-                                                    .as_ref()
-                                                    == Some(&key);
-                                                if dismissed {
-                                                    return;
-                                                }
-                                                this.toggle_chat_model_picker(&key, cx);
-                                                if this.chat.model_picker.contains(&key)
-                                                    && matches!(event, gpui::ClickEvent::Mouse(_))
-                                                    && !input_state
-                                                        .read(cx)
-                                                        .focus_handle(cx)
-                                                        .is_focused(window)
-                                                {
-                                                    input_state.update(cx, |state, cx| {
-                                                        state.focus(window, cx);
-                                                    });
-                                                }
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, event, window, cx| {
+                                            let dismissed = matches!(
+                                                event,
+                                                gpui::ClickEvent::Mouse(_)
+                                            ) && cx
+                                                .default_global::<DismissedComposerPopovers>()
+                                                .model_picker
+                                                .take()
+                                                .as_ref()
+                                                == Some(&key);
+                                            if dismissed {
+                                                this.chat.composer_popover.remove(&key);
+                                                cx.notify();
+                                                return;
                                             }
-                                        }))
-                                    })
+                                            this.toggle_chat_model_picker(&key, Some(window), cx);
+                                        }
+                                    }))
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .max_w(px(140.))
+                                            .truncate()
                                             .text_size(ui::TEXT_XS)
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(palette.foreground)
                                             .child(model_label),
                                     )
-                                    .children(effort_label.map(|effort| {
-                                        div()
-                                            .text_size(ui::TEXT_XS)
-                                            .text_color(muted_fg)
-                                            .child(effort)
-                                    }))
                                     .child(
                                         Icon::new(IconName::ChevronDown)
                                             .size(px(11.))
                                             .text_color(muted_fg),
                                     ),
                             )
-                            .children(context_ring)
+                            .children(show_effort.then(|| {
+                                let eff_down_key = key.clone();
+                                let eff_click_key = key.clone();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "chat-composer-effort-{}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-composer-effort".into())
+                                    .flex_none()
+                                    .h(px(24.))
+                                    .px_1p5()
+                                    .rounded(ui::RADIUS_SM)
+                                    .flex()
+                                    .items_center()
+                                    .gap_0p5()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(palette.secondary))
+                                    .when(is_pending, |d| d.opacity(0.65))
+                                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.default_global::<DismissedComposerPopovers>()
+                                            .effort_picker =
+                                            effort_picker_open.then(|| eff_down_key.clone());
+                                    })
+                                    .on_click(cx.listener(move |this, event, _, cx| {
+                                        let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
+                                            && cx
+                                                .default_global::<DismissedComposerPopovers>()
+                                                .effort_picker
+                                                .take()
+                                                .as_ref()
+                                                == Some(&eff_click_key);
+                                        if dismissed {
+                                            this.chat.composer_popover.remove(&eff_click_key);
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.toggle_chat_effort_picker(&eff_click_key, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(effort_label.clone()),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(px(10.))
+                                            .text_color(muted_fg),
+                                    )
+                            }))
+                            .children(context_ring.map(|ring| div().flex_none().child(ring)))
                             .children(
                                 (matches!(
                                     primary_action,
@@ -2032,7 +2416,7 @@ impl Shell {
                                                 .ghost()
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
-                                                        this.submit_chat_prompt(
+                                                        this.submit_chat_prompt_from_click(
                                                             &queue_key, window, cx,
                                                         );
                                                     },
@@ -2049,7 +2433,7 @@ impl Shell {
                                                 .ghost()
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
-                                                        this.steer_chat_prompt(
+                                                        this.steer_chat_prompt_from_click(
                                                             &steer_key, window, cx,
                                                         );
                                                     },
@@ -2057,56 +2441,58 @@ impl Shell {
                                             )
                                     }),
                             )
-                            .child(self.render_chat_voice_control(
+                            .child(div().flex_none().child(self.render_chat_voice_control(
                                 pane,
                                 &key,
                                 matches!(primary_action, super::ComposerPrimaryAction::Sending),
                                 cx,
-                            ))
-                            .child({
+                            )))
+                            .child(div().flex_none().child({
                                 use gpui_component::button::ButtonCustomVariant;
                                 match primary_action {
-                                    super::ComposerPrimaryAction::Stop { latched } => Button::new(
-                                        SharedString::from(format!(
+                                    super::ComposerPrimaryAction::Stop { cooling_down } => {
+                                        Button::new(SharedString::from(format!(
                                             "desktop-chat-stop-{}",
                                             pane.get()
-                                        )),
-                                    )
-                                    .debug_selector(|| "desktop-chat-stop".into())
-                                    .icon(
-                                        gpui_component::Icon::default()
-                                            .data(ui::icons::STOP_SQUARE_SVG)
-                                            .size(px(ui::ICON_SM)),
-                                    )
-                                    .tooltip(if latched {
-                                        ctext::STOPPING.get()
-                                    } else {
-                                        ctext::STOP.get()
-                                    })
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(palette.foreground)
-                                            .foreground(palette.background)
-                                            .hover(palette.foreground.opacity(0.88))
-                                            .active(palette.foreground.opacity(0.76)),
-                                    )
-                                    .w(px(28.))
-                                    .h(px(28.))
-                                    .p_0()
-                                    .rounded(px(999.))
-                                    .disabled(latched)
-                                    .on_click(cx.listener(
-                                        move |this, event: &gpui::ClickEvent, _, cx| {
-                                            if event.click_count() > 1 {
-                                                return;
-                                            }
-                                            // Orca `#47784`: clicking Stop focuses this chat pane.
-                                            if this.layout.focused() != Some(pane) {
-                                                this.change(false, cx, |l| l.focus(pane));
-                                            }
-                                            this.interrupt_chat_turn(&key, cx);
-                                        },
-                                    )),
+                                        )))
+                                        .debug_selector(|| "desktop-chat-stop".into())
+                                        .icon(
+                                            gpui_component::Icon::default()
+                                                .data(ui::icons::STOP_SQUARE_SVG)
+                                                .size(px(ui::ICON_SM)),
+                                        )
+                                        .tooltip(if cooling_down {
+                                            ctext::STOPPING.get()
+                                        } else {
+                                            ctext::STOP.get()
+                                        })
+                                        .custom(
+                                            ButtonCustomVariant::new(cx)
+                                                .color(palette.foreground)
+                                                .foreground(palette.background)
+                                                .hover(palette.foreground.opacity(0.88))
+                                                .active(palette.foreground.opacity(0.76)),
+                                        )
+                                        .w(px(28.))
+                                        .h(px(28.))
+                                        .p_0()
+                                        .rounded(px(999.))
+                                        .disabled(cooling_down)
+                                        .on_click(
+                                            cx.listener(
+                                                move |this, event: &gpui::ClickEvent, _, cx| {
+                                                    if event.click_count() > 1 {
+                                                        return;
+                                                    }
+                                                    // Orca `#47784`: clicking Stop focuses this chat pane.
+                                                    if this.layout.focused() != Some(pane) {
+                                                        this.change(false, cx, |l| l.focus(pane));
+                                                    }
+                                                    this.interrupt_chat_turn(&key, cx);
+                                                },
+                                            ),
+                                        )
+                                    }
                                     super::ComposerPrimaryAction::Sending => {
                                         Button::new(SharedString::from(format!(
                                             "desktop-chat-send-{}",
@@ -2162,12 +2548,14 @@ impl Shell {
                                                 if this.layout.focused() != Some(pane) {
                                                     this.change(false, cx, |l| l.focus(pane));
                                                 }
-                                                this.submit_chat_prompt(&key, window, cx);
+                                                this.submit_chat_prompt_from_click(
+                                                    &key, window, cx,
+                                                );
                                             },
                                         ))
                                     }
                                 }
-                            }),
+                            })),
                     ),
             );
 
@@ -2196,7 +2584,7 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let palette = ui::palette(cx);
         let mut notices = Vec::new();
-        if self.chat.poll_failed.contains(key) {
+        if self.chat.poll_failed.contains(key) && !self.is_remote_host_offline(&key.0, cx) {
             notices.push(
                 ui::error_banner(palette, ctext::POLL_FAILED.get())
                     .id("chat-poll-error")
@@ -2460,6 +2848,8 @@ impl Shell {
             Button::new("chat-rate-limit-more")
                 .debug_selector(|| "chat-rate-limit-more".into())
                 .icon(gpui_kit_assets::IconName::Ellipsis)
+                .tooltip(ctext::MORE_OPTIONS.get())
+                .accessibility_label(ctext::MORE_OPTIONS.get())
                 .small()
                 .ghost()
                 .text_color(muted)
@@ -2617,6 +3007,7 @@ mod name_tests {
             effort: Some("medium".into()),
             efforts: vec![],
             supported: true,
+            effort_supported: true,
             ..Default::default()
         };
         let (_, resolved_efforts) = resolved_composer_choices("codex", Some(&meta));

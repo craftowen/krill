@@ -937,6 +937,8 @@ impl StateInner {
 
         if delta.y > px(0.) {
             self.follow_state.stop_following();
+        } else if delta.y < px(0.) && new_scroll_top >= scroll_max - px(1.0) {
+            self.follow_state.start_following();
         }
 
         if let Some(handler) = self.scroll_handler.as_mut() {

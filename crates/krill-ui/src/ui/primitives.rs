@@ -344,35 +344,54 @@ pub fn format_short_time_ago(ts_ms: u64, now_ms: u64) -> String {
     format_short_time_ago_secs(ts_ms / 1000, now_ms / 1000)
 }
 
-/// 초 단위 타임스탬프용 콤팩트 상대 시각(`now`, `13m`, `1h`, `1d`, `2w`, `3mo`, `1y`).
+/// 초 단위 타임스탬프용 Orca 콤팩트 상대 시각(`now`, `13m`, `1h`, `1d`, `2w`, `3mo`, `1y`).
+/// 로케일 인식 포맷은 [`format_short_time_ago_secs_localized`] 또는
+/// [`format_short_time_ago_secs_in`]을 사용한다.
 #[must_use]
 pub fn format_short_time_ago_secs(ts_secs: u64, now_secs: u64) -> String {
+    format_short_time_ago_secs_in(ts_secs, now_secs, crate::i18n::Language::En)
+}
+
+/// 현재 앱 언어로 초 단위 상대 시각(`방금`/`now`, `13분`/`13m`, `1시간`/`1h` 등)을 포맷한다.
+#[must_use]
+pub fn format_short_time_ago_secs_localized(ts_secs: u64, now_secs: u64) -> String {
+    format_short_time_ago_secs_in(ts_secs, now_secs, crate::i18n::language())
+}
+
+/// 지정 언어의 콤팩트 상대 시각을 포맷한다.
+#[must_use]
+pub fn format_short_time_ago_secs_in(
+    ts_secs: u64,
+    now_secs: u64,
+    lang: crate::i18n::Language,
+) -> String {
+    use crate::i18n::catalog::chat as ctext;
     let diff = now_secs.saturating_sub(ts_secs);
     let mins = diff / 60;
     if mins < 1 {
-        return "now".to_owned();
+        return ctext::SHORT_AGO_NOW.in_language(lang).to_owned();
     }
     if mins < 60 {
-        return format!("{mins}m");
+        return ctext::SHORT_AGO_MINUTES.format_in(lang, &[("n", &mins.to_string())]);
     }
     let hours = mins / 60;
     if hours < 24 {
-        return format!("{hours}h");
+        return ctext::SHORT_AGO_HOURS.format_in(lang, &[("n", &hours.to_string())]);
     }
     let days = hours / 24;
     if days < 7 {
-        return format!("{days}d");
+        return ctext::SHORT_AGO_DAYS.format_in(lang, &[("n", &days.to_string())]);
     }
     let weeks = days / 7;
     if weeks < 4 {
-        return format!("{weeks}w");
+        return ctext::SHORT_AGO_WEEKS.format_in(lang, &[("n", &weeks.to_string())]);
     }
     let months = days / 30;
     if months < 12 {
-        return format!("{months}mo");
+        return ctext::SHORT_AGO_MONTHS.format_in(lang, &[("n", &months.to_string())]);
     }
     let years = days / 365;
-    format!("{years}y")
+    ctext::SHORT_AGO_YEARS.format_in(lang, &[("n", &years.to_string())])
 }
 
 /// 다중 선택지(2~4개) 세그먼트 컨트롤 트랙(Orca `SegmentedControl` 대응, OWE-793).
@@ -1255,38 +1274,96 @@ mod tests {
 
     #[test]
     fn short_time_ago_matches_orca_format() {
+        use crate::i18n::Language;
         let now = 1_700_000_000_u64;
-        assert_eq!(super::format_short_time_ago_secs(now, now), "now");
-        assert_eq!(super::format_short_time_ago_secs(now + 10, now), "now");
-        assert_eq!(super::format_short_time_ago_secs(now - 59, now), "now");
-        assert_eq!(super::format_short_time_ago_secs(now - 60, now), "1m");
-        assert_eq!(super::format_short_time_ago_secs(now - 13 * 60, now), "13m");
-        assert_eq!(super::format_short_time_ago_secs(now - 59 * 60, now), "59m");
-        assert_eq!(super::format_short_time_ago_secs(now - 3600, now), "1h");
         assert_eq!(
-            super::format_short_time_ago_secs(now - 18 * 3600, now),
+            super::format_short_time_ago_secs_in(now, now, Language::En),
+            "now"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now + 10, now, Language::En),
+            "now"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 59, now, Language::En),
+            "now"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 60, now, Language::En),
+            "1m"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 13 * 60, now, Language::En),
+            "13m"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 59 * 60, now, Language::En),
+            "59m"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 3600, now, Language::En),
+            "1h"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 18 * 3600, now, Language::En),
             "18h"
         );
-        assert_eq!(super::format_short_time_ago_secs(now - 86_400, now), "1d");
         assert_eq!(
-            super::format_short_time_ago_secs(now - 6 * 86_400, now),
+            super::format_short_time_ago_secs_in(now - 86_400, now, Language::En),
+            "1d"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 6 * 86_400, now, Language::En),
             "6d"
         );
         assert_eq!(
-            super::format_short_time_ago_secs(now - 7 * 86_400, now),
+            super::format_short_time_ago_secs_in(now - 7 * 86_400, now, Language::En),
             "1w"
         );
         assert_eq!(
-            super::format_short_time_ago_secs(now - 30 * 86_400, now),
+            super::format_short_time_ago_secs_in(now - 30 * 86_400, now, Language::En),
             "1mo"
         );
         assert_eq!(
-            super::format_short_time_ago_secs(now - 365 * 86_400, now),
+            super::format_short_time_ago_secs_in(now - 365 * 86_400, now, Language::En),
             "1y"
+        );
+
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now, now, Language::Ko),
+            "방금"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 60, now, Language::Ko),
+            "1분"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 3600, now, Language::Ko),
+            "1시간"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 86_400, now, Language::Ko),
+            "1일"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 7 * 86_400, now, Language::Ko),
+            "1주"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 30 * 86_400, now, Language::Ko),
+            "1개월"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_in(now - 365 * 86_400, now, Language::Ko),
+            "1년"
         );
         assert_eq!(
             super::format_short_time_ago((now - 120) * 1000, now * 1000),
             "2m"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs_localized(now - 120, now),
+            super::format_short_time_ago_secs_in(now - 120, now, crate::i18n::language())
         );
     }
 }

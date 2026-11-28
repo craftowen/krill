@@ -704,6 +704,7 @@ fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut 
         "desktop-chat-composer",
         "chat-composer-plus",
         "chat-composer-model",
+        "chat-composer-effort",
         "chat-composer-context",
         "desktop-chat-send",
     ] {
@@ -737,10 +738,13 @@ fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut 
         picker.left() >= overlay.left() && picker.right() <= overlay.right(),
         "chat-model-picker overflowed pane horizontally: {picker:?} outside {overlay:?}"
     );
+    assert!(cx.debug_bounds("chat-model-search").is_some());
+    assert!(cx.debug_bounds("chat-model-picker-reason").is_none());
+    // Plan A Pillar 4: clicking a model keeps popover open so effort can be adjusted right below.
     let opus_opt = cx.debug_bounds("chat-model-option-opus").unwrap();
     cx.simulate_click(opus_opt.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("chat-model-picker").is_none());
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.chat.logs[&local_key(SESSION)]
@@ -751,13 +755,22 @@ fn chat_orca_composer_controls_and_quick_menu_work_and_fit_narrow_pane(cx: &mut 
         );
     });
 
-    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
-    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
+    // Clicking an effort inside the open popover applies immediately and closes it.
     let max_opt = cx.debug_bounds("chat-effort-option-max").unwrap();
     cx.simulate_click(max_opt.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("chat-model-picker").is_none());
+
+    // Plan A Pillar 3: clicking the standalone effort chip opens only the 1-row effort popover.
+    let effort_btn = cx.debug_bounds("chat-composer-effort").unwrap();
+    cx.simulate_click(effort_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-effort-picker").is_some());
+    assert!(cx.debug_bounds("chat-model-picker").is_none());
+    let high_opt = cx.debug_bounds("chat-effort-option-high").unwrap();
+    cx.simulate_click(high_opt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-effort-picker").is_none());
     let actions: Vec<String> = workflow_requests
         .lock()
         .unwrap()
@@ -2193,7 +2206,7 @@ fn chat_autocomplete_supports_file_and_slash_selection_ime_guard_working_priorit
     assert!((stop_btn.size.width - px(28.)).abs() <= px(1.));
     cx.simulate_click(stop_btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(*sent.lock().unwrap(), vec![b"\x03".to_vec()]);
+    assert_eq!(*sent.lock().unwrap(), vec![b"\x1b".to_vec()]);
     assert_eq!(input.read_with(cx, |s, _| s.value()), "/comp");
 }
 
@@ -3838,7 +3851,13 @@ fn prune_chat_sessions_drops_cooldown_history_tokens_and_other_inputs(cx: &mut T
     let stale_key = local_key(SessionId(9999));
     cx.update(|window, cx| {
         shell.update(cx, |s, cx| {
-            s.chat.stop_cooldown_since.insert(stale_key.clone(), 42);
+            s.chat.stop_cooldown.insert(
+                stale_key.clone(),
+                super::StopCooldown {
+                    turn_since: 42,
+                    until: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                },
+            );
             s.chat
                 .sent_history
                 .insert(stale_key.clone(), vec!["old".into()]);
@@ -3853,7 +3872,7 @@ fn prune_chat_sessions_drops_cooldown_history_tokens_and_other_inputs(cx: &mut T
                 .insert(std::path::PathBuf::from("/tmp/a.png"));
             s.ensure_question_other_input(&stale_key, "tool:1", window, cx);
             s.prune_chat_sessions();
-            assert!(!s.chat.stop_cooldown_since.contains_key(&stale_key));
+            assert!(!s.chat.stop_cooldown.contains_key(&stale_key));
             assert!(!s.chat.sent_history.contains_key(&stale_key));
             assert!(!s.chat.history_cursor.contains_key(&stale_key));
             assert!(!s.chat.history_saved_draft.contains_key(&stale_key));
@@ -5059,7 +5078,7 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             s.chat.permission_picker.insert(key.clone());
             s.chat.agy_auth_picker.insert(key.clone());
             s.chat.worker_dock_expanded.insert(key.clone());
-            s.chat.worker_keep_open.insert(SESSION);
+            s.chat.worker_keep_open.insert(key.clone());
             s.chat.question_batch_step.insert((key.clone(), 0), 1);
             s.chat.question_batch_answers.insert(
                 (key.clone(), 0),
@@ -5092,7 +5111,7 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             assert!(s.chat.permission_picker.contains(&new_key));
             assert!(s.chat.agy_auth_picker.contains(&new_key));
             assert!(s.chat.worker_dock_expanded.contains(&new_key));
-            assert!(s.chat.worker_keep_open.contains(&rebind_to));
+            assert!(s.chat.worker_keep_open.contains(&new_key));
             assert_eq!(
                 s.chat.side_chat_mode.get(&new_key),
                 Some(&super::side_chat::SideChatPrefix::btw())
@@ -5140,12 +5159,18 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             s.chat.permission_picker.insert(stale_key.clone());
             s.chat.agy_auth_picker.insert(stale_key.clone());
             s.chat.worker_dock_expanded.insert(stale_key.clone());
-            s.chat.worker_dock_cleared.insert("gone-dispatch".into());
+            s.chat
+                .worker_dock_cleared
+                .insert((HostId::Local, "gone-dispatch".into()));
             s.chat
                 .worker_dock_owner_stopped
-                .insert("gone-owner-stop".into());
-            s.chat.worker_keep_open.insert(SessionId(8888));
-            s.chat.worker_banner_kept.insert("gone-banner".into());
+                .insert((HostId::Local, "gone-owner-stop".into()));
+            s.chat
+                .worker_keep_open
+                .insert((HostId::Local, SessionId(8888)));
+            s.chat
+                .worker_banner_kept
+                .insert((HostId::Local, "gone-banner".into()));
             s.chat
                 .side_chat_mode
                 .insert(stale_key.clone(), super::side_chat::SideChatPrefix::btw());
@@ -5178,10 +5203,26 @@ fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mu
             assert!(!s.chat.permission_picker.contains(&stale_key));
             assert!(!s.chat.agy_auth_picker.contains(&stale_key));
             assert!(!s.chat.worker_dock_expanded.contains(&stale_key));
-            assert!(!s.chat.worker_dock_cleared.contains("gone-dispatch"));
-            assert!(!s.chat.worker_dock_owner_stopped.contains("gone-owner-stop"));
-            assert!(!s.chat.worker_keep_open.contains(&SessionId(8888)));
-            assert!(!s.chat.worker_banner_kept.contains("gone-banner"));
+            assert!(
+                !s.chat
+                    .worker_dock_cleared
+                    .contains(&(HostId::Local, "gone-dispatch".into()))
+            );
+            assert!(
+                !s.chat
+                    .worker_dock_owner_stopped
+                    .contains(&(HostId::Local, "gone-owner-stop".into()))
+            );
+            assert!(
+                !s.chat
+                    .worker_keep_open
+                    .contains(&(HostId::Local, SessionId(8888)))
+            );
+            assert!(
+                !s.chat
+                    .worker_banner_kept
+                    .contains(&(HostId::Local, "gone-banner".into()))
+            );
             assert!(!s.chat.side_chat_mode.contains_key(&stale_key));
             assert!(!s.chat.editing_queued.contains(&stale_key));
             assert!(!s.chat.queued_focused.contains_key(&stale_key));
@@ -5660,10 +5701,17 @@ fn temporary_chat_worker_banner_renders_countdown_and_keep_open_removes_it(
     cx.run_until_parked();
     assert!(cx.debug_bounds("chat-worker-auto-close-banner").is_some());
     shell.read_with(cx, |s, _| {
+        let kept: std::collections::BTreeSet<String> = s
+            .chat
+            .worker_banner_kept
+            .iter()
+            .filter(|(h, _)| h == &krill_app_core::hosts::HostId::Local)
+            .map(|(_, id)| id.clone())
+            .collect();
         let state = worker_dock::temporary_worker_banner_for_session(
             &s.orch_snapshot,
             SESSION,
-            &s.chat.worker_banner_kept,
+            &kept,
             s.chat_now_epoch_ms(),
         )
         .unwrap();
@@ -5681,8 +5729,12 @@ fn temporary_chat_worker_banner_renders_countdown_and_keep_open_removes_it(
     cx.run_until_parked();
     assert!(cx.debug_bounds("chat-worker-auto-close-banner").is_none());
     shell.read_with(cx, |s, _| {
-        assert!(s.chat.worker_keep_open.contains(&SESSION));
-        assert!(s.chat.worker_banner_kept.contains("disp-temp"));
+        assert!(s.chat.worker_keep_open.contains(&local_key(SESSION)));
+        assert!(
+            s.chat
+                .worker_banner_kept
+                .contains(&(krill_app_core::hosts::HostId::Local, "disp-temp".into()))
+        );
         assert_eq!(
             s.orch_snapshot.dispatches[0].release_state,
             DispatchReleaseState::Retained
@@ -6837,4 +6889,262 @@ fn chat_markdown_file_links_after_korean_text_and_inline_code_click_and_open(
     });
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn p0_3_plan_a_claude_sequential_apply_search_filter_rollback_and_hidden_effort_chip(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(cx, "chat-plan-a-claude-seq", vec![]);
+    let requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::Arc::default();
+    let fail_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorded = std::sync::Arc::clone(&requests);
+    let fail_flag = std::sync::Arc::clone(&fail_next);
+
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        shell.chat.workflow_call = Some(std::sync::Arc::new(move |raw| {
+            let req: serde_json::Value = serde_json::from_str(raw).unwrap();
+            recorded.lock().unwrap().push(req.clone());
+            let action = req.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+            let resp = match action {
+                "chat_composer" | "composer_models" => serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "agent": "claude",
+                        "model": "claude-sonnet-4-6",
+                        "model_label": "Sonnet 4.6",
+                        "effort": "medium",
+                        "supported": true,
+                        "effort_supported": true,
+                        "reason": "Native composer picker is ready.",
+                        "efforts": ["low", "medium", "high", "max"],
+                        "items": [
+                            { "id": "opus", "label": "Opus 4.7", "efforts": ["low", "medium", "high", "max"] },
+                            { "id": "sonnet", "label": "Sonnet 4.6", "efforts": ["low", "medium", "high", "max"] },
+                            { "id": "haiku", "label": "Haiku 4.5", "efforts": ["low", "medium"] }
+                        ],
+                        "models": [
+                            { "id": "opus", "label": "Opus 4.7", "efforts": ["low", "medium", "high", "max"] },
+                            { "id": "sonnet", "label": "Sonnet 4.6", "efforts": ["low", "medium", "high", "max"] },
+                            { "id": "haiku", "label": "Haiku 4.5", "efforts": ["low", "medium"] }
+                        ]
+                    }
+                }),
+                "set_model" => {
+                    if fail_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "applied": false,
+                                "supported": true,
+                                "reason": "Model change was not confirmed"
+                            }
+                        })
+                    } else {
+                        let model = req.get("model").and_then(serde_json::Value::as_str).unwrap_or("opus");
+                        serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "applied": true,
+                                "supported": true,
+                                "model": model,
+                                "label": "Opus 4.7"
+                            }
+                        })
+                    }
+                }
+                "set_effort" => {
+                    let effort = req.get("effort").and_then(serde_json::Value::as_str).unwrap_or("high");
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "applied": true,
+                            "supported": true,
+                            "effort": effort
+                        }
+                    })
+                }
+                _ => serde_json::json!({ "ok": false, "error": "unknown" }),
+            };
+            Ok(resp.to_string())
+        }));
+        shell.refresh_chat_composer(&local_key(SESSION), false, cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // 2-chip split rendered, and opening model picker shows NO normal-state reason banner.
+    assert!(cx.debug_bounds("chat-composer-model").is_some());
+    assert!(cx.debug_bounds("chat-composer-effort").is_some());
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+    assert!(cx.debug_bounds("chat-model-search").is_some());
+    assert!(
+        cx.debug_bounds("chat-model-picker-reason").is_none(),
+        "supported normal state must never render chat-model-picker-reason"
+    );
+
+    // Live search filters models immediately.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let search = s.chat.composer_popover[&local_key(SESSION)]
+                .search_input
+                .clone()
+                .unwrap();
+            search.update(cx, |st, cx| st.set_value("haiku", window, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-option-haiku").is_some());
+    assert!(cx.debug_bounds("chat-model-option-opus").is_none());
+
+    // Clear search and select Opus -> Claude must send effort: null and keep popover open.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let search = s.chat.composer_popover[&local_key(SESSION)]
+                .search_input
+                .clone()
+                .unwrap();
+            search.update(cx, |st, cx| st.set_value("", window, cx));
+        });
+    });
+    cx.run_until_parked();
+    let opus = cx.debug_bounds("chat-model-option-opus").unwrap();
+    cx.simulate_click(opus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+    {
+        let reqs = requests.lock().unwrap();
+        let set_model_req = reqs
+            .iter()
+            .rfind(|v| v.get("action").and_then(|a| a.as_str()) == Some("set_model"))
+            .unwrap();
+        assert!(
+            set_model_req
+                .get("effort")
+                .is_none_or(serde_json::Value::is_null),
+            "Claude set_model must always send effort: null, got {set_model_req}"
+        );
+    }
+
+    // Failed set_model rolls back cleanly and displays localized apply_error banner.
+    fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let sonnet = cx.debug_bounds("chat-model-option-sonnet").unwrap();
+    cx.simulate_click(sonnet.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker-reason").is_some());
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.chat.logs[&local_key(SESSION)]
+                .meta
+                .current_model_id
+                .as_deref(),
+            Some("opus"),
+            "failed set_model must roll back to previous confirmed model"
+        );
+    });
+
+    // When effort_supported == false, standalone effort chip is hidden.
+    shell.update(cx, |s, cx| {
+        s.close_all_composer_popovers(&local_key(SESSION));
+        let meta = &mut s.chat.logs.get_mut(&local_key(SESSION)).unwrap().meta;
+        meta.effort_supported = false;
+        meta.efforts.clear();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-composer-effort").is_none());
+}
+
+#[gpui::test]
+fn p0_1_and_p0_4_esc_shortcut_pending_dismiss_and_offline_poll_banner_suppress(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = fixture(cx, "chat-esc-dismiss-offline", vec![]);
+    let sent: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> = std::sync::Arc::default();
+    let recorded = std::sync::Arc::clone(&sent);
+    let key = local_key(SESSION);
+
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            attach_live_test_pane(s, pane, SESSION, cx);
+            s.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            s.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "claude".into(),
+                    bound: true,
+                    ..Default::default()
+                },
+            );
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |st, cx| st.focus(window, cx));
+            // Seed a ReviewRequired pending prompt to verify CHAT-26 dismiss button.
+            s.chat
+                .pending_prompts
+                .entry(key.clone())
+                .or_default()
+                .push(super::PendingChatPrompt {
+                    id: 77,
+                    origin_item: 0,
+                    display_text: "stuck prompt".into(),
+                    attachments: Vec::new(),
+                    submitted_payload: "stuck prompt".into(),
+                    submitted_at_ms: 0,
+                    status: super::PendingStatus::ReviewRequired,
+                });
+            s.chat.prompt_review.insert(key.clone());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    // CHAT-26: Dismiss removes ReviewRequired card and clears prompt_review.
+    let dismiss = cx
+        .debug_bounds("chat-pending-dismiss")
+        .expect("ReviewRequired card must show dismiss button");
+    cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(!s.chat.pending_prompts.contains_key(&key));
+        assert!(!s.chat.prompt_review.contains(&key));
+    });
+
+    // BOT-03: Esc closes open quick menu first, then Esc while Working sends b"\x1b".
+    set_phase2b_session_state(&shell, cx, krill_proto::control::AgentState::Working, 777);
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |st, cx| st.focus(window, cx));
+            s.chat.quick_menu.insert(key.clone());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(!s.chat.quick_menu.contains(&key));
+    });
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "first Esc must dismiss open popover without interrupting"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![b"\x1b".to_vec()],
+        "second Esc while Working with no open overlays must send b\"\\x1b\""
+    );
 }

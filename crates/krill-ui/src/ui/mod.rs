@@ -24,10 +24,10 @@ pub use icons::{ICON_LG, ICON_MD, ICON_SM, ICON_XL, ICON_XS};
 pub use primitives::{
     BadgeTone, LabelDesc, SessionHoverCardSpec, badge, button_with_reserved_label,
     button_with_tooltip, button_with_tooltip_when, card, controls, danger_confirm, error_banner,
-    field_label, format_short_time_ago, format_short_time_ago_secs, ghost, group, group_row,
-    keycap, label, modal_backdrop, modal_focus_scope, page_modal_size, primary, row, secondary,
-    section_title, segment, segmented_control, session_hover_card_view, switch, switch_compact,
-    tooltip_view,
+    field_label, format_short_time_ago, format_short_time_ago_secs, format_short_time_ago_secs_in,
+    format_short_time_ago_secs_localized, ghost, group, group_row, keycap, label, modal_backdrop,
+    modal_focus_scope, page_modal_size, primary, row, secondary, section_title, segment,
+    segmented_control, session_hover_card_view, switch, switch_compact, tooltip_view,
 };
 pub use terminal_themes::{
     BUILTIN_TERMINAL_THEMES, BuiltinTerminalTheme, CustomTerminalTheme,

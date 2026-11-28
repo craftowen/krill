@@ -485,8 +485,8 @@ pub const LIGHT: Palette = Palette {
     worktree_sidebar_accent: hex(0x00ea_eaea),
     worktree_sidebar_border: hex(0x00e5_e5e5),
     success: hex(0x0014_7638),
-    warning: hex(0x00ca_8a04),
-    warning_foreground: hex(0x0017_1717),
+    warning: hex(0x00a1_6207),
+    warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00ea_580c),
     unread: hex(0x003b_82f6),
     // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
@@ -709,7 +709,7 @@ pub const PAPER: Palette = Palette {
     worktree_sidebar_accent: hex(0x00e0_d9ca),
     worktree_sidebar_border: hex(0x00e2_dccf),
     success: hex(0x001f_7a45),
-    warning: hex(0x00a1_6207),
+    warning: hex(0x0094_5804),
     warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00c2_410c),
     unread: hex(0x003b_82f6),
@@ -1558,6 +1558,11 @@ mod tests {
             assert!(
                 warning_ratio >= 4.5,
                 "{name}: warning_foreground on warning = {warning_ratio:.2}:1 < 4.5:1"
+            );
+            let warning_on_bg = contrast(p.warning, p.background);
+            assert!(
+                warning_on_bg >= 4.5,
+                "{name}: warning on background = {warning_on_bg:.2}:1 < 4.5:1"
             );
         }
     }
